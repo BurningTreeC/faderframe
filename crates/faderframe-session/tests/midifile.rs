@@ -22,7 +22,7 @@ fn empty() -> Session {
 
 #[test]
 fn export_then_import_keeps_notes_and_tempo() {
-    let demo = Session::demo(EngineConfig::default()).unwrap();
+    let mut demo = Session::demo(EngineConfig::default()).unwrap();
     let path = dir().join("demo.mid");
     let tracks = demo.export_midi_file(&path, None).unwrap();
     assert_eq!(tracks, 2, "the demo's instrument track and MIDI track");
@@ -200,7 +200,7 @@ fn format_0_files_split_by_channel_with_tempo_meter_controllers_and_sysex() {
 
 #[test]
 fn exporting_only_selected_clips_and_nothing_to_export() {
-    let demo = Session::demo(EngineConfig::default()).unwrap();
+    let mut demo = Session::demo(EngineConfig::default()).unwrap();
     let melody = demo
         .project()
         .clips

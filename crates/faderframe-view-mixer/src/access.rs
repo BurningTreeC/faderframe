@@ -1,7 +1,7 @@
 //! The mixer for screen readers and the keyboard: a group per strip (its
 //! track's name) with the volume fader and pan as sliders the arrows move,
-//! mute, solo and record arm as toggles, and the inserts as buttons that
-//! open their editors.
+//! mute, solo and record arm (a folder's: its Group switch) as toggles, and
+//! the inserts as buttons that open their editors.
 
 use crate::MixerView;
 use faderframe_core::gain::{SILENCE_DB, format_db};
@@ -20,6 +20,7 @@ const ARM: u64 = 6;
 const INSERT: u64 = 7;
 const PAN_LEFT: u64 = 8;
 const PAN_RIGHT: u64 = 9;
+const GROUP: u64 = 10;
 
 /// The fader's floor and top as a screen reader reports them.
 const FLOOR_DB: f64 = -80.0;
@@ -35,6 +36,7 @@ impl MixerView {
         let id = t.id;
         let l = self.layout_for(rect, t, model.project());
         let kind = match t.kind {
+            _ if t.is_folder_bus() => "folder bus",
             TrackKind::Master => "master",
             TrackKind::Bus => "bus",
             TrackKind::Aux => "aux",
@@ -50,8 +52,19 @@ impl MixerView {
             format!("{} {kind}", t.name),
         )
         .at(rect);
+        // A folder's Group switch (a folder bus: where a track's record
+        // button is).
+        let group = |r: faderframe_ui_canvas::Rect| {
+            AccessNode::new(access_id(&[GROUP, id.0]), AccessRole::ToggleButton, "Group")
+                .at(r)
+                .checked(t.folder_group)
+                .on_activate(Action::SetFolderGroup {
+                    folder: id,
+                    on: !t.folder_group,
+                })
+        };
         if t.kind == TrackKind::Folder {
-            return strip;
+            return strip.child(group(crate::folder_layout(rect).group));
         }
         // In a cue mix the fader is the track's send level there.
         let cue = model.mixer_cue().map(|c| c.name.clone());
@@ -167,6 +180,9 @@ impl MixerView {
                     })),
             );
         }
+        if t.is_folder_bus() && cue.is_none() {
+            strip = strip.child(group(l.record));
+        }
         if t.kind.has_clips() {
             strip = strip.child(
                 AccessNode::new(
@@ -219,7 +235,7 @@ impl MixerView {
             }
         }
         if (self.master_only || !self.hide_master)
-            && let Some(m) = model.project().master()
+            && let Some(m) = self.pinned(model)
         {
             out.push(self.strip_node(m, self.master_rect(size), model));
         }

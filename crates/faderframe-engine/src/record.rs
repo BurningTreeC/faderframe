@@ -88,6 +88,16 @@ impl Default for RecordingNow {
 }
 
 impl RecordingNow {
+    /// A record window and no audio tracks (a MIDI-only take: its count-in
+    /// silences the arrangement before the window all the same).
+    pub(crate) fn window_only(from: i64, to: i64, count_in: bool) -> Self {
+        Self {
+            window: Some((from, to)),
+            tracks: [None; RECORDING_TRACKS],
+            count_in,
+        }
+    }
+
     /// Counting in: the arrangement is silent before this position.
     pub fn silent_before(&self, recording: bool) -> Option<i64> {
         let (from, _) = self.window?;

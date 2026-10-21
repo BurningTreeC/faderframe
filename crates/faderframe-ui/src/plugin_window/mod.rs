@@ -243,6 +243,24 @@ pub fn open(app: &Rc<AppState>, plugin: PluginInstanceId, generic: bool) {
     open_generic(app, plugin);
 }
 
+/// Close `plugin`'s editor windows (its own GUI, the generic one, a
+/// device editor) as their close buttons do.
+pub fn close(app: &Rc<AppState>, plugin: PluginInstanceId) {
+    close_native(app, plugin);
+    let windows: Vec<gtk::Window> = EDITORS.with(|e| {
+        [
+            e.generic.borrow_mut().remove(&plugin),
+            e.devices.borrow_mut().remove(&plugin),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    });
+    for w in windows {
+        w.close();
+    }
+}
+
 /// The Bypass toggle of an editor window's header.
 fn bypass_button(
     app: &Rc<AppState>,

@@ -53,6 +53,7 @@ faderframe-video.workspace = true
 faderframe-view-modulators.workspace = true
 faderframe-view-pitch.workspace = true
 faderframe-view-clipfx.workspace = true
+faderframe-view-inspector.workspace = true
 faderframe-view-launcher.workspace = true
 faderframe-view-tools.workspace = true
 faderframe-view-devices.workspace = true
@@ -71,6 +72,8 @@ libloading.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 glib-unix.workspace = true
+# The crash reporter's fatal-signal handlers.
+libc.workspace = true
 
 # Plugin editor parent windows: X11 (Linux/BSD), Win32, Cocoa.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -79,7 +82,9 @@ x11rb.workspace = true
 [target.'cfg(windows)'.dependencies]
 # Shared D3D12 textures to GTK's Vulkan renderer (GTK 4.20).
 gdk4-win32 = { version = "0.11", features = ["v4_20"] }
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_OpenGL", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+# (Diagnostics/Kernel/Threading: the crash reporter's exception filter and
+# its look at earlier runs.)
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_OpenGL", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 faderframe-plugin-au.workspace = true

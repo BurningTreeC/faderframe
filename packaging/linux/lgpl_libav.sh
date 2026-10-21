@@ -5,9 +5,9 @@
 #     packaging/linux/lgpl_libav.sh PREFIX
 #
 # A distribution's FFmpeg is usually built with GPL parts (x264, x265…),
-# which FaderFrame's packages must not carry; this one has decoders only
-# (ProRes, DNxHD/DNxHR, MPEG-2, DV, HuffYUV, FFV1, Cineform, JPEG 2000, …)
-# and no GPL or non-free code (FFmpeg's configure refuses those unless
+# which FaderFrame's packages must not carry; this one has decoders
+# (ProRes, DNxHD/DNxHR, MPEG-2, DV, HuffYUV, FFV1, Cineform, JPEG 2000, …),
+# the MXF demuxer and no GPL or non-free code (FFmpeg's configure refuses those unless
 # asked). tarball.sh takes the result with FADERFRAME_LIBAV=PREFIX.
 #
 # Environment: FFMPEG_VERSION (default 7.1.2), GST_VERSION (default: the
@@ -35,6 +35,11 @@ fetch "https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-$gst_version.ta
 
 decoders=prores,dnxhd,mpeg2video,mpeg1video,dvvideo,huffyuv,ffvhuff,ffv1,cfhd,jpeg2000,v210,v410,r210,r10k,qtrle,rawvideo,mjpeg,utvideo,hqx,hq_hqa,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le
 parsers=dnxhd,mpegvideo,dvd_nav,mjpeg,jpeg2000
+# FFmpeg's MXF demuxer (avdemux_mxf): GStreamer's own before 1.28.4 — the
+# one the tarball bundles from Debian 13 is 1.26.2 — crashes on some MXF
+# files, and FaderFrame then reads MXF with this one
+# (faderframe-video `streams::avoid_crashing_demuxers`).
+demuxers=mxf
 asm=""
 command -v nasm >/dev/null 2>&1 || asm=--disable-x86asm
 
@@ -47,6 +52,7 @@ if [ ! -f "$prefix/lib/pkgconfig/libavcodec.pc" ]; then
         --disable-avdevice --disable-swresample --disable-postproc \
         --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale \
         --enable-decoder="$decoders" --enable-parser="$parsers" \
+        --enable-demuxer="$demuxers" \
         --enable-filter=yadif,scale,format,null,buffer,buffersink \
         $asm
     # The licence the build ended up with: LGPL, or stop.

@@ -8,13 +8,19 @@
 //!
 //! The thread sleeps *between* callbacks to emulate a device clock; nothing
 //! sleeps inside the processing callback itself.
+//!
+//! [`DummyDevices`] stands in for a machine's interfaces in tests: devices
+//! with their own rates, buffer sizes and channels that can be unplugged
+//! (a stream on one shuts down, like a USB interface pulled out) and
+//! plugged in again.
 
 use crate::{
-    AudioBackend, AudioCallback, AudioError, AudioStream, DeviceBuffers, DeviceInfo, OwnedBuffers,
-    STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor, StreamStatus, validate_format,
+    AudioBackend, AudioCallback, AudioError, AudioStream, Capabilities, DeviceBuffers, DeviceInfo,
+    OwnedBuffers, RateControl, STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor,
+    StreamRouting, StreamStatus, validate_format,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -24,7 +30,99 @@ const CATCH_UP: Duration = Duration::from_millis(500);
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_BUFFER_SIZE: u32 = 256;
 
-#[derive(Clone, Copy, Debug, Default)]
+/// A pretend device and its presence (cleared when it is unplugged; its
+/// streams watch it).
+type Plugged = (DeviceInfo, Arc<AtomicBool>);
+
+/// Pretend interfaces for a [`DummyBackend`], shared with the test that
+/// plugs and unplugs them.
+#[derive(Clone, Debug, Default)]
+pub struct DummyDevices(Arc<Mutex<Vec<Plugged>>>);
+
+impl DummyDevices {
+    pub fn new(devices: Vec<DeviceInfo>) -> Self {
+        let this = Self::default();
+        for d in devices {
+            this.plug(d);
+        }
+        this
+    }
+
+    /// A device appears (again).
+    pub fn plug(&self, device: DeviceInfo) {
+        let mut list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(d, _)| d.id != device.id);
+        list.push((device, Arc::new(AtomicBool::new(true))));
+    }
+
+    /// A device goes away: streams on it shut down.
+    pub fn unplug(&self, id: &str) {
+        let mut list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|(d, present)| {
+            if d.id == id {
+                present.store(false, Ordering::Relaxed);
+            }
+            d.id != id
+        });
+    }
+
+    pub fn list(&self) -> Vec<DeviceInfo> {
+        let list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.iter().map(|(d, _)| d.clone()).collect()
+    }
+
+    /// A device by id (or name), with its presence flag.
+    fn find(&self, wanted: &str) -> Option<Plugged> {
+        let list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.iter()
+            .find(|(d, _)| d.id == wanted)
+            .or_else(|| list.iter().find(|(d, _)| d.name == wanted))
+            .cloned()
+    }
+
+    /// The default device of a direction.
+    fn default_for(&self, output: bool) -> Option<Plugged> {
+        let list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let has = |d: &DeviceInfo| {
+            if output {
+                d.output_channels > 0
+            } else {
+                d.input_channels > 0
+            }
+        };
+        list.iter()
+            .find(|(d, _)| d.is_default && has(d))
+            .or_else(|| list.iter().find(|(d, _)| has(d)))
+            .cloned()
+    }
+}
+
+/// A pretend interface: `rates` and `buffers` are what it takes (empty /
+/// `None`: anything), the first rate its current one.
+pub fn mock_device(
+    id: &str,
+    inputs: u16,
+    outputs: u16,
+    rates: &[u32],
+    buffers: Option<(u32, u32)>,
+) -> DeviceInfo {
+    DeviceInfo {
+        id: id.into(),
+        name: id.into(),
+        input_channels: inputs,
+        output_channels: outputs,
+        input_names: (1..=inputs).map(|n| format!("In {n}")).collect(),
+        output_names: (1..=outputs).map(|n| format!("Out {n}")).collect(),
+        sample_rates: rates.to_vec(),
+        current_sample_rate: rates.first().copied(),
+        current_buffer_size: None,
+        buffer_sizes: buffers,
+        clock: Some(id.into()),
+        is_default: false,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct DummyBackend {
     /// Sine frequency fed to every input channel (amplitude 0.5), if any.
     input_tone: Option<f32>,
@@ -36,6 +134,8 @@ pub struct DummyBackend {
     /// frames longer than the device's own buffer (hardware inserts
     /// without hardware).
     loopback: Option<u32>,
+    /// Pretend interfaces (`None`: the one silent device).
+    devices: Option<DummyDevices>,
 }
 
 impl DummyBackend {
@@ -77,6 +177,30 @@ impl DummyBackend {
             ..Self::default()
         }
     }
+
+    /// Offer these pretend interfaces instead of the one silent device:
+    /// streams open on one of them (by id), refuse rates and buffer sizes
+    /// it does not take, and shut down when it is unplugged.
+    pub fn with_devices(devices: DummyDevices) -> Self {
+        Self {
+            devices: Some(devices),
+            ..Self::default()
+        }
+    }
+
+    /// The pretend device a stream opens on for a direction.
+    fn pick(&self, wanted: &[String], output: bool) -> Result<Option<Plugged>, AudioError> {
+        let Some(devices) = &self.devices else {
+            return Ok(None);
+        };
+        match wanted.first() {
+            Some(id) => devices
+                .find(id)
+                .map(Some)
+                .ok_or_else(|| AudioError::DeviceNotFound(id.clone())),
+            None => Ok(devices.default_for(output)),
+        }
+    }
 }
 
 impl AudioBackend for DummyBackend {
@@ -88,20 +212,39 @@ impl AudioBackend for DummyBackend {
         "No audio device (silent)"
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            rate: RateControl::Device,
+            live_buffer_size: true,
+            live_sample_rate: false,
+            output_devices: 1,
+            input_devices: 1,
+            clocked_by_server: false,
+            follows_devices: false,
+            free_channel_counts: true,
+            force_format: false,
+        }
+    }
+
     fn is_available(&self) -> bool {
         true
     }
 
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+        if let Some(devices) = &self.devices {
+            return Ok(devices.list());
+        }
         Ok(vec![DeviceInfo {
             id: "dummy".into(),
             name: "Silent dummy device".into(),
-            input_channels: 2,
+            // Any count opens; these are what a stream opens by default.
+            input_channels: 8,
             output_channels: 2,
             sample_rates: STANDARD_SAMPLE_RATES.to_vec(),
             current_sample_rate: None,
             current_buffer_size: None,
             is_default: true,
+            ..DeviceInfo::default()
         }])
     }
 
@@ -110,12 +253,75 @@ impl AudioBackend for DummyBackend {
         config: StreamConfig,
         mut callback: Box<dyn AudioCallback>,
     ) -> Result<Box<dyn AudioStream>, AudioError> {
-        let sample_rate = config.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-        let buffer_size = config.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE);
+        let output = self.pick(&config.output_devices, true)?;
+        // The output device records where it can.
+        let input = match output.clone().filter(|(d, _)| d.input_channels > 0) {
+            Some(same) if config.input_devices.is_empty() => Some(same),
+            _ => self.pick(&config.input_devices, false)?,
+        };
+        let device = output.as_ref().map(|(d, _)| d);
+        let sample_rate = config
+            .sample_rate
+            .or(device.and_then(|d| d.current_sample_rate))
+            .unwrap_or(DEFAULT_SAMPLE_RATE);
+        let buffer_size = config
+            .buffer_size
+            .or(device.and_then(|d| d.current_buffer_size))
+            .unwrap_or(DEFAULT_BUFFER_SIZE);
         validate_format(sample_rate, buffer_size)?;
+        for (d, _) in output.iter().chain(input.iter()) {
+            if !d.sample_rates.is_empty() && !d.sample_rates.contains(&sample_rate) {
+                return Err(AudioError::UnsupportedConfig(format!(
+                    "{} cannot run at {sample_rate} Hz",
+                    d.name
+                )));
+            }
+            if let Some((lo, hi)) = d.buffer_sizes
+                && !(lo..=hi).contains(&buffer_size)
+            {
+                return Err(AudioError::UnsupportedConfig(format!(
+                    "{} takes buffers of {lo}–{hi} frames, not {buffer_size}",
+                    d.name
+                )));
+            }
+        }
+        let routing = output.as_ref().map(|(o, _)| {
+            let name = |d: &DeviceInfo, names: &[String], c: usize| {
+                names.get(c).map(|n| format!("{} · {n}", d.name))
+            };
+            StreamRouting {
+                outputs: (0..config.output_channels as usize)
+                    .map(|c| name(o, &o.output_names, c))
+                    .collect(),
+                inputs: (0..config.input_channels as usize)
+                    .map(|c| input.as_ref().and_then(|(i, _)| name(i, &i.input_names, c)))
+                    .collect(),
+                missing: Vec::new(),
+                devices: std::iter::once(o.name.clone())
+                    .chain(input.iter().map(|(i, _)| i.name.clone()))
+                    .fold(Vec::new(), |mut v, n| {
+                        if !v.contains(&n) {
+                            v.push(n);
+                        }
+                        v
+                    }),
+            }
+        });
+        let present: Vec<Arc<AtomicBool>> = output
+            .iter()
+            .chain(input.iter())
+            .map(|(_, p)| Arc::clone(p))
+            .collect();
+        let buffers = output
+            .iter()
+            .chain(input.iter())
+            .filter_map(|(d, _)| d.buffer_sizes)
+            .fold(None, |acc: Option<(u32, u32)>, (lo, hi)| {
+                Some(acc.map_or((lo, hi), |(a, b)| (a.max(lo), b.min(hi))))
+            });
         let info = StreamInfo {
             backend: "dummy",
-            device: "Silent dummy device".into(),
+            device: device.map_or_else(|| "Silent dummy device".into(), |d| d.name.clone()),
             sample_rate,
             buffer_size,
             input_channels: config.input_channels,
@@ -164,6 +370,12 @@ impl AudioBackend for DummyBackend {
                     let mut write = ahead;
                     let mut read = 0usize;
                     while !stop.load(Ordering::Relaxed) {
+                        // A pretend interface pulled out: the stream ends
+                        // as a real one would.
+                        if present.iter().any(|p| !p.load(Ordering::Relaxed)) {
+                            monitor.mark_shut_down();
+                            return;
+                        }
                         let want = requested.load(Ordering::Relaxed);
                         if want != info.buffer_size {
                             info.buffer_size = want;
@@ -255,6 +467,8 @@ impl AudioBackend for DummyBackend {
             monitor,
             stop,
             requested,
+            buffers,
+            routing,
             thread: Some(thread),
         }))
     }
@@ -265,6 +479,9 @@ struct DummyStream {
     monitor: Arc<StreamMonitor>,
     stop: Arc<AtomicBool>,
     requested: Arc<AtomicU32>,
+    /// Buffer sizes the pretend devices take.
+    buffers: Option<(u32, u32)>,
+    routing: Option<StreamRouting>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -281,8 +498,20 @@ impl AudioStream for DummyStream {
 
     fn request_buffer_size(&mut self, frames: u32) -> Result<(), AudioError> {
         validate_format(self.info.sample_rate, frames)?;
+        if let Some((lo, hi)) = self.buffers
+            && !(lo..=hi).contains(&frames)
+        {
+            return Err(AudioError::UnsupportedConfig(format!(
+                "{} takes buffers of {lo}–{hi} frames, not {frames}",
+                self.info.device
+            )));
+        }
         self.requested.store(frames, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn routing(&self) -> StreamRouting {
+        self.routing.clone().unwrap_or_default()
     }
 }
 
@@ -349,6 +578,61 @@ mod tests {
         assert_eq!(prepared.load(Ordering::Relaxed), 512);
         assert!(stream.request_buffer_size(100_000).is_err());
         drop(stream);
+    }
+
+    #[test]
+    fn pretend_devices_check_formats_and_go_away() {
+        let devices = DummyDevices::new(vec![
+            mock_device("a", 2, 2, &[44_100], Some((64, 512))),
+            mock_device("b", 8, 8, &[48_000, 96_000], None),
+        ]);
+        let mut backend = DummyBackend::with_devices(devices.clone());
+        assert_eq!(backend.enumerate_devices().unwrap().len(), 2);
+        let counting = || {
+            Box::new(Counting {
+                frames: Arc::default(),
+                prepared: Arc::default(),
+            })
+        };
+        let open = |backend: &mut DummyBackend, device: &str, rate: Option<u32>| {
+            backend.open_stream(
+                StreamConfig {
+                    output_devices: vec![device.into()],
+                    sample_rate: rate,
+                    buffer_size: Some(128),
+                    ..StreamConfig::default()
+                },
+                counting(),
+            )
+        };
+        assert!(matches!(
+            open(&mut backend, "a", Some(48_000)),
+            Err(AudioError::UnsupportedConfig(_))
+        ));
+        assert!(matches!(
+            open(&mut backend, "c", None),
+            Err(AudioError::DeviceNotFound(_))
+        ));
+        let mut stream = open(&mut backend, "a", None).unwrap();
+        assert_eq!(stream.info().sample_rate, 44_100, "the device's own rate");
+        assert_eq!(stream.info().device, "a");
+        assert_eq!(stream.routing().output(1), Some("a · Out 2"));
+        assert!(
+            stream.request_buffer_size(1024).is_err(),
+            "beyond the device"
+        );
+        stream.request_buffer_size(256).unwrap();
+        devices.unplug("a");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stream.status().shut_down && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stream.status().shut_down, "unplugged");
+        assert_eq!(backend.enumerate_devices().unwrap().len(), 1);
+        devices.plug(mock_device("a", 2, 2, &[44_100], Some((64, 512))));
+        if let Err(e) = open(&mut backend, "a", None) {
+            panic!("back: {e}");
+        }
     }
 
     #[test]

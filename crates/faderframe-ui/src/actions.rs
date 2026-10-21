@@ -68,6 +68,11 @@ pub fn install(app: &Rc<AppState>) {
             a.app.quit();
         }),
         entry(app, "render", crate::render::open),
+        entry(
+            app,
+            "render-selected-track",
+            crate::render::open_for_selected_track,
+        ),
         entry(app, "preferences", |a| crate::preferences::open(a, None)),
         entry(app, "audio-settings", |a| {
             crate::preferences::open(a, Some("audio"))
@@ -116,17 +121,28 @@ pub fn install(app: &Rc<AppState>) {
             let main = a.window.borrow().clone();
             if let Some(w) = main.as_ref() {
                 crate::screenshot::capture(w, &canvases, std::path::Path::new(&path));
-                // Other open windows (plugin browser, preferences, …).
-                for (i, other) in a
-                    .app
-                    .windows()
-                    .into_iter()
+                // Other open windows (plugin browser, preferences, …), then
+                // windows GTK opens outside the application (alert dialogs).
+                let windows = a.app.windows();
+                let mut others: Vec<gtk::Window> = windows
+                    .iter()
                     .filter(|o| {
                         o.upcast_ref::<gtk::Window>() != w.upcast_ref::<gtk::Window>()
                             && o.is_visible()
                     })
-                    .enumerate()
-                {
+                    .cloned()
+                    .collect();
+                others.extend(
+                    gtk::Window::list_toplevels()
+                        .into_iter()
+                        .filter_map(|t| t.downcast::<gtk::Window>().ok())
+                        .filter(|t| {
+                            t.is_visible()
+                                && t.upcast_ref::<gtk::Window>() != w.upcast_ref::<gtk::Window>()
+                                && !windows.contains(t)
+                        }),
+                );
+                for (i, other) in others.into_iter().enumerate() {
                     let p = std::path::Path::new(&path);
                     let stem = p
                         .file_stem()
@@ -150,26 +166,27 @@ pub fn install(app: &Rc<AppState>) {
                         Err(e) => tracing::warn!("screenshot of the menu failed: {e}"),
                     }
                 }
+                // A menu of the menu bar `show-menu:<name>` opened.
+                if let Some(menu) = crate::toggles::shown_menu() {
+                    let p = std::path::Path::new(&path);
+                    let stem = p
+                        .file_stem()
+                        .map_or_else(String::new, |s| s.to_string_lossy().to_string());
+                    let file = p.with_file_name(format!("{stem}-menubar.png"));
+                    match crate::screenshot::popover_to_png(&menu, &file) {
+                        Ok(()) => tracing::info!("menu bar menu saved to {}", file.display()),
+                        Err(e) => tracing::warn!("screenshot of the menu failed: {e}"),
+                    }
+                }
             }
         }),
-        dispatch(app, "undo", A::Undo),
-        dispatch(app, "redo", A::Redo),
-        dispatch(app, "delete", A::DeleteSelection),
+        // While typing: the text field's own undo.
+        entry(app, "undo", |a| crate::edit_keys::undo(a, false)),
+        entry(app, "redo", |a| crate::edit_keys::undo(a, true)),
         dispatch(app, "split", A::SplitSelectedAtPlayhead),
-        dispatch(app, "toggle-snap", A::ToggleSnap),
-        entry(app, "toggle-edit-toolbar", |a| {
-            let on = !a.session.borrow().editor.show_edit_toolbar;
-            a.dispatch(A::SetEditFlag(
-                faderframe_session::EditFlag::EditToolbar,
-                on,
-            ));
-            let mut p = crate::prefs::Preferences::load();
-            p.show_edit_toolbar = on;
-            if let Err(e) = p.save() {
-                tracing::warn!("cannot save preferences: {e}");
-            }
-        }),
-        dispatch(app, "toggle-follow", A::ToggleFollowPlayhead),
+        // Toggles and choices with their state (Snap to Grid, Follow
+        // Playhead, Loop, the edit flags, edit mode and tool, …):
+        // `crate::toggles`.
         dispatch(app, "add-audio", A::AddTrack(TrackKind::Audio)),
         dispatch(
             app,
@@ -195,11 +212,6 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "remove-tracks", A::RemoveSelectedTracks),
         dispatch(
             app,
-            "input-quantize",
-            A::Transport(faderframe_session::TransportAction::ToggleInputQuantize),
-        ),
-        dispatch(
-            app,
             "duplicate-tracks",
             A::DuplicateTracks {
                 tracks: Vec::new(),
@@ -214,7 +226,6 @@ pub fn install(app: &Rc<AppState>) {
                 content: true,
             },
         ),
-        dispatch(app, "arm-selected", A::ToggleArmSelected),
         entry(app, "save-track-preset", |a| {
             let tracks: Vec<_> = a
                 .session
@@ -306,8 +317,6 @@ pub fn install(app: &Rc<AppState>) {
         dispatch(app, "shuttle-forward", A::Shuttle(ShuttleOp::Forward)),
         dispatch(app, "previous-frame", A::Shuttle(ShuttleOp::Step(-1))),
         dispatch(app, "next-frame", A::Shuttle(ShuttleOp::Step(1))),
-        dispatch(app, "loop", A::Transport(T::ToggleLoop)),
-        dispatch(app, "record", A::Transport(T::ToggleRecord)),
         dispatch(app, "capture-midi", A::CaptureMidi),
         dispatch(app, "download-speech-model", A::DownloadSpeechModel),
         dispatch(app, "save-version", A::PromptSaveVersion),
@@ -367,6 +376,16 @@ pub fn install(app: &Rc<AppState>) {
                 Ok(())
             });
         }),
+        dispatch(
+            app,
+            "show-inspector",
+            A::Workspace(W::ShowView(ViewId::inspector())),
+        ),
+        dispatch(
+            app,
+            "show-channel-overview",
+            A::Workspace(W::ShowView(ViewId::channel_overview())),
+        ),
         dispatch(
             app,
             "show-mixer",
@@ -479,14 +498,8 @@ pub fn install(app: &Rc<AppState>) {
             },
         ));
     }
-    for i in 0..5 {
-        entries.push(dispatch(
-            app,
-            &format!("workspace-{}", i + 1),
-            A::Workspace(W::Switch(i)),
-        ));
-    }
     app.app.add_action_entries(entries);
+    crate::toggles::install(app);
     // Development aid: insert a plugin (by id) on the selected or first
     // audio track, e.g. FADERFRAME_STARTUP_ACTIONS="insert-plugin:com.vendor.plugin".
     let weak = Rc::downgrade(app);
@@ -516,6 +529,7 @@ pub fn install(app: &Rc<AppState>) {
             };
             match found {
                 Some((plugin, (track, index))) => {
+                    tracing::info!("insert-plugin: {} as insert {index}", plugin.plugin.name);
                     let placed = a.session.borrow_mut().place_plugin(
                         track,
                         faderframe_session::PluginTarget::Insert(index),
@@ -577,22 +591,8 @@ pub fn install(app: &Rc<AppState>) {
             .parameter_type(Some(&String::static_variant_type()))
             .activate(move |_, _, param| {
                 let Some(a) = weak.upgrade() else { return };
-                let n: usize = param
-                    .and_then(|p| p.get::<String>())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                let found = {
-                    let s = a.session.borrow();
-                    let p = s.project();
-                    s.selection
-                        .tracks
-                        .iter()
-                        .filter_map(|t| p.track(*t))
-                        .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
-                        .find(|t| t.inserts.len() > n)
-                        .map(|t| (t.id, t.inserts[n].id))
-                };
-                match found {
+                let n = param.and_then(|p| p.get::<String>()).unwrap_or_default();
+                match insert_at(&a, &n) {
                     Some((track, plugin)) => a.dispatch(Action::OpenPluginEditor {
                         track,
                         plugin,
@@ -642,7 +642,8 @@ pub fn install(app: &Rc<AppState>) {
     // `edit-tool:<smart|trim|stretch|select|grab|separate|scrub|pencil|zoom>`,
     // `edit-flag:<warp|transients|tab-transients|link|insertion-follows|follow>`
     // (toggles), `edit:<separate|trim|clear|silence|copy|cut|paste|duplicate|
-    // quantize|humanize|separate-transients|unwarp>`, and the development aid
+    // select-all|quantize|humanize|separate-transients|unwarp>`, and the
+    // development aid
     // `select-clip:<track>` (adds the track's first clip to the selection).
     let named = |name: &'static str, f: fn(&Rc<AppState>, &str)| {
         let weak = Rc::downgrade(app);
@@ -657,33 +658,13 @@ pub fn install(app: &Rc<AppState>) {
             })
             .build()
     };
+    // `edit-mode:<id>` and `edit-tool:<id>` are radio actions in
+    // `crate::toggles`.
     let edit_entries = [
-        named("edit-mode", |a, arg| {
-            use faderframe_session::EditMode as M;
-            match arg {
-                "shuffle" => a.dispatch(Action::SetEditMode(M::Shuffle)),
-                "slip" => a.dispatch(Action::SetEditMode(M::Slip)),
-                "spot" => a.dispatch(Action::SetEditMode(M::Spot)),
-                "grid" => a.dispatch(Action::SetEditMode(M::Grid)),
-                _ => tracing::warn!("edit-mode: unknown '{arg}'"),
-            }
-        }),
-        named("edit-tool", |a, arg| {
-            use faderframe_session::EditTool as T;
-            let tool = match arg {
-                "smart" => T::Smart,
-                "trim" => T::Trim,
-                "stretch" => T::TrimStretch,
-                "select" => T::Select,
-                "grab" => T::Grab,
-                "separate" => T::GrabSeparation,
-                "scrub" => T::Scrub,
-                "pencil" => T::Pencil,
-                "zoom" => T::Zoom,
-                _ => return tracing::warn!("edit-tool: unknown '{arg}'"),
-            };
-            a.dispatch(Action::SetEditTool(tool));
-        }),
+        // `show-menu:<File|Edit|…>`: a menu of the menu bar opened, its
+        // entries' states logged (screenshots of its checks).
+        named("show-menu", crate::toggles::show_menu),
+        named("command-palette-search", crate::palette::open_with),
         // The realtime check from scripts: `check-plugins:all` (every
         // plugin from another maker not checked in its version) or
         // `check-plugins:<name>` (those whose name has it, again).
@@ -707,8 +688,48 @@ pub fn install(app: &Rc<AppState>) {
             tracing::info!("check-plugins: {} plugin(s)", todo.len());
             crate::plugin_check::check(a, todo);
         }),
+        // Development aid: `grid-strength:<0…1>` draws the editors' grid
+        // as the Preferences slider would.
+        named("grid-strength", |a, arg| match arg.trim().parse::<f32>() {
+            Ok(v) => a.set_grid_strength(v.clamp(0.0, 1.0)),
+            Err(_) => tracing::warn!("grid-strength: not a number '{arg}'"),
+        }),
         named("plugin-browser-search", |_, arg| {
             crate::plugin_browser::search(arg);
+        }),
+        // Development aids for favorites: `plugin-browser-scope:<all|
+        // favorites|category name>` shows that sidebar entry;
+        // `favorite:<plugin id>[=<category>]` makes a plugin a favorite
+        // (in that category, made if needed).
+        named("plugin-browser-scope", |_, arg| {
+            crate::plugin_browser::show_scope(arg);
+        }),
+        named("favorite", |a, arg| {
+            use faderframe_session::plugin_favorites::{FavoriteOp, FavoritePlugin};
+            let (id, category) = match arg.split_once('=') {
+                Some((id, c)) => (id, Some(c)),
+                None => (arg, None),
+            };
+            let found = a
+                .session
+                .borrow()
+                .available_plugins()
+                .into_iter()
+                .find(|p| p.plugin.id == id);
+            let Some(p) = found else {
+                return tracing::warn!("favorite: no plugin '{id}'");
+            };
+            let plugin = FavoritePlugin::of(&p);
+            a.dispatch(Action::PluginFavorites(match category {
+                Some(name) => FavoriteOp::NewCategory {
+                    name: name.to_string(),
+                    with: Some(plugin),
+                },
+                None => FavoriteOp::Set {
+                    plugin,
+                    favorite: true,
+                },
+            }));
         }),
         named("edit-flag", |a, arg| {
             use faderframe_session::EditFlag as F;
@@ -722,6 +743,7 @@ pub fn install(app: &Rc<AppState>) {
                 "follow" => (F::FollowPlayhead, e.follow_playhead),
                 "samples" => (F::SnapToSamples, e.snap_samples),
                 "zero-crossings" => (F::SnapToZeroCrossings, e.zero_crossings),
+                "objects" => (F::SnapToObjects, e.snap_objects),
                 "polyphonic-pitch" => (F::PolyphonicPitch, e.pitch_polyphonic),
                 "stop-to-start" => (F::StopToStart, e.stop_to_start),
                 _ => return tracing::warn!("edit-flag: unknown '{arg}'"),
@@ -736,10 +758,12 @@ pub fn install(app: &Rc<AppState>) {
                 "trim" => Action::TrimToSelection,
                 "clear" => Action::ClearRange,
                 "silence" => Action::InsertSilence,
-                "copy" => Action::CopyRange,
-                "cut" => Action::CutRange,
-                "paste" => Action::PasteRange,
-                "duplicate" => Action::RepeatRange(1),
+                // As Ctrl+C/X/V/D: the range, else the selected clips.
+                "copy" => Action::Copy,
+                "cut" => Action::Cut,
+                "paste" => Action::Paste,
+                "duplicate" => Action::Repeat(1),
+                "select-all" => Action::SelectAllClips,
                 "merge-clips" => Action::MergeClips(clips),
                 "quantize" => Action::QuantizeClips(clips),
                 "humanize" => Action::HumanizeClips(clips),
@@ -748,6 +772,21 @@ pub fn install(app: &Rc<AppState>) {
                 _ => return tracing::warn!("edit: unknown '{arg}'"),
             };
             a.dispatch(action);
+        }),
+        // Development aid: `slip:<quarters>` slips what the selected clips
+        // play (one gesture, as a Ctrl+Alt drag in the arranger).
+        named("slip", |a, arg| {
+            let Ok(q) = arg.trim().parse::<f64>() else {
+                return tracing::warn!("slip: '{arg}' is not a number of quarters");
+            };
+            let clips: Vec<faderframe_core::ClipId> =
+                a.session.borrow().selection.clips.iter().copied().collect();
+            a.dispatch(Action::BeginGesture("Slip Clip".into()));
+            a.dispatch(Action::SlipClips {
+                clips,
+                by: faderframe_timeline::MusicalTime::from_quarters(q).ticks(),
+            });
+            a.dispatch(Action::EndGesture);
         }),
         // Development aid: `fade-demo:x` gives the selected clips long
         // fades (one drawn), +3 dB clip gain and, once transients are
@@ -2210,6 +2249,70 @@ pub fn install(app: &Rc<AppState>) {
                 });
             }
         }),
+        // Development aids: `folder-bus:<folder>=<on|off>` (the folder sums
+        // what it holds), `pan:<track>=<-1…1>` (its pan or balance).
+        named("folder-bus", |a, arg| {
+            let Some((name, on)) = arg.split_once('=') else {
+                tracing::warn!("folder-bus: '{arg}' is not <folder>=<on|off>");
+                return;
+            };
+            let folder = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            if let Some(folder) = folder {
+                a.dispatch(Action::SetFolderBus {
+                    folder,
+                    on: on != "off",
+                });
+            }
+        }),
+        // Development aid: `folder-group:<folder>=<on|off>` (its tracks are
+        // edited and armed as one).
+        named("folder-group", |a, arg| {
+            let Some((name, on)) = arg.split_once('=') else {
+                tracing::warn!("folder-group: '{arg}' is not <folder>=<on|off>");
+                return;
+            };
+            let folder = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            if let Some(folder) = folder {
+                a.dispatch(Action::SetFolderGroup {
+                    folder,
+                    on: on != "off",
+                });
+            }
+        }),
+        named("pan", |a, arg| {
+            let Some((name, pan)) = arg.split_once('=') else {
+                tracing::warn!("pan: '{arg}' is not <track>=<-1…1>");
+                return;
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            if let (Some(track), Ok(pan)) = (track, pan.parse::<f32>()) {
+                a.dispatch(Action::Edit(faderframe_project::Command::SetTrackPan {
+                    track,
+                    pan,
+                }));
+            }
+        }),
         // Development aid: `midi-plays:<MIDI track>=<instrument track|none>`.
         named("midi-plays", |a, arg| {
             let Some((from, to)) = arg.split_once('=') else {
@@ -2383,6 +2486,103 @@ pub fn install(app: &Rc<AppState>) {
                 button: PointerButton::Secondary,
                 modifiers: Modifiers::NONE,
             });
+        }),
+        // Development aid: `drag:<view>@<x>/<y>=><x>/<y>` presses the
+        // primary button at the first point and moves to the second in a
+        // few steps, holding it there (a screenshot shows the drag, e.g. a
+        // snap guide); `drag:<view>@release` lets go where it is. Modifiers
+        // held throughout: `drag:<view>+ctrl+shift+alt@…` (a press and a
+        // release at one point is a click).
+        named("drag", |a, arg| {
+            use faderframe_ui_canvas::{Modifiers, Point, PointerButton, ViewEvent};
+            let Some((view, at)) = arg.split_once('@') else {
+                tracing::warn!("drag: '{arg}' is not <view id>@<x>/<y>=><x>/<y>");
+                return;
+            };
+            let mut parts = view.split('+');
+            let view = parts.next().unwrap_or_default();
+            let mut mods = Modifiers::NONE;
+            for m in parts {
+                match m {
+                    "ctrl" => mods.ctrl = true,
+                    "shift" => mods.shift = true,
+                    "alt" => mods.alt = true,
+                    other => tracing::warn!("drag: no modifier '{other}'"),
+                }
+            }
+            let canvas = a
+                .dock
+                .borrow()
+                .hosts
+                .get(&faderframe_workspace::ViewId::new(view))
+                .map(|(_, h)| h.canvas.clone());
+            let Some(canvas) = canvas else {
+                tracing::warn!("drag: no view '{view}'");
+                return;
+            };
+            thread_local! {
+                static HELD: std::cell::Cell<Option<(f32, f32, Modifiers)>> = const { std::cell::Cell::new(None) };
+            }
+            if at == "release" {
+                if let Some((x, y, held)) = HELD.with(|h| h.take()) {
+                    canvas.deliver(ViewEvent::PointerUp {
+                        pos: Point::new(x, y),
+                        button: PointerButton::Primary,
+                        modifiers: held,
+                    });
+                }
+                return;
+            }
+            let point = |s: &str| {
+                let mut xy = s.split('/').filter_map(|v| v.trim().parse::<f32>().ok());
+                Some(Point::new(xy.next()?, xy.next()?))
+            };
+            let Some((from, to)) = at
+                .split_once("=>")
+                .and_then(|(f, t)| Some((point(f)?, point(t)?)))
+            else {
+                tracing::warn!("drag: '{at}' is not <x>/<y>=><x>/<y>");
+                return;
+            };
+            canvas.deliver(ViewEvent::PointerDown {
+                pos: from,
+                button: PointerButton::Primary,
+                modifiers: mods,
+                clicks: 1,
+            });
+            if from != to {
+                for k in 1..=4 {
+                    let t = k as f32 / 4.0;
+                    canvas.deliver(ViewEvent::PointerMove {
+                        pos: Point::new(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
+                        modifiers: mods,
+                        dragging: true,
+                    });
+                }
+            }
+            HELD.with(|h| h.set(Some((to.x, to.y, mods))));
+        }),
+        // Development aid: `log-edit:x` logs the selection, the edit range,
+        // the Play Start Marker and the newest undo step (scripted checks).
+        named("log-edit", |a, _| {
+            let s = a.session.borrow();
+            let p = s.project();
+            let clips: Vec<String> = s
+                .selected_arranger_clips()
+                .iter()
+                .filter_map(|c| p.clip(*c))
+                .map(|c| format!("{}@{:.3}", c.name, c.start.quarters()))
+                .collect();
+            tracing::info!(
+                "edit: clips [{}], range {:?}, play start {:?}, last step {:?}, notes {}",
+                clips.join(", "),
+                s.selection
+                    .range
+                    .map(|r| (r.start.quarters(), r.end.quarters())),
+                p.play_start.map(|m| (m.at.quarters(), m.on)),
+                s.history_steps().0.last(),
+                s.selection.notes.len(),
+            );
         }),
         named("menu", |_, arg| {
             if !crate::canvas::activate_menu_entry(arg) {
@@ -2915,10 +3115,58 @@ pub fn install(app: &Rc<AppState>) {
         named("reload-plugins", |a, _| {
             a.dispatch(Action::ReloadAllPlugins);
         }),
+        // Development aids for editor lifecycles: `close-insert:<n>`
+        // closes insert n's editor (as its close button), `remove-insert:<n>`
+        // removes the plugin (the track as for `show-insert`).
+        named("close-insert", |a, arg| match insert_at(a, arg) {
+            Some((_, plugin)) => crate::plugin_window::close(a, plugin),
+            None => tracing::warn!("close-insert: no insert {arg}"),
+        }),
+        named("remove-insert", |a, arg| match insert_at(a, arg) {
+            Some((track, plugin)) => {
+                a.dispatch(Action::Edit(faderframe_project::Command::RemovePlugin {
+                    track,
+                    plugin,
+                }))
+            }
+            None => tracing::warn!("remove-insert: no insert {arg}"),
+        }),
         // Development aid: `render-preset:<n>` opens Render / Export with
         // delivery preset n (1-based).
         named("render-preset", |a, arg| {
             crate::render::open_with_preset(a, arg.trim().parse().unwrap_or(0));
+        }),
+        // Development aid: `render-track:<track>` opens Render / Export
+        // rendering that track alone; `render-now:[<path>]` presses Render
+        // in the open window (to `path` when given) — the overwrite
+        // question and the report follow as they would.
+        named("render-track", |a, arg| {
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if track.is_none() {
+                tracing::warn!("render-track: no track '{arg}'");
+            }
+            crate::render::open_for_track(a, track);
+        }),
+        named("render-now", |_, arg| {
+            crate::render::render_now(Some(arg.trim()));
+        }),
+        // Development aids: `render-stop:x` presses Stop in the Render
+        // window (a cancelled render's report); `answer-question:<overwrite|
+        // cancel>` answers the open Overwrite / Cancel question (a render's
+        // or an export's) as its button would.
+        named("render-stop", |_, _| crate::render::render_stop()),
+        named("answer-question", |_, arg| {
+            let replace = arg.trim() == "overwrite";
+            if !crate::render_report::answer_question(replace) {
+                tracing::warn!("answer-question: no question is open");
+            }
         }),
         // Development aid: `log-levels:x` logs every track's meter (peak
         // dBFS, left/right) — scripted checks that a track makes sound.
@@ -3132,6 +3380,9 @@ pub fn install(app: &Rc<AppState>) {
         // `move-section:<n>@<quarters>` / `copy-section:<n>@<quarters>`:
         // section number n (0-based) with its content.
         named("move-section", |a, arg| section_op(a, arg, false)),
+        // Scratch pads (the Edit menu's and scripted checks), see
+        // `scratch_pad_op`.
+        named("scratch-pad", scratch_pad_op),
         named("copy-section", |a, arg| section_op(a, arg, true)),
         named("add-tempo", |a, arg| {
             if let Ok(q) = arg.parse::<f64>() {
@@ -3420,6 +3671,11 @@ pub fn install(app: &Rc<AppState>) {
             .state(false.to_variant())
             .activate(move |_, _, _| {
                 if let Some(a) = weak.upgrade() {
+                    // F11 (the Inspector's) in a video window: full screen
+                    // there, as before the Inspector had it.
+                    if name == "inspector" && crate::video::toggle_active_full_screen(&a) {
+                        return;
+                    }
                     a.dispatch(Action::Workspace(
                         faderframe_session::WorkspaceAction::ToggleView(id()),
                     ));
@@ -3460,6 +3716,24 @@ pub fn install(app: &Rc<AppState>) {
 
     // The default shortcuts, then the user's (the shortcut editor's).
     crate::palette::apply_shortcuts(&app.app, &crate::prefs::Preferences::load().shortcuts);
+}
+
+/// Insert `n` (0-based; unparsable: 0) of the first selected track that
+/// has it, else of the first audio track that has it (dev actions).
+fn insert_at(
+    a: &AppState,
+    n: &str,
+) -> Option<(faderframe_core::TrackId, faderframe_core::PluginInstanceId)> {
+    let n: usize = n.trim().parse().unwrap_or(0);
+    let s = a.session.borrow();
+    let p = s.project();
+    s.selection
+        .tracks
+        .iter()
+        .filter_map(|t| p.track(*t))
+        .chain(p.tracks.iter().filter(|t| t.kind == TrackKind::Audio))
+        .find(|t| t.inserts.len() > n)
+        .map(|t| (t.id, t.inserts[n].id))
 }
 
 /// Remaining single-key shortcuts run after focused widgets. Space is
@@ -3619,6 +3893,133 @@ fn section_op(app: &Rc<AppState>, arg: &str, copy: bool) {
     }
 }
 
+/// `scratch-pad:<op>`: `new`, `new-from-selection`, `copy-section=<n>`
+/// (song section n, 0-based, into a new pad; `@<pad>` into pad number
+/// `<pad>`, 1-based), `copy-selection@<pad>`, `show=<pad>`, `song`,
+/// `next`, `to-song[@<quarters>]` (the shown pad, else the first, inserted
+/// at the song's playhead bar or there), `overwrite[@<quarters>]`,
+/// `replace=<section n>[/keep]`, `rename[=<pad>=<name>]` (no name: ask),
+/// `duplicate[=<pad>]`, `delete[=<pad>]` (no pad: the one shown).
+fn scratch_pad_op(app: &Rc<AppState>, arg: &str) {
+    use faderframe_session::scratch::{PadMaterial, ScratchOp, SongPlacement};
+    use faderframe_timeline::MusicalTime;
+    let (pads, shown, sections, song_at) = {
+        let s = app.session.borrow();
+        let pads: Vec<_> = s.scratch_pads().iter().map(|p| p.id).collect();
+        let sections: Vec<_> = s.song_sections().iter().map(|x| x.id).collect();
+        (
+            pads,
+            s.shown_pad(),
+            sections,
+            s.song_bar_line(s.song_position()),
+        )
+    };
+    let pad_n = |n: &str| {
+        n.parse::<usize>()
+            .ok()
+            .and_then(|n| pads.get(n.saturating_sub(1)).copied())
+    };
+    let this = || shown.or_else(|| pads.first().copied());
+    let (name, rest) = arg.split_once('=').unwrap_or((arg, ""));
+    let (name, at) = match name.split_once('@') {
+        Some((n, at)) => (n, Some(at)),
+        None => (name, None),
+    };
+    let quarters = |at: Option<&str>| {
+        at.and_then(|q| q.parse::<f64>().ok())
+            .map_or(song_at, MusicalTime::from_quarters)
+    };
+    let op = match name {
+        "new" => Some(ScratchOp::New {
+            name: None,
+            from: None,
+        }),
+        "new-from-selection" => Some(ScratchOp::New {
+            name: None,
+            from: Some(PadMaterial::Selection),
+        }),
+        "copy-section" => {
+            let (n, into) = rest
+                .split_once('@')
+                .map_or((rest, None), |(n, p)| (n, Some(p)));
+            let section = n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| sections.get(n).copied());
+            match (section, into.map(pad_n)) {
+                (Some(s), None) => Some(ScratchOp::New {
+                    name: None,
+                    from: Some(PadMaterial::Section(s)),
+                }),
+                (Some(s), Some(Some(pad))) => Some(ScratchOp::CopyTo {
+                    pad,
+                    what: PadMaterial::Section(s),
+                }),
+                _ => None,
+            }
+        }
+        "copy-selection" => at.and_then(pad_n).map(|pad| ScratchOp::CopyTo {
+            pad,
+            what: PadMaterial::Selection,
+        }),
+        "show" => pad_n(rest).map(|p| ScratchOp::Show(Some(p))),
+        "song" => Some(ScratchOp::Show(None)),
+        "next" => {
+            let i = shown.and_then(|p| pads.iter().position(|x| *x == p));
+            Some(ScratchOp::Show(match i {
+                None => pads.first().copied(),
+                Some(i) => pads.get(i + 1).copied(),
+            }))
+        }
+        "to-song" => this().map(|pad| ScratchOp::ToSong {
+            pad,
+            what: PadMaterial::All,
+            place: SongPlacement::Insert { at: quarters(at) },
+        }),
+        "overwrite" => this().map(|pad| ScratchOp::ToSong {
+            pad,
+            what: PadMaterial::All,
+            place: SongPlacement::Overwrite { at: quarters(at) },
+        }),
+        "replace" => {
+            let (n, keep) = rest
+                .strip_suffix("/keep")
+                .map_or((rest, false), |n| (n, true));
+            let section = n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| sections.get(n).copied());
+            match (this(), section) {
+                (Some(pad), Some(section)) => Some(ScratchOp::ToSong {
+                    pad,
+                    what: PadMaterial::All,
+                    place: SongPlacement::Replace {
+                        section,
+                        keep_length: keep,
+                    },
+                }),
+                _ => None,
+            }
+        }
+        "rename" => match rest.split_once('=') {
+            Some((n, new)) => pad_n(n).map(|pad| ScratchOp::Rename {
+                pad,
+                name: new.to_string(),
+            }),
+            None => this().map(ScratchOp::PromptRename),
+        },
+        "duplicate" if rest.is_empty() => this().map(ScratchOp::Duplicate),
+        "duplicate" => pad_n(rest).map(ScratchOp::Duplicate),
+        "delete" if rest.is_empty() => shown.map(ScratchOp::Delete),
+        "delete" => pad_n(rest).map(ScratchOp::Delete),
+        _ => None,
+    };
+    match op {
+        Some(op) => app.dispatch(Action::ScratchPad(op)),
+        None => tracing::warn!("scratch-pad: cannot do '{arg}'"),
+    }
+}
+
 /// `<track name>@<scene number>` as a slot.
 fn slot_by_name(
     a: &AppState,
@@ -3690,5 +4091,24 @@ pub(crate) fn sync_lane_actions(app: &Rc<AppState>) {
                 a.set_state(&on.to_variant());
             }
         }
+    }
+}
+
+/// Snap to Objects is remembered across restarts, from wherever it was
+/// switched (menu, edit toolbar, Preferences): called after every dispatch
+/// with the setting before it.
+pub(crate) fn remember_snap_objects(app: &Rc<AppState>, before: bool) {
+    let Ok(s) = app.session.try_borrow() else {
+        return;
+    };
+    let on = s.editor.snap_objects;
+    drop(s);
+    if on == before {
+        return;
+    }
+    let mut p = crate::prefs::Preferences::load();
+    p.snap_objects = on;
+    if let Err(e) = p.save() {
+        tracing::warn!("cannot save preferences: {e}");
     }
 }

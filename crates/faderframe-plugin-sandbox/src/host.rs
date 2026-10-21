@@ -273,17 +273,21 @@ pub struct RemoteInstance {
     reaped: bool,
     /// The gain reduction the plugin reports (through the helper).
     reduction: Arc<faderframe_plugin_host::Reduction>,
-    /// A Poll or SaveState sent and not answered yet (since when): they
-    /// are answered at a later tick, so a busy helper never holds up the
-    /// UI.
-    polling: std::cell::Cell<Option<(Waiting, Instant)>>,
+    /// A Poll or SaveState sent and not answered yet (since when, and what
+    /// FaderFrame had changed by then): they are answered at a later tick,
+    /// so a busy helper never holds up the UI.
+    polling: std::cell::Cell<Option<(Waiting, Instant, Changes)>>,
     /// Answers to polls taken in before another request (applied by the
-    /// next `poll`).
-    polled: std::cell::RefCell<Vec<wire::Polled>>,
+    /// next `poll`), with the changes they were asked after.
+    polled: std::cell::RefCell<Vec<(wire::Polled, Changes)>>,
     /// The state asked for with `request_state`: wanted (not sent yet),
     /// and the answer when it came.
     state_wanted: bool,
-    state: std::cell::RefCell<Option<Vec<u8>>>,
+    state: std::cell::RefCell<Option<(Vec<u8>, Changes)>>,
+    /// What FaderFrame has changed in the helper so far.
+    changes: Changes,
+    /// Parameters FaderFrame set: the `changes.params` count after each.
+    set_at: HashMap<u32, u64>,
 }
 
 /// What an answer on its way answers.
@@ -291,6 +295,25 @@ pub struct RemoteInstance {
 enum Waiting {
     Poll,
     State,
+}
+
+/// Counts of what FaderFrame changed in the helper. A pipelined poll is
+/// answered as the helper was when it read the poll: what FaderFrame
+/// changed after sending it (opened the editor, loaded a state, …) the
+/// answer cannot know, and its picture of those things must not replace
+/// FaderFrame's own. (Taking a stale "editor closed" for the truth made
+/// FaderFrame destroy the window a just-opened editor sat in; plugins on
+/// Xlib then died of a BadWindow error — issue #12.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Changes {
+    /// The editor opened, attached, floated or closed.
+    editor: u64,
+    /// A program selected or a state loaded.
+    state: u64,
+    /// Activated or deactivated (the latency and tail it reports).
+    activation: u64,
+    /// Parameter values set (`RemoteInstance::set_at` says which).
+    params: u64,
 }
 
 fn failed(e: impl std::fmt::Display) -> PluginError {
@@ -348,6 +371,8 @@ impl RemoteInstance {
             polled: std::cell::RefCell::new(Vec::new()),
             state_wanted: false,
             state: std::cell::RefCell::new(None),
+            changes: Changes::default(),
+            set_at: HashMap::new(),
             reduction: faderframe_plugin_host::Reduction::unreported(),
         };
         let req = Request::Instantiate {
@@ -400,11 +425,20 @@ impl RemoteInstance {
     }
 
     /// Take a poll's answer in: values, parameters, editor requests; what
-    /// the host must do about it.
-    fn apply_polled(&mut self, p: wire::Polled) -> PluginPoll {
+    /// the host must do about it. `asked` is what FaderFrame had changed
+    /// when it sent the poll: what changed since, the answer does not
+    /// describe (the next one will).
+    fn apply_polled(&mut self, p: wire::Polled, asked: Changes) -> PluginPoll {
+        let now = self.changes;
         for (id, v) in p.values {
+            // Set by FaderFrame since: the helper's new value is ours.
+            if self.set_at.get(&id).is_some_and(|&at| at > asked.params) {
+                continue;
+            }
             self.values.insert(id, v);
         }
+        // Later answers know every value set before this one was asked.
+        self.set_at.retain(|_, at| *at > asked.params);
         if let Some(params) = &p.params {
             self.params = params.iter().map(ParameterInfo::from).collect();
             self.modulation = params
@@ -413,23 +447,35 @@ impl RemoteInstance {
                 .map(|p| (p.id, p.per_note))
                 .collect();
         }
-        if let Some(t) = p.tail {
-            self.tail = t.into();
-        }
         if let Some(programs) = p.programs {
             self.programs = programs;
         }
-        self.program = p.program;
-        self.pending = p.pending;
-        let latency_changed = p.latency != self.latency;
-        self.latency = p.latency;
+        // Edits made in the plugin's editor are events: always taken.
         self.edits.extend(p.edits.into_iter().map(EditorEdit::from));
-        let r: EditorRequests = p.editor.into();
-        self.requests.resize = r.resize.or(self.requests.resize);
-        self.requests.show |= r.show;
-        self.requests.hide |= r.hide;
-        self.requests.closed |= r.closed;
-        self.editor_open = p.editor_open;
+        // The program, and whether the processor has taken it.
+        if asked.state == now.state {
+            self.program = p.program;
+            self.pending = p.pending;
+        }
+        // The latency and tail of the activation the helper had then.
+        let mut latency_changed = false;
+        if asked.activation == now.activation {
+            if let Some(t) = p.tail {
+                self.tail = t.into();
+            }
+            latency_changed = p.latency != self.latency;
+            self.latency = p.latency;
+        }
+        // The editor as it was then: opened or closed since, the answer
+        // speaks of another (its close request, its "not open").
+        if asked.editor == now.editor {
+            let r: EditorRequests = p.editor.into();
+            self.requests.resize = r.resize.or(self.requests.resize);
+            self.requests.show |= r.show;
+            self.requests.hide |= r.hide;
+            self.requests.closed |= r.closed;
+            self.editor_open = p.editor_open;
+        }
         let restart = p.restart || (latency_changed && self.active.is_some());
         if restart {
             self.needs_restart = true;
@@ -445,7 +491,7 @@ impl RemoteInstance {
     /// read is the next request's (`&self`: through another handle on
     /// the stream).
     fn collect_answer(&self) -> Result<(), PluginError> {
-        let Some((waiting, _)) = self.polling.take() else {
+        let Some((waiting, _, asked)) = self.polling.take() else {
             return Ok(());
         };
         let mut control = self.control.try_clone().map_err(failed)?;
@@ -455,11 +501,11 @@ impl RemoteInstance {
         }));
         match wire::recv::<Response>(&mut control) {
             Ok((Response::Polled(p), _)) => {
-                self.polled.borrow_mut().push(*p);
+                self.polled.borrow_mut().push((*p, asked));
                 Ok(())
             }
             Ok((Response::Bytes, bytes)) if waiting == Waiting::State => {
-                *self.state.borrow_mut() = Some(bytes);
+                *self.state.borrow_mut() = Some((bytes, asked));
                 Ok(())
             }
             // The state could not be had: asked again next time.
@@ -532,6 +578,7 @@ impl RemoteInstance {
     /// Retire the current activation (its processors fall silent).
     fn deactivate(&mut self) {
         if let Some((ch, retired)) = self.active.take() {
+            self.changes.activation += 1;
             retired.store(true, Ordering::Relaxed);
             // Wake the helper's audio thread so it sees the request quickly.
             if let Some(c) = ch.lock_blocking(10_000) {
@@ -588,6 +635,8 @@ impl PluginInstance for RemoteInstance {
 
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError> {
         self.values.insert(id.0, value);
+        self.changes.params += 1;
+        self.set_at.insert(id.0, self.changes.params);
         self.done(
             &Request::SetParameter { id: id.0, value },
             &[],
@@ -650,6 +699,7 @@ impl PluginInstance for RemoteInstance {
     }
 
     fn select_program(&mut self, index: usize) -> Result<(), PluginError> {
+        self.changes.state += 1;
         self.done(&Request::SelectProgram { index }, &[], LOAD_TIMEOUT)?;
         self.program = Some(index);
         // Until the next poll says the helper's processor has it.
@@ -690,6 +740,7 @@ impl PluginInstance for RemoteInstance {
     }
 
     fn load_state(&mut self, data: &[u8]) -> Result<(), PluginError> {
+        self.changes.state += 1;
         self.done(&Request::LoadState, data, LOAD_TIMEOUT)
     }
 
@@ -705,7 +756,7 @@ impl PluginInstance for RemoteInstance {
         }
         // Last tick's answer, if it is here (and any taken in before other
         // requests), then the next poll on its way.
-        if let Some((waiting, sent)) = self.polling.get() {
+        if let Some((waiting, sent, _)) = self.polling.get() {
             let timeout = match waiting {
                 Waiting::Poll => REQUEST_TIMEOUT,
                 Waiting::State => LOAD_TIMEOUT,
@@ -722,8 +773,8 @@ impl PluginInstance for RemoteInstance {
         }
         let answers = std::mem::take(&mut *self.polled.borrow_mut());
         let mut out = PluginPoll::default();
-        for p in answers {
-            out = out.merge(self.apply_polled(p));
+        for (p, asked) in answers {
+            out = out.merge(self.apply_polled(p, asked));
         }
         if self.polling.get().is_none() {
             let (req, waiting) = if std::mem::take(&mut self.state_wanted) {
@@ -733,7 +784,9 @@ impl PluginInstance for RemoteInstance {
             };
             let _ = self.control.set_write_timeout(Some(REQUEST_TIMEOUT));
             match wire::send(&mut self.control, &req, &[]) {
-                Ok(()) => self.polling.set(Some((waiting, Instant::now()))),
+                Ok(()) => self
+                    .polling
+                    .set(Some((waiting, Instant::now(), self.changes))),
                 Err(e) => self.mark_dead(&e.to_string()),
             }
         }
@@ -755,7 +808,14 @@ impl PluginInstance for RemoteInstance {
     }
 
     fn take_state(&mut self) -> Option<Vec<u8>> {
-        self.state.borrow_mut().take()
+        let (bytes, asked) = self.state.borrow_mut().take()?;
+        if asked.state != self.changes.state {
+            // Saved before a state or program FaderFrame loaded since: the
+            // state it holds is no longer the plugin's. Asked again.
+            self.state_wanted = true;
+            return None;
+        }
+        Some(bytes)
     }
 
     fn editor(&mut self) -> Option<&mut dyn PluginEditor> {
@@ -797,6 +857,7 @@ impl PluginInstance for RemoteInstance {
         {
             self.needs_restart = false;
             self.deactivate();
+            self.changes.activation += 1;
             let mut block = Block::create(config.max_block_size.max(1) as usize).map_err(failed)?;
             let req = Request::Activate {
                 sample_rate: config.sample_rate,
@@ -853,6 +914,7 @@ impl PluginEditor for RemoteInstance {
     }
 
     fn open_embedded(&mut self, api: WindowApi, scale: f64) -> Result<(u32, u32), PluginError> {
+        self.changes.editor += 1;
         match self.editor_call(EditorCall::OpenEmbedded {
             api: api.into(),
             scale,
@@ -864,6 +926,7 @@ impl PluginEditor for RemoteInstance {
     }
 
     fn attach(&mut self, parent: ParentWindow) -> Result<(), PluginError> {
+        self.changes.editor += 1;
         match self.editor_call(EditorCall::Attach {
             api: parent.api.into(),
             handle: parent.handle,
@@ -878,6 +941,7 @@ impl PluginEditor for RemoteInstance {
     }
 
     fn open_floating(&mut self, api: WindowApi, title: &str) -> Result<(), PluginError> {
+        self.changes.editor += 1;
         match self.editor_call(EditorCall::OpenFloating {
             api: api.into(),
             title: title.to_string(),
@@ -898,6 +962,7 @@ impl PluginEditor for RemoteInstance {
     }
 
     fn close(&mut self) {
+        self.changes.editor += 1;
         if self.editor_open {
             self.editor_call(EditorCall::Close);
         }

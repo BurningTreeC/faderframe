@@ -3,7 +3,7 @@
 
 use crate::state::BackendChoice;
 use faderframe_engine::MetronomeMode;
-use faderframe_session::{LoopRecordMode, RecordMode, RecordSettings};
+use faderframe_session::{AudioPreferences, LoopRecordMode, RecordMode, RecordSettings};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -16,6 +16,14 @@ pub struct Preferences {
     pub buffer_size: Option<u32>,
     /// Processing threads (`None`: one per core).
     pub threads: Option<u16>,
+    /// The audio devices chosen for each backend ("pipewire", "jack",
+    /// "system", "asio", "dummy"), by the backend's device ids.
+    pub audio_devices: std::collections::BTreeMap<String, faderframe_session::DeviceChoice>,
+    /// Device channels to open (`None`: as many as the devices have).
+    pub audio_input_channels: Option<u16>,
+    pub audio_output_channels: Option<u16>,
+    /// PipeWire: hold the graph at the rate and buffer size while running.
+    pub audio_force_format: bool,
     /// The edit toolbar is shown.
     pub show_edit_toolbar: bool,
     /// What a new start opens: "last", "new" or "demo".
@@ -28,6 +36,12 @@ pub struct Preferences {
     /// The skin (`Theme::id`).
     pub theme: String,
     pub snap: bool,
+    /// Drags snap to clip edges, markers, sections, the loop, the
+    /// selection and the playhead (Snap to Objects).
+    pub snap_objects: bool,
+    /// How strongly the editors draw their time grid, 0…1 (Preferences →
+    /// Editing → Grid lines; `GridLook`).
+    pub grid_strength: f32,
     pub follow_playhead: bool,
     /// Which global lanes the arranger shows, across projects and restarts.
     pub global_lanes: faderframe_session::lanes::GlobalLanes,
@@ -60,6 +74,9 @@ pub struct Preferences {
     pub talkback: faderframe_session::cues::TalkbackSettings,
     /// Stop puts the playhead at the start of the project.
     pub stop_to_start: bool,
+    /// Stop puts the playhead back where playback started (Return to
+    /// Start on Stop; off: it stays where it stopped).
+    pub return_to_play_start: bool,
     /// Extra recording latency compensation in frames.
     pub record_latency_offset: i64,
     /// MIDI inputs (port keys) not to use.
@@ -140,11 +157,17 @@ impl Default for Preferences {
             sample_rate: None,
             buffer_size: None,
             threads: None,
+            audio_devices: Default::default(),
+            audio_input_channels: None,
+            audio_output_channels: None,
+            audio_force_format: false,
             show_edit_toolbar: false,
             startup_project: crate::recent::StartupProject::default().id().into(),
             recent_projects: Vec::new(),
             theme: "studio".into(),
             snap: true,
+            snap_objects: true,
+            grid_strength: faderframe_ui_canvas::GridLook::DEFAULT,
             follow_playhead: true,
             global_lanes: Default::default(),
             record_mode: RecordMode::default().id().into(),
@@ -162,6 +185,7 @@ impl Default for Preferences {
             metronome_sound: Default::default(),
             talkback: Default::default(),
             stop_to_start: false,
+            return_to_play_start: false,
             record_latency_offset: 0,
             midi_disabled_inputs: Vec::new(),
             midi_disabled_outputs: Vec::new(),
@@ -289,6 +313,33 @@ impl Preferences {
         self.record_latency_offset = r.latency_offset;
     }
 
+    /// The audio device settings as stored, with the rate, buffer size and
+    /// threads `options` start with (the command line wins over these).
+    pub fn audio_preferences(&self, options: &crate::RunOptions) -> AudioPreferences {
+        AudioPreferences {
+            sample_rate: options.sample_rate,
+            buffer_size: options.buffer_size,
+            threads: options.threads,
+            devices: self.audio_devices.clone(),
+            input_channels: self.audio_input_channels,
+            output_channels: self.audio_output_channels,
+            force_format: self.audio_force_format,
+        }
+    }
+
+    /// Store audio device settings (the backend's choice under its id).
+    pub fn set_audio_preferences(&mut self, backend: BackendChoice, a: &AudioPreferences) {
+        self.set_backend(backend);
+        self.sample_rate = a.sample_rate;
+        self.buffer_size = a.buffer_size;
+        self.threads = a.threads;
+        self.audio_devices = a.devices.clone();
+        self.audio_devices.retain(|_, c| !c.is_empty());
+        self.audio_input_channels = a.input_channels;
+        self.audio_output_channels = a.output_channels;
+        self.audio_force_format = a.force_format;
+    }
+
     pub fn backend(&self) -> BackendChoice {
         match self.backend.as_str() {
             "jack" => BackendChoice::Jack,
@@ -317,6 +368,70 @@ impl Preferences {
 mod tests {
     use super::*;
     use faderframe_session::lanes::{GlobalLane, GlobalLanes};
+
+    #[test]
+    fn snapping_and_grid_preferences_round_trip_and_default_for_older_files() {
+        let old: Preferences = serde_json::from_str(r#"{"snap":false}"#).unwrap();
+        assert!(old.snap_objects, "Snap to Objects is on by default");
+        assert_eq!(old.grid_strength, faderframe_ui_canvas::GridLook::DEFAULT);
+        let mut prefs = old;
+        prefs.snap_objects = false;
+        prefs.grid_strength = 0.8;
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored, prefs);
+    }
+
+    #[test]
+    fn audio_device_settings_round_trip_and_older_files_use_the_defaults() {
+        let old: Preferences =
+            serde_json::from_str(r#"{"backend":"pipewire","buffer_size":128}"#).unwrap();
+        assert!(old.audio_devices.is_empty());
+        assert_eq!(old.audio_input_channels, None);
+        let options = crate::RunOptions {
+            buffer_size: old.buffer_size,
+            ..crate::RunOptions::default()
+        };
+        assert_eq!(
+            old.audio_preferences(&options),
+            AudioPreferences {
+                buffer_size: Some(128),
+                ..AudioPreferences::default()
+            }
+        );
+        let mut prefs = old;
+        let chosen = AudioPreferences {
+            sample_rate: Some(96_000),
+            buffer_size: Some(64),
+            output_channels: Some(10),
+            force_format: true,
+            ..AudioPreferences::default()
+        }
+        .with_devices(
+            "pipewire",
+            &["alsa_output.usb-desk"],
+            &["alsa_input.usb-desk"],
+        )
+        .with_devices("system", &[], &[]);
+        prefs.set_audio_preferences(BackendChoice::PipeWire, &chosen);
+        assert_eq!(prefs.audio_devices.len(), 1, "empty choices are not kept");
+        let saved = serde_json::to_string(&prefs).unwrap();
+        let restored: Preferences = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, prefs);
+        assert_eq!(restored.backend(), BackendChoice::PipeWire);
+        let options = crate::RunOptions {
+            sample_rate: restored.sample_rate,
+            buffer_size: restored.buffer_size,
+            ..crate::RunOptions::default()
+        };
+        let back = restored.audio_preferences(&options);
+        assert_eq!(
+            back.devices_for("pipewire").outputs,
+            vec!["alsa_output.usb-desk"]
+        );
+        assert_eq!(back.output_channels, Some(10));
+        assert!(back.force_format);
+    }
 
     #[test]
     fn lane_preferences_round_trip_and_accept_older_files() {

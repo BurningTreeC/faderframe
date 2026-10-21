@@ -38,8 +38,34 @@ fn an_unlinked_node_runs_and_closes() {
         eprintln!("no PipeWire server: skipped");
         return;
     }
+    // The graph's sinks and sources, each with its channels' names.
     let devices = backend.enumerate_devices().unwrap();
-    assert_eq!(devices.len(), 1);
+    for d in &devices {
+        assert!(!d.id.is_empty() && !d.name.is_empty(), "{d:?}");
+        assert!(d.input_channels > 0 || d.output_channels > 0, "{d:?}");
+        assert_eq!(d.output_names.len(), usize::from(d.output_channels));
+        assert_eq!(d.input_names.len(), usize::from(d.input_channels));
+    }
+    if devices.iter().any(|d| d.output_channels > 0) {
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.is_default && d.output_channels > 0),
+            "a default sink: {devices:?}"
+        );
+    }
+    eprintln!(
+        "{} devices: {}",
+        devices.len(),
+        devices
+            .iter()
+            .map(|d| format!(
+                "{} ({} in / {} out)",
+                d.name, d.input_channels, d.output_channels
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let frames = Arc::new(AtomicU64::new(0));
     let channels = Arc::new(AtomicU64::new(0));
     let stream = backend
@@ -70,5 +96,9 @@ fn an_unlinked_node_runs_and_closes() {
     assert_eq!(channels.load(Ordering::Relaxed), 302);
     assert!(info.sample_rate >= 8_000 && info.buffer_size > 0, "{info}");
     assert!(stream.status().running);
+    // Not linked: nothing on its channels.
+    let routing = stream.routing();
+    assert_eq!(routing.outputs, vec![None, None]);
+    assert_eq!(routing.inputs, vec![None, None, None]);
     drop(stream);
 }

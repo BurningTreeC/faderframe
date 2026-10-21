@@ -23,8 +23,8 @@ mod layout;
 mod presets;
 
 pub use layout::{
-    Axis, DockAreaId, DockNode, FloatingWindow, LayoutError, TabBar, TabGroup, ViewKind,
-    ViewLocation, WindowGeometry, WindowId, WindowRef, WorkspaceLayout,
+    Axis, DockAreaId, DockNode, FloatingWindow, LEFT_AREA_RATIO, LayoutError, TabBar, TabGroup,
+    ViewKind, ViewLocation, WindowGeometry, WindowId, WindowRef, WorkspaceLayout,
 };
 pub use presets::Preset;
 
@@ -123,6 +123,14 @@ impl ViewId {
 
     pub fn setlist() -> Self {
         Self::new("setlist")
+    }
+
+    pub fn inspector() -> Self {
+        Self::new("inspector")
+    }
+
+    pub fn channel_overview() -> Self {
+        Self::new("channel-overview")
     }
 }
 

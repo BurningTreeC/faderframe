@@ -42,6 +42,37 @@ impl ClipContent {
     pub fn is_audio(&self) -> bool {
         !matches!(self, ClipContent::Midi(_))
     }
+
+    /// Every audio source this content needs: the ones it plays
+    /// ([`Self::sources`]) and the ones kept to go back to — the audio
+    /// under clip effects, the unedited audio of spectral edits and of a
+    /// polyphonic pitch edit.
+    pub fn referenced_sources(&self) -> Vec<AudioSourceId> {
+        fn pitch(p: Option<&crate::pitch::PitchEdit>, out: &mut Vec<AudioSourceId>) {
+            if let Some(poly) = p.and_then(|p| p.polyphonic.as_ref()) {
+                out.push(poly.original);
+            }
+        }
+        let mut out = Vec::new();
+        match self {
+            ClipContent::Audio(a) => {
+                out.push(a.source);
+                pitch(a.pitch.as_ref(), &mut out);
+                if let Some(e) = &a.effects {
+                    out.push(e.original.source);
+                    pitch(e.original.pitch.as_ref(), &mut out);
+                }
+                if let Some(s) = &a.spectral {
+                    out.push(s.original);
+                }
+            }
+            ClipContent::Takes(f) => out.extend(f.sources()),
+            ClipContent::Midi(_) => {}
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// Audio region referencing part of an audio source.

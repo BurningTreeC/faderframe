@@ -377,6 +377,8 @@ impl Session {
             format: WavFormat::Float32,
             dither: faderframe_audio_files::Dither::Off,
             report: false,
+            // Its own file (a name the session chose): no one to ask.
+            overwrite: crate::render::Overwrite::Always,
             ..RenderSettings::defaults_for(&copy, path.clone())
         };
         let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;

@@ -140,7 +140,7 @@ impl MixerView {
     /// The input stage's menu: on the master the console (the whole mix),
     /// on a bus or return its bus amplifier, on a channel the microphone
     /// preamps.
-    pub(super) fn stage_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn stage_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         match t.kind {
             TrackKind::Master => Self::console_menu(model, t, at),
             TrackKind::Bus | TrackKind::Aux => Self::bus_amp_menu(model, t, at),

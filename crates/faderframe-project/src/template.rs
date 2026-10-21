@@ -11,9 +11,11 @@
 use crate::Project;
 use crate::album::SongSource;
 
-/// `project` without its content (see the module).
+/// `project` without its content (see the module). Scratch pads are
+/// content too: the song's set-up is kept.
 pub fn without_content(project: &Project) -> Project {
-    let mut p = project.clone();
+    let mut p = project.song().into_owned();
+    p.scratch_pads = Default::default();
     p.clips.clear();
     p.sources.clear();
     p.clip_links.clear();

@@ -82,6 +82,27 @@ impl MusicalRange {
     }
 }
 
+/// The Play Start Marker: a fixed place, set by the user, that playback
+/// starts from while it is `on` (wherever the playhead is) — not the
+/// dynamic play start that Stop returns to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayStart {
+    pub at: MusicalTime,
+    #[serde(default = "PlayStart::on_by_default")]
+    pub on: bool,
+}
+
+impl PlayStart {
+    /// A marker at `at`, playing from it.
+    pub fn at(at: MusicalTime) -> Self {
+        Self { at, on: true }
+    }
+
+    fn on_by_default() -> bool {
+        true
+    }
+}
+
 /// The persistent multitrack project.
 ///
 /// Contains only persistent data: no engine handles, plugin instances, GUI
@@ -104,6 +125,9 @@ pub struct Project {
     pub punch_range: Option<MusicalRange>,
     #[serde(default)]
     pub punch_enabled: bool,
+    /// The Play Start Marker (None: not set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub play_start: Option<PlayStart>,
     /// Subtle analogue leakage between adjacent mixer audio/instrument channels.
     #[serde(default)]
     pub crosstalk: bool,
@@ -169,6 +193,10 @@ pub struct Project {
     /// The clip launcher's scenes and slots.
     #[serde(default, skip_serializing_if = "crate::launcher::Launcher::is_empty")]
     pub launcher: crate::launcher::Launcher,
+    /// Scratch pads: other arrangements of the tracks, and which one the
+    /// arrangement fields hold (see [`crate::scratch`]).
+    #[serde(default, skip_serializing_if = "crate::scratch::ScratchPads::is_empty")]
+    pub scratch_pads: crate::scratch::ScratchPads,
     /// Clip aliases: clips with the same link share their content (an edit
     /// of one reaches the others; position, name, colour and mute are each
     /// one's own).
@@ -205,6 +233,7 @@ impl Project {
             loop_enabled: false,
             punch_range: None,
             punch_enabled: false,
+            play_start: None,
             crosstalk: false,
             pan_law: faderframe_core::PanLaw::default(),
             downmix: faderframe_core::surround::Downmix::STANDARD,
@@ -224,6 +253,7 @@ impl Project {
             adr: Default::default(),
             setlist: Default::default(),
             launcher: crate::launcher::Launcher::default(),
+            scratch_pads: crate::scratch::ScratchPads::default(),
             clip_links: BTreeMap::new(),
             video: crate::video::Video::default(),
             timecode: None,
@@ -280,7 +310,7 @@ impl Project {
         let mut chain: Vec<&Track> = Vec::new();
         let mut next = track.folder;
         while let Some(id) = next {
-            let Some(f) = self.track(id).filter(|f| f.kind == TrackKind::Folder) else {
+            let Some(f) = self.track(id).filter(|f| f.is_folder()) else {
                 break;
             };
             if f.id == track.id || chain.iter().any(|c| c.id == f.id) {
@@ -295,6 +325,97 @@ impl Project {
     /// Is `track` inside `folder` (directly or in a folder inside it)?
     pub fn in_folder(&self, track: &Track, folder: TrackId) -> bool {
         self.folder_chain(track).iter().any(|f| f.id == folder)
+    }
+
+    /// The folder bus `track`'s default output plays through: the nearest
+    /// one it is in (plain folders between are passed by). Only tracks with
+    /// audio have one (MIDI tracks, VCAs and plain folders do not).
+    pub fn folder_bus_of(&self, track: &Track) -> Option<&Track> {
+        if !track.kind.has_audio() || track.kind == TrackKind::Master {
+            return None;
+        }
+        self.folder_chain(track)
+            .into_iter()
+            .find(|f| f.is_folder_bus())
+    }
+
+    /// The grouped folder whose group `track` is part of (see
+    /// [`Track::folder_group`]): the outermost folder with its Group switch
+    /// on among the folders it is in — and itself, for a folder. So every
+    /// track is in one group at most: a grouped folder inside a grouped
+    /// folder belongs to the outer group (its own switch counts again once
+    /// the outer one is off), and edits never travel on from one group to
+    /// another.
+    pub fn edit_group<'a>(&'a self, track: &'a Track) -> Option<&'a Track> {
+        let own = track.is_folder().then_some(track);
+        own.into_iter()
+            .chain(self.folder_chain(track))
+            .rfind(|f| f.folder_group)
+    }
+
+    /// The tracks a grouped folder's group edits together: those with clips
+    /// (audio, instrument and MIDI tracks) it holds at every level, in
+    /// project order. Folders, buses, auxes and VCAs inside are no members.
+    pub fn edit_group_members(&self, folder: &Track) -> Vec<TrackId> {
+        self.tracks
+            .iter()
+            .filter(|t| t.kind.has_clips() && self.in_folder(t, folder.id))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// The other tracks `track` is edited together with: the other members
+    /// of its group ([`Self::edit_group`]; for a grouped folder itself all
+    /// of them). Empty when it is in no group.
+    pub fn grouped_with(&self, track: TrackId) -> Vec<TrackId> {
+        let Some(t) = self.track(track) else {
+            return Vec::new();
+        };
+        self.edit_group(t).map_or_else(Vec::new, |g| {
+            self.edit_group_members(g)
+                .into_iter()
+                .filter(|m| *m != track)
+                .collect()
+        })
+    }
+
+    /// Does the routing (outputs, enabled sends, plugin outputs taken,
+    /// sidechains) loop anywhere?
+    pub fn routing_loops(&self) -> bool {
+        let edges = self.dependency_edges();
+        let mut next: HashMap<TrackId, Vec<TrackId>> = HashMap::new();
+        for (a, b) in edges {
+            next.entry(a).or_default().push(b);
+        }
+        // Depth first, three colours: on the stack means a loop.
+        let mut state: HashMap<TrackId, u8> = HashMap::new();
+        for t in &self.tracks {
+            if state.contains_key(&t.id) {
+                continue;
+            }
+            let mut stack = vec![(t.id, 0usize)];
+            state.insert(t.id, 1);
+            while let Some((node, i)) = stack.last().copied() {
+                let to = next.get(&node).and_then(|v| v.get(i)).copied();
+                let Some(to) = to else {
+                    state.insert(node, 2);
+                    stack.pop();
+                    continue;
+                };
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+                match state.get(&to) {
+                    Some(1) => return true,
+                    Some(_) => {}
+                    None => {
+                        state.insert(to, 1);
+                        stack.push((to, 0));
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// The tracks as the editors show them: each folder followed by what it
@@ -313,7 +434,7 @@ impl Project {
             let t = &self.tracks[i];
             out.push(t);
             stack.push((at, i + 1));
-            if t.kind == TrackKind::Folder {
+            if t.is_folder() {
                 stack.push((Some(t.id), 0));
             }
         }
@@ -358,32 +479,13 @@ impl Project {
     }
 
     /// Every source something in the project plays or keeps to go back
-    /// to: clips (each take of a folder too), their originals (clip
+    /// to: clips (each take of a folder too; those of the arrangements put
+    /// aside, scratch pads and the song, too), their originals (clip
     /// effects, spectral edits, polyphonic pitch) and frozen tracks.
     pub fn used_sources(&self) -> BTreeSet<AudioSourceId> {
-        fn pitch(p: Option<&crate::pitch::PitchEdit>, out: &mut BTreeSet<AudioSourceId>) {
-            if let Some(poly) = p.and_then(|p| p.polyphonic.as_ref()) {
-                out.insert(poly.original);
-            }
-        }
-        fn audio(a: &crate::AudioClip, out: &mut BTreeSet<AudioSourceId>) {
-            out.insert(a.source);
-            pitch(a.pitch.as_ref(), out);
-            if let Some(e) = &a.effects {
-                out.insert(e.original.source);
-                pitch(e.original.pitch.as_ref(), out);
-            }
-            if let Some(s) = &a.spectral {
-                out.insert(s.original);
-            }
-        }
         let mut out = BTreeSet::new();
-        for c in self.clips.values() {
-            match &c.content {
-                crate::ClipContent::Audio(a) => audio(a, &mut out),
-                crate::ClipContent::Takes(f) => out.extend(f.sources()),
-                crate::ClipContent::Midi(_) => {}
-            }
+        for c in self.clips.values().chain(self.stashed_clips()) {
+            out.extend(c.content.referenced_sources());
         }
         for t in &self.tracks {
             if let Some(f) = &t.freeze {
@@ -413,14 +515,18 @@ impl Project {
             .max(self.timeline.meter.bar_start(1))
     }
 
-    /// The track that `track`'s output feeds, if it is another track.
+    /// The track that `track`'s output feeds, if it is another track. The
+    /// default output ([`OutputRouting::Master`]) of a track with audio
+    /// goes to the nearest folder bus it is in, else to the master.
     pub fn output_target(&self, track: &Track) -> Option<TrackId> {
         match track.output {
             OutputRouting::Master => {
                 if track.kind == TrackKind::Master {
                     None
                 } else {
-                    self.master_id()
+                    self.folder_bus_of(track)
+                        .map(|f| f.id)
+                        .or_else(|| self.master_id())
                 }
             }
             OutputRouting::Track { track: t } => Some(t),
@@ -765,9 +871,12 @@ impl Project {
                 max_id = max_id.max(p.id.raw());
             }
         }
-        // Links of clips that are gone (and of a clip alone) go.
+        // Links of clips that are gone (and of a clip alone) go (clips of
+        // arrangements put aside are there).
+        let stashed: BTreeSet<ClipId> = self.stashed_clips().map(|c| c.id).collect();
         let clips = &self.clips;
-        self.clip_links.retain(|c, _| clips.contains_key(c));
+        self.clip_links
+            .retain(|c, _| clips.contains_key(c) || stashed.contains(c));
         let mut counts: BTreeMap<faderframe_core::ClipLinkId, usize> = BTreeMap::new();
         for l in self.clip_links.values() {
             *counts.entry(*l).or_default() += 1;
@@ -788,6 +897,8 @@ impl Project {
                     .unwrap_or(0),
             );
         self.ids.reserve_through(max_id);
+        // Scratch pads: consistent with the tracks, their ids reserved.
+        notes.extend(self.repair_scratch_pads());
 
         // Clip ↔ track membership consistency.
         let track_ids: BTreeSet<TrackId> = self.tracks.iter().map(|t| t.id).collect();
@@ -918,6 +1029,122 @@ mod tests {
         assert!(p.would_cycle(a, a));
         let master = p.master_id().unwrap();
         assert!(p.would_cycle(master, bus));
+    }
+
+    /// A folder bus takes the default outputs of the tracks with audio it
+    /// holds (in plain folders inside it too); MIDI tracks, VCAs and plain
+    /// folders keep theirs; a folder bus in one goes to it; the flag is
+    /// only written when set and only means something on a bus.
+    #[test]
+    fn folder_buses_take_their_tracks_default_outputs() {
+        let mut p = Project::new("Folders", 48_000);
+        let master = p.master_id().unwrap();
+        let add = |p: &mut Project, kind, name: &str, folder| {
+            let id: TrackId = p.ids.allocate();
+            let mut t = Track::new(id, kind, name, TrackColor::palette(0));
+            t.folder = folder;
+            p.tracks.insert(0, t);
+            id
+        };
+        let outer = add(&mut p, TrackKind::Bus, "Outer", None);
+        let f = add(&mut p, TrackKind::Bus, "F", Some(outer));
+        let plain = add(&mut p, TrackKind::Folder, "Plain", Some(f));
+        for id in [outer, f] {
+            p.track_mut(id).unwrap().folder_bus = true;
+        }
+        let kinds = [
+            TrackKind::Audio,
+            TrackKind::Instrument,
+            TrackKind::Bus,
+            TrackKind::Aux,
+        ];
+        for kind in kinds {
+            let t = add(&mut p, kind, "In", Some(plain));
+            assert_eq!(p.output_target(p.track(t).unwrap()), Some(f), "{kind:?}");
+        }
+        let midi = add(&mut p, TrackKind::Midi, "Notes", Some(f));
+        assert_eq!(p.output_target(p.track(midi).unwrap()), Some(master));
+        let vca = add(&mut p, TrackKind::Vca, "VCA", Some(f));
+        assert!(p.folder_bus_of(p.track(vca).unwrap()).is_none());
+        assert!(p.folder_bus_of(p.track(plain).unwrap()).is_none());
+        assert_eq!(p.output_target(p.track(f).unwrap()), Some(outer));
+        assert_eq!(p.output_target(p.track(outer).unwrap()), Some(master));
+        // Named outputs stay named.
+        let named = add(&mut p, TrackKind::Audio, "Named", Some(f));
+        p.track_mut(named).unwrap().output = OutputRouting::Track { track: master };
+        assert_eq!(p.output_target(p.track(named).unwrap()), Some(master));
+        // The editors show what a folder bus holds under it.
+        let order: Vec<TrackId> = p.folder_order().iter().map(|t| t.id).collect();
+        let at = |id| order.iter().position(|x| *x == id).unwrap();
+        assert!(at(outer) < at(f) && at(f) < at(plain) && at(f) < at(named));
+        assert!(!p.routing_loops());
+        // Written only when set; a stray flag on another kind means nothing.
+        let json = serde_json::to_string(p.track(plain).unwrap()).unwrap();
+        assert!(!json.contains("folder_bus"), "{json}");
+        let json = serde_json::to_string(p.track(f).unwrap()).unwrap();
+        assert!(json.contains("\"folder_bus\":true"), "{json}");
+        let back: Track = serde_json::from_str(&json).unwrap();
+        assert!(back.is_folder_bus() && back.is_folder());
+        let mut aux = Track::new(TrackId(999), TrackKind::Aux, "A", TrackColor::palette(0));
+        aux.folder_bus = true;
+        assert!(!aux.is_folder_bus() && !aux.is_folder());
+    }
+
+    /// A folder's group: the tracks with clips it holds at every level; a
+    /// grouped folder inside a grouped one belongs to the outer group (one
+    /// group a track at most), its own switch counts once the outer one is
+    /// off; folder buses group too; the switch is written only when set.
+    #[test]
+    fn grouped_folders_edit_their_tracks_together() {
+        let mut p = Project::new("Groups", 48_000);
+        let add = |p: &mut Project, kind, name: &str, folder| {
+            let id: TrackId = p.ids.allocate();
+            let mut t = Track::new(id, kind, name, TrackColor::palette(0));
+            t.folder = folder;
+            p.tracks.push(t);
+            id
+        };
+        let outer = add(&mut p, TrackKind::Folder, "Guitars", None);
+        let dry = add(&mut p, TrackKind::Audio, "Dry", Some(outer));
+        let inner = add(&mut p, TrackKind::Bus, "Amp", Some(outer));
+        p.track_mut(inner).unwrap().folder_bus = true;
+        let wet = add(&mut p, TrackKind::Audio, "Wet", Some(inner));
+        let keys = add(&mut p, TrackKind::Midi, "Notes", Some(inner));
+        let vca = add(&mut p, TrackKind::Vca, "VCA", Some(outer));
+        let other = add(&mut p, TrackKind::Audio, "Other", None);
+        let with = |p: &Project, t| p.grouped_with(t);
+        // No switch on: no groups.
+        assert!(with(&p, dry).is_empty() && p.edit_group(p.track(wet).unwrap()).is_none());
+        // The inner folder bus grouped: its tracks with clips.
+        p.track_mut(inner).unwrap().folder_group = true;
+        assert_eq!(with(&p, wet), [keys]);
+        assert_eq!(
+            with(&p, inner),
+            [wet, keys],
+            "the folder itself: all of them"
+        );
+        assert!(with(&p, dry).is_empty());
+        // The outer one too: one group, the outer one's.
+        p.track_mut(outer).unwrap().folder_group = true;
+        assert_eq!(p.edit_group(p.track(wet).unwrap()).unwrap().id, outer);
+        assert_eq!(p.edit_group(p.track(inner).unwrap()).unwrap().id, outer);
+        assert_eq!(with(&p, wet), [dry, keys]);
+        assert_eq!(with(&p, dry), [wet, keys]);
+        assert!(with(&p, vca).iter().all(|t| *t != vca) && !with(&p, dry).contains(&vca));
+        assert!(with(&p, other).is_empty());
+        // The outer one off: the inner group again.
+        p.track_mut(outer).unwrap().folder_group = false;
+        assert_eq!(with(&p, wet), [keys]);
+        // Written only when set; a stray flag on a track that is no folder
+        // means nothing.
+        let json = serde_json::to_string(p.track(outer).unwrap()).unwrap();
+        assert!(!json.contains("folder_group"), "{json}");
+        let json = serde_json::to_string(p.track(inner).unwrap()).unwrap();
+        assert!(json.contains("\"folder_group\":true"), "{json}");
+        let back: Track = serde_json::from_str(&json).unwrap();
+        assert!(back.folder_group && back.is_folder_bus());
+        p.track_mut(other).unwrap().folder_group = true;
+        assert!(with(&p, other).is_empty());
     }
 
     #[test]

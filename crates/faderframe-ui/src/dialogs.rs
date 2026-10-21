@@ -6,6 +6,18 @@ use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
 use std::rc::Rc;
 
+/// What a save dialog that returned `chosen` asked about already: the
+/// file there now (GTK's file choosers ask before choosing a file that
+/// exists, on every platform), which the export may then replace without
+/// asking again.
+pub(crate) fn chooser_agreed(chosen: &std::path::Path) -> Vec<std::path::PathBuf> {
+    if faderframe_session::render::files::occupied(chosen) {
+        vec![chosen.to_path_buf()]
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn project_filters() -> gio::ListStore {
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("FaderFrame projects"));
@@ -124,12 +136,21 @@ pub fn export_midi(app: &Rc<AppState>) {
             return;
         };
         let Some(path) = file.path() else { return };
-        export_midi_to(&app, &path);
+        export_midi_agreeing(&app, &path, chooser_agreed(&path));
     });
 }
 
-/// Write the MIDI file (selected MIDI clips only when some are selected).
+/// Write the MIDI file (selected MIDI clips only when some are selected);
+/// a file there is asked about first.
 pub fn export_midi_to(app: &Rc<AppState>, path: &std::path::Path) {
+    export_midi_agreeing(app, path, Vec::new());
+}
+
+fn export_midi_agreeing(
+    app: &Rc<AppState>,
+    path: &std::path::Path,
+    agreed: Vec<std::path::PathBuf>,
+) {
     let clips: Vec<faderframe_core::ClipId> = {
         let s = app.session.borrow();
         s.selection
@@ -140,19 +161,13 @@ pub fn export_midi_to(app: &Rc<AppState>, path: &std::path::Path) {
             .collect()
     };
     let only = (!clips.is_empty()).then_some(clips.as_slice());
-    let result = app.session.borrow().export_midi_file(path, only);
-    match result {
-        Ok(n) => app.session.borrow_mut().notify(
-            faderframe_session::NoticeLevel::Info,
-            format!(
-                "exported {n} track{} to {}",
-                if n == 1 { "" } else { "s" },
-                path.display()
-            ),
-        ),
-        Err(e) => app.report(e, true),
-    }
-    app.after_change();
+    // The session says when it is written (after a question, if any).
+    app.with_session(|s| {
+        s.agree_to_replace(agreed);
+        let r = s.export_midi_file(path, only);
+        s.forget_agreement();
+        r
+    });
 }
 
 /// File → Export MIDI 2.0 Clip…: the selected MIDI clip as a MIDI 2.0 clip
@@ -193,29 +208,31 @@ pub fn export_midi2(app: &Rc<AppState>) {
             return;
         };
         let Some(path) = file.path() else { return };
-        export_midi2_to(&app, &path);
+        export_midi2_agreeing(&app, &path, chooser_agreed(&path));
     });
 }
 
-/// Write the MIDI 2.0 clip file.
+/// Write the MIDI 2.0 clip file (a file there is asked about first).
 pub fn export_midi2_to(app: &Rc<AppState>, path: &std::path::Path) {
-    let result = {
-        let s = app.session.borrow();
-        match s.midi2_export_clip() {
-            Some(clip) => s.export_midi2_clip(path, clip),
-            None => Err(faderframe_session::SessionError::Other(
-                "select a MIDI clip to export".into(),
-            )),
+    export_midi2_agreeing(app, path, Vec::new());
+}
+
+fn export_midi2_agreeing(
+    app: &Rc<AppState>,
+    path: &std::path::Path,
+    agreed: Vec<std::path::PathBuf>,
+) {
+    app.with_session(|s| match s.midi2_export_clip() {
+        Some(clip) => {
+            s.agree_to_replace(agreed);
+            let r = s.export_midi2_clip(path, clip);
+            s.forget_agreement();
+            r
         }
-    };
-    match result {
-        Ok(()) => app.session.borrow_mut().notify(
-            faderframe_session::NoticeLevel::Info,
-            format!("exported the MIDI 2.0 clip to {}", path.display()),
-        ),
-        Err(e) => app.report(e, true),
-    }
-    app.after_change();
+        None => Err(faderframe_session::SessionError::Other(
+            "select a MIDI clip to export".into(),
+        )),
+    });
 }
 
 /// File → Import Audio…: onto the selected audio track (others on new
@@ -371,23 +388,25 @@ pub fn export_track_preset(app: &Rc<AppState>) {
         let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
             return;
         };
-        let Some(mut path) = file.path() else { return };
+        let Some(chosen) = file.path() else { return };
+        let mut path = chosen.clone();
         if path.extension().is_none() {
             path.set_extension(faderframe_project::preset::PRESET_EXTENSION);
         }
-        if app
-            .with_session(|s| {
-                s.export_track_preset(track, &path)?;
-                s.rescan_track_presets();
-                Ok(())
-            })
-            .is_some()
-        {
-            app.session.borrow_mut().notify(
-                faderframe_session::NoticeLevel::Info,
-                format!("exported {}", path.display()),
-            );
-        }
+        // The dialog asked about the file it returned, not one with an
+        // extension added.
+        let agreed = if path == chosen {
+            chooser_agreed(&path)
+        } else {
+            Vec::new()
+        };
+        // The session tells when it is written (after a question, if any).
+        app.with_session(|s| {
+            s.agree_to_replace(agreed);
+            let r = s.export_track_preset(track, &path);
+            s.forget_agreement();
+            r
+        });
     });
 }
 
@@ -542,6 +561,14 @@ pub fn confirm_discard(app: &Rc<AppState>, next: impl Fn(&Rc<AppState>) + 'stati
         next(a);
         c.done(a);
     });
+    // A take being recorded: it ends and is placed first, so the question
+    // below covers it (and Save keeps it).
+    if app.session.borrow().recording_in_progress() {
+        app.with_session(|s| {
+            s.wait_for_recordings();
+            Ok(())
+        });
+    }
     if !app.session.borrow().is_dirty() {
         next(app);
         return;
@@ -741,6 +768,33 @@ pub fn rename_group(app: &Rc<AppState>, group: faderframe_core::GroupId) {
         &name,
         "Rename",
         move |name| faderframe_session::Action::RenameGroup { group, name },
+    );
+}
+
+/// Ask for a scratch pad's new name.
+pub fn rename_scratch_pad(app: &Rc<AppState>, pad: faderframe_core::ScratchPadId) {
+    let Some(name) = app
+        .session
+        .borrow()
+        .project()
+        .scratch_pads
+        .pad(pad)
+        .map(|p| p.name.clone())
+    else {
+        return;
+    };
+    name_prompt(
+        app,
+        "Rename Scratch Pad",
+        "Scratch pad name:",
+        &name,
+        "Rename",
+        move |name| {
+            faderframe_session::Action::ScratchPad(faderframe_session::scratch::ScratchOp::Rename {
+                pad,
+                name,
+            })
+        },
     );
 }
 
@@ -1662,8 +1716,13 @@ pub fn install_close_guard(app: &Rc<AppState>, window: &gtk::ApplicationWindow) 
         let Some(app) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        // Nothing to ask: closes at once.
-        if confirmed.get() || (!app.session.borrow().is_dirty() && closing(&app).unused.is_none()) {
+        // Nothing to ask: closes at once (a take being recorded is asked
+        // about: `confirm_discard` places it first).
+        let idle = {
+            let s = app.session.borrow();
+            !s.is_dirty() && !s.recording_in_progress()
+        };
+        if confirmed.get() || (idle && closing(&app).unused.is_none()) {
             app.app.quit();
             return glib::Propagation::Proceed;
         }
@@ -1710,17 +1769,25 @@ pub fn save_sample(
     let weak = Rc::downgrade(app);
     dialog.save(Some(&win), gio::Cancellable::NONE, move |res| {
         if let (Ok(file), Some(app)) = (res, weak.upgrade())
-            && let Some(mut path) = file.path()
+            && let Some(chosen) = file.path()
         {
+            let mut path = chosen.clone();
             if path.extension().is_none() {
                 path.set_extension("wav");
             }
-            app.dispatch(faderframe_session::Action::MakeSample {
+            let action = faderframe_session::Action::MakeSample {
                 track,
                 start,
                 end,
-                target: faderframe_session::sampling::SampleTarget::File(path),
-            });
+                target: faderframe_session::sampling::SampleTarget::File(path.clone()),
+            };
+            // The dialog asked about the file it returned (not one with
+            // an extension added).
+            if path == chosen {
+                app.dispatch_chosen(action, &path);
+            } else {
+                app.dispatch(action);
+            }
         }
     });
 }

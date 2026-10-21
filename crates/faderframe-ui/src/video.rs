@@ -117,16 +117,25 @@ pub fn export(app: &Rc<AppState>) {
         let (Ok(file), Some(app)) = (res, weak.upgrade()) else {
             return;
         };
-        let Some(mut path) = file.path() else { return };
+        let Some(chosen) = file.path() else { return };
+        let mut path = chosen.clone();
         let container = Container::for_path(&path).unwrap_or_else(|| {
             path.set_extension("mov");
             Container::Mov
         });
-        app.dispatch(Action::Video(VideoOp::Export {
+        let action = Action::Video(VideoOp::Export {
             clip: None,
-            path,
+            path: path.clone(),
             container,
-        }));
+        });
+        // The dialog asked about the file it returned (not one with an
+        // extension added): an existing one is replaced without asking
+        // again.
+        if path == chosen {
+            app.dispatch_chosen(action, &path);
+        } else {
+            app.dispatch(action);
+        }
     });
 }
 
@@ -206,6 +215,23 @@ pub fn full_screen(app: &Rc<AppState>, view: ViewId) {
                 }
             });
         }
+    }
+}
+
+/// The active window is a video window gone full screen once: F11 (an
+/// application shortcut, the Inspector's) toggles its full screen. Returns
+/// whether it did.
+pub(crate) fn toggle_active_full_screen(app: &Rc<AppState>) -> bool {
+    match app.app.active_window() {
+        Some(w) if w.widget_name() == "faderframe-video-window" => {
+            if w.is_fullscreen() {
+                w.unfullscreen();
+            } else {
+                go_full_screen(&w);
+            }
+            true
+        }
+        _ => false,
     }
 }
 

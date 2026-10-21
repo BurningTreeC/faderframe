@@ -38,6 +38,7 @@ pub mod modulation;
 pub mod pitch;
 pub mod preset;
 mod project;
+pub mod scratch;
 pub mod setlist;
 pub mod spectral;
 mod takes;
@@ -59,8 +60,8 @@ pub use midimap::{
     MappingMode, MappingTarget, MidiControl, MidiMapping, MidiSource, ShowControl, TransportControl,
 };
 pub use preset::{PresetError, TrackPreset};
-pub use project::{AudioSource, Marker, MusicalRange, Project, Section, SourceSpec};
-pub use takes::{CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
+pub use project::{AudioSource, Marker, MusicalRange, PlayStart, Project, Section, SourceSpec};
+pub use takes::{COMP_DECLICK, CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
 pub use track::{
     AuxSend, BinauralRender, Freeze, GroupLink, InputRouting, MidiOutputRouting, MonitorMode,
     OutputRouting, PluginFormat, PluginRef, PluginSlot, SavedParameter, SendTap, Track, TrackColor,

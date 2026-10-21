@@ -369,3 +369,95 @@ fn a_count_in_plays_the_click_alone_before_the_take() {
     assert!((out[60_050] - level).abs() < 1e-4, "{}", out[60_050]);
     assert!((out[70_000] - level).abs() < 1e-4, "{}", out[70_000]);
 }
+
+/// A count-in before a MIDI-only take (no audio track records): the
+/// arrangement waits for the take all the same, then plays on; the end of
+/// the take ends the count-in's silence.
+#[test]
+fn a_count_in_before_a_midi_only_take_keeps_the_song_silent() {
+    use faderframe_engine::midi::{MidiFilter, MidiRecordTarget};
+    use faderframe_timeline::MusicalTime;
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Song", ChannelLayout::Stereo);
+    let dc = tp.dc(2, 0.25, 200_000);
+    tp.clip(t, dc, MusicalTime::ZERO, 200_000);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let mut play = |r: &mut OfflineRenderer, blocks: usize| {
+        let mut out = Vec::new();
+        for _ in 0..blocks {
+            bufs.set_frames(BLOCK);
+            r.processor.process_device(&mut bufs);
+            r.controller.collect_garbage();
+            out.extend_from_slice(bufs.output(0));
+        }
+        out
+    };
+    r.controller.metronome().set_mode(MetronomeMode::Off);
+    r.play_from(0).unwrap();
+    let level = play(&mut r, 20)[1_000];
+    r.controller.set_count_in(true).unwrap();
+    let _rx = r
+        .controller
+        .begin_midi_recording(
+            vec![MidiRecordTarget {
+                track: TrackId(999_998),
+                filter: MidiFilter {
+                    port: None,
+                    channel: None,
+                },
+            }],
+            60_000,
+            i64::MAX,
+        )
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
+    let out = play(&mut r, 800);
+    assert_eq!(out[30_000], 0.0, "the song waits");
+    assert_eq!(out[59_999], 0.0);
+    assert!((out[70_000] - level).abs() < 1e-4, "{}", out[70_000]);
+    // The take ends: the song plays from the start again.
+    r.controller.end_midi_recording().unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(false))
+        .unwrap();
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
+    let out = play(&mut r, 400);
+    assert!((out[30_000] - level).abs() < 1e-4, "{}", out[30_000]);
+}
+
+/// Frames a take could not keep (its ring full) are counted for that take
+/// only: the next take starts from none (it used to warn about every
+/// earlier take's losses again).
+#[test]
+fn each_take_counts_its_own_dropped_frames() {
+    let (mut r, t) = renderer();
+    // The smallest ring (half a second) that nobody drains: once full,
+    // blocks are dropped.
+    let _full = r
+        .controller
+        .begin_recording(target(t), 0, i64::MAX, 0.0)
+        .unwrap();
+    r.controller
+        .transport(TransportCommand::SetRecording(true))
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let mut frame = 0;
+    run(&mut r, &mut bufs, 300, &mut frame);
+    assert!(r.controller.record_counters().0 > 0, "overruns counted");
+    r.controller.end_recording().unwrap();
+    run(&mut r, &mut bufs, 1, &mut frame);
+    let _next = r
+        .controller
+        .begin_recording(target(t), 0, i64::MAX, 2.0)
+        .unwrap();
+    assert_eq!(r.controller.record_counters().0, 0, "a new take, no losses");
+}

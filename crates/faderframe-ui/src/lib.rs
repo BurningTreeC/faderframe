@@ -13,11 +13,15 @@
 
 pub mod access;
 mod actions;
+mod audio_prefs;
 pub mod canvas;
 mod console;
+pub mod crash;
 mod cues;
 mod dialogs;
 pub mod dock;
+mod edit_keys;
+mod favorites;
 pub mod gpu;
 #[cfg(all(feature = "gpu-painter", windows))]
 mod gpu_win32;
@@ -39,12 +43,14 @@ pub mod prefs;
 mod recent;
 mod recording;
 mod render;
+mod render_report;
 mod screenshot;
 mod speaker_layouts;
 pub mod state;
 mod style;
 mod surface_prefs;
 mod templates;
+mod toggles;
 mod transport_display;
 mod transport_keys;
 mod video;
@@ -162,6 +168,7 @@ fn build_session(
         tracing::warn!("render ahead: {e}");
     }
     listen::apply_preferences(&mut session, prefs);
+    favorites::load_into(&mut session);
     if let Err(e) = session.set_bass_management(prefs.bass_management) {
         tracing::warn!("bass management: {e}");
     }
@@ -263,8 +270,10 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     }
     let (mut session, error, open) = build_session(&options, &prefs);
     session.editor.snap = prefs.snap;
+    session.editor.snap_objects = prefs.snap_objects;
     session.editor.follow_playhead = prefs.follow_playhead;
     session.editor.stop_to_start = prefs.stop_to_start;
+    session.editor.insertion_follows_playback = !prefs.return_to_play_start;
     session.editor.lanes = prefs.global_lanes;
     if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(
         prefs.record_settings(),
@@ -317,15 +326,20 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     transport_keys::install(&state);
     let window = window::build(&state);
     actions::install(&state);
+    edit_keys::install_actions(&state);
     recording::install_actions(&state);
     listen::install_actions(&state);
     monitoring::install_actions(&state);
     console::install_actions(&state);
     cues::install_actions(&state);
+    edit_keys::install_window(&state, &window);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);
     dock::realize(&state);
     window.present();
+    // The last run ended without closing: its crash report (or that there
+    // is none) and where its files are.
+    crash::offer_previous_run(window.upcast_ref());
     tracing::info!(
         "display backend: {}",
         gtk::prelude::WidgetExt::display(&window).type_().name()

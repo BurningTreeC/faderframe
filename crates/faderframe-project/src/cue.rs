@@ -167,7 +167,8 @@ pub struct CueSend {
     pub cue: CueId,
     pub level_db: f32,
     /// −1…1: a mono source by the project's pan law, a stereo one's
-    /// balance.
+    /// balance — the source placed in the cue mix before or after the
+    /// fader alike (the main mix's pan is the main mix's).
     #[serde(default)]
     pub pan: f32,
     /// Heard in the cue mix (off: kept, silent).

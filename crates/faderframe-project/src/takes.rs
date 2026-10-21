@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 /// Default crossfade at comp boundaries: 10 ms at 48 kHz.
 pub const DEFAULT_COMP_CROSSFADE: i64 = 480;
 
+/// Frames of linear fade at comp edges inside the folder that touch no
+/// other piece (a declick): what the engine plays and Flatten Comp keeps.
+pub const COMP_DECLICK: i64 = 64;
+
 fn default_crossfade() -> i64 {
     DEFAULT_COMP_CROSSFADE
 }
@@ -196,12 +200,16 @@ impl TakeFolder {
         self.normalize();
     }
 
-    /// Play `take` everywhere it has material (silence elsewhere).
+    /// Play `take` everywhere it has material (silence elsewhere); a take
+    /// with none here (a split left it outside this half) changes nothing.
     pub fn use_take(&mut self, take: usize) {
         let Some(t) = self.takes.get(take) else {
             return;
         };
-        let (a, b) = (t.start, t.end);
+        let (a, b) = (t.start.clamp(0, self.length), t.end.clamp(0, self.length));
+        if b <= a {
+            return;
+        }
         self.comp = vec![CompSegment {
             start: 0,
             take: None,
@@ -402,6 +410,24 @@ mod tests {
         assert_eq!(r.takes[1].source_offset, f.takes[1].source_offset + 700);
         assert_eq!((r.takes[1].start, r.takes[1].end), (0, 400));
         assert!(f.split(0).is_none() && f.split(1150).is_none());
+    }
+
+    /// After a split, a take with no material in one half keeps its lane
+    /// there; using it changes nothing (it used to silence the half).
+    #[test]
+    fn using_a_take_with_no_material_here_changes_nothing() {
+        let mut f = folder(2, 1000);
+        f.takes[1].start = 600;
+        f.use_take(0);
+        let (left, _) = f.split(500).unwrap();
+        assert_eq!(
+            left.takes[1].start, left.takes[1].end,
+            "empty in the left half"
+        );
+        let mut used = left.clone();
+        used.use_take(1);
+        assert_eq!(used, left);
+        assert_eq!(used.take_at(100), Some(0), "still plays");
     }
 
     #[test]

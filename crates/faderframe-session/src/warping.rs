@@ -6,7 +6,7 @@
 //! it ([`Session::gesture_clip`]), so dragging back restores exactly what
 //! was there.
 
-use crate::editing::{ClipEdge, EditMode};
+use crate::editing::ClipEdge;
 use crate::{Result, Session, SessionError};
 use faderframe_core::ClipId;
 use faderframe_project::midi_ops::quantize_target;
@@ -252,6 +252,18 @@ impl Session {
         edge: ClipEdge,
         to: MusicalTime,
     ) -> Result<Vec<Command>> {
+        let t = self.stretch_part(clip, edge, to)?;
+        self.trims_commands(vec![t])
+    }
+
+    /// The clip (as the gesture first saw it) time-stretched by one edge,
+    /// not yet placed (Shuffle moves what follows an end it stretched).
+    pub(crate) fn stretch_part(
+        &mut self,
+        clip: ClipId,
+        edge: ClipEdge,
+        to: MusicalTime,
+    ) -> Result<crate::editing::Trimmed> {
         let c = self.gesture_clip(clip)?;
         let end = self.clip_end(&c);
         let min = MusicalTime::from_quarters(1.0 / 64.0);
@@ -281,49 +293,12 @@ impl Session {
                 ));
             }
         };
-        let mut cmds = vec![Command::SetClipContent {
-            clip,
+        Ok(crate::editing::Trimmed {
+            base: c,
             start,
-            content: Box::new(content),
-        }];
-        if self.editor.edit_mode == EditMode::Shuffle && edge == ClipEdge::End {
-            cmds.extend(self.shuffle_later(&c, end, new_end)?);
-        }
-        Ok(cmds)
-    }
-
-    /// Moves of the clips after `c` on its track (as the gesture first saw
-    /// them) when its end moves from `old_end` to `new_end`.
-    pub(crate) fn shuffle_later(
-        &mut self,
-        c: &Clip,
-        old_end: MusicalTime,
-        new_end: MusicalTime,
-    ) -> Result<Vec<Command>> {
-        let ids: Vec<ClipId> = self
-            .project
-            .clips_of(c.track)
-            .into_iter()
-            .map(|o| o.id)
-            .filter(|id| *id != c.id)
-            .collect();
-        let mut cmds = Vec::new();
-        for id in ids {
-            let o = self.gesture_clip(id)?;
-            if o.start >= old_end {
-                let start = if new_end >= old_end {
-                    o.start + (new_end - old_end)
-                } else {
-                    o.start - (old_end - new_end)
-                };
-                cmds.push(Command::MoveClip {
-                    clip: id,
-                    track: o.track,
-                    start: start.max(MusicalTime::ZERO),
-                });
-            }
-        }
-        Ok(cmds)
+            content,
+            shuffles: edge == ClipEdge::End,
+        })
     }
 
     /// Split an audio clip at each of its transients.
@@ -367,8 +342,15 @@ impl Session {
 }
 
 /// Warp-aware trimming of an audio clip's start by `delta` output frames
-/// (negative: extend to the left, at the original speed).
+/// (negative: extend to the left, at the original speed) — never before
+/// the source's start, nor into the devices' latency at the start of a
+/// clip-effects render (`rendered_offset`).
 pub(crate) fn trim_audio_start(a: &mut AudioClip, delta: i64) {
+    let lo = a
+        .effects
+        .as_ref()
+        .map_or(0, |e| e.rendered_offset.max(0))
+        .min(a.source_offset);
     match a.warp.take() {
         Some(w) if delta >= 0 => {
             let delta = delta.min(a.length - 1);
@@ -378,7 +360,7 @@ pub(crate) fn trim_audio_start(a: &mut AudioClip, delta: i64) {
             a.warp = Some(right);
         }
         Some(mut w) => {
-            let e = (-delta).min(a.source_offset);
+            let e = (-delta).min(a.source_offset - lo);
             for m in &mut w.markers {
                 m.at += e;
             }
@@ -396,7 +378,7 @@ pub(crate) fn trim_audio_start(a: &mut AudioClip, delta: i64) {
             a.warp = Some(w);
         }
         None => {
-            let delta = delta.max(-a.source_offset).min(a.length - 1);
+            let delta = delta.max(lo - a.source_offset).min(a.length - 1);
             a.source_offset += delta;
             a.length -= delta;
         }

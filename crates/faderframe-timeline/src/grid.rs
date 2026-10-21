@@ -154,12 +154,37 @@ impl GridMenuEntry {
     }
 }
 
-/// What a grid line represents (for drawing emphasis).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a grid line represents (for drawing emphasis), strongest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GridLineKind {
     Bar,
     Beat,
+    /// A position of the grid between the beats.
     Subdivision,
+    /// Finer than the grid — a position nothing snaps to — drawn where the
+    /// grid's lines are far apart (see [`for_each_visible_line`]).
+    Fine,
+}
+
+/// How dense a drawn grid may get, in pixels (see
+/// [`for_each_visible_line`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridDensity {
+    /// Lines of a kind closer than this are thinned (bars, the grid) or
+    /// left out (beats).
+    pub min_px: f64,
+    /// Fine lines are at least this far apart; they appear once the
+    /// finest lines drawn are twice as far apart.
+    pub fine_px: f64,
+}
+
+impl Default for GridDensity {
+    fn default() -> Self {
+        Self {
+            min_px: 8.0,
+            fine_px: 18.0,
+        }
+    }
 }
 
 /// Bar-relative grid points around `pos`: (previous-or-equal, next).
@@ -231,6 +256,176 @@ pub fn for_each_grid_line(
         }
         bar += 1;
     }
+}
+
+/// Every 2ⁿth bar is drawn when bars are closer than `min_px` (from the bar
+/// at `at`): the stride.
+pub fn bar_stride(
+    at: MusicalTime,
+    meter: &TimeSignatureMap,
+    px_per_quarter: f64,
+    min_px: f64,
+) -> i32 {
+    let bar = meter.signature_at(at).bar_length().quarters() * px_per_quarter;
+    let mut stride = 1;
+    while (stride as f64) * bar < min_px && stride < 1 << 20 {
+        stride *= 2;
+    }
+    stride
+}
+
+/// Visit the grid an editor draws over `[start, end)` at `px_per_quarter`
+/// pixels per quarter note — in time order, each position once with its
+/// strongest kind:
+///
+/// * bar lines, every 2ⁿth bar when bars are closer than
+///   [`GridDensity::min_px`] ([`bar_stride`]);
+/// * beat lines, where beats are that far apart;
+/// * the lines of `grid` — exactly the positions [`snap_nearest`] snaps to
+///   (restarting at every bar) — where they are that far apart, else every
+///   2ⁿth of them (still positions it snaps to) while that is finer than a
+///   beat: a hierarchy bar > beat > subdivision;
+/// * [`GridLineKind::Fine`] lines halving the finest cells drawn (the
+///   grid's when it is finer than a beat, else the beats') until about
+///   [`GridDensity::fine_px`] apart, once those cells are twice as wide —
+///   so a grid shows at every zoom, down to single samples. Nothing snaps
+///   to them.
+///
+/// The lines follow the time-signature map (bars and beats of each bar's
+/// signature); triplet and dotted grids keep their own steps. Wide views
+/// never flood: no two lines of a kind are closer than `min_px` (fine ones
+/// than `fine_px`).
+pub fn for_each_visible_line(
+    start: MusicalTime,
+    end: MusicalTime,
+    grid: GridDivision,
+    meter: &TimeSignatureMap,
+    px_per_quarter: f64,
+    density: GridDensity,
+    mut visit: impl FnMut(MusicalTime, GridLineKind),
+) {
+    if end <= start || !(px_per_quarter.is_finite() && px_per_quarter > 0.0) {
+        return;
+    }
+    let px = |ticks: i64| ticks as f64 / TICKS_PER_QUARTER as f64 * px_per_quarter;
+    let min = density.min_px.max(1.0);
+    let fine_min = density.fine_px.max(min);
+    let stride = bar_stride(start, meter, px_per_quarter, min);
+    let mut lines: Vec<(MusicalTime, GridLineKind)> = Vec::new();
+    let mut bar = meter.bar_at(start);
+    if stride > 1 {
+        bar -= bar.rem_euclid(stride);
+    }
+    loop {
+        let bar_start = meter.bar_start(bar);
+        if bar_start >= end {
+            break;
+        }
+        let next_bar = meter.bar_start(bar + 1);
+        if bar_start >= start {
+            lines.push((bar_start, GridLineKind::Bar));
+        }
+        if stride > 1 {
+            bar += stride;
+            continue;
+        }
+        // The visible part of the bar.
+        let (lo, hi) = (start.max(bar_start), end.min(next_bar));
+        let sig = meter.signature_of_bar(bar);
+        let beat = sig.beat_length().ticks().max(1);
+        let step = grid.step(sig).ticks().max(1);
+        let kind = |t: MusicalTime| {
+            let off = (t - bar_start).ticks();
+            if off == 0 {
+                GridLineKind::Bar
+            } else if off % beat == 0 {
+                GridLineKind::Beat
+            } else {
+                GridLineKind::Subdivision
+            }
+        };
+        // Lines `every` ticks apart from the bar start, inside [lo, hi).
+        let mut lattice = |every: i64, kind: &dyn Fn(MusicalTime) -> GridLineKind| {
+            let first = ((lo - bar_start).ticks() + every - 1).div_euclid(every);
+            let mut i = first.max(0);
+            loop {
+                let t = bar_start + MusicalTime(i * every);
+                if t >= hi {
+                    break;
+                }
+                lines.push((t, kind(t)));
+                i += 1;
+            }
+        };
+        let beats = px(beat) >= min;
+        if beats {
+            lattice(beat, &kind);
+        }
+        // The grid, or every 2ⁿth of its lines while finer than a beat.
+        let mut every = step;
+        while px(every) < min && every < beat {
+            every *= 2;
+        }
+        let shown = px(every) >= min && (every == step || every < beat);
+        if shown {
+            lattice(every, &kind);
+        }
+        // Fine lines in the finest cells drawn.
+        let cell = if shown && step < beat {
+            Some(every)
+        } else if beats {
+            Some(beat)
+        } else {
+            None
+        };
+        if let Some(cell) = cell
+            && px(cell) >= 2.0 * fine_min
+        {
+            let parts = 1i64 << ((px(cell) / fine_min).log2().floor() as u32).min(40);
+            let fine = cell as f64 / parts as f64;
+            // Cells start on the lattice from the bar start (the last one of
+            // a bar may be short).
+            let mut c = (lo - bar_start).ticks().div_euclid(cell);
+            loop {
+                let cell_start = bar_start + MusicalTime(c * cell);
+                if cell_start >= hi {
+                    break;
+                }
+                let cell_end = (cell_start + MusicalTime(cell)).min(next_bar);
+                let from = ((lo - cell_start).ticks() as f64 / fine).ceil().max(1.0) as i64;
+                for j in from..parts {
+                    let t = cell_start + MusicalTime((j as f64 * fine).round() as i64);
+                    if t >= hi || t >= cell_end {
+                        break;
+                    }
+                    lines.push((t, GridLineKind::Fine));
+                }
+                c += 1;
+            }
+        }
+        bar += 1;
+    }
+    lines.sort_unstable();
+    lines.dedup_by_key(|l| l.0);
+    for (t, k) in lines {
+        visit(t, k);
+    }
+}
+
+/// [`for_each_visible_line`] into a list.
+pub fn visible_lines(
+    start: MusicalTime,
+    end: MusicalTime,
+    grid: GridDivision,
+    meter: &TimeSignatureMap,
+    px_per_quarter: f64,
+    density: GridDensity,
+) -> Vec<(MusicalTime, GridLineKind)> {
+    let mut out = Vec::new();
+    for_each_visible_line(start, end, grid, meter, px_per_quarter, density, |t, k| {
+        out.push((t, k));
+    });
+    out
 }
 
 #[cfg(test)]
@@ -307,6 +502,171 @@ mod tests {
                 (q(4.0), GridLineKind::Bar),
                 (q(4.5), GridLineKind::Subdivision),
             ]
+        );
+    }
+
+    /// Meters to check grids in: plain, odd with a change, compound.
+    fn meters() -> Vec<TimeSignatureMap> {
+        let mut odd = TimeSignatureMap::new(TimeSignature::new(7, 8).unwrap());
+        odd.set_change(MeterChange {
+            bar: 3,
+            signature: TimeSignature::FOUR_FOUR,
+        });
+        vec![
+            TimeSignatureMap::new(TimeSignature::FOUR_FOUR),
+            odd,
+            TimeSignatureMap::new(TimeSignature::new(6, 8).unwrap()),
+        ]
+    }
+
+    /// The drawn grid is the snap grid: every subdivision line is a
+    /// position snapping goes to, no fine line is, and wherever the grid's
+    /// own lines are far enough apart to be drawn, every position snapping
+    /// can reach is drawn (as a bar, beat or subdivision line).
+    #[test]
+    fn drawn_grid_lines_are_the_snap_positions() {
+        let density = GridDensity::default();
+        for meter in meters() {
+            for grid in GridDivision::all() {
+                for ppq in [3.0, 20.0, 80.0, 300.0, 2_000.0, 40_000.0, 400_000.0] {
+                    let width = 1500.0;
+                    let start = q(9.3);
+                    let end = start + MusicalTime::from_quarters(width / ppq);
+                    let lines = visible_lines(start, end, grid, &meter, ppq, density);
+                    for &(t, kind) in &lines {
+                        assert!(t >= start && t < end);
+                        let snapped = snap_nearest(t, grid, &meter);
+                        match kind {
+                            GridLineKind::Subdivision => assert_eq!(
+                                snapped, t,
+                                "{grid:?} at {ppq}: a subdivision is a snap position"
+                            ),
+                            GridLineKind::Fine => assert_ne!(
+                                snapped, t,
+                                "{grid:?} at {ppq}: nothing snaps to a fine line"
+                            ),
+                            _ => {}
+                        }
+                    }
+                    assert!(lines.windows(2).all(|w| w[0].0 < w[1].0), "in order, once");
+                    // Where the grid itself is wide enough to draw, all of it is.
+                    let step = grid.step(meter.signature_at(start)).quarters() * ppq;
+                    let bar = meter.signature_at(start).bar_length().quarters() * ppq;
+                    if step >= density.min_px && bar >= density.min_px {
+                        for_each_grid_line(start, end, grid, &meter, |t, _| {
+                            assert!(
+                                lines
+                                    .iter()
+                                    .any(|&(l, k)| l == t && k != GridLineKind::Fine),
+                                "{grid:?} at {ppq}: the snap position {t:?} is drawn"
+                            );
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Zoomed far in — down to single samples — the grid still shows
+    /// (finer lines between the grid's), and zoomed far out it does not
+    /// flood: no two lines of a kind closer than the density allows.
+    #[test]
+    fn the_grid_shows_at_every_zoom_without_flooding() {
+        let meter = TimeSignatureMap::new(TimeSignature::FOUR_FOUR);
+        let density = GridDensity::default();
+        let width = 1500.0;
+        let mut ppq = 1.5;
+        while ppq <= 400_000.0 {
+            for grid in [
+                GridDivision::Bar,
+                GridDivision::Beat,
+                GridDivision::Note(16),
+                GridDivision::Triplet(8),
+                GridDivision::Dotted(8),
+                GridDivision::Note(256),
+            ] {
+                let start = q(41.7);
+                let end = start + MusicalTime::from_quarters(width / ppq);
+                let lines = visible_lines(start, end, grid, &meter, ppq, density);
+                assert!(
+                    lines.len() as f64 >= width / (2.0 * density.fine_px + 4.0),
+                    "{grid:?} at {ppq} px/quarter: only {} lines",
+                    lines.len()
+                );
+                assert!(
+                    lines.len() as f64 <= 2.0 * width / density.min_px + 2.0,
+                    "{grid:?} at {ppq}: {} lines",
+                    lines.len()
+                );
+                for kind in [
+                    GridLineKind::Bar,
+                    GridLineKind::Beat,
+                    GridLineKind::Subdivision,
+                    GridLineKind::Fine,
+                ] {
+                    let xs: Vec<f64> = lines
+                        .iter()
+                        .filter(|l| l.1 == kind)
+                        .map(|l| l.0.quarters() * ppq)
+                        .collect();
+                    let least = if kind == GridLineKind::Fine {
+                        density.fine_px
+                    } else {
+                        density.min_px
+                    };
+                    // Dotted grids restart at the bar: their last cell is short.
+                    let least = if matches!(grid, GridDivision::Dotted(_)) {
+                        least / 3.0
+                    } else {
+                        least
+                    };
+                    assert!(
+                        xs.windows(2).all(|w| w[1] - w[0] >= least - 0.01),
+                        "{grid:?} at {ppq}: {kind:?} lines closer than {least} px"
+                    );
+                }
+            }
+            ppq *= 1.7;
+        }
+    }
+
+    #[test]
+    fn visible_lines_keep_bar_beat_and_subdivision_apart() {
+        let meter = TimeSignatureMap::new(TimeSignature::FOUR_FOUR);
+        let d = GridDensity::default();
+        // Eighth triplets, a beat 120 px wide: triplet subdivisions, and
+        // fine lines between them (40 px cells → halves).
+        let lines = visible_lines(q(0.0), q(4.0), GridDivision::Triplet(8), &meter, 120.0, d);
+        let of = |k| {
+            lines
+                .iter()
+                .filter(|l| l.1 == k)
+                .map(|l| l.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(of(GridLineKind::Bar), vec![q(0.0)]);
+        assert_eq!(of(GridLineKind::Beat), vec![q(1.0), q(2.0), q(3.0)]);
+        let subs = of(GridLineKind::Subdivision);
+        assert_eq!(subs.len(), 8);
+        assert!(subs.contains(&MusicalTime(TICKS_PER_QUARTER / 3)));
+        assert_eq!(of(GridLineKind::Fine).len(), 12, "a line between each pair");
+        // Wide: 6 px bars thin to every second bar, nothing else.
+        let wide = visible_lines(q(0.0), q(400.0), GridDivision::Note(16), &meter, 1.5, d);
+        assert!(wide.iter().all(|l| l.1 == GridLineKind::Bar));
+        assert!(wide.iter().all(|l| meter.bar_at(l.0) % 2 == 0));
+        assert_eq!(bar_stride(q(0.0), &meter, 1.5, d.min_px), 2);
+        // 7/8: beats are eighths, bars 3.5 quarters.
+        let seven = TimeSignatureMap::new(TimeSignature::new(7, 8).unwrap());
+        let lines = visible_lines(q(0.0), q(7.0), GridDivision::Beat, &seven, 40.0, d);
+        let bars: Vec<_> = lines
+            .iter()
+            .filter(|l| l.1 == GridLineKind::Bar)
+            .map(|l| l.0)
+            .collect();
+        assert_eq!(bars, vec![q(0.0), q(3.5)]);
+        assert_eq!(
+            lines.iter().filter(|l| l.1 == GridLineKind::Beat).count(),
+            12
         );
     }
 

@@ -84,6 +84,55 @@ impl PianoRollView {
         abs - clip_start
     }
 
+    /// Snap to Objects for notes: of `edges` (clip-relative), the one
+    /// nearest another note's start or end — or an object the arranger
+    /// snaps to (clip edges, markers, sections, the loop, the playhead) —
+    /// within a few pixels: how far to shift them all. Remembered as the
+    /// guide; `None` with Shift (free) or Snap to Objects off.
+    pub(crate) fn note_object_shift(
+        &mut self,
+        edges: &[MusicalTime],
+        clip: &Clip,
+        m: &MidiClip,
+        moving: &[NoteId],
+        model: &Session,
+        free: bool,
+    ) -> Option<MusicalTime> {
+        if free {
+            self.snap_guide = None;
+            return None;
+        }
+        let notes: Vec<(MusicalTime, faderframe_session::SnapObject)> = m
+            .notes
+            .iter()
+            .filter(|n| !moving.contains(&n.id))
+            .flat_map(|n| {
+                [
+                    (
+                        clip.start + n.start,
+                        faderframe_session::SnapObject::NoteStart(n.id),
+                    ),
+                    (
+                        clip.start + n.end(),
+                        faderframe_session::SnapObject::NoteEnd(n.id),
+                    ),
+                ]
+            })
+            .collect();
+        let abs: Vec<MusicalTime> = edges.iter().map(|e| clip.start + *e).collect();
+        let reach = MusicalTime::from_quarters(
+            f64::from(faderframe_session::snapping::SNAP_PX) / f64::from(self.ppq.max(1e-3)),
+        );
+        let hit = model.snap_edges_to_objects_and(
+            &abs,
+            reach,
+            &faderframe_session::SnapSkip::default(),
+            &notes,
+        );
+        self.snap_guide = hit.map(|(_, h)| h);
+        hit.map(|(shift, _)| shift)
+    }
+
     /// Previous grid point (clip-relative).
     pub(crate) fn snap_floor_rel(
         &self,
@@ -596,6 +645,7 @@ impl PianoRollView {
             Some(Drag::Move {
                 origin,
                 grab,
+                notes,
                 dt,
                 dk,
                 moved,
@@ -608,8 +658,21 @@ impl PianoRollView {
                 }
                 *moved = true;
                 *copy |= mods.alt;
-                let raw = grab.start + (self.time_at(pos.x) - self.time_at(origin.x));
-                let start = self.snap_rel(raw.max(MusicalTime::ZERO), clip.start, model, bypass);
+                let raw = (grab.start + (self.time_at(pos.x) - self.time_at(origin.x)))
+                    .max(MusicalTime::ZERO);
+                // The group's leading and trailing edges, then the grabbed
+                // note's: onto an object near one, else the grid.
+                let dt_raw = raw - grab.start;
+                let moving: Vec<&MidiNote> =
+                    m.notes.iter().filter(|n| notes.contains(&n.id)).collect();
+                let lead = moving.iter().map(|n| n.start).min().unwrap_or(grab.start);
+                let trail = moving.iter().map(|n| n.end()).max().unwrap_or(grab.end());
+                let edges = [lead + dt_raw, trail + dt_raw, raw, raw + grab.length];
+                let ids = notes.clone();
+                let start = match self.note_object_shift(&edges, clip, m, &ids, model, mods.shift) {
+                    Some(shift) => (raw + shift).max(MusicalTime::ZERO),
+                    None => self.snap_rel(raw, clip.start, model, bypass),
+                };
                 let key = self.scale_key(self.key_at(pos.y), clip.start + start, model);
                 let new_dk = key as i32 - grab.key as i32;
                 if new_dk != *dk {
@@ -619,14 +682,17 @@ impl PianoRollView {
                 *dk = new_dk;
             }
             Some(Drag::Resize {
-                grab, start, delta, ..
+                grab,
+                start,
+                delta,
+                notes,
             }) => {
-                let t = self.snap_rel(
-                    self.time_at(pos.x).max(MusicalTime::ZERO),
-                    clip.start,
-                    model,
-                    bypass,
-                );
+                let raw = self.time_at(pos.x).max(MusicalTime::ZERO);
+                let ids = notes.clone();
+                let t = match self.note_object_shift(&[raw], clip, m, &ids, model, mods.shift) {
+                    Some(shift) => (raw + shift).max(MusicalTime::ZERO),
+                    None => self.snap_rel(raw, clip.start, model, bypass),
+                };
                 *delta = if *start {
                     t - grab.start
                 } else {
@@ -746,6 +812,7 @@ impl PianoRollView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) {
+        self.snap_guide = None;
         let Some(drag) = self.drag.take() else {
             return;
         };

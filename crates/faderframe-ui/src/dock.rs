@@ -158,6 +158,18 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             true,
             true,
         ),
+        ViewKind::Inspector => ViewHost::new(
+            app,
+            Box::new(faderframe_view_inspector::InspectorView::new(theme)),
+            false,
+            true,
+        ),
+        ViewKind::ChannelOverview => ViewHost::new(
+            app,
+            Box::new(faderframe_view_inspector::ChannelOverviewView::new(theme)),
+            true,
+            false,
+        ),
     };
     app.register_canvas(&host.canvas);
     host
@@ -399,6 +411,40 @@ fn build_node(
     }
 }
 
+/// The bottom dock while it is hidden: its views' names (a click shows
+/// that one) and, at the right end where the hide button was, the button
+/// that shows the dock again.
+fn collapsed_bar(app: &Rc<AppState>, g: &TabGroup) -> gtk::Widget {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    bar.add_css_class("dock-collapsed");
+    bar.set_hexpand(true);
+    bar.update_property(&[gtk::accessible::Property::Label("Bottom dock (hidden)")]);
+    for v in &g.views {
+        let b = gtk::Button::with_label(&title_of(app, v));
+        b.add_css_class("flat");
+        b.add_css_class("dock-collapsed-tab");
+        b.set_tooltip_text(Some("Show the bottom dock with this view"));
+        let weak = Rc::downgrade(app);
+        let id = v.clone();
+        b.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Workspace(WorkspaceAction::ShowView(id.clone())));
+            }
+        });
+        bar.append(&b);
+    }
+    let fill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    fill.set_hexpand(true);
+    bar.append(&fill);
+    let show = gtk::Button::from_icon_name("pan-up-symbolic");
+    show.add_css_class("flat");
+    show.set_tooltip_text(Some("Show the bottom dock (F2)"));
+    show.update_property(&[gtk::accessible::Property::Label("Show the bottom dock")]);
+    show.set_action_name(Some("app.dock-bottom"));
+    bar.append(&show);
+    bar.upcast()
+}
+
 fn floating_window(
     app: &Rc<AppState>,
     id: WindowId,
@@ -413,6 +459,10 @@ fn floating_window(
         .show_menubar(false)
         .build();
     win.add_css_class("ff-window");
+    // Editing keys and the single-key transport shortcuts as in the main
+    // window.
+    crate::edit_keys::install_window(app, &win);
+    crate::actions::install_window_keys(app, &win);
     let header = gtk::HeaderBar::new();
     let dock = gtk::Button::with_label("Dock");
     dock.set_tooltip_text(Some("Return this view to the main window"));
@@ -488,6 +538,14 @@ pub fn realize(app: &Rc<AppState>) {
         tree.set_hexpand(true);
         tree.set_vexpand(true);
         slot.append(&tree);
+        // The bottom dock folded away keeps a bar with its tabs and the
+        // button that brings it back, where its hide button was.
+        if let Some(g) = layout
+            .area(&DockAreaId::bottom())
+            .filter(|g| g.hidden && !g.views.is_empty())
+        {
+            slot.append(&collapsed_bar(app, g));
+        }
     }
 
     // 3. Floating windows.
@@ -556,8 +614,10 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 19] = [
+pub(crate) const DOCK_VIEWS: [DockView; 21] = [
+    ("inspector", ViewId::inspector),
     ("mixer", ViewId::mixer),
+    ("channel-overview", ViewId::channel_overview),
     ("piano-roll", ViewId::piano_roll),
     ("events", ViewId::events),
     ("automation", ViewId::automation),

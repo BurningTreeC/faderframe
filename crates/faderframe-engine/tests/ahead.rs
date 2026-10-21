@@ -78,6 +78,11 @@ struct Run {
     bufs: OwnedBuffers,
     /// Left master output by transport position, while playing.
     heard: HashMap<i64, f32>,
+    /// The transport's position after each callback (playing or not).
+    positions: Vec<i64>,
+    /// [`Self::heard`] of the callbacks that ran on from the one before
+    /// (no wrap or jump in them: positions known for sure).
+    ran_on: HashMap<i64, f32>,
 }
 
 impl Run {
@@ -112,6 +117,8 @@ impl Run {
             r,
             bufs: OwnedBuffers::new(2, 2, BLOCK),
             heard: HashMap::new(),
+            positions: Vec::new(),
+            ran_on: HashMap::new(),
         }
     }
 
@@ -121,10 +128,15 @@ impl Run {
         for _ in 0..blocks {
             self.r.processor.process_device(&mut self.bufs);
             let t = self.r.controller.transport_snapshot();
+            let ran_on = self.positions.last() == Some(&(t.position - BLOCK as i64));
+            self.positions.push(t.position);
             if t.playing {
                 let start = t.position - BLOCK as i64;
                 for (i, s) in self.bufs.output_ref(0).iter().enumerate() {
                     self.heard.insert(start + i as i64, *s);
+                    if ran_on {
+                        self.ran_on.insert(start + i as i64, *s);
+                    }
                 }
             }
             if paced {
@@ -485,6 +497,72 @@ fn buses_rendered_ahead_sound_the_same() {
     });
 }
 
+/// A folder bus is rendered ahead as a bus is (it and the strips of what
+/// it holds in the shallow tier) and sounds exactly as it plays live.
+#[test]
+fn a_folder_bus_renders_ahead_as_it_plays() {
+    use faderframe_core::{ChannelLayout, TrackId};
+    use faderframe_project::{Track, TrackColor, TrackKind};
+    let mut project = project();
+    project
+        .tracks
+        .retain(|t| !["Chords", "Arp Synth", "Arpeggios"].contains(&t.name.as_str()));
+    let id = |p: &Project, name: &str| p.tracks.iter().find(|t| t.name == name).unwrap().id;
+    let keys: TrackId = project.ids.allocate();
+    let mut folder = Track::new(keys, TrackKind::Bus, "Keys", TrackColor::palette(2))
+        .with_layout(ChannelLayout::Stereo);
+    folder.folder_bus = true;
+    folder.inserts.push(PluginSlot {
+        id: PluginInstanceId(9_400),
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: vec![faderframe_project::SavedParameter {
+            id: faderframe_core::ParameterId(0),
+            value: -3.0,
+        }],
+        state: None,
+        sidechain: None,
+    });
+    folder.volume_db = -2.0;
+    folder.pan = 0.3;
+    let at = project.tracks.len() - 1;
+    project.tracks.insert(at, folder);
+    for name in ["Pluck", "Pad"] {
+        let t = id(&project, name);
+        let t = project.track_mut(t).unwrap();
+        t.folder = Some(keys);
+        t.output = faderframe_project::OutputRouting::Master;
+    }
+    on_time(|| {
+        let mut plain = Run::new(&project, false);
+        let mut ahead = Run::with(&project, true, true);
+        let c = &ahead.r.controller;
+        assert!(c.ahead_tracks().contains(&keys), "the folder bus ahead");
+        for name in ["Pluck", "Pad", "Keys"] {
+            assert!(
+                c.ahead_strips().contains(&id(&project, name)),
+                "{name}'s strip ahead"
+            );
+        }
+        ahead.run(20, true);
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::Play);
+        }
+        let blocks = 2 * SR as usize / BLOCK;
+        plain.run(blocks, false);
+        ahead.run(blocks, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let (both, differ) = compare(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        assert!(ahead.heard.values().any(|s| s.abs() > 0.01));
+        0
+    });
+}
+
 /// A bus is rendered ahead only when everything that reaches it is; a
 /// track that plays live keeps its buses live, and while playing a strip
 /// that has to come back brings its chain (no gap), and its buses theirs.
@@ -642,6 +720,558 @@ fn faders_reaching_buses_rendered_ahead_answer_within_milliseconds() {
             let ms = (silent - at) as f64 * 1000.0 / f64::from(SR);
             eprintln!("buses {buses}: the fader is heard after {ms:.1} ms");
             assert!(ms < 30.0, "buses {buses}: heard after {ms:.1} ms");
+            0
+        });
+    }
+}
+
+/// A tone track (a utility on it: rendered ahead), with `bus` through a
+/// bus with a utility (rendered ahead by the shallow tier), and nothing
+/// else that keeps state: every sample heard is a function of its
+/// position alone, whatever path the transport took to get there.
+fn tone_project(bus: bool) -> (Project, faderframe_engine::SourceMap) {
+    use faderframe_core::ChannelLayout;
+    use faderframe_project::{OutputRouting, TrackKind};
+    let mut tp = common::TestProject::new(SR);
+    let track = tp.track(TrackKind::Audio, "Tone", ChannelLayout::Stereo);
+    // A tone that rises: no two positions sound alike.
+    let tone: Vec<f32> = (0..20 * SR as usize)
+        .map(|n| {
+            let t = n as f32 / SR as f32;
+            0.25 * (std::f32::consts::TAU * (220.0 + 10.0 * t) * t).sin()
+        })
+        .collect();
+    let src = tp.source(faderframe_audio_files::AudioData::from_channels(
+        SR,
+        vec![tone.clone(), tone],
+    ));
+    tp.clip(
+        track,
+        src,
+        faderframe_timeline::MusicalTime::ZERO,
+        20 * SR as i64,
+    );
+    let utility = |id| PluginSlot {
+        id: PluginInstanceId(id),
+        plugin: PluginRef::builtin(builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    tp.project
+        .track_mut(track)
+        .unwrap()
+        .inserts
+        .push(utility(9_400));
+    if bus {
+        let b = tp.track(TrackKind::Bus, "Bus", ChannelLayout::Stereo);
+        tp.project.track_mut(track).unwrap().output = OutputRouting::Track { track: b };
+        tp.project
+            .track_mut(b)
+            .unwrap()
+            .inserts
+            .push(utility(9_401));
+    }
+    (tp.project, tp.sources)
+}
+
+/// What a run of callbacks did: `(index, from, to)` of the callbacks
+/// after which the transport neither moved on by a callback's frames nor
+/// wrapped exactly at the end of one of `loops` (a repeat, a skip), and of
+/// those that wrapped.
+struct Steps {
+    irregular: Vec<(usize, i64, i64)>,
+    wraps: Vec<(usize, i64, i64)>,
+}
+
+fn steps(positions: &[i64], loops: &[(i64, i64)]) -> Steps {
+    let mut out = Steps {
+        irregular: Vec::new(),
+        wraps: Vec::new(),
+    };
+    let block = BLOCK as i64;
+    for (i, w) in positions.windows(2).enumerate() {
+        let (a, b) = (w[0], w[1]);
+        if b == a + block {
+            continue;
+        }
+        let wrapped = loops
+            .iter()
+            .any(|&(start, end)| a < end && a + block >= end && b == start + (a + block - end));
+        if wrapped {
+            out.wraps.push((i + 1, a, b));
+        } else {
+            out.irregular.push((i + 1, a, b));
+        }
+    }
+    out
+}
+
+/// Positions heard by both runs (on callbacks that ran on), and how many
+/// samples differ: with [`tone_project`], none may, whatever the paths.
+fn compare_ran_on(a: &Run, b: &Run) -> (usize, usize) {
+    let mut both = 0;
+    let mut differ = 0;
+    for (p, x) in &a.ran_on {
+        if let Some(y) = b.ran_on.get(p) {
+            both += 1;
+            if x != y {
+                differ += 1;
+            }
+        }
+    }
+    (both, differ)
+}
+
+fn set_loop(runs: &mut [&mut Run], start: i64, end: i64) {
+    for run in runs.iter_mut() {
+        run.command(TransportCommand::SetLoopRange(LoopRange::new(start, end)));
+    }
+}
+
+/// Dragging a loop's end while playing (every few callbacks a new range,
+/// far from the playhead) was a repeat of the last callback per change —
+/// each change started a new sequence of the anticipators and the switch
+/// put the playhead back to where the change was made. Now the transport
+/// goes on frame by frame, nothing repeats or drops out, it sounds exactly
+/// as without rendering ahead, and the loop wraps at the end it was given
+/// last.
+#[test]
+fn resizing_the_loop_while_playing_neither_repeats_nor_drops_out() {
+    let (project, sources) = tone_project(false);
+    on_time(|| {
+        let mut plain = Run::with_sources(&project, sources.clone(), false, false);
+        let mut ahead = Run::with_sources(&project, sources.clone(), true, false);
+        assert!(!ahead.r.controller.ahead_tracks().is_empty());
+        ahead.run(20, true);
+        let (start, mut end) = (24_000i64, 24_000 + 2 * SR as i64);
+        let mut loops = vec![(start, end)];
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::SetLoopRange(LoopRange::new(start, end)));
+            run.command(TransportCommand::SetLoopEnabled(true));
+            run.command(TransportCommand::Locate(SR as i64));
+            run.command(TransportCommand::Play);
+        }
+        plain.run(40, false);
+        ahead.run(40, true);
+        let (first_plain, first) = (plain.positions.len(), ahead.positions.len());
+        for _ in 0..40 {
+            end += 480;
+            loops.push((start, end));
+            set_loop(&mut [&mut plain, &mut ahead], start, end);
+            plain.run(4, false);
+            ahead.run(4, true);
+        }
+        // On to the wrap.
+        plain.run(200, false);
+        ahead.run(200, true);
+        let misses = ahead.r.controller.ahead_misses();
+        let s = steps(&ahead.positions[first..], &loops);
+        eprintln!(
+            "rendered ahead: {} irregular steps in {} callbacks, {misses} misses, wraps {:?}: {:?}",
+            s.irregular.len(),
+            ahead.positions.len() - first,
+            s.wraps,
+            &s.irregular[..s.irregular.len().min(12)]
+        );
+        if misses > 0 {
+            return misses;
+        }
+        assert!(
+            s.irregular.is_empty(),
+            "the transport jumped: {:?}",
+            s.irregular
+        );
+        let p = steps(&plain.positions[first_plain..], &loops);
+        assert!(p.irregular.is_empty(), "{:?}", p.irregular);
+        // Once, at the end as dragged to last.
+        for wraps in [&s.wraps, &p.wraps] {
+            assert_eq!(wraps.len(), 1, "{wraps:?}");
+            let (_, a, b) = wraps[0];
+            assert!(a < end && a + BLOCK as i64 >= end, "wrapped at {a}");
+            assert_eq!(b, start + a + BLOCK as i64 - end);
+        }
+        let (both, differ) = compare_ran_on(&plain, &ahead);
+        assert!(both > SR as usize, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        assert!(ahead.ran_on.values().any(|s| s.abs() > 0.1), "sounding");
+        0
+    });
+}
+
+/// Where a loop change lands while playing, rendering ahead: beyond what
+/// the anticipator has rendered (here 150 ms and two blocks), from there
+/// exactly as asked. A loop end pulled in well ahead of the playhead wraps
+/// there; one pushed out just before the playhead reaches the old end
+/// wraps at the old end once (that pass was rendered), then at the new
+/// one; an end pulled in behind the playhead lets it play on. Never a
+/// repeat or a gap.
+#[test]
+fn loop_changes_near_the_playhead_land_beyond_the_lookahead() {
+    let (project, sources) = tone_project(false);
+    on_time(|| {
+        let mut ahead = Run::with_sources(&project, sources.clone(), true, false);
+        ahead.run(20, true);
+        let start = 24_000i64;
+        let mut loops = vec![(start, 10 * SR as i64)];
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            start,
+            10 * SR as i64,
+        )));
+        ahead.command(TransportCommand::SetLoopEnabled(true));
+        ahead.command(TransportCommand::Locate(SR as i64));
+        ahead.command(TransportCommand::Play);
+        ahead.run(40, true);
+        let first = ahead.positions.len();
+        // 1. Pulled in to 0.3 s ahead: wraps there.
+        let at = ahead.r.controller.transport_snapshot().position;
+        let near = at + (0.3 * f64::from(SR)) as i64;
+        loops.push((start, near));
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(start, near)));
+        ahead.run(80, true);
+        // 2. Pushed out 20 ms before the playhead gets to the end: the
+        // pass rendered still wraps there, the next at the new end.
+        let short = (start, start + SR as i64 / 2);
+        loops.push(short);
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            short.0, short.1,
+        )));
+        let mut guard = 0;
+        while ahead.r.controller.transport_snapshot().position < short.1 - SR as i64 / 50 {
+            ahead.run(1, true);
+            guard += 1;
+            assert!(guard < 400, "never got near the end");
+        }
+        let wraps_before = steps(&ahead.positions[first..], &loops).wraps.len();
+        let long = (start, start + SR as i64);
+        loops.push(long);
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            long.0, long.1,
+        )));
+        ahead.run(4 * SR as usize / BLOCK / 2, true);
+        // 3. Pulled in behind the playhead, early in a pass (no wrap of
+        // the old range before it lands): it plays on past it.
+        let mut guard = 0;
+        let at = loop {
+            let at = ahead.r.controller.transport_snapshot().position;
+            if at > start + 9_600 && at < long.1 - 2 * SR as i64 / 5 {
+                break at;
+            }
+            ahead.run(1, true);
+            guard += 1;
+            assert!(guard < 400, "never early in a pass");
+        };
+        let behind = (start, start + 4_800);
+        loops.push(behind);
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            behind.0, behind.1,
+        )));
+        ahead.run(60, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let s = steps(&ahead.positions[first..], &loops);
+        assert!(
+            s.irregular.is_empty(),
+            "the transport jumped: {:?}",
+            s.irregular
+        );
+        let ends: Vec<i64> = s
+            .wraps
+            .iter()
+            .map(|&(_, a, b)| a + BLOCK as i64 - (b - start))
+            .collect();
+        eprintln!("wrapped at the ends {ends:?}");
+        assert_eq!(ends[0], near, "the end pulled in");
+        assert_eq!(ends[wraps_before], short.1, "the pass already rendered");
+        assert_eq!(ends[wraps_before + 1], long.1, "then the end pushed out");
+        assert!(ends[wraps_before + 1..].iter().all(|e| *e == long.1));
+        // Played on past the end behind it.
+        let last = *ahead.positions.last().unwrap();
+        assert!(last > at + 50 * BLOCK as i64, "played on: {last}");
+        0
+    });
+}
+
+/// Loop changes in quick succession while playing — the range moved,
+/// resized, crossed (no range), switched off and on, around the playhead
+/// and through its wraps — keep rendering ahead seamless: no repeat, no
+/// skip, no late block, and every sample is the one of its position.
+#[test]
+fn rapid_loop_changes_while_playing_stay_seamless() {
+    rapid_loop_changes(false);
+    // With a bus rendered ahead by the shallow tier too.
+    rapid_loop_changes(true);
+}
+
+fn rapid_loop_changes(buses: bool) {
+    let (project, sources) = tone_project(buses);
+    on_time(|| {
+        let mut plain = Run::with_sources(&project, sources.clone(), false, false);
+        let mut ahead = Run::with_sources(&project, sources.clone(), true, buses);
+        if buses {
+            let bus = project.tracks.iter().find(|t| t.name == "Bus").unwrap().id;
+            assert!(
+                ahead.r.controller.ahead_tracks().contains(&bus),
+                "the bus ahead"
+            );
+        }
+        ahead.run(20, true);
+        let mut loops = vec![(24_000i64, 72_000i64)];
+        for run in [&mut plain, &mut ahead] {
+            run.command(TransportCommand::SetLoopRange(LoopRange::new(
+                24_000, 72_000,
+            )));
+            run.command(TransportCommand::SetLoopEnabled(true));
+            run.command(TransportCommand::Locate(30_000));
+            run.command(TransportCommand::Play);
+        }
+        plain.run(10, false);
+        ahead.run(10, true);
+        let (first_plain, first) = (plain.positions.len(), ahead.positions.len());
+        // A fixed pseudo-random walk.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // A loop of about a second that the playhead keeps wrapping in,
+        // its ends nudged by up to 25 ms either way all the time; now and
+        // then switched off and back on, crossed (no range) and given back,
+        // moved to wherever the playhead is.
+        let (mut ls, mut le) = (24_000i64, 72_000i64);
+        let mut enabled = true;
+        for _ in 0..400 {
+            let pos = ahead.r.controller.transport_snapshot().position;
+            let mut cmds = Vec::new();
+            match next(20) {
+                0 | 1 => {
+                    enabled = !enabled;
+                    cmds.push(TransportCommand::SetLoopEnabled(enabled));
+                }
+                2 => {
+                    // Crossed, then back.
+                    cmds.push(TransportCommand::SetLoopRange(LoopRange::new(le, ls)));
+                    cmds.push(TransportCommand::SetLoopRange(LoopRange::new(ls, le)));
+                }
+                3 => {
+                    // Around the playhead, its end well beyond the
+                    // lookahead.
+                    ls = (pos - next(SR as u64 / 2) as i64).max(0);
+                    le = pos + 12_000 + next(SR as u64 / 2) as i64;
+                    cmds.push(TransportCommand::SetLoopRange(LoopRange::new(ls, le)));
+                }
+                4..=6 => {
+                    ls = (ls + next(2_401) as i64 - 1_200).max(0);
+                    le = le.max(ls + 12_000);
+                    cmds.push(TransportCommand::SetLoopRange(LoopRange::new(ls, le)));
+                }
+                _ => {
+                    le = (le + next(2_401) as i64 - 1_200).max(ls + 12_000);
+                    cmds.push(TransportCommand::SetLoopRange(LoopRange::new(ls, le)));
+                }
+            }
+            loops.push((ls, le));
+            let wait = 1 + next(3) as usize;
+            for (k, cmd) in cmds.into_iter().enumerate() {
+                if k > 0 {
+                    plain.run(1, false);
+                    ahead.run(1, true);
+                }
+                for run in [&mut plain, &mut ahead] {
+                    run.command(cmd);
+                }
+            }
+            plain.run(wait, false);
+            ahead.run(wait, true);
+            // Switched off for long: back on.
+            if !enabled && next(2) == 0 {
+                enabled = true;
+                for run in [&mut plain, &mut ahead] {
+                    run.command(TransportCommand::SetLoopEnabled(true));
+                }
+            }
+        }
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let s = steps(&ahead.positions[first..], &loops);
+        eprintln!(
+            "buses {buses}: {} wraps, {} irregular steps in {} callbacks",
+            s.wraps.len(),
+            s.irregular.len(),
+            ahead.positions.len() - first
+        );
+        assert!(
+            s.irregular.is_empty(),
+            "the transport jumped: {:?}",
+            s.irregular
+        );
+        assert!(s.wraps.len() >= 2, "wrapped: {}", s.wraps.len());
+        let p = steps(&plain.positions[first_plain..], &loops);
+        assert!(p.irregular.is_empty(), "{:?}", p.irregular);
+        let (both, differ) = compare_ran_on(&plain, &ahead);
+        assert!(both > SR as usize / 4, "heard together: {both}");
+        assert_eq!(differ, 0, "{differ} of {both} samples differ");
+        0
+    });
+}
+
+/// Stopped, a loop change is in force at once: playing from there wraps
+/// at the new end on the first pass.
+#[test]
+fn a_loop_changed_while_stopped_holds_from_the_first_pass() {
+    let (project, sources) = tone_project(false);
+    on_time(|| {
+        let mut ahead = Run::with_sources(&project, sources.clone(), true, false);
+        ahead.run(20, true);
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            24_000, 120_000,
+        )));
+        ahead.command(TransportCommand::SetLoopEnabled(true));
+        ahead.command(TransportCommand::Locate(30_000));
+        ahead.run(20, true);
+        ahead.command(TransportCommand::SetLoopRange(LoopRange::new(
+            24_000, 40_000,
+        )));
+        ahead.run(3, true);
+        let first = ahead.positions.len();
+        ahead.command(TransportCommand::Play);
+        ahead.run(60, true);
+        let misses = ahead.r.controller.ahead_misses();
+        if misses > 0 {
+            return misses;
+        }
+        let s = steps(&ahead.positions[first..], &[(24_000, 40_000)]);
+        // The first step is the start (from where it stood).
+        assert!(s.irregular.len() <= 1, "{:?}", s.irregular);
+        let (_, a, _) = s.wraps[0];
+        assert!(a < 40_000 && a + BLOCK as i64 >= 40_000, "{:?}", s.wraps);
+        0
+    });
+}
+
+/// Automation behind latency, rendered ahead: a utility's mute after a
+/// 4000-frame latent device (the deep tier) and the fader of that track
+/// (its strip in the shallow tier when buses render ahead) read where
+/// their audio was played — the play history, which the anticipators
+/// keep as the audio thread does — and sound bit for bit as on the audio
+/// thread. Without it they read position 0 for ever (a mute that never
+/// comes, a fader shut at its first value).
+#[test]
+fn automation_behind_latency_renders_ahead_as_it_plays() {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId};
+    use faderframe_project::{OutputRouting, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+    const Q: usize = 24_000;
+    let mut tp = common::TestProject::new(SR);
+    let track = tp.track(TrackKind::Audio, "A", ChannelLayout::Mono);
+    let bus = tp.track(TrackKind::Bus, "Mix", ChannelLayout::Stereo);
+    let src = tp.dc(1, 0.5, Q * 8);
+    tp.clip(track, src, MusicalTime::ZERO, (Q * 8) as i64);
+    let slot = |id: u64, plugin: &str, parameters: Vec<SavedParameter>| PluginSlot {
+        id: PluginInstanceId(id),
+        plugin: PluginRef::builtin(plugin, "Device"),
+        bypass: false,
+        parameters,
+        state: None,
+        sidechain: None,
+    };
+    let utility = PluginInstanceId(9_401);
+    {
+        let t = tp.project.track_mut(track).unwrap();
+        t.output = OutputRouting::Track { track: bus };
+        t.inserts.push(slot(
+            9_400,
+            builtin::LATENCY_PROBE,
+            vec![SavedParameter {
+                id: ParameterId(0),
+                value: 4000.0,
+            }],
+        ));
+        t.inserts.push(slot(utility.0, builtin::GAIN, Vec::new()));
+    }
+    tp.project
+        .track_mut(bus)
+        .unwrap()
+        .inserts
+        .push(slot(9_402, builtin::GAIN, Vec::new()));
+    let lane = |target: AutomationTarget, points: &[(f64, f64)]| AutomationLane {
+        id: faderframe_core::AutomationLaneId(0),
+        target,
+        curve: AutomationCurve::from_points(
+            points
+                .iter()
+                .map(|&(q, value)| AutomationPoint {
+                    time: MusicalTime::from_quarters(q),
+                    value,
+                    shape: CurveShape::Step,
+                })
+                .collect(),
+        ),
+        mode: AutomationMode::Read,
+        visible: true,
+    };
+    let mute = lane(
+        AutomationTarget::PluginParameter {
+            plugin: utility,
+            parameter: ParameterId(faderframe_plugin_host::devices::utility::id::MUTE),
+        },
+        &[(0.0, 0.0), (1.0, 1.0), (1.5, 0.0), (2.5, 1.0), (3.0, 0.0)],
+    );
+    let fader = lane(
+        AutomationTarget::TrackVolume,
+        &[(0.0, -144.0), (0.5, 0.0), (2.0, -144.0), (2.25, 0.0)],
+    );
+    for (i, mut l) in [mute, fader].into_iter().enumerate() {
+        l.id = faderframe_core::AutomationLaneId(9_500 + i as u64);
+        tp.project
+            .track_mut(track)
+            .unwrap()
+            .automation
+            .lanes
+            .push(l);
+    }
+    let project = tp.project.clone();
+    for buses in [false, true] {
+        on_time(|| {
+            let mut plain = Run::with_sources(&project, tp.sources.clone(), false, false);
+            let mut ahead = Run::with_sources(&project, tp.sources.clone(), true, buses);
+            assert!(ahead.r.controller.ahead_tracks().contains(&track));
+            assert_eq!(ahead.r.controller.ahead_strips().contains(&track), buses);
+            ahead.run(20, true);
+            for run in [&mut plain, &mut ahead] {
+                run.command(TransportCommand::Play);
+            }
+            let blocks = 2 * SR as usize / BLOCK;
+            plain.run(blocks, false);
+            ahead.run(blocks, true);
+            let misses = ahead.r.controller.ahead_misses();
+            if misses > 0 {
+                return misses;
+            }
+            // The automation acts in the plain run: open and shut stretches.
+            let loud = plain.heard.values().filter(|s| s.abs() > 0.1).count();
+            let quiet = plain.heard.values().filter(|s| s.abs() < 1e-6).count();
+            assert!(
+                loud > SR as usize / 4 && quiet > SR as usize / 4,
+                "{loud} / {quiet}"
+            );
+            let (both, differ) = compare(&plain, &ahead);
+            assert!(both > SR as usize, "heard together: {both}");
+            assert_eq!(
+                differ, 0,
+                "buses {buses}: {differ} of {both} samples differ"
+            );
             0
         });
     }

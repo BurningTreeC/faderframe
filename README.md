@@ -297,7 +297,11 @@ long sessions), Neon and High Contrast:
   Bus routes the folder's tracks through a bus. In the mixer a folder has
   a narrow strip of its own (its triangle, mute, solo, what it holds), its
   tracks a band of its colour along their foot, and a closed folder's
-  strips fold away there too.
+  strips fold away there too. A folder's G button (its header, its strip,
+  the Inspector) groups what it holds: arming one of its tracks arms the
+  others, selecting a clip or a range selects the material at the same
+  place on the others, and edits of it — split, move, trim, fades, gain,
+  slip, cut/copy/paste, delete, duplicate — reach them, one undo step each.
 * Adding tracks: the "+" under the last track in the arranger and right of
   the last strip in the mixer (each kind of track, or one from a saved
   track preset; an instrument track opens the plugin browser).
@@ -836,6 +840,7 @@ computer's cache folder even then.
 | Home | Return to start |
 | L | Toggle loop |
 | Shift+R | Record |
+| Ctrl+Space / Ctrl+Shift+Space | Abort the take being recorded / abort it and record again from where it began |
 | Ctrl+P | Punch in/out |
 | T | Show / hide the take lanes of the selected take folder |
 | A | Show / hide automation of the selected tracks |
@@ -858,13 +863,13 @@ computer's cache folder even then.
 | Ctrl+E | Show / hide the edit toolbar |
 | K (or keypad 7) | Metronome on / off |
 | Alt+1 … Alt+4 | Edit mode: Shuffle, Slip, Spot, Grid |
-| Alt+S, F5–F7, F9, F10 (Alt+5 … Alt+0) | Smart, Zoom, Trim, Selector, Scrubber, Pencil (Grabber: Alt+8) |
+| Alt+S, Alt+5 … Alt+0 (F5–F7, F9 in the arranger; F10 there in detached windows — the main window's F10 is the menu bar) | Smart, Zoom, Trim, Selector, Grabber, Scrubber, Pencil |
 | B | Separate clips at the selection (or the selected clips at the playhead) |
 | Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+D | Copy / cut / paste / duplicate the selection range |
 | Alt+R | Repeat the selection range… |
 | Ctrl+Alt+T | Trim clips to the selection |
-| , / . | Nudge back / forward (Alt: trim start, Ctrl: trim end) |
-| Tab / Shift+Tab | Next / previous clip boundary or transient (Ctrl: extend the selection) |
+| , / . | Nudge back / forward (Alt: trim start, Ctrl+Alt (or Ctrl with .): trim end — Ctrl+, is Preferences) |
+| Tab / Shift+Tab | Next / previous clip boundary or transient |
 | Ctrl+Shift+↑ / ↓ | Clip gain ±0.5 dB |
 | Ctrl+] / Ctrl+[ | Zoom in / out |
 | Double-click, F11 / Escape (video window) | Full screen / leave full screen |

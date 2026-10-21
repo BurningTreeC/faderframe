@@ -4,11 +4,21 @@
 //! Plugins from other makers show how they did in the realtime check
 //! (`crate::plugin_check`): a badge per row, findings and advice in the
 //! detail panel, a filter for those with findings.
+//!
+//! Favorites (issue #15): a star on every row and in the detail panel,
+//! the user's categories (made in the sidebar or the detail panel, renamed
+//! and removed from a category's right-click), and a sidebar section to
+//! browse them. Favorites whose plugin is gone show as missing. They are
+//! the user's (`faderframe_session::plugin_favorites`, saved by
+//! `crate::favorites`), never the project's.
 
 use crate::state::AppState;
 use faderframe_core::TrackId;
 use faderframe_project::{PluginFormat, PluginRef};
-use faderframe_session::{AvailablePlugin, PluginTarget};
+use faderframe_session::plugin_favorites::{
+    CategoryId, FavoriteKey, FavoriteOp, FavoritePlugin, PluginFavorites,
+};
+use faderframe_session::{Action, AvailablePlugin, PluginTarget};
 use gtk::glib;
 use gtk::prelude::*;
 use std::cell::RefCell;
@@ -29,9 +39,31 @@ struct Entry {
     audio: String,
     midi: String,
     bundle: Option<String>,
+    /// One of the user's favorites, in these categories.
+    favorite: bool,
+    categories: Vec<CategoryId>,
+    category_names: Vec<String>,
+    /// A favorite whose plugin is not in the catalogue (uninstalled,
+    /// moved): shown by its remembered name; it cannot be inserted.
+    missing: bool,
+    /// The same plugin in other formats (named for missing favorites).
+    other_formats: Vec<PluginRef>,
 }
 
 impl Entry {
+    /// The plugin as favorite operations name it.
+    fn favorite_plugin(&self) -> FavoritePlugin {
+        FavoritePlugin {
+            key: FavoriteKey::of(&self.plugin),
+            name: self.plugin.name.clone(),
+            vendor: if self.vendor == UNKNOWN_VENDOR {
+                String::new()
+            } else {
+                self.vendor.clone()
+            },
+        }
+    }
+
     /// How it did in the realtime check (this version).
     fn check(&self) -> Option<faderframe_plugin_check::CheckReport> {
         crate::plugin_check::report(&self.plugin, &self.version)
@@ -39,11 +71,13 @@ impl Entry {
 
     /// Checked (built-ins keep the rules by their own tests).
     fn checkable(&self) -> bool {
-        self.plugin.format != PluginFormat::Builtin
+        !self.missing && self.plugin.format != PluginFormat::Builtin
     }
 
     fn kind_label(&self) -> &'static str {
-        if self.instrument {
+        if self.missing {
+            "—"
+        } else if self.instrument {
             "Instrument"
         } else if self.midi_effect {
             "MIDI Effect"
@@ -53,13 +87,7 @@ impl Entry {
     }
 
     fn format_label(&self) -> &'static str {
-        match self.plugin.format {
-            PluginFormat::Builtin => "Built-in",
-            PluginFormat::Clap => "CLAP",
-            PluginFormat::Vst3 => "VST3",
-            PluginFormat::AudioUnit => "AU",
-            PluginFormat::Lv2 => "LV2",
-        }
+        format_name(self.plugin.format)
     }
 
     fn matches(&self, text: &str) -> bool {
@@ -67,11 +95,12 @@ impl Entry {
             return true;
         }
         let hay = format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             self.plugin.name,
             self.vendor,
             self.format_label(),
-            self.features.join(" ")
+            self.features.join(" "),
+            self.category_names.join(" ")
         )
         .to_lowercase();
         text.to_lowercase()
@@ -97,6 +126,9 @@ enum Scope {
     Unchecked,
     Format(PluginFormat),
     Vendor(String),
+    /// The user's favorites (missing ones too).
+    Favorites,
+    Category(CategoryId),
 }
 
 struct Filter {
@@ -107,13 +139,17 @@ struct Filter {
 
 impl Filter {
     fn accepts(&self, e: &Entry) -> bool {
-        let kind = match self.kind {
-            Kind::All => true,
-            Kind::Effects => !e.instrument && !e.midi_effect,
-            Kind::Instruments => e.instrument,
-            Kind::MidiEffects => e.midi_effect,
-        };
+        // What a missing favorite is, is not known any more.
+        let kind = e.missing
+            || match self.kind {
+                Kind::All => true,
+                Kind::Effects => !e.instrument && !e.midi_effect,
+                Kind::Instruments => e.instrument,
+                Kind::MidiEffects => e.midi_effect,
+            };
         let scope = match &self.scope {
+            // Missing favorites only where favorites are listed.
+            _ if e.missing && !matches!(self.scope, Scope::Favorites | Scope::Category(_)) => false,
             Scope::All => true,
             Scope::Findings => e
                 .check()
@@ -121,6 +157,8 @@ impl Filter {
             Scope::Unchecked => e.checkable() && e.check().is_none(),
             Scope::Format(f) => e.plugin.format == *f,
             Scope::Vendor(v) => &e.vendor == v,
+            Scope::Favorites => e.favorite,
+            Scope::Category(c) => e.categories.contains(c),
         };
         kind && scope && e.matches(&self.text)
     }
@@ -150,44 +188,98 @@ struct Browser {
     scopes: RefCell<Vec<Option<Scope>>>,
 }
 
+const UNKNOWN_VENDOR: &str = "Unknown vendor";
+
 fn entries(app: &AppState) -> Vec<Entry> {
-    let mut out: Vec<Entry> = app
-        .session
-        .borrow()
-        .available_plugins()
-        .into_iter()
-        .map(|p: AvailablePlugin| {
-            let ch = |n: u16| match n {
-                0 => "none".to_string(),
-                1 => "mono".to_string(),
-                2 => "stereo".to_string(),
-                n => format!("{n} channels"),
-            };
-            let scanned = crate::plugins::scanned(p.plugin.format, &p.plugin.id);
+    let s = app.session.borrow();
+    build_entries(s.available_plugins(), s.plugin_favorites(), |p| {
+        crate::plugins::scanned(p.format, &p.id)
+            .map(|c| (c.features, c.bundle.display().to_string()))
+    })
+}
+
+/// The browser's rows: every available plugin, then the favorites missing
+/// from the catalogue. `scanned` gives a hosted plugin's features and
+/// bundle.
+fn build_entries(
+    available: Vec<AvailablePlugin>,
+    favorites: &PluginFavorites,
+    scanned: impl Fn(&PluginRef) -> Option<(Vec<String>, String)>,
+) -> Vec<Entry> {
+    let ch = |n: u16| match n {
+        0 => "none".to_string(),
+        1 => "mono".to_string(),
+        2 => "stereo".to_string(),
+        n => format!("{n} channels"),
+    };
+    let favorite_of = |plugin: &PluginRef| {
+        let f = favorites.favorite(plugin);
+        (
+            f.is_some(),
+            f.map(|f| f.categories.iter().copied().collect())
+                .unwrap_or_default(),
+            favorites.category_names(plugin),
+        )
+    };
+    let mut out: Vec<Entry> = available
+        .iter()
+        .map(|p| {
+            let scanned = scanned(&p.plugin);
+            let (favorite, categories, category_names) = favorite_of(&p.plugin);
             Entry {
                 vendor: if p.vendor.is_empty() {
-                    "Unknown vendor".into()
+                    UNKNOWN_VENDOR.into()
                 } else {
                     p.vendor.clone()
                 },
                 version: p.version.clone(),
                 instrument: p.instrument,
                 midi_effect: p.midi_effect,
-                features: scanned
-                    .as_ref()
-                    .map(|c| c.features.clone())
-                    .unwrap_or_default(),
+                features: scanned.as_ref().map(|(f, _)| f.clone()).unwrap_or_default(),
                 audio: format!("{} in · {} out", ch(p.audio_inputs), ch(p.audio_outputs)),
                 midi: if p.note_inputs > 0 {
                     "Note / MIDI input".into()
                 } else {
                     "—".into()
                 },
-                bundle: scanned.map(|c| c.bundle.display().to_string()),
-                plugin: p.plugin,
+                bundle: scanned.map(|(_, b)| b),
+                plugin: p.plugin.clone(),
+                favorite,
+                categories,
+                category_names,
+                missing: false,
+                other_formats: Vec::new(),
             }
         })
         .collect();
+    for f in favorites.missing(&available) {
+        let plugin = PluginRef {
+            format: f.key.format,
+            id: f.key.id.clone(),
+            name: f.name.clone(),
+        };
+        let (_, categories, category_names) = favorite_of(&plugin);
+        out.push(Entry {
+            vendor: if f.vendor.is_empty() {
+                UNKNOWN_VENDOR.into()
+            } else {
+                f.vendor.clone()
+            },
+            version: String::new(),
+            instrument: false,
+            midi_effect: false,
+            features: Vec::new(),
+            audio: "—".into(),
+            midi: "—".into(),
+            bundle: None,
+            other_formats: PluginFavorites::other_formats(&f.key, &f.name, &f.vendor, &available),
+            plugin,
+            favorite: true,
+            categories,
+            category_names,
+            missing: true,
+        });
+    }
     out.sort_by(|a, b| {
         (
             a.plugin.format != PluginFormat::Builtin,
@@ -199,6 +291,16 @@ fn entries(app: &AppState) -> Vec<Entry> {
             ))
     });
     out
+}
+
+fn format_name(f: PluginFormat) -> &'static str {
+    match f {
+        PluginFormat::Builtin => "Built-in",
+        PluginFormat::Clap => "CLAP",
+        PluginFormat::Vst3 => "VST3",
+        PluginFormat::AudioUnit => "AU",
+        PluginFormat::Lv2 => "LV2",
+    }
 }
 
 /// A colour for a vendor's avatar, stable per name.
@@ -230,9 +332,47 @@ fn badge(text: &str, class: &str) -> gtk::Label {
     l
 }
 
+/// The open browser (for buttons made inside its rows and panels).
+fn open_browser() -> Option<std::rc::Weak<Browser>> {
+    OPEN.with(|o| o.borrow().as_ref().map(Rc::downgrade))
+}
+
+/// A star that makes the plugin a favorite or no longer one.
+fn star_button(e: &Entry) -> gtk::Button {
+    let star = gtk::Button::with_label(if e.favorite { "★" } else { "☆" });
+    star.add_css_class("flat");
+    star.add_css_class("favorite-star");
+    if e.favorite {
+        star.add_css_class("starred");
+    }
+    star.set_valign(gtk::Align::Center);
+    let tip = if e.favorite {
+        "Remove from Favorites"
+    } else {
+        "Add to Favorites"
+    };
+    star.set_tooltip_text(Some(tip));
+    star.update_property(&[gtk::accessible::Property::Label(tip)]);
+    let (plugin, on) = (e.favorite_plugin(), !e.favorite);
+    let weak = open_browser();
+    star.connect_clicked(move |_| {
+        if let Some(b) = weak.as_ref().and_then(|w| w.upgrade()) {
+            b.change_favorites(FavoriteOp::Set {
+                plugin: plugin.clone(),
+                favorite: on,
+            });
+        }
+    });
+    star
+}
+
 fn row_widget(e: &Entry) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("plugin-row");
+    if e.missing {
+        row.add_css_class("plugin-missing");
+    }
+    row.append(&star_button(e));
     let avatar = gtk::Label::new(Some(&initials(&e.plugin.name)));
     avatar.add_css_class("avatar");
     avatar.add_css_class(avatar_class(&e.vendor));
@@ -256,16 +396,22 @@ fn row_widget(e: &Entry) -> gtk::Widget {
     text.append(&name);
     text.append(&sub);
     row.append(&text);
-    row.append(&badge(
-        e.kind_label(),
-        if e.instrument {
-            "badge-instrument"
-        } else if e.midi_effect {
-            "badge-midi"
-        } else {
-            "badge-effect"
-        },
-    ));
+    if e.missing {
+        let b = badge("Missing", "badge-missing");
+        b.set_tooltip_text(Some("Not found in the last scan: uninstalled or moved"));
+        row.append(&b);
+    } else {
+        row.append(&badge(
+            e.kind_label(),
+            if e.instrument {
+                "badge-instrument"
+            } else if e.midi_effect {
+                "badge-midi"
+            } else {
+                "badge-effect"
+            },
+        ));
+    }
     row.append(&badge(
         e.format_label(),
         match e.plugin.format {
@@ -405,7 +551,225 @@ fn check_section(e: &Entry, running: bool) -> gtk::Box {
     section
 }
 
+/// Ask for a name in a popover under `parent` (made when shown, gone when
+/// closed); Enter or the button hands it to `done`.
+fn ask_name(
+    parent: &impl IsA<gtk::Widget>,
+    initial: &str,
+    action: &str,
+    extra: Option<gtk::Widget>,
+    done: impl Fn(String) + 'static,
+) -> gtk::Popover {
+    let pop = gtk::Popover::new();
+    pop.set_parent(parent);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    column.set_margin_top(4);
+    column.set_margin_bottom(4);
+    column.set_margin_start(4);
+    column.set_margin_end(4);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let entry = gtk::Entry::new();
+    entry.set_text(initial);
+    entry.set_placeholder_text(Some("Category name"));
+    entry.set_width_chars(18);
+    let ok = gtk::Button::with_label(action);
+    ok.add_css_class("suggested-action");
+    line.append(&entry);
+    line.append(&ok);
+    column.append(&line);
+    if let Some(w) = extra {
+        column.append(&w);
+    }
+    pop.set_child(Some(&column));
+    let done = Rc::new(done);
+    let go = {
+        let (entry, pop) = (entry.clone(), pop.clone());
+        move || {
+            let name = entry.text().to_string();
+            pop.popdown();
+            let done = Rc::clone(&done);
+            // After the popover is gone (the sidebar is rebuilt).
+            glib::idle_add_local_once(move || done(name));
+        }
+    };
+    let again = go.clone();
+    entry.connect_activate(move |_| again());
+    ok.connect_clicked(move |_| go());
+    pop.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    pop.popup();
+    entry.grab_focus();
+    pop
+}
+
 impl Browser {
+    /// Change the favorites (through the session, which the shell saves)
+    /// and show them; the selected plugin stays selected.
+    fn change_favorites(self: &Rc<Self>, op: FavoriteOp) {
+        let Some(app) = self.app.upgrade() else {
+            return;
+        };
+        let keep = self.selected().map(|e| FavoriteKey::of(&e.plugin));
+        app.dispatch(Action::PluginFavorites(op));
+        *self.entries.borrow_mut() = entries(&app);
+        self.refresh_sidebar();
+        self.refresh_list_keeping(keep);
+    }
+
+    /// The rows again, the plugin `keep` selected if it is still shown.
+    fn refresh_list_keeping(self: &Rc<Self>, keep: Option<FavoriteKey>) {
+        self.refresh_list();
+        let Some(keep) = keep else { return };
+        let at = self
+            .visible_entries()
+            .iter()
+            .position(|e| keep.is(&e.plugin));
+        if let Some(row) = at.and_then(|i| self.list.row_at_index(i as i32)) {
+            self.list.select_row(Some(&row));
+        }
+    }
+
+    /// A category's sidebar row: right-click renames or removes it.
+    fn category_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, id: CategoryId, name: &str) {
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        let weak = Rc::downgrade(self);
+        let (row_w, name) = (row.downgrade(), name.to_string());
+        click.connect_pressed(move |_, _, _, _| {
+            let (Some(b), Some(row)) = (weak.upgrade(), row_w.upgrade()) else {
+                return;
+            };
+            let remove = gtk::Button::with_label("Remove Category");
+            remove.add_css_class("destructive-action");
+            remove.set_tooltip_text(Some("Its plugins stay favorites"));
+            let rename = Rc::downgrade(&b);
+            let pop = ask_name(
+                &row,
+                &name,
+                "Rename",
+                Some(remove.clone().upcast()),
+                move |n| {
+                    if let Some(b) = rename.upgrade() {
+                        b.change_favorites(FavoriteOp::RenameCategory {
+                            category: id,
+                            name: n,
+                        });
+                    }
+                },
+            );
+            let weak = Rc::downgrade(&b);
+            remove.connect_clicked(move |_| {
+                pop.popdown();
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(b) = weak.upgrade() {
+                        b.change_favorites(FavoriteOp::RemoveCategory(id));
+                    }
+                });
+            });
+        });
+        row.add_controller(click);
+    }
+
+    /// The detail panel's favorites: the star, the categories, a new one.
+    fn favorites_section(self: &Rc<Self>, e: &Entry) -> gtk::Box {
+        let section = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        section.add_css_class("favorites-section");
+        let plugin = e.favorite_plugin();
+        let toggle = gtk::Button::with_label(if e.favorite {
+            "★ Favorite"
+        } else {
+            "☆ Add to Favorites"
+        });
+        toggle.add_css_class("favorite-toggle");
+        if e.favorite {
+            toggle.add_css_class("starred");
+            toggle.set_tooltip_text(Some("Remove from Favorites"));
+        }
+        toggle.set_halign(gtk::Align::Start);
+        let weak = Rc::downgrade(self);
+        let (p, on) = (plugin.clone(), !e.favorite);
+        toggle.connect_clicked(move |_| {
+            if let Some(b) = weak.upgrade() {
+                b.change_favorites(FavoriteOp::Set {
+                    plugin: p.clone(),
+                    favorite: on,
+                });
+            }
+        });
+        section.append(&toggle);
+        if e.missing {
+            let text = if e.other_formats.is_empty() {
+                "Not found in the last scan (uninstalled, moved, or it failed its scan). It \
+                 stays a favorite until you remove it."
+                    .to_string()
+            } else {
+                format!(
+                    "Not found in the last scan; installed as {}. It stays a favorite until \
+                     you remove it.",
+                    e.other_formats
+                        .iter()
+                        .map(|p| format_name(p.format))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let l = gtk::Label::new(Some(&text));
+            l.set_xalign(0.0);
+            l.set_wrap(true);
+            l.set_width_chars(1);
+            l.set_max_width_chars(30);
+            l.add_css_class("dim-label");
+            section.append(&l);
+        }
+        let favorites = self
+            .app
+            .upgrade()
+            .map(|a| a.session.borrow().plugin_favorites().clone())
+            .unwrap_or_default();
+        for c in favorites.categories() {
+            let check = gtk::CheckButton::with_label(&c.name);
+            check.set_active(e.categories.contains(&c.id));
+            let weak = Rc::downgrade(self);
+            let (p, id) = (plugin.clone(), c.id);
+            check.connect_toggled(move |c| {
+                let member = c.is_active();
+                let (weak, p) = (weak.clone(), p.clone());
+                // After the toggle's own handling (the panel is rebuilt).
+                glib::idle_add_local_once(move || {
+                    if let Some(b) = weak.upgrade() {
+                        b.change_favorites(FavoriteOp::Assign {
+                            plugin: p,
+                            category: id,
+                            member,
+                        });
+                    }
+                });
+            });
+            section.append(&check);
+        }
+        let new = gtk::Button::with_label("+ New Category…");
+        new.add_css_class("flat");
+        new.set_halign(gtk::Align::Start);
+        new.set_tooltip_text(Some("A category of your own, with this plugin in it"));
+        let weak = Rc::downgrade(self);
+        new.connect_clicked(move |button| {
+            let (weak, p) = (weak.clone(), plugin.clone());
+            ask_name(button, "", "Create", None, move |name| {
+                if let Some(b) = weak.upgrade() {
+                    b.change_favorites(FavoriteOp::NewCategory {
+                        name,
+                        with: Some(p.clone()),
+                    });
+                }
+            });
+        });
+        section.append(&new);
+        section
+    }
+
     fn selected(&self) -> Option<Entry> {
         let row = self.list.selected_row()?;
         let i = row.index();
@@ -423,7 +787,7 @@ impl Browser {
     }
 
     /// Rebuild the list from the filter (cheap: a few hundred rows at most).
-    fn refresh_list(&self) {
+    fn refresh_list(self: &Rc<Self>) {
         while let Some(c) = self.list.first_child() {
             self.list.remove(&c);
         }
@@ -477,7 +841,8 @@ impl Browser {
         };
         self.sidebar.append(&heading("LIBRARY"));
         scopes.push(None);
-        let (all, scope) = item("All plugins", entries.len(), Scope::All);
+        let installed = entries.iter().filter(|e| !e.missing).count();
+        let (all, scope) = item("All plugins", installed, Scope::All);
         self.sidebar.append(&all);
         scopes.push(Some(scope));
         let checked: Vec<_> = entries.iter().map(|e| (e, e.check())).collect();
@@ -490,7 +855,7 @@ impl Browser {
             .count();
         let unchecked = checked
             .iter()
-            .filter(|(e, r)| e.checkable() && r.is_none())
+            .filter(|(e, r)| !e.missing && e.checkable() && r.is_none())
             .count();
         let (r, scope) = item("With findings", findings, Scope::Findings);
         self.sidebar.append(&r);
@@ -505,7 +870,10 @@ impl Browser {
             (PluginFormat::Lv2, "LV2"),
             (PluginFormat::AudioUnit, "AU"),
         ] {
-            let n = entries.iter().filter(|e| e.plugin.format == f).count();
+            let n = entries
+                .iter()
+                .filter(|e| !e.missing && e.plugin.format == f)
+                .count();
             if n == 0 && matches!(f, PluginFormat::Lv2 | PluginFormat::AudioUnit) {
                 continue;
             }
@@ -513,8 +881,50 @@ impl Browser {
             self.sidebar.append(&r);
             scopes.push(Some(scope));
         }
+        // The user's favorites and categories.
+        self.sidebar.append(&heading("FAVORITES"));
+        scopes.push(None);
+        let n = entries.iter().filter(|e| e.favorite).count();
+        let (r, scope) = item("All favorites", n, Scope::Favorites);
+        self.sidebar.append(&r);
+        scopes.push(Some(scope));
+        let favorites = self
+            .app
+            .upgrade()
+            .map(|a| a.session.borrow().plugin_favorites().clone())
+            .unwrap_or_default();
+        for c in favorites.categories() {
+            let n = entries
+                .iter()
+                .filter(|e| e.categories.contains(&c.id))
+                .count();
+            let (r, scope) = item(&c.name, n, Scope::Category(c.id));
+            r.set_tooltip_text(Some("Right-click to rename or remove"));
+            self.category_menu(&r, c.id, &c.name);
+            self.sidebar.append(&r);
+            scopes.push(Some(scope));
+        }
+        let new = gtk::Button::with_label("+ New Category…");
+        new.add_css_class("flat");
+        new.add_css_class("sidebar-new");
+        new.set_halign(gtk::Align::Start);
+        let weak = Rc::downgrade(self);
+        new.connect_clicked(move |button| {
+            let weak = weak.clone();
+            ask_name(button, "", "Create", None, move |name| {
+                if let Some(b) = weak.upgrade() {
+                    b.change_favorites(FavoriteOp::NewCategory { name, with: None });
+                }
+            });
+        });
+        let r = gtk::ListBoxRow::new();
+        r.set_child(Some(&new));
+        r.set_selectable(false);
+        r.set_activatable(false);
+        self.sidebar.append(&r);
+        scopes.push(None);
         let mut vendors: Vec<(String, usize)> = Vec::new();
-        for e in entries.iter() {
+        for e in entries.iter().filter(|e| !e.missing) {
             match vendors.iter_mut().find(|(v, _)| *v == e.vendor) {
                 Some((_, n)) => *n += 1,
                 None => vendors.push((e.vendor.clone(), 1)),
@@ -541,7 +951,7 @@ impl Browser {
         }
     }
 
-    fn show_detail(&self, e: Option<&Entry>) {
+    fn show_detail(self: &Rc<Self>, e: Option<&Entry>) {
         while let Some(c) = self.detail.first_child() {
             self.detail.remove(&c);
         }
@@ -568,6 +978,7 @@ impl Browser {
         vendor.add_css_class("plugin-sub");
         vendor.set_xalign(0.0);
         self.detail.append(&vendor);
+        self.detail.append(&self.favorites_section(e));
         if !e.features.is_empty() {
             // (A grid: FlowBox mis-measures in this pane.)
             let chips = gtk::Grid::new();
@@ -600,6 +1011,9 @@ impl Browser {
             y += 1;
         };
         row("Format", e.format_label());
+        if e.missing {
+            row("ID", &e.plugin.id);
+        }
         if !e.version.is_empty() {
             row("Version", &e.version);
         }
@@ -610,8 +1024,10 @@ impl Browser {
             row("Bundle", b);
         }
         self.detail.append(&grid);
-        self.detail
-            .append(&check_section(e, crate::plugin_check::progress().is_some()));
+        if !e.missing {
+            self.detail
+                .append(&check_section(e, crate::plugin_check::progress().is_some()));
+        }
         let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         spacer.set_vexpand(true);
         self.detail.append(&spacer);
@@ -629,7 +1045,10 @@ impl Browser {
         place.add_css_class("suggested-action");
         place.add_css_class("place-button");
         let wrong_kind = matches!(target, PluginTarget::Instrument) && !e.instrument;
-        place.set_sensitive(!wrong_kind);
+        place.set_sensitive(!wrong_kind && !e.missing);
+        if e.missing {
+            place.set_label("Not installed");
+        }
         let plugin = e.plugin.clone();
         let weak = OPEN.with(|o| o.borrow().as_ref().map(Rc::downgrade));
         place.connect_clicked(move |_| {
@@ -644,6 +1063,14 @@ impl Browser {
         let Some(app) = self.app.upgrade() else {
             return;
         };
+        let missing = self
+            .entries
+            .borrow()
+            .iter()
+            .any(|e| e.missing && e.plugin == plugin);
+        if missing {
+            return;
+        }
         let (track, target) = (*self.track.borrow(), *self.target.borrow());
         if app
             .with_session(|s| s.place_plugin(track, target, plugin))
@@ -654,7 +1081,7 @@ impl Browser {
     }
 
     /// Show the check under way (and new reports) as they come.
-    fn follow_checks(&self) {
+    fn follow_checks(self: &Rc<Self>) {
         let g = crate::plugin_check::generation();
         if g != self.check_generation.get() {
             self.check_generation.set(g);
@@ -703,7 +1130,7 @@ impl Browser {
     }
 
     /// Check every plugin from another maker not checked in its version.
-    fn check_all(&self) {
+    fn check_all(self: &Rc<Self>) {
         let Some(app) = self.app.upgrade() else {
             return;
         };
@@ -723,7 +1150,7 @@ impl Browser {
         self.follow_checks();
     }
 
-    fn set_kind(&self, kind: Kind) {
+    fn set_kind(self: &Rc<Self>, kind: Kind) {
         self.filter.borrow_mut().kind = kind;
         for (b, k) in self.kind_buttons.iter().zip([
             Kind::All,
@@ -736,7 +1163,7 @@ impl Browser {
         self.refresh_list();
     }
 
-    fn retarget(&self, track: TrackId, target: PluginTarget) {
+    fn retarget(self: &Rc<Self>, track: TrackId, target: PluginTarget) {
         *self.track.borrow_mut() = track;
         *self.target.borrow_mut() = target;
         let name = self
@@ -798,6 +1225,33 @@ fn target_name(app: &AppState, track: TrackId, target: PluginTarget) -> String {
 pub fn search(text: &str) {
     if let Some(b) = OPEN.with(|o| o.borrow().clone()) {
         b.search.set_text(text);
+    }
+}
+
+/// Show a sidebar entry of the open browser by its label ("all",
+/// "favorites", a category's or vendor's name; scripts).
+pub fn show_scope(name: &str) {
+    let Some(b) = OPEN.with(|o| o.borrow().clone()) else {
+        return;
+    };
+    let wanted = name.trim().to_lowercase();
+    let favorites = b
+        .app
+        .upgrade()
+        .map(|a| a.session.borrow().plugin_favorites().clone())
+        .unwrap_or_default();
+    let at = b.scopes.borrow().iter().position(|s| match s {
+        Some(Scope::All) => wanted == "all",
+        Some(Scope::Favorites) => wanted == "favorites",
+        Some(Scope::Category(c)) => favorites
+            .category(*c)
+            .is_some_and(|c| c.name.to_lowercase() == wanted),
+        Some(Scope::Vendor(v)) => v.to_lowercase() == wanted,
+        _ => false,
+    });
+    match at.and_then(|i| b.sidebar.row_at_index(i as i32)) {
+        Some(row) => b.sidebar.select_row(Some(&row)),
+        None => tracing::warn!("plugin-browser-scope: no '{name}'"),
     }
 }
 
@@ -1042,6 +1496,11 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
             && let Some(app) = b.app.upgrade()
         {
             b.generation.set(g);
+            // Favorites take renamed plugins' new names (saved).
+            if let Ok(mut s) = app.session.try_borrow_mut() {
+                s.note_favorite_names();
+            }
+            crate::favorites::follow(&app);
             *b.entries.borrow_mut() = entries(&app);
             b.refresh_sidebar();
             b.refresh_list();
@@ -1058,4 +1517,154 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     b.retarget(track, target);
     window.present();
     search.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin(format: PluginFormat, id: &str, name: &str, vendor: &str) -> AvailablePlugin {
+        AvailablePlugin {
+            plugin: PluginRef {
+                format,
+                id: id.into(),
+                name: name.into(),
+            },
+            vendor: vendor.into(),
+            version: "1".into(),
+            instrument: false,
+            midi_effect: false,
+            audio_inputs: 2,
+            audio_outputs: 2,
+            note_inputs: 0,
+        }
+    }
+
+    fn catalogue() -> Vec<AvailablePlugin> {
+        let mut diva = plugin(PluginFormat::Clap, "com.u-he.Diva", "Diva", "u-he");
+        diva.instrument = true;
+        vec![
+            plugin(
+                PluginFormat::Clap,
+                "com.tone3000.plugin",
+                "TONE3000",
+                "TONE3000",
+            ),
+            plugin(PluginFormat::Vst3, "ABCD", "TONE3000", "TONE3000"),
+            plugin(PluginFormat::Clap, "com.u-he.Satin", "Satin", "u-he"),
+            diva,
+        ]
+    }
+
+    fn filter(scope: Scope, kind: Kind, text: &str) -> Filter {
+        Filter {
+            text: text.into(),
+            kind,
+            scope,
+        }
+    }
+
+    fn names(entries: &[Entry], f: &Filter) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| f.accepts(e))
+            .map(|e| format!("{} {}", e.plugin.name, e.format_label()))
+            .collect()
+    }
+
+    #[test]
+    fn favorites_and_categories_filter_the_list_and_missing_ones_show_there_only() {
+        let cat = catalogue();
+        let mut favs = PluginFavorites::default();
+        favs.apply(FavoriteOp::NewCategory {
+            name: "Amps".into(),
+            with: Some(FavoritePlugin::of(&cat[0])),
+        })
+        .unwrap();
+        let amps = favs.categories()[0].id;
+        for p in [&cat[2], &cat[3]] {
+            favs.apply(FavoriteOp::Set {
+                plugin: FavoritePlugin::of(p),
+                favorite: true,
+            })
+            .unwrap();
+        }
+        // The CLAP of TONE3000 uninstalled since: its VST3 is still there.
+        let installed: Vec<AvailablePlugin> = cat[1..].to_vec();
+        let entries = build_entries(installed, &favs, |_| None);
+        assert_eq!(entries.len(), 4, "three installed and one missing");
+        let missing: Vec<&Entry> = entries.iter().filter(|e| e.missing).collect();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].plugin.name, "TONE3000");
+        assert_eq!(missing[0].other_formats.len(), 1, "named: the VST3");
+        assert_eq!(missing[0].category_names, ["Amps"]);
+
+        // The library leaves out what is not installed…
+        assert_eq!(
+            names(&entries, &filter(Scope::All, Kind::All, "")),
+            ["Diva CLAP", "Satin CLAP", "TONE3000 VST3"]
+        );
+        assert_eq!(
+            names(
+                &entries,
+                &filter(Scope::Format(PluginFormat::Clap), Kind::All, "")
+            ),
+            ["Diva CLAP", "Satin CLAP"]
+        );
+        // … favorites show it, as missing; the kind filter still applies to
+        // the others.
+        assert_eq!(
+            names(&entries, &filter(Scope::Favorites, Kind::Effects, "")),
+            ["Satin CLAP", "TONE3000 CLAP"]
+        );
+        assert_eq!(
+            names(&entries, &filter(Scope::Favorites, Kind::All, "")),
+            ["Diva CLAP", "Satin CLAP", "TONE3000 CLAP"]
+        );
+        assert_eq!(
+            names(&entries, &filter(Scope::Category(amps), Kind::All, "")),
+            ["TONE3000 CLAP"]
+        );
+        // Search works in favorites, and finds category names.
+        assert_eq!(
+            names(&entries, &filter(Scope::Favorites, Kind::All, "u-he sat")),
+            ["Satin CLAP"]
+        );
+        assert!(
+            names(&entries, &filter(Scope::All, Kind::All, "amps")).is_empty(),
+            "the installed VST3 is not in Amps"
+        );
+        assert_eq!(
+            names(&entries, &filter(Scope::Favorites, Kind::All, "amps")),
+            ["TONE3000 CLAP"]
+        );
+        // A star on an installed row names the plugin by format and id.
+        let satin = entries
+            .iter()
+            .find(|e| e.plugin.id == "com.u-he.Satin")
+            .unwrap();
+        assert!(satin.favorite);
+        let f = satin.favorite_plugin();
+        assert_eq!(f.key, FavoriteKey::of(&cat[2].plugin));
+        assert_eq!(f.vendor, "u-he");
+    }
+
+    #[test]
+    fn without_favorites_the_browser_lists_as_before() {
+        let entries = build_entries(catalogue(), &PluginFavorites::default(), |_| None);
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().all(|e| !e.favorite && !e.missing));
+        assert_eq!(
+            names(&entries, &filter(Scope::All, Kind::Effects, "tone")),
+            ["TONE3000 CLAP", "TONE3000 VST3"]
+        );
+        assert_eq!(
+            names(
+                &entries,
+                &filter(Scope::Vendor("u-he".into()), Kind::Instruments, "")
+            ),
+            ["Diva CLAP"]
+        );
+        assert!(names(&entries, &filter(Scope::Favorites, Kind::All, "")).is_empty());
+    }
 }

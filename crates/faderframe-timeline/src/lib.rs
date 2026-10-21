@@ -18,7 +18,8 @@ mod tempo;
 mod time;
 
 pub use grid::{
-    GridDivision, GridLineKind, GridMenuEntry, for_each_grid_line, snap_floor, snap_nearest,
+    GridDensity, GridDivision, GridLineKind, GridMenuEntry, bar_stride, for_each_grid_line,
+    for_each_visible_line, snap_floor, snap_nearest, visible_lines,
 };
 pub use meter::{Bbt, MeterChange, TimeSignature, TimeSignatureMap};
 pub use tempo::{TempoCurve, TempoMap, TempoPoint};

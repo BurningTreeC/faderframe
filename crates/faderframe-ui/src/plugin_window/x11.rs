@@ -27,7 +27,19 @@ pub struct Parents {
     root: xproto::Window,
     black: u32,
     atoms: Atoms,
+    /// Windows closed (unmapped) and when: destroyed once
+    /// [`RETIRE_AFTER`] has passed.
+    retired: std::cell::RefCell<Vec<(xproto::Window, std::time::Instant)>>,
 }
+
+/// How long a closed editor's window outlives it. The plugin's GUI talks
+/// to the X server on a connection of its own (in its helper process, or
+/// its toolkit's in ours): requests it made on its window inside ours as
+/// it closed — destroying it, a last draw — may reach the server after our
+/// answer that it closed. Were our window gone by then, they would fail
+/// (BadWindow, BadDrawable), and Xlib's default handler ends the process
+/// for that; so it goes a little later, out of sight meanwhile.
+const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn x_err(e: impl std::fmt::Display) -> String {
     format!("X11: {e}")
@@ -62,6 +74,7 @@ impl Parents {
             root,
             black,
             atoms,
+            retired: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -265,9 +278,29 @@ impl Parents {
         let _ = self.conn.flush();
     }
 
+    /// Close a window: hidden now, destroyed after [`RETIRE_AFTER`].
     pub fn destroy(&self, win: u64) {
-        let _ = self.conn.destroy_window(id(win));
+        let _ = self.conn.unmap_window(id(win));
         let _ = self.conn.flush();
+        self.retired
+            .borrow_mut()
+            .push((id(win), std::time::Instant::now()));
+    }
+
+    /// Destroy the closed windows whose time has come.
+    fn reap(&self) {
+        let mut retired = self.retired.borrow_mut();
+        let before = retired.len();
+        retired.retain(|&(win, at)| {
+            if at.elapsed() < RETIRE_AFTER {
+                return true;
+            }
+            let _ = self.conn.destroy_window(win);
+            false
+        });
+        if retired.len() != before {
+            let _ = self.conn.flush();
+        }
     }
 }
 
@@ -306,6 +339,7 @@ impl Parents {
 impl Parents {
     /// Close buttons and resizes since the last call.
     pub fn events(&self) -> Vec<ParentEvent> {
+        self.reap();
         let mut out = Vec::new();
         let a = &self.atoms;
         while let Ok(Some(ev)) = self.conn.poll_for_event() {

@@ -29,7 +29,11 @@
 //!   FaderFrame's own editor window across processes (window ids and
 //!   handles are global); on macOS, where views cannot cross processes,
 //!   the helper shows them in a window of its own. Resize and close
-//!   requests come back with the poll.
+//!   requests come back with the poll. Polls are pipelined (answered a
+//!   tick later): an answer never overrides what FaderFrame changed after
+//!   asking (the editor opened or closed, a state loaded, an activation, a
+//!   parameter set). X errors of a plugin's GUI are logged, not fatal
+//!   ([`xlib`]).
 //!
 //! [`PluginInstance`]: faderframe_plugin_host::PluginInstance
 //! [`PluginProcessor`]: faderframe_plugin_host::PluginProcessor
@@ -44,6 +48,7 @@ mod mac;
 mod shm;
 mod sys;
 pub mod workgroup;
+pub mod xlib;
 
 use faderframe_plugin_host::{PluginDescriptor, PluginError, PluginFactory, PluginFormat};
 use std::path::PathBuf;

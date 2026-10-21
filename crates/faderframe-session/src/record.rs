@@ -294,6 +294,8 @@ fn run(
         let mut worked = false;
         while let Ok(h) = streams.headers.pop() {
             worked = true;
+            // Catching up never sleeps: within the realtime time limit.
+            faderframe_realtime::priority::breathe();
             let n = h.frames as usize;
             block.resize(n * total_channels, 0.0);
             // Data is pushed before its header, so it is complete.
@@ -768,9 +770,27 @@ pub(crate) fn place_takes(
 }
 
 impl Session {
-    /// Start playback; with record mode on and starting from stop, the
-    /// record window restarts at the playhead and pre-roll applies.
+    /// The transport's Play (and Record from stop): from stop, the
+    /// playhead first goes to the Play Start Marker while it is on.
+    /// Programmatic starts that put the playhead somewhere first (a song
+    /// of the setlist, an ADR cue's pre-roll, the shuttle, the launcher)
+    /// call [`Self::play`] and play from there.
+    pub(crate) fn locate_play_start(&mut self) -> Result<()> {
+        let at = self.play_start_position();
+        if !self.transport.playing && at != self.transport.position {
+            self.engine.transport(TransportCommand::Locate(at))?;
+            self.show_position(at);
+        }
+        Ok(())
+    }
+
+    /// Start playback from the playhead; with record mode on and starting
+    /// from stop, the record window restarts at the playhead and pre-roll
+    /// applies.
     pub(crate) fn play(&mut self) -> Result<()> {
+        // Where playback starts, before any pre-roll: Return to Start on
+        // Stop comes back here, so the next take pre-rolls the same way.
+        let start = self.transport.position;
         if !self.transport.playing && self.recording.is_some() {
             // Slot recordings ignore the punch range and count in by the
             // launcher's setting.
@@ -812,11 +832,235 @@ impl Session {
         self.loader.wake();
         self.automation_play_requested();
         if !self.transport.playing {
-            self.play_started_at = Some(self.transport.position);
+            // Where Stop returns to (Return to Start on Stop): where
+            // playback started, before any pre-roll.
+            self.play_started_at = Some(start);
             self.mtc_started(self.transport.position);
             self.automation_play_started();
+            // A Play pressed again before the engine reports playing (Record
+            // and Play together) finds it playing: it neither restarts the
+            // take from the pre-roll's start nor locates again.
+            self.requested_playing(true);
         }
         Ok(())
+    }
+
+    /// Where Play starts from stop (engine samples): the Play Start
+    /// Marker while it is on, else the playhead.
+    pub(crate) fn play_start_position(&self) -> i64 {
+        match self.project.play_start {
+            Some(m) if m.on && !self.play_here => {
+                self.engine.musical_to_samples(&self.project, m.at)
+            }
+            _ => self.transport.position,
+        }
+    }
+
+    /// Whether a take is being recorded or still being written.
+    pub fn recording_in_progress(&self) -> bool {
+        self.recording.is_some() || !self.finishing.is_empty()
+    }
+
+    /// Throw the take being recorded away (Abort Recording, Ctrl+Space):
+    /// playback stops, nothing of this pass reaches the project or the
+    /// undo history, its files are deleted once the writer lets go of them
+    /// (never earlier takes or other media), and the playhead goes back to
+    /// where recording began — with a punch range, to where playback
+    /// started. What was played on MIDI stays capturable. `restart`: record
+    /// again from there as soon as playback has stopped, with the same
+    /// pre-roll and count-in. A launcher slot's recording is thrown away
+    /// while playback goes on (`restart`: the slot records again from its
+    /// next launch position). Not recording: Stop (a restart does nothing).
+    pub(crate) fn abort_recording(&mut self, restart: bool) -> Result<()> {
+        self.restart_recording = None;
+        let Some(mut r) = self.recording.take() else {
+            if restart {
+                self.notify(NoticeLevel::Info, "Nothing is being recorded");
+                return Ok(());
+            }
+            if self.transport.playing {
+                return self.transport_action(crate::TransportAction::Stop);
+            }
+            return Ok(());
+        };
+        // Out of record mode whatever else fails (a device gone): the take
+        // is thrown away all the same.
+        let mut failed: Option<SessionError> = None;
+        let mut note = |e: Result<()>| {
+            if let Err(e) = e
+                && failed.is_none()
+            {
+                failed = Some(e);
+            }
+        };
+        note(self.disarm_postroll());
+        note(
+            self.engine
+                .transport(TransportCommand::SetRecording(false))
+                .map_err(Into::into),
+        );
+        note(self.engine.end_recording().map_err(Into::into));
+        if r.midi.take().is_some() {
+            // Played, not taken: Capture MIDI still has it.
+            note(self.engine.end_midi_recording().map_err(Into::into));
+        }
+        let slot = r.slot.take();
+        let from = r.from;
+        self.discarding.push(r);
+        self.pump_idle();
+        self.notify(NoticeLevel::Info, "Recording discarded");
+        self.revision += 1;
+        if let Some(slot) = slot {
+            if restart {
+                note(self.dispatch(crate::Action::Launcher(
+                    crate::launcher::LauncherOp::Record {
+                        track: slot.track,
+                        scene: slot.scene,
+                    },
+                )));
+            }
+            return failed.map_or(Ok(()), Err);
+        }
+        let back = match self.punch_window() {
+            Some(_) => self.play_started_at.unwrap_or(from),
+            None => from,
+        };
+        if self.transport.playing {
+            note(
+                self.engine
+                    .transport(TransportCommand::Stop)
+                    .map_err(Into::into),
+            );
+            self.automation_stop_sent();
+        }
+        note(
+            self.engine
+                .transport(TransportCommand::Locate(back))
+                .map_err(Into::into),
+        );
+        self.show_position(back);
+        self.play_started_at = None;
+        if restart {
+            self.restart_recording = Some((back, std::time::Instant::now()));
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// An abort-and-restart's new take, once playback has stopped (the
+    /// stop is deferred while rendering ahead primes it; the new take must
+    /// not catch what still plays before it). Every tick.
+    pub(crate) fn tick_restart_recording(&mut self) {
+        let Some((at, asked)) = self.restart_recording else {
+            return;
+        };
+        if self.transport.playing || self.engine.transport_snapshot().playing {
+            if asked.elapsed() > Duration::from_secs(2) {
+                // It never stopped (the device is gone?): no retake.
+                self.restart_recording = None;
+            }
+            return;
+        }
+        self.restart_recording = None;
+        let result = (|| -> Result<()> {
+            self.engine.transport(TransportCommand::Locate(at))?;
+            self.show_position(at);
+            self.start_recording(at)?;
+            if self.recording.is_some() {
+                self.play()?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.notify(NoticeLevel::Error, format!("restarting the recording: {e}"));
+        }
+    }
+
+    /// Delete an aborted recording's files (its writer is done): only the
+    /// files it made, never one a source of the project names.
+    fn discard_recording(&mut self, r: ActiveRecording) {
+        let outcome = r.writer.map(RecordWriter::join).unwrap_or_default();
+        let mut files = r.paths;
+        for t in outcome.takes {
+            if !files.contains(&t.path) {
+                files.push(t.path);
+            }
+        }
+        let used: std::collections::HashSet<PathBuf> = self
+            .project
+            .sources
+            .values()
+            .filter_map(|s| match &s.spec {
+                SourceSpec::File { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        for f in files {
+            if used.contains(&f) {
+                continue;
+            }
+            for file in [peaks_path_for(&f), f] {
+                if file.exists()
+                    && let Err(e) = std::fs::remove_file(&file)
+                {
+                    tracing::warn!("cannot remove {}: {e}", file.display());
+                }
+            }
+        }
+    }
+
+    /// Wait (a while) for aborted recordings' writers and delete their
+    /// files (tests, quitting).
+    pub fn wait_for_discarded_recordings(&mut self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !self.discarding.is_empty() && std::time::Instant::now() < deadline {
+            self.engine.collect_garbage();
+            self.pump_idle();
+            self.poll_recording();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The project is replaced (closed) while recording: the recording
+    /// ends without its takes reaching either project (the shell places
+    /// them before asking about unsaved changes, see
+    /// [`Self::wait_for_recordings`]); their files stay where they are.
+    pub(crate) fn end_recordings_for_close(&mut self) {
+        let mut ended = Vec::new();
+        if let Some(mut r) = self.recording.take() {
+            let _ = self.engine.transport(TransportCommand::SetRecording(false));
+            let _ = self.engine.end_recording();
+            if r.midi.take().is_some() {
+                let _ = self.engine.end_midi_recording();
+            }
+            ended.push(r);
+        }
+        ended.append(&mut self.finishing);
+        self.restart_recording = None;
+        if ended.is_empty() && self.discarding.is_empty() {
+            return;
+        }
+        self.pump_idle();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for r in ended {
+            while r.writer.as_ref().is_some_and(|w| !w.is_finished())
+                && std::time::Instant::now() < deadline
+            {
+                self.engine.collect_garbage();
+                self.pump_idle();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if let Some(w) = r.writer
+                && w.is_finished()
+            {
+                for t in w.join().takes {
+                    tracing::warn!(
+                        "a take recorded while the project closed stays at {}",
+                        t.path.display()
+                    );
+                }
+            }
+        }
+        self.wait_for_discarded_recordings();
     }
 
     /// Where a pre-roll of `roll` before `from` (engine samples) starts:
@@ -958,9 +1202,37 @@ impl Session {
         let Some(info) = self.stream_info() else {
             return Err(SessionError::Other("start audio before recording".into()));
         };
-        let targets = self.record_targets(only);
+        let mut targets = self.record_targets(only);
         let mut midi_targets = self.midi_record_targets();
         midi_targets.retain(|t| only.is_none_or(|o| o == t.track));
+        // A frozen track takes no clips: recording it would refuse every
+        // track's take at the end (one undo step), so it is left out.
+        let mut frozen: Vec<TrackId> = targets
+            .iter()
+            .map(|t| t.track)
+            .chain(midi_targets.iter().map(|t| t.track))
+            .filter(|t| self.is_frozen(*t))
+            .collect();
+        frozen.dedup();
+        if !frozen.is_empty() {
+            targets.retain(|t| !frozen.contains(&t.track));
+            midi_targets.retain(|t| !frozen.contains(&t.track));
+            let names: Vec<String> = frozen
+                .iter()
+                .filter_map(|t| self.project.track(*t).map(|t| t.name.clone()))
+                .collect();
+            self.notify(
+                NoticeLevel::Warning,
+                format!(
+                    "{} {} frozen and not recorded: unfreeze to record",
+                    names.join(", "),
+                    if names.len() == 1 { "is" } else { "are" }
+                ),
+            );
+            if targets.is_empty() && midi_targets.is_empty() {
+                return Ok(());
+            }
+        }
         if targets.is_empty() && midi_targets.is_empty() {
             self.notify(
                 NoticeLevel::Warning,
@@ -989,7 +1261,14 @@ impl Session {
                 + i64::from(self.engine.varispeed_delay());
             let tracks: Vec<TrackId> = midi_targets.iter().map(|t| t.track).collect();
             let rx = self.engine.begin_midi_recording(midi_targets, from, to)?;
-            Some(crate::midi::MidiTake::new(rx, tracks, shift))
+            let mut take = crate::midi::MidiTake::new(rx, tracks, shift);
+            take.window = (from, to);
+            take.loop_end = self
+                .project
+                .loop_range
+                .filter(|_| self.project.loop_enabled)
+                .map(|r| self.engine.musical_to_samples(&self.project, r.end));
+            Some(take)
         };
         let midi_tracks: Vec<TrackId> = midi.as_ref().map(|m| m.tracks.clone()).unwrap_or_default();
         if targets.is_empty() {
@@ -998,6 +1277,7 @@ impl Session {
                 .transport(TransportCommand::SetRecording(true))?;
             self.recording = Some(ActiveRecording {
                 writer: None,
+                paths: Vec::new(),
                 midi,
                 from,
                 to,
@@ -1045,13 +1325,14 @@ impl Session {
         let streams = self
             .engine
             .begin_recording(targets, from, to, self.record.buffer_seconds)?;
-        let writer = RecordWriter::spawn(streams, paths)
+        let writer = RecordWriter::spawn(streams, paths.clone())
             .map_err(|e| SessionError::Other(format!("cannot start the record writer: {e}")))?;
         self.engine.metronome().set_mode(self.record.metronome);
         self.engine
             .transport(TransportCommand::SetRecording(true))?;
         self.recording = Some(ActiveRecording {
             writer: Some(writer),
+            paths,
             midi,
             from,
             to,
@@ -1082,7 +1363,7 @@ impl Session {
                 self.engine.end_midi_recording()?;
                 m.drain();
                 let at = self.engine.transport_snapshot().position - m.shift;
-                m.close_all(at.max(m.last));
+                m.close_all(at);
             }
             self.pump_idle();
             self.finishing.push(r);
@@ -1105,6 +1386,19 @@ impl Session {
         });
         if ended && let Err(e) = self.stop_recording() {
             self.notify(NoticeLevel::Error, e.to_string());
+        }
+        let mut i = 0;
+        while i < self.discarding.len() {
+            if self.discarding[i]
+                .writer
+                .as_ref()
+                .is_none_or(|w| w.is_finished())
+            {
+                let r = self.discarding.remove(i);
+                self.discard_recording(r);
+            } else {
+                i += 1;
+            }
         }
         let mut i = 0;
         while i < self.finishing.len() {
@@ -1164,6 +1458,19 @@ impl Session {
             commands.extend(c);
             placed.extend(p);
         }
+        // New track per pass: (armed track's index, pass tracks put under it).
+        let mut pass_tracks: Vec<(usize, usize)> = Vec::new();
+        // The loop (engine samples) the passes wrapped at.
+        let loop_samples = self
+            .project
+            .loop_range
+            .filter(|_| self.project.loop_enabled)
+            .map(|l| {
+                (
+                    self.engine.musical_to_samples(&self.project, l.start),
+                    self.engine.musical_to_samples(&self.project, l.end),
+                )
+            });
         for take in outcome.takes {
             let p = &mut self.project;
             let Some(track_name) = p.track(take.track).map(|t| t.name.clone()) else {
@@ -1193,7 +1500,25 @@ impl Session {
             let mut new = Vec::new();
             for (k, seg) in take.segments.iter().enumerate() {
                 let offset = seg.file_offset as i64 + r.latency;
-                let len = (seg.frames as i64).min(take.frames as i64 - offset);
+                // A pass reads `latency` frames past its own: the next
+                // pass's first frames are what was played at its end only
+                // when the next one followed at once (the loop wrapped
+                // inside the window). After a punch-out or a locate they are
+                // other audio, so the pass ends with its own frames.
+                let follows = take.segments.get(k + 1).is_some_and(|next| {
+                    loop_samples.is_some_and(|(start, end)| {
+                        seg.timeline_start + seg.frames as i64 == end
+                            && next.timeline_start == start
+                    })
+                });
+                let own_end = if follows {
+                    take.frames as i64
+                } else {
+                    (seg.file_offset + seg.frames) as i64
+                };
+                let len = (seg.frames as i64)
+                    .min(take.frames as i64 - offset)
+                    .min(own_end - offset);
                 if len <= 0 {
                     continue;
                 }
@@ -1231,7 +1556,17 @@ impl Session {
                     placed.extend(clip);
                 }
                 LoopRecordMode::LastPass => {
-                    let last = new.split_off(new.len() - 1);
+                    // The last complete pass: one cut short by Stop (just
+                    // after a wrap, say) does not throw away the whole
+                    // pass before it; with none complete, the last.
+                    let longest = new.iter().map(|t| t.abs_end - t.abs_start).max();
+                    let keep = longest
+                        .and_then(|l| {
+                            let enough = l - (l / 100).max(64);
+                            new.iter().rposition(|t| t.abs_end - t.abs_start >= enough)
+                        })
+                        .unwrap_or(new.len() - 1);
+                    let last = vec![new.swap_remove(keep)];
                     let (cmds, clip) = place_takes(p, take.track, &last, mode, &folder_name);
                     commands.extend(cmds);
                     placed.extend(clip);
@@ -1244,7 +1579,17 @@ impl Session {
                     commands.extend(cmds);
                     placed.extend(clip);
                     let template = p.track(take.track).cloned();
-                    let first = p.track_index(take.track).map_or(0, |i| i + 1);
+                    // Right under the armed track as the batch has it then:
+                    // pass tracks put in above it for other armed tracks
+                    // moved it down.
+                    let own = p.track_index(take.track).unwrap_or(0);
+                    let above: usize = pass_tracks
+                        .iter()
+                        .filter(|(i, _)| *i < own)
+                        .map(|(_, n)| *n)
+                        .sum();
+                    pass_tracks.push((own, new.len()));
+                    let first = own + above + 1;
                     for (index, (k, pass)) in (first..).zip(new.into_iter().enumerate()) {
                         let Some(mut t) = template.clone() else { break };
                         t.id = p.ids.allocate();
@@ -1332,40 +1677,56 @@ impl Session {
                 piece.end
             };
             let fade = |touch: bool, len: i64, edge: i64| if touch { len } else { edge };
+            // As the engine plays the comp: an edge inside the folder that
+            // touches no other piece gets a short declick.
+            let declick = faderframe_project::COMP_DECLICK.min(b - a);
+            let (inner_in, inner_out) = (!touches_prev && a > 0, !touches_next && b < f.length);
             let id: ClipId = p.ids.allocate();
             let start = p.timeline.to_musical(base + a, rate);
             let fades = faderframe_project::ClipFades {
                 fade_in: fade(
                     touches_prev,
                     piece.start + half - a,
-                    if a == 0 { f.fades.fade_in } else { 0 },
+                    if a == 0 { f.fades.fade_in } else { declick },
                 ),
                 fade_out: fade(
                     touches_next,
                     b - (piece.end - half),
-                    if b == f.length { f.fades.fade_out } else { 0 },
+                    if b == f.length {
+                        f.fades.fade_out
+                    } else {
+                        declick
+                    },
                 ),
                 fade_in_shape: if touches_prev {
                     faderframe_project::FadeShape::EqualPower
+                } else if inner_in {
+                    faderframe_project::FadeShape::Linear
                 } else {
                     f.fades.fade_in_shape
                 },
                 fade_out_shape: if touches_next {
                     faderframe_project::FadeShape::EqualPower
+                } else if inner_out {
+                    faderframe_project::FadeShape::Linear
                 } else {
                     f.fades.fade_out_shape
                 },
-                fade_in_bend: if touches_prev {
+                fade_in_bend: if touches_prev || inner_in {
                     0
                 } else {
                     f.fades.fade_in_bend
                 },
-                fade_out_bend: if touches_next {
+                fade_out_bend: if touches_next || inner_out {
                     0
                 } else {
                     f.fades.fade_out_bend
                 },
             };
+            // Both fades fit the piece.
+            let mut fades = fades;
+            fades.fade_in = fades.fade_in.clamp(0, b - a);
+            fades.fade_out = fades.fade_out.clamp(0, b - a - fades.fade_in);
             commands.push(Command::AddClip {
                 clip: Box::new(Clip {
                     id,

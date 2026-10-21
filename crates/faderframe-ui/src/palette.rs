@@ -39,12 +39,23 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.save-as", &["<Control><Shift>s"]),
     ("app.quit", &["<Control>q"]),
     ("app.render", &["<Control><Shift>r"]),
+    ("app.punch", &["<Control>p"]),
     ("app.capture-midi", &["<Control><Shift>c"]),
+    // Ctrl+Space as in Ardour; plain Space stays play/stop
+    // (`transport_keys` leaves Ctrl+Space to these).
+    ("app.abort-recording", &["<Control>space"]),
+    ("app.abort-and-restart", &["<Control><Shift>space"]),
     ("app.save-version", &["<Control><Alt>s"]),
     ("app.command-palette", &["<Control><Shift>p"]),
     ("app.preferences", &["<Control>comma"]),
     ("app.undo", &["<Control>z"]),
     ("app.redo", &["<Control><Shift>z", "<Control>y"]),
+    // The editing context's (or the focused text field's): `edit_keys`.
+    ("app.cut", &["<Control>x"]),
+    ("app.copy", &["<Control>c"]),
+    ("app.paste", &["<Control>v"]),
+    ("app.duplicate", &["<Control>d"]),
+    ("app.select-all", &["<Control>a"]),
     ("app.add-audio", &["<Control>t"]),
     ("app.add-instrument", &["<Control><Shift>t"]),
     ("app.dock-bottom", &["F2"]),
@@ -52,6 +63,7 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.view-piano-roll", &["F4"]),
     ("app.view-performance", &["F8"]),
     ("app.view-tools", &["F12"]),
+    ("app.view-inspector", &["F11"]),
     ("app.workspace-1", &["<Control>1"]),
     ("app.workspace-2", &["<Control>2"]),
     ("app.workspace-3", &["<Control>3"]),
@@ -71,6 +83,19 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.edit-tool::pencil", &["<Alt>0"]),
     ("app.edit-tool::smart", &["<Alt>s"]),
 ];
+
+/// Whether a command is on now (the check or radio dot its menu item
+/// shows): a toggle's state, or a choice's state being the command's
+/// target. `None`: the command switches nothing.
+pub(crate) fn checked(group: &impl IsA<gio::ActionGroup>, c: &Command) -> Option<bool> {
+    let name = c.action.strip_prefix("app.")?;
+    let state = group.action_state(name)?;
+    match &c.target {
+        None => state.get::<bool>(),
+        Some(t) if t.type_() == state.type_() => Some(*t == state),
+        Some(_) => None,
+    }
+}
 
 /// The fixed single-key shortcuts, for the editor's note.
 const FIXED: &str = "Fixed: Space play/stop · Home to start · L loop · K metronome · Shift+R record · T take lanes · A automation · Esc ends MIDI learn";
@@ -189,6 +214,12 @@ fn margins(w: &impl IsA<gtk::Widget>, m: i32) {
 /// The command palette: type to find a command of the menus, Enter runs
 /// it.
 pub fn open(app: &Rc<AppState>) {
+    open_with(app, "");
+}
+
+/// The palette with `query` typed (`command-palette-search:<text>` in
+/// scripts).
+pub(crate) fn open_with(app: &Rc<AppState>, query: &str) {
     let Some(main) = app.window.borrow().clone() else {
         return;
     };
@@ -235,7 +266,19 @@ pub fn open(app: &Rc<AppState>) {
             for (_, c) in found.into_iter().take(80) {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
                 margins(&row, 6);
+                // On/off commands show their state, as the menus do.
+                let state = checked(&app.app, c);
+                let mark = gtk::Label::new(Some(if state == Some(true) { "✓" } else { "" }));
+                mark.set_width_chars(2);
+                row.append(&mark);
                 let label = gtk::Label::new(Some(&c.path));
+                if let Some(on) = state {
+                    label.update_property(&[gtk::accessible::Property::Description(if on {
+                        "on"
+                    } else {
+                        "off"
+                    })]);
+                }
                 label.set_xalign(0.0);
                 label.set_hexpand(true);
                 label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -305,6 +348,9 @@ pub fn open(app: &Rc<AppState>) {
     search.add_controller(keys);
     win.present();
     search.grab_focus();
+    if !query.is_empty() {
+        search.set_text(query);
+    }
 }
 
 /// Change shortcut `accel` to run `detailed` (`None`: clear `detailed`'s);
@@ -375,9 +421,10 @@ pub fn shortcuts(app: &Rc<AppState>) {
         .into_iter()
         .filter(|c| c.action != "app.open-recent" && seen.insert(c.detailed()))
         .collect();
+    // Not an application window: the shortcuts being set must not run
+    // (Ctrl+Q would quit) while the editor waits for keys.
     let win = gtk::Window::builder()
         .title("Keyboard Shortcuts")
-        .application(&app.app)
         .transient_for(&main)
         .default_width(640)
         .default_height(560)
@@ -556,6 +603,34 @@ mod tests {
         assert_eq!(all[2].detailed(), "app.edit::separate");
     }
 
+    /// A command is on when its toggle is, or when its choice is the one
+    /// chosen; others switch nothing.
+    #[test]
+    fn commands_know_whether_they_are_on() {
+        let g = gio::SimpleActionGroup::new();
+        g.add_action(&gio::SimpleAction::new_stateful(
+            "toggle-snap",
+            None,
+            &true.to_variant(),
+        ));
+        g.add_action(&gio::SimpleAction::new_stateful(
+            "edit-mode",
+            Some(&String::static_variant_type()),
+            &"slip".to_variant(),
+        ));
+        g.add_action(&gio::SimpleAction::new("save", None));
+        let c = |action: &str, target: Option<&str>| Command {
+            path: String::new(),
+            action: action.into(),
+            target: target.map(|t| t.to_variant()),
+        };
+        assert_eq!(checked(&g, &c("app.toggle-snap", None)), Some(true));
+        assert_eq!(checked(&g, &c("app.edit-mode", Some("slip"))), Some(true));
+        assert_eq!(checked(&g, &c("app.edit-mode", Some("grid"))), Some(false));
+        assert_eq!(checked(&g, &c("app.save", None)), None);
+        assert_eq!(checked(&g, &c("app.nope", None)), None);
+    }
+
     #[test]
     fn queries_find_commands_by_words() {
         let a = "File › Save Version…";
@@ -566,5 +641,31 @@ mod tests {
         // A word's start beats its middle; shorter wins ties.
         assert!(score("ver", a) > score("ers", a));
         assert!(score("save", "File › Save") > score("save", a));
+    }
+
+    /// No two commands share a default shortcut, and none takes a key an
+    /// editor needs plainly (Ctrl+Alt+,/. nudge-trim, the canvases' Ctrl+Tab
+    /// into the controls); Punch has its default here (the shortcut editor
+    /// shows and restores it).
+    #[test]
+    fn default_shortcuts_do_not_collide() {
+        let mut seen: std::collections::HashMap<&str, &str> = Default::default();
+        for (action, keys) in DEFAULT_SHORTCUTS {
+            for k in *keys {
+                if let Some(other) = seen.insert(k, action) {
+                    panic!("{k} is both {other}'s and {action}'s");
+                }
+            }
+        }
+        for free in [
+            "<Control><Alt>comma",
+            "<Control><Alt>period",
+            "<Control>Tab",
+            "F10",
+            "space",
+        ] {
+            assert!(!seen.contains_key(free), "{free} is taken");
+        }
+        assert_eq!(seen.get("<Control>p"), Some(&"app.punch"));
     }
 }

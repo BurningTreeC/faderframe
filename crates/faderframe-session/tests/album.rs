@@ -294,6 +294,13 @@ fn the_album_is_premastered_for_vinyl_with_a_cutting_sheet() {
         let r = measure(&wav.channels, wav.sample_rate);
         assert!(r.true_peak <= -2.95, "side {k}: {r:?}");
         loudest = loudest.max(r.true_peak);
+        // The report measured the side as written (in its folder, moved
+        // into place as a whole).
+        let reported = done.report.iter().find(|f| &f.path == path).unwrap();
+        let st = reported.stats.clone().unwrap().unwrap();
+        assert_eq!(st.frames, wav.channels[0].len() as u64);
+        let tp = st.levels.unwrap().true_peak;
+        assert!((tp - r.true_peak).abs() < 0.1, "side {k}: {tp} vs {r:?}");
     }
     assert!(loudest > -3.3, "{loudest}");
     // Each song's file, named for its place on the record.

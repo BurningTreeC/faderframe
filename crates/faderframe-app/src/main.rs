@@ -130,11 +130,20 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
 }
 
 fn main() -> ExitCode {
+    // A realtime time limit inherited (a sandbox helper's from FaderFrame)
+    // or set by the desktop: a thread running realtime past it must lose
+    // its priority, never get the process killed.
+    faderframe_realtime::priority::note_rttime_limit();
+    // Where RealtimeKit grants realtime, a thread of this process asks it
+    // for the threads that want it (they never wait for the answer).
+    faderframe_realtime::priority::start_requests();
     // Plugin scan helper (run by FaderFrame itself; a crashing plugin only
     // takes this process down).
     let args: Vec<String> = std::env::args().collect();
     // Plugin sandbox helper: hosts one plugin for FaderFrame.
     if args.get(1).map(String::as_str) == Some("--plugin-sandbox") {
+        // A plugin that crashes here leaves a report (the host plays on).
+        faderframe_ui::crash::install(faderframe_ui::crash::Role::Helper("plugin-sandbox"));
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         tracing_subscriber::fmt()
@@ -150,6 +159,7 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("--check-plugin")
         && let (Some(format), Some(id)) = (args.get(2), args.get(3))
     {
+        faderframe_ui::crash::install(faderframe_ui::crash::Role::Helper("check-plugin"));
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         faderframe_plugin_check::set_alloc_counter(alloc_probe::counter());
         // As the program runs (memory locked where allowed, code mapped).
@@ -173,28 +183,44 @@ fn main() -> ExitCode {
         return ExitCode::from(code.clamp(0, 255) as u8);
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
-
-    match parse(std::env::args().skip(1)) {
-        Ok(Some(options)) => {
-            lock_memory();
-            let code = faderframe_ui::run(options);
-            if code == gtk_exit_success() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        Ok(None) => ExitCode::SUCCESS,
+    let options = match parse(std::env::args().skip(1)) {
+        Ok(Some(options)) => options,
+        Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("faderframe: {e}\n\n{USAGE}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    // Crash reports, and this run's log beside them (Windows' GUI build
+    // has no console to show it in).
+    let log = faderframe_ui::crash::install(faderframe_ui::crash::Role::App);
+    {
+        use tracing_subscriber::prelude::*;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let to_file = log.map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(f))
+        });
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(to_file)
+            .init();
+    }
+    if let Some(report) = faderframe_ui::crash::report_path() {
+        tracing::debug!("crash reports go to {}", report.display());
+    }
+    lock_memory();
+    let code = faderframe_ui::run(options);
+    // Closed, not crashed: nothing to offer next time.
+    faderframe_ui::crash::finished();
+    if code == gtk_exit_success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 

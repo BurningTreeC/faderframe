@@ -25,6 +25,8 @@ pub struct Chrome {
     pub quantize_saved: Cell<(bool, Option<faderframe_timeline::GridDivision>)>,
     pub capture: gtk::Button,
     pub edit_button: gtk::Button,
+    /// "i": the Inspector shown or not.
+    pub inspector: gtk::Button,
     pub edit_bar: CanvasWidget,
     /// Measures how tall the edit toolbar must be at the window's width.
     pub edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView,
@@ -203,6 +205,11 @@ impl Chrome {
             self.edit_bar.set_visible(show);
         }
         set_pressed(&self.edit_button, "edit-active", show);
+        let inspecting = s
+            .workspace()
+            .active_layout()
+            .is_placed(&faderframe_workspace::ViewId::inspector());
+        set_pressed(&self.inspector, "edit-active", inspecting);
         if show {
             let w = self.edit_bar.width();
             if w > 0 {
@@ -377,6 +384,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[
             ("Render / Export…", "app.render"),
+            ("Render Selected Track…", "app.render-selected-track"),
             (
                 "Export Movie (Picture Copied, New Sound)…",
                 "app.export-movie",
@@ -397,6 +405,17 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Undo", "app.undo"),
             ("Redo", "app.redo"),
             ("Undo History", "app.show-history"),
+        ]),
+    );
+    // The selection's (or the focused text field's): `edit_keys`.
+    edit.append_section(
+        None,
+        &section(&[
+            ("Cut", "app.cut"),
+            ("Copy", "app.copy"),
+            ("Paste", "app.paste"),
+            ("Duplicate", "app.duplicate"),
+            ("Select All", "app.select-all"),
         ]),
     );
     edit.append_section(
@@ -424,10 +443,6 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         ("Trim Clips to Selection (Ctrl+Alt+T)", "trim"),
         ("Clear Selection Range", "clear"),
         ("Insert Silence", "silence"),
-        ("Copy Range (Ctrl+C)", "copy"),
-        ("Cut Range (Ctrl+X)", "cut"),
-        ("Paste at Playhead (Ctrl+V)", "paste"),
-        ("Duplicate Range (Ctrl+D)", "duplicate"),
         ("Merge Selected Clips", "merge-clips"),
     ] {
         range.append_item(&target(label, "app.edit", arg));
@@ -442,6 +457,27 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         warp.append_item(&target(label, "app.edit", arg));
     }
     edit.append_section(None, &warp);
+    // Scratch pads (`app.scratch-pad`, see `actions::scratch_pad_op`).
+    let pads = gio::Menu::new();
+    for (label, arg) in [
+        ("New Scratch Pad", "new"),
+        ("New Scratch Pad from Selection", "new-from-selection"),
+        ("Show Song", "song"),
+        ("Show Next Scratch Pad", "next"),
+        ("Bring Scratch Pad to Song (Insert at Playhead)", "to-song"),
+        (
+            "Bring Scratch Pad to Song (Overwrite at Playhead)",
+            "overwrite",
+        ),
+        ("Rename Scratch Pad…", "rename"),
+        ("Duplicate Scratch Pad", "duplicate"),
+        ("Delete Scratch Pad", "delete"),
+    ] {
+        pads.append_item(&target(label, "app.scratch-pad", arg));
+    }
+    let pads_section = gio::Menu::new();
+    pads_section.append_submenu(Some("Scratch Pads"), &pads);
+    edit.append_section(None, &pads_section);
     let modes = gio::Menu::new();
     for (label, arg) in [
         ("Shuffle (Alt+1)", "shuffle"),
@@ -461,19 +497,23 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         ("Grabber (Alt+8)", "grab"),
         ("Separation Grabber", "separate"),
         ("Scrubber (F9)", "scrub"),
-        ("Pencil (F10)", "pencil"),
+        // F10 is the menu bar's (GTK); the arranger takes it in detached
+        // windows. Alt+0 everywhere (shown as the item's shortcut).
+        ("Pencil", "pencil"),
     ] {
         tools.append_item(&target(label, "app.edit-tool", arg));
     }
     let edit_opts = gio::Menu::new();
     edit_opts.append_submenu(Some("Edit Mode"), &modes);
     edit_opts.append_submenu(Some("Edit Tool"), &tools);
+    edit_opts.append_submenu(Some("Edit Options"), &section(&crate::toggles::FLAG_ITEMS));
     edit_opts.append(Some("Edit Toolbar"), Some("app.toggle-edit-toolbar"));
     edit.append_section(None, &edit_opts);
     edit.append_section(
         None,
         &section(&[
             ("Snap to Grid", "app.toggle-snap"),
+            ("Snap to Objects", "app.toggle-snap-objects"),
             ("Follow Playhead", "app.toggle-follow"),
         ]),
     );
@@ -526,7 +566,23 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
             ("Play / Pause", "app.play"),
             ("Stop", "app.stop"),
             ("Return to Start", "app.to-start"),
-            ("Stop Returns to Start", "app.stop-to-start"),
+            ("Return to Start on Stop", "app.return-to-play-start"),
+            ("Return to Project Start on Stop", "app.stop-to-start"),
+        ]),
+    );
+    transport.append_section(
+        None,
+        &section(&[
+            ("Abort Recording", "app.abort-recording"),
+            ("Abort Recording and Restart", "app.abort-and-restart"),
+        ]),
+    );
+    transport.append_section(
+        None,
+        &section(&[
+            ("Set Play Start Marker at Playhead", "app.set-play-start"),
+            ("Play from Play Start Marker", "app.play-from-marker"),
+            ("Remove Play Start Marker", "app.remove-play-start"),
         ]),
     );
     transport.append_section(
@@ -534,6 +590,8 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Loop", "app.loop"),
             ("Record", "app.record"),
+            ("Metronome On (K)", "app.toggle-metronome"),
+            ("Input Quantize (Q)", "app.input-quantize"),
             ("Capture MIDI", "app.capture-midi"),
             ("Varispeed…", "app.varispeed"),
         ]),
@@ -566,7 +624,9 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     view.append_section(
         None,
         &section(&[
+            ("Inspector", "app.view-inspector"),
             ("Mixer", "app.view-mixer"),
+            ("Channel Overview", "app.view-channel-overview"),
             ("Piano Roll", "app.view-piano-roll"),
             ("MIDI Event List", "app.view-events"),
             ("Automation", "app.view-automation"),
@@ -694,7 +754,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     transport.append(&to_start);
     let stop = icon_button(
         "media-playback-stop-symbolic",
-        "Stop (twice: to start)",
+        "Stop (twice: to start) · right-click: Return to Start on Stop",
         "app.stop",
     );
     transport.append(&stop);
@@ -774,9 +834,16 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     // A right-click on each learns a MIDI control for it (or forgets one).
     {
         use faderframe_project::{MappingTarget, TransportControl as T};
+        // The Stop button's own choices first: where Stop leaves the
+        // playhead.
+        crate::learn::on_right_click_with(
+            app,
+            &stop,
+            MappingTarget::Transport { control: T::Stop },
+            crate::recording::stop_menu,
+        );
         for (b, control) in [
             (&to_start, T::ToStart),
-            (&stop, T::Stop),
             (&play, T::PlayStop),
             (&record, T::Record),
             (&looping, T::Loop),
@@ -808,6 +875,17 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     edit_button.set_action_name(Some("app.toggle-edit-toolbar"));
     edit_button.add_css_class("edit-toggle");
     transport.append(&edit_button);
+    // The Inspector (Studio One's "i"): the selected track's settings,
+    // devices and channel, left of the arranger.
+    let inspector = gtk::Button::with_label("i");
+    inspector.set_tooltip_text(Some(
+        "Inspector: the selected track's routing, settings, devices and channel (F11)",
+    ));
+    inspector.update_property(&[gtk::accessible::Property::Label("Inspector")]);
+    inspector.set_action_name(Some("app.view-inspector"));
+    inspector.add_css_class("edit-toggle");
+    inspector.add_css_class("inspector-toggle");
+    transport.append(&inspector);
 
     let display = CanvasWidget::new(app, Box::new(TransportDisplay::new()));
     display.set_size_request(370, 38);
@@ -954,6 +1032,7 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         quantize_saved: Cell::new((false, None)),
         capture,
         edit_button,
+        inspector,
         edit_bar,
         edit_bar_layout: faderframe_view_arranger::edit_bar::EditToolbarView::new(
             app.theme.borrow().clone(),

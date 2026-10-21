@@ -329,6 +329,8 @@ impl Session {
 
     /// Write the lyrics as `<project>.lrc` and `.srt` next to the project
     /// (in the media folder while it is unsaved); returns the LRC's path.
+    /// Existing ones are asked about first (both in one question), and
+    /// the two files move into place together ([`crate::exports`]).
     pub fn export_lyrics(&mut self) -> Result<PathBuf> {
         if self.project.lyrics.is_empty() {
             return Err(SessionError::Other("there are no lyrics to export".into()));
@@ -341,17 +343,17 @@ impl Session {
         let stem = self.project.name.clone();
         let lrc = dir.join(format!("{stem}.lrc"));
         let srt = dir.join(format!("{stem}.srt"));
-        for (path, text) in [
-            (&lrc, self.lyrics_text(false)),
-            (&srt, self.lyrics_text(true)),
-        ] {
-            std::fs::write(path, text)
-                .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
-        }
-        self.notify(
-            NoticeLevel::Info,
-            format!("Lyrics written to {} and .srt", lrc.display()),
-        );
+        let files = vec![
+            (lrc.clone(), self.lyrics_text(false).into_bytes()),
+            (srt, self.lyrics_text(true).into_bytes()),
+        ];
+        let shown = lrc.clone();
+        self.write_export("Lyrics", files, move |s, _| {
+            s.notify(
+                NoticeLevel::Info,
+                format!("Lyrics written to {} and .srt", shown.display()),
+            );
+        })?;
         Ok(lrc)
     }
 

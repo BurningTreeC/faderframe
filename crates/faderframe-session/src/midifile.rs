@@ -430,8 +430,33 @@ impl Session {
     }
 
     /// Write the MIDI of instrument and MIDI tracks (or only `clips`) as a
-    /// format-1 MIDI file. Returns the number of tracks written.
-    pub fn export_midi_file(&self, path: &Path, clips: Option<&[ClipId]>) -> Result<usize> {
+    /// format-1 MIDI file. Returns the number of tracks it holds. An
+    /// existing file is asked about first; the file is staged and moved
+    /// into place ([`crate::exports`]), then a notice says so.
+    pub fn export_midi_file(&mut self, path: &Path, clips: Option<&[ClipId]>) -> Result<usize> {
+        let (bytes, n) = self.midi_file_bytes(clips)?;
+        crate::exports::make_parent(path)?;
+        let shown = path.to_path_buf();
+        self.write_export(
+            "MIDI file",
+            vec![(path.to_path_buf(), bytes)],
+            move |s, _| {
+                s.notify(
+                    crate::NoticeLevel::Info,
+                    format!(
+                        "exported {n} track{} to {}",
+                        if n == 1 { "" } else { "s" },
+                        shown.display()
+                    ),
+                );
+            },
+        )?;
+        Ok(n)
+    }
+
+    /// The MIDI file of instrument and MIDI tracks (or only `clips`), and
+    /// how many tracks it holds.
+    fn midi_file_bytes(&self, clips: Option<&[ClipId]>) -> Result<(Vec<u8>, usize)> {
         let p = &self.project;
         let tick = |t: MusicalTime| -> u64 {
             (t.ticks().max(0) as i128 * EXPORT_PPQ as i128 / TICKS_PER_QUARTER as i128) as u64
@@ -568,8 +593,9 @@ impl Session {
             });
             smf.tracks.push(out);
         }
-        smf.save(path)
-            .map_err(|e| err(format!("{}: {e}", path.display())))?;
-        Ok(written)
+        let mut bytes = Vec::new();
+        smf.write_std(&mut bytes)
+            .map_err(|e| err(format!("the MIDI file: {e}")))?;
+        Ok((bytes, written))
     }
 }

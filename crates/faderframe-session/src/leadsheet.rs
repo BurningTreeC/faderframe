@@ -930,11 +930,20 @@ impl Session {
                 ));
             }
         };
-        std::fs::write(path, bytes).map_err(|e| SessionError::Other(e.to_string()))?;
-        self.notify(
-            NoticeLevel::Info,
-            format!("Lead sheet written to {}", path.display()),
-        );
+        // Staged and moved into place; an existing file is asked about
+        // ([`crate::exports`]).
+        crate::exports::make_parent(path)?;
+        let shown = path.to_path_buf();
+        self.write_export(
+            "Lead sheet",
+            vec![(path.to_path_buf(), bytes)],
+            move |s, _| {
+                s.notify(
+                    NoticeLevel::Info,
+                    format!("Lead sheet written to {}", shown.display()),
+                );
+            },
+        )?;
         Ok(path.to_path_buf())
     }
 }

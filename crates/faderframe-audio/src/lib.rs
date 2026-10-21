@@ -15,17 +15,26 @@
 //!
 //! Backends in this repository:
 //! * [`dummy::DummyBackend`] — a timer-driven backend without hardware, used
-//!   when no audio server is available and for CI.
+//!   when no audio server is available and for CI (and, with
+//!   [`dummy::DummyDevices`], devices that come and go in tests).
+//! * `faderframe-audio-pipewire` — PipeWire's own API (Linux).
 //! * `faderframe-audio-jack` — JACK (JACK2 or pipewire-jack).
+//! * `faderframe-audio-cpal` — WASAPI/ASIO (Windows), CoreAudio (macOS),
+//!   ALSA (Linux).
 //!
-//! Planned: PipeWire native, ALSA, WASAPI/ASIO (Windows), CoreAudio (macOS).
+//! What a backend lets the user choose is [`Capabilities`]; a request is
+//! checked against its devices with [`resolve`] before a stream opens.
 
 #![forbid(unsafe_code)]
 
 pub mod dummy;
 mod owned;
+mod setup;
 
 pub use owned::OwnedBuffers;
+pub use setup::{
+    Capabilities, RateControl, Request, Resolution, StreamRouting, find_device, resolve,
+};
 
 use std::fmt;
 use std::sync::Arc;
@@ -83,26 +92,44 @@ pub enum AudioError {
     Unsupported(&'static str),
 }
 
-/// A device (or, for server backends such as JACK, the server) as seen by
-/// device enumeration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A device (or, for server backends, a node or port group of the server's
+/// graph) as seen by device enumeration. A device may only play
+/// (`input_channels == 0`) or only record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceInfo {
+    /// Stable identifier to ask for it by (PipeWire node name, JACK client
+    /// name, the system API's device id).
     pub id: String,
     pub name: String,
     pub input_channels: u16,
     pub output_channels: u16,
+    /// The channels' own names where the backend has them (PipeWire and
+    /// JACK port names), in channel order.
+    pub input_names: Vec<String>,
+    pub output_names: Vec<String>,
     /// Rates the device can run at (empty = determined by a server).
     pub sample_rates: Vec<u32>,
     /// Current rate if the device/server has a fixed one.
     pub current_sample_rate: Option<u32>,
     pub current_buffer_size: Option<u32>,
+    /// Buffer sizes the device takes (frames, inclusive), if it says.
+    pub buffer_sizes: Option<(u32, u32)>,
+    /// Devices with the same clock run in step (one card's playback and
+    /// capture); `None`: not known.
+    pub clock: Option<String>,
     pub is_default: bool,
 }
 
 /// Requested stream parameters. `None` means "backend default".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamConfig {
-    pub device: Option<String>,
+    /// Devices to play on, by [`DeviceInfo::id`]; their channels follow one
+    /// another on the stream's outputs (backends that take one use the
+    /// first). Empty: the default output.
+    pub output_devices: Vec<String>,
+    /// Devices to record from. Empty: the output device where it records,
+    /// else the default input.
+    pub input_devices: Vec<String>,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
     pub input_channels: u16,
@@ -111,12 +138,17 @@ pub struct StreamConfig {
     pub client_name: String,
     /// Connect to the system's physical ports automatically.
     pub auto_connect: bool,
+    /// Server backends that can: hold the whole graph at this rate and
+    /// buffer size while the stream runs, instead of asking (PipeWire's
+    /// `node.force-rate`/`node.force-quantum`). Others ignore it.
+    pub force_format: bool,
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            device: None,
+            output_devices: Vec::new(),
+            input_devices: Vec::new(),
             sample_rate: None,
             buffer_size: None,
             // Enough for multitrack recording; JACK connects them to the
@@ -125,6 +157,7 @@ impl Default for StreamConfig {
             output_channels: 2,
             client_name: "FaderFrame".into(),
             auto_connect: true,
+            force_format: false,
         }
     }
 }
@@ -193,6 +226,10 @@ pub struct StreamMonitor {
     callbacks: AtomicU64,
     running: AtomicBool,
     shut_down: AtomicBool,
+    /// Latencies beyond the stream's buffer as the backend learns them
+    /// while running (frames); `u32::MAX`: not known.
+    input_latency: AtomicU32,
+    output_latency: AtomicU32,
 }
 
 impl StreamMonitor {
@@ -200,7 +237,22 @@ impl StreamMonitor {
         let m = Self::default();
         m.sample_rate.store(sample_rate, Ordering::Relaxed);
         m.buffer_size.store(buffer_size, Ordering::Relaxed);
+        m.input_latency.store(u32::MAX, Ordering::Relaxed);
+        m.output_latency.store(u32::MAX, Ordering::Relaxed);
         Arc::new(m)
+    }
+
+    /// The latency between the device and the stream's input (realtime
+    /// safe: an atomic store).
+    #[inline]
+    pub fn set_input_latency(&self, frames: u32) {
+        self.input_latency.store(frames, Ordering::Relaxed);
+    }
+
+    /// The latency between the stream's output and the device.
+    #[inline]
+    pub fn set_output_latency(&self, frames: u32) {
+        self.output_latency.store(frames, Ordering::Relaxed);
     }
 
     #[inline]
@@ -238,8 +290,14 @@ impl StreamMonitor {
             buffer_size: self.buffer_size.load(Ordering::Relaxed),
             running: self.running.load(Ordering::Relaxed),
             shut_down: self.shut_down.load(Ordering::Relaxed),
+            input_latency: known(self.input_latency.load(Ordering::Relaxed)),
+            output_latency: known(self.output_latency.load(Ordering::Relaxed)),
         }
     }
+}
+
+fn known(frames: u32) -> Option<u32> {
+    (frames != u32::MAX).then_some(frames)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -251,6 +309,10 @@ pub struct StreamStatus {
     pub running: bool,
     /// The server/device went away; the stream must be reopened.
     pub shut_down: bool,
+    /// Latencies beyond the buffer the backend measured or was told while
+    /// running (frames), if any.
+    pub input_latency: Option<u32>,
+    pub output_latency: Option<u32>,
 }
 
 /// An open, running stream. Dropping it stops processing and releases the
@@ -259,11 +321,27 @@ pub trait AudioStream: Send {
     fn info(&self) -> StreamInfo;
     fn status(&self) -> StreamStatus;
 
-    /// Ask the backend for a different buffer size (JACK supports this at
-    /// runtime; device backends may need a reopen).
+    /// Ask the backend for a different buffer size (JACK and PipeWire
+    /// support this at runtime; device backends need a reopen).
     fn request_buffer_size(&mut self, _frames: u32) -> Result<(), AudioError> {
         Err(AudioError::Unsupported("changing the buffer size"))
     }
+
+    /// Ask the server for a different sample rate without reopening
+    /// (PipeWire). It may keep its own: the stream's status says.
+    fn request_sample_rate(&mut self, _rate: u32) -> Result<(), AudioError> {
+        Err(AudioError::Unsupported("changing the sample rate"))
+    }
+
+    /// How the stream's channels are connected now, as far as the backend
+    /// knows (control side; may take a lock).
+    fn routing(&self) -> StreamRouting {
+        StreamRouting::default()
+    }
+
+    /// Called about once a second on the control side: reconnect channels
+    /// whose device came back (JACK). Never on the realtime path.
+    fn maintain(&mut self) {}
 
     /// The device's audio workgroup (macOS: CoreAudio's IO thread is in
     /// it), for threads that do part of the callback's work to join.
@@ -277,6 +355,11 @@ pub trait AudioBackend: Send {
     /// Stable identifier ("jack", "dummy").
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
+
+    /// What can be chosen for this backend's streams.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
 
     /// Cheap probe: can a stream be opened right now?
     fn is_available(&self) -> bool;

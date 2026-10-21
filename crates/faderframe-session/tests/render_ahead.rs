@@ -151,3 +151,80 @@ fn a_locate_shows_at_once_while_render_ahead_primes_it() {
     );
     s.stop_audio();
 }
+
+/// Dragging the loop's end while playing, as the arranger does (one
+/// gesture, a `SetLoop` per pointer move): no timeline snapshot, no graph
+/// and no new render-ahead sequence per move — the playhead runs on
+/// without stepping back — one undo step, and the loop ends where it was
+/// dragged to.
+#[test]
+fn dragging_the_loop_while_playing_rebuilds_nothing() {
+    use faderframe_project::MusicalRange;
+    use faderframe_timeline::MusicalTime;
+    let mut s = Session::new(lead_alone(), None, EngineConfig::default()).unwrap();
+    s.set_render_ahead(Some(Duration::from_millis(150)))
+        .unwrap();
+    s.dispatch(Action::SelectTracks {
+        tracks: Vec::new(),
+        mode: faderframe_session::SelectMode::Replace,
+    })
+    .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    run(&mut s, Duration::from_millis(200));
+    assert!(!s.engine().ahead_tracks().is_empty(), "rendered ahead");
+    let q = MusicalTime::from_quarters_i;
+    s.dispatch(Action::Transport(TransportAction::SetLoop(
+        MusicalRange::new(q(0), q(32)),
+    )))
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Locate(q(2))))
+        .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    run(&mut s, Duration::from_millis(400));
+    let plan = s.engine().stream_plan();
+    let graphs = s.engine().graphs_installed();
+    let late = s.render_ahead_status().1;
+    let undo = s.history_steps().0.len();
+    let mut last = s.processing_position();
+    let mut back = Vec::new();
+    s.dispatch(Action::BeginGesture("Change Loop".into()))
+        .unwrap();
+    // 120 bpm: the playhead (bar 1 and a bit) never nears the loop's end.
+    for k in 0..60 {
+        let end = MusicalTime::from_quarters(32.0 + f64::from(k) * 0.25);
+        s.dispatch(Action::Transport(TransportAction::SetLoop(
+            MusicalRange::new(q(0), end),
+        )))
+        .unwrap();
+        let until = Instant::now() + Duration::from_millis(16);
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
+            s.tick(0.002);
+            let now = s.processing_position();
+            if now < last {
+                back.push((last, now));
+            }
+            last = now;
+        }
+    }
+    s.dispatch(Action::EndGesture).unwrap();
+    assert!(back.is_empty(), "the playhead stepped back: {back:?}");
+    assert!(
+        std::sync::Arc::ptr_eq(&plan, &s.engine().stream_plan()),
+        "no new timeline snapshot"
+    );
+    assert_eq!(s.engine().graphs_installed(), graphs, "no new graph");
+    assert_eq!(s.history_steps().0.len(), undo + 1, "one undo step");
+    assert_eq!(
+        s.project().loop_range,
+        MusicalRange::new(q(0), MusicalTime::from_quarters(32.0 + 59.0 * 0.25))
+    );
+    let late = s.render_ahead_status().1 - late;
+    assert!(late <= 2, "late {late} times while dragging");
+    s.stop_audio();
+}

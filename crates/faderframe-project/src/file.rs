@@ -109,13 +109,20 @@ fn migrate_v1_to_v2(mut doc: Value) -> Result<Value, FileError> {
     Ok(doc)
 }
 
-/// Serialise to the current file format.
+/// Serialise to the current file format. The song is always written in
+/// place (a scratch pad shown is put aside and named as the one to show
+/// when the file is opened, see [`crate::scratch`]).
 pub fn to_string(project: &Project, workspace: Option<&WorkspaceSet>) -> Result<String, FileError> {
+    let shown = project.shown_pad();
+    let mut song = project.song();
+    if shown.is_some() {
+        song.to_mut().scratch_pads.open = shown;
+    }
     let out = FileOut {
         format: FORMAT_ID,
         version: CURRENT_VERSION,
         generator: concat!("FaderFrame ", env!("CARGO_PKG_VERSION")).to_string(),
-        project,
+        project: &song,
         workspace,
     };
     Ok(serde_json::to_string_pretty(&out)?)
@@ -153,6 +160,12 @@ pub fn from_str(text: &str) -> Result<LoadedProject, FileError> {
         mut workspace,
     } = serde_json::from_value(doc)?;
     notes.extend(project.repair());
+    // The scratch pad that was shown when it was saved.
+    if let Some(pad) = project.scratch_pads.open.take()
+        && let Err(e) = project.show_arrangement(Some(pad))
+    {
+        notes.push(format!("the scratch pad shown last is gone: {e}"));
+    }
     if let Some(ws) = &mut workspace {
         ws.sanitise();
     }

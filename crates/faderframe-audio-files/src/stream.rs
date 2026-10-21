@@ -158,6 +158,11 @@ impl StreamSource {
             if i >= self.pages.len() || self.pages.is_resident(i) {
                 continue;
             }
+            // The loader runs realtime (below the audio thread, see
+            // `faderframe_realtime::priority`): a whole session's pages
+            // after a locate, read from the cache without ever sleeping, can
+            // take longer than the realtime time limit.
+            faderframe_realtime::priority::breathe();
             let mut channels: Vec<Box<[f32]>> = (0..self.channels())
                 .map(|_| vec![0.0; PAGE_FRAMES].into_boxed_slice())
                 .collect();

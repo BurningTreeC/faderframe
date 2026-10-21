@@ -373,11 +373,15 @@ pub(crate) fn start(
     progress.total.store(frames, Ordering::Relaxed);
     let p = Arc::clone(&progress);
     let path = settings.output.clone();
+    let (bed_channels, objects) = (plan.bed.len(), plan.objects());
     RenderJob::spawn(progress, move || {
         let io = |source: std::io::Error| RenderError::Io {
             path: path.clone(),
             source,
         };
+        // Written beside the destination, moved there when complete.
+        let file = crate::render::files::StagedFile::new(&path)?;
+        let began = std::time::Instant::now();
         let mut sources = faderframe_engine::render_generated_sources(&routed, rate);
         for (_, file, e) in crate::media::open_file_sources(&routed, None, &mut sources) {
             tracing::warn!("render: {}: {e}", file.display());
@@ -401,7 +405,7 @@ pub(crate) fn start(
         // The plugins' delay comes off the front: metadata and audio line up.
         let mut skip = r.controller.graph_stats().output_latency as u64;
         let mut w = faderframe_audio_files::bw64::Bw64Writer::create(
-            &path,
+            file.temp(),
             order.len() as u16,
             rate,
             faderframe_audio_files::WavFormat::Pcm24,
@@ -413,8 +417,8 @@ pub(crate) fn start(
         let mut done = 0u64;
         while done < frames {
             if p.cancel.load(Ordering::Relaxed) {
+                // Closed before the temporary file goes (Windows).
                 drop(w);
-                let _ = std::fs::remove_file(&path);
                 return Err(RenderError::Cancelled);
             }
             let n = (frames - done).min(16_384) + skip.min(16_384);
@@ -443,10 +447,21 @@ pub(crate) fn start(
             ));
         }
         w.finish(&after).map_err(io)?;
-        Ok(vec![Rendered {
-            path: path.clone(),
-            finished: None,
-        }])
+        let written = crate::render::stats::Written::Adm {
+            bed: bed_channels,
+            objects,
+        };
+        let seconds = began.elapsed().as_secs_f64();
+        let stats = crate::render::measure_written(&file, &written, &settings, seconds, &p)?;
+        crate::render::Staged::new(vec![(
+            file,
+            Rendered {
+                path: path.clone(),
+                finished: None,
+                stats,
+            },
+        )])
+        .commit(&settings.overwrite)
     })
 }
 

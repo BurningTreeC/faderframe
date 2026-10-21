@@ -42,10 +42,16 @@ pub enum ViewKind {
     Spectral,
     /// The show's songs; show mode.
     Setlist,
+    /// The selected track's settings, devices and channel strip (left of
+    /// the arranger).
+    Inspector,
+    /// The selected track's processing chain from input to output, a card
+    /// per device.
+    ChannelOverview,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 20] = [
+    pub const ALL: [ViewKind; 22] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -66,13 +72,17 @@ impl ViewKind {
         ViewKind::Events,
         ViewKind::Spectral,
         ViewKind::Setlist,
+        ViewKind::Inspector,
+        ViewKind::ChannelOverview,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 20] = [
+    pub const TAB_ORDER: [ViewKind; 22] = [
         ViewKind::Arranger,
+        ViewKind::Inspector,
         ViewKind::Mixer,
+        ViewKind::ChannelOverview,
         ViewKind::PianoRoll,
         ViewKind::Events,
         ViewKind::Automation,
@@ -129,6 +139,18 @@ impl ViewKind {
             ViewKind::Events => "Event List",
             ViewKind::Spectral => "Spectral Editor",
             ViewKind::Setlist => "Setlist",
+            ViewKind::Inspector => "Inspector",
+            ViewKind::ChannelOverview => "Channel Overview",
+        }
+    }
+
+    /// The dock area the view goes to when it is shown and has no home
+    /// yet: the Inspector's own area left of the arranger, the bottom
+    /// dock for the others.
+    pub fn default_area(self) -> DockAreaId {
+        match self {
+            ViewKind::Inspector => DockAreaId::left(),
+            _ => DockAreaId::bottom(),
         }
     }
 
@@ -154,9 +176,15 @@ impl ViewKind {
             ViewKind::Events => ViewId::events(),
             ViewKind::Spectral => ViewId::spectral(),
             ViewKind::Setlist => ViewId::setlist(),
+            ViewKind::Inspector => ViewId::inspector(),
+            ViewKind::ChannelOverview => ViewId::channel_overview(),
         }
     }
 }
+
+/// The share of the main window's width the left area (the Inspector)
+/// starts with.
+pub const LEFT_AREA_RATIO: f32 = 0.2;
 
 /// Named dock area; tab groups with an area id survive becoming empty.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -174,6 +202,11 @@ impl DockAreaId {
 
     pub fn bottom() -> Self {
         Self::new("bottom")
+    }
+
+    /// Left of the main area (the Inspector's).
+    pub fn left() -> Self {
+        Self::new("left")
     }
 }
 
@@ -647,15 +680,19 @@ impl WorkspaceLayout {
         Ok(id)
     }
 
-    /// Dock a view into `area` (or its home area, or "bottom") and make it
-    /// the active, visible tab there.
+    /// Dock a view into `area` (or its home area, or its kind's
+    /// [`ViewKind::default_area`]) and make it the active, visible tab
+    /// there. The left area is made when a layout has none yet.
     pub fn attach(&mut self, view: &ViewId, area: Option<DockAreaId>) -> Result<(), LayoutError> {
-        if !self.views.contains_key(view) {
+        let Some(kind) = self.views.get(view).copied() else {
             return Err(LayoutError::UnknownView(view.clone()));
-        }
+        };
         let target = area
             .or_else(|| self.home.get(view).cloned())
-            .unwrap_or_else(DockAreaId::bottom);
+            .unwrap_or_else(|| kind.default_area());
+        if target == DockAreaId::left() {
+            self.ensure_left_area();
+        }
         if self.area(&target).is_none() {
             return Err(LayoutError::UnknownArea(target));
         }
@@ -670,6 +707,36 @@ impl WorkspaceLayout {
         // Back in its place among the tabs, not at the end.
         self.order_tabs();
         Ok(())
+    }
+
+    /// Make the area left of the main one (the Inspector's) when the
+    /// layout has none (layouts saved before it existed): the main area's
+    /// node is split, an empty left group first. An empty area takes no
+    /// room. Returns whether the layout has it now.
+    pub fn ensure_left_area(&mut self) -> bool {
+        if self.area(&DockAreaId::left()).is_some() {
+            return true;
+        }
+        let mut found = None;
+        self.main.for_each_group(&mut Vec::new(), &mut |path, g| {
+            if found.is_none() && g.area == Some(DockAreaId::main()) {
+                found = Some(path.to_vec());
+            }
+        });
+        let Some(path) = found else {
+            return false;
+        };
+        let Some(node) = self.main.node_at_mut(&path) else {
+            return false;
+        };
+        let main = std::mem::replace(node, DockNode::Tabs(TabGroup::new(None, vec![])));
+        *node = DockNode::split(
+            Axis::Horizontal,
+            LEFT_AREA_RATIO,
+            DockNode::Tabs(TabGroup::new(Some(DockAreaId::left()), vec![])),
+            main,
+        );
+        true
     }
 
     /// Every tab group in [`ViewKind::TAB_ORDER`] (views of unknown kinds
@@ -915,6 +982,70 @@ mod tests {
         assert!(!l.set_ratio(WindowRef::Main, &[0], 0.5));
         assert!(l.set_active(WindowRef::Main, &[1], 1));
         assert!(!l.set_active(WindowRef::Main, &[1], 10));
+    }
+
+    /// The Inspector goes left of the arranger: layouts without the left
+    /// area (saved before it existed) get it on first use, empty it takes
+    /// no room, and closing the Inspector keeps it for next time.
+    #[test]
+    fn the_inspector_docks_left_of_the_arranger() {
+        let mut l = layout();
+        assert!(l.area(&DockAreaId::left()).is_none(), "made on first use");
+        let inspector = ViewId::inspector();
+        l.activate(&inspector).unwrap();
+        l.validate().unwrap();
+        assert!(l.is_showing(&inspector));
+        let left = l.area(&DockAreaId::left()).unwrap();
+        assert_eq!(left.views, vec![inspector.clone()]);
+        // Beside the arranger, the bottom dock under both as before.
+        let DockNode::Split {
+            axis: Axis::Vertical,
+            first,
+            ..
+        } = &l.main
+        else {
+            panic!("the bottom dock's split stays the root");
+        };
+        let DockNode::Split {
+            axis: Axis::Horizontal,
+            first: side,
+            second: main,
+            ratio,
+        } = first.as_ref()
+        else {
+            panic!("the left area beside the main one");
+        };
+        assert!((ratio - LEFT_AREA_RATIO).abs() < 1e-6);
+        assert!(matches!(side.as_ref(), DockNode::Tabs(g) if g.area == Some(DockAreaId::left())));
+        assert!(matches!(main.as_ref(), DockNode::Tabs(g) if g.views == vec![ViewId::arranger()]));
+        // Closed: the area stays (empty, out of sight), the arranger shows.
+        l.remove_view(&inspector);
+        l.validate().unwrap();
+        assert!(!l.area(&DockAreaId::left()).unwrap().is_visible());
+        assert!(l.is_showing(&ViewId::arranger()));
+        // Shown again it goes back there; detached and docked back too.
+        l.activate(&inspector).unwrap();
+        assert_eq!(
+            l.area(&DockAreaId::left()).unwrap().views,
+            vec![inspector.clone()]
+        );
+        l.detach(&inspector, WindowGeometry::default()).unwrap();
+        l.attach(&inspector, None).unwrap();
+        assert!(
+            l.area(&DockAreaId::left())
+                .unwrap()
+                .views
+                .contains(&inspector)
+        );
+        // The other views still go to the bottom dock.
+        l.activate(&ViewId::channel_overview()).unwrap();
+        assert!(
+            l.area(&DockAreaId::bottom())
+                .unwrap()
+                .views
+                .contains(&ViewId::channel_overview())
+        );
+        l.validate().unwrap();
     }
 
     #[test]

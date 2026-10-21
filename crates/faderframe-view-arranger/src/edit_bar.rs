@@ -202,6 +202,13 @@ impl EditToolbarView {
         );
         add(
             &mut flow,
+            Item::Flag(EditFlag::SnapToObjects),
+            "Objects".into(),
+            e.snap_objects,
+            56.0,
+        );
+        add(
+            &mut flow,
             Item::Flag(EditFlag::SnapToSamples),
             "Samples".into(),
             e.snap_samples,
@@ -406,6 +413,9 @@ impl EditToolbarView {
             Item::Flag(EditFlag::SnapToSamples) => {
                 "Snap to Samples: positions off the grid (snap off, Alt, Slip) land on whole samples".into()
             }
+            Item::Flag(EditFlag::SnapToObjects) => {
+                "Snap to Objects: drags snap to clip starts and ends on every shown track, markers, sections, the loop, the selection and the playhead within 8 pixels, before the grid (Alt: no snapping)".into()
+            }
             Item::Flag(EditFlag::SnapToZeroCrossings) => {
                 "Snap to Zero Crossings: cuts and trims of audio clips move to the nearest zero crossing (within 5 ms), so they do not click".into()
             }
@@ -481,6 +491,7 @@ impl EditToolbarView {
                     EditFlag::EditToolbar => e.show_edit_toolbar,
                     EditFlag::SnapToSamples => e.snap_samples,
                     EditFlag::SnapToZeroCrossings => e.zero_crossings,
+                    EditFlag::SnapToObjects => e.snap_objects,
                     EditFlag::PolyphonicPitch => e.pitch_polyphonic,
                     EditFlag::StopToStart => e.stop_to_start,
                 };

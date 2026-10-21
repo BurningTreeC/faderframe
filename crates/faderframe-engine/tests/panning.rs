@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 //! Panning through the engine: mono pan by the project's law, stereo
 //! balance, dual pan, their automation and smoothing, and how they meet
-//! sends, buses and the master.
+//! sends (their own pans too), buses, aux returns, beds and the master.
 
 mod common;
 
@@ -13,7 +13,7 @@ use faderframe_automation::{
 use faderframe_core::{AudioSourceId, ChannelLayout, DualPan, PanLaw, PanMode, SendId, TrackId};
 use faderframe_engine::EngineConfig;
 use faderframe_engine::offline::{OfflineRenderer, render_project};
-use faderframe_project::{AuxSend, Command, History, SendTap, TrackKind};
+use faderframe_project::{AuxSend, Command, History, OutputRouting, SendTap, TrackKind};
 use faderframe_timeline::MusicalTime;
 
 const SR: u32 = 48_000;
@@ -647,4 +647,287 @@ fn a_sine_keeps_its_phase_through_every_mode() {
 
 fn t_dual(left: f32, right: f32) -> DualPan {
     DualPan { left, right }
+}
+
+/// A send from `from` to `to` (its own pan `pan`).
+fn send_to(
+    tp: &mut TestProject,
+    from: TrackId,
+    to: TrackId,
+    tap: SendTap,
+    pan: Option<f32>,
+) -> SendId {
+    let id = SendId(tp.project.ids.allocate::<SendId>().raw());
+    tp.project.track_mut(from).unwrap().sends.push(AuxSend {
+        id,
+        target: to,
+        level_db: 0.0,
+        tap,
+        enabled: true,
+        pan,
+    });
+    id
+}
+
+/// Aux returns pan as every strip does, whatever feeds them: a stereo
+/// return by its balance, a mono one by the pan law; fed by a mono or a
+/// stereo track, from every tap. Only the return is heard (the track's
+/// output is off: its taps carry the source as it is).
+#[test]
+fn aux_returns_pan_whatever_feeds_them() {
+    let law = PanLaw::ConstantPower3dB;
+    for aux_layout in [ChannelLayout::Stereo, ChannelLayout::Mono] {
+        for (src_l, src_r, stereo) in [(0.5f32, 0.5, false), (0.6, -0.2, true)] {
+            for tap in [SendTap::PreFx, SendTap::PreFader, SendTap::PostFader] {
+                for pan in [-1.0f32, -0.4, 0.0, 0.7, 1.0] {
+                    let mut tp = TestProject::new(SR);
+                    let aux = tp.track(TrackKind::Aux, "Aux", aux_layout);
+                    let (src, layout) = if stereo {
+                        (
+                            stereo_dc(&mut tp, src_l, src_r, 9600),
+                            ChannelLayout::Stereo,
+                        )
+                    } else {
+                        (tp.dc(1, src_l, 9600), ChannelLayout::Mono)
+                    };
+                    let a = track_with(&mut tp, "A", layout, src, 9600);
+                    tp.project.track_mut(a).unwrap().output = OutputRouting::None;
+                    send_to(&mut tp, a, aux, tap, None);
+                    tp.project.track_mut(aux).unwrap().pan = pan;
+                    let out = render(&tp, 256, 4096);
+                    let (l, r) = if aux_layout == ChannelLayout::Stereo {
+                        let (gl, gr) = faderframe_core::pan::stereo_balance(pan);
+                        (src_l * gl, src_r * gr)
+                    } else {
+                        // Into a mono return (L + R) / 2, placed by the law.
+                        let m = (src_l + src_r) * 0.5;
+                        let (gl, gr) = law.mono_gains(pan);
+                        (m * gl, m * gr)
+                    };
+                    let what = format!("{aux_layout:?} return, {layout:?} {tap:?}, pan {pan}");
+                    assert!(
+                        approx(out[0][AT], l, 1e-5),
+                        "{what}: L {} vs {l}",
+                        out[0][AT]
+                    );
+                    assert!(
+                        approx(out[1][AT], r, 1e-5),
+                        "{what}: R {} vs {r}",
+                        out[1][AT]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A return's pan lane moves it (and its knob's value waits under it).
+#[test]
+fn an_aux_returns_pan_lane_moves_it() {
+    let law = PanLaw::ConstantPower3dB;
+    let mut tp = TestProject::new(SR);
+    let aux = tp.track(TrackKind::Aux, "Aux", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.5, Q * 2);
+    let a = track_with(&mut tp, "A", ChannelLayout::Mono, src, Q * 2);
+    tp.project.track_mut(a).unwrap().output = OutputRouting::None;
+    send_to(&mut tp, a, aux, SendTap::PostFader, None);
+    tp.project.track_mut(aux).unwrap().pan = 1.0;
+    lane(
+        &mut tp,
+        aux,
+        AutomationTarget::TrackPan,
+        &[(0.0, -1.0), (1.0, 1.0)],
+    );
+    let out = render(&tp, 256, Q + 2048);
+    let sweep = |f: usize| (-1.0 + 2.0 * f as f64 / Q as f64).min(1.0) as f32;
+    for f in [AT, Q / 4, Q / 2, 3 * Q / 4, Q + 1000] {
+        let (l, r) = law.mono_gains(sweep(f + 1));
+        assert!(
+            approx(out[0][f], 0.5 * l, 2e-4),
+            "@{f}: {} vs {}",
+            out[0][f],
+            0.5 * l
+        );
+        assert!(
+            approx(out[1][f], 0.5 * r, 2e-4),
+            "@{f}: {} vs {}",
+            out[1][f],
+            0.5 * r
+        );
+    }
+}
+
+/// Into a surround bed a return follows its own spatial model: a mono
+/// one the room panner (left: only the left speakers), a stereo one
+/// balanced into the bed by its knob when it is set to.
+#[test]
+fn aux_returns_pan_into_a_surround_bed() {
+    use faderframe_core::SurroundFormat;
+    use faderframe_core::surround::StereoSource;
+    let bed = ChannelLayout::Surround(SurroundFormat::S51);
+    // L R C LFE Ls Rs.
+    let right_side = [1usize, 5];
+    let mut tp = TestProject::new(SR);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = bed;
+    let mono = tp.track(TrackKind::Aux, "Mono Return", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.5, 9600);
+    let a = track_with(&mut tp, "A", ChannelLayout::Mono, src, 9600);
+    tp.project.track_mut(a).unwrap().output = OutputRouting::None;
+    send_to(&mut tp, a, mono, SendTap::PreFader, None);
+    tp.project.track_mut(mono).unwrap().surround.x = -1.0;
+    let r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 6);
+    let mut r = r.unwrap();
+    r.play_from(0).unwrap();
+    let out = r.render(4096);
+    assert!(out[0][AT] > 0.1, "front left: {}", out[0][AT]);
+    for c in right_side {
+        assert!(out[c][AT].abs() < 1e-6, "{c}: {}", out[c][AT]);
+    }
+
+    let mut tp = TestProject::new(SR);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = bed;
+    let stereo = tp.track(TrackKind::Aux, "Stereo Return", ChannelLayout::Stereo);
+    let src = stereo_dc(&mut tp, 0.5, 0.5, 9600);
+    let a = track_with(&mut tp, "A", ChannelLayout::Stereo, src, 9600);
+    tp.project.track_mut(a).unwrap().output = OutputRouting::None;
+    send_to(&mut tp, a, stereo, SendTap::PreFader, None);
+    let t = tp.project.track_mut(stereo).unwrap();
+    t.surround.stereo = StereoSource::Balance;
+    t.pan = -1.0;
+    assert!(
+        tp.project
+            .balanced_into_bed(tp.project.track(stereo).unwrap())
+    );
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 6).unwrap();
+    r.play_from(0).unwrap();
+    let out = r.render(4096);
+    assert!(out[0][AT] > 0.1, "front left: {}", out[0][AT]);
+    for c in right_side {
+        assert!(out[c][AT].abs() < 1e-6, "{c}: {}", out[c][AT]);
+    }
+}
+
+/// A post-fader send with a pan of its own places the *source* there —
+/// not the main mix's panned image balanced again (a mono track panned
+/// hard right sent hard left reached the return as silence). Its level
+/// still follows the fader and the mute; "as tapped" keeps the image.
+#[test]
+fn a_post_fader_send_with_its_own_pan_places_the_source() {
+    let law = PanLaw::ConstantPower3dB;
+    let build = |pan: Option<f32>, fader_db: f32| {
+        let mut tp = TestProject::new(SR);
+        let aux = tp.track(TrackKind::Aux, "Aux", ChannelLayout::Stereo);
+        let src = tp.dc(1, 0.5, 9600);
+        let a = track_with(&mut tp, "A", ChannelLayout::Mono, src, 9600);
+        let t = tp.project.track_mut(a).unwrap();
+        t.pan = 1.0;
+        t.volume_db = fader_db;
+        send_to(&mut tp, a, aux, SendTap::PostFader, pan);
+        // The track into the master by name (the default would do too).
+        let master = tp.master();
+        let t = tp.project.track_mut(a).unwrap();
+        t.output = OutputRouting::Track { track: master };
+        (tp, a, aux)
+    };
+    // The track alone (hard right) plus the send placing it hard left.
+    let (tp, _, _) = build(Some(-1.0), 0.0);
+    let out = render(&tp, 256, 4096);
+    assert!(
+        approx(out[0][AT], 0.5, 1e-6),
+        "the send, hard left: {}",
+        out[0][AT]
+    );
+    assert!(
+        approx(out[1][AT], 0.5, 1e-6),
+        "the track, hard right: {}",
+        out[1][AT]
+    );
+    // Positions in between by the law, the fader on top (post-fader).
+    for pan in [-0.6f32, 0.0, 0.3, 1.0] {
+        let (tp, _, _) = build(Some(pan), -6.020_6);
+        let out = render(&tp, 256, 4096);
+        let (gl, gr) = law.mono_gains(pan);
+        let (l, r) = (0.25 * gl, 0.25 * gr + 0.25);
+        assert!(
+            approx(out[0][AT], l, 1e-5),
+            "{pan}: L {} vs {l}",
+            out[0][AT]
+        );
+        assert!(
+            approx(out[1][AT], r, 1e-5),
+            "{pan}: R {} vs {r}",
+            out[1][AT]
+        );
+    }
+    // As tapped: the main mix's image (hard right) at the fader's level.
+    let (tp, _, _) = build(None, 0.0);
+    let out = render(&tp, 256, 4096);
+    assert_eq!((out[0][AT], out[1][AT]), (0.0, 1.0));
+    // The track's mute silences its send too.
+    let (mut tp, a, _) = build(Some(-1.0), 0.0);
+    tp.project.track_mut(a).unwrap().mute = true;
+    let out = render(&tp, 256, 4096);
+    assert!(out.iter().flatten().all(|x| *x == 0.0));
+
+    // A stereo track, dual-panned (sides swapped): its own pan balances
+    // the source's sides, not the swapped image.
+    let mut tp = TestProject::new(SR);
+    let aux = tp.track(TrackKind::Aux, "Aux", ChannelLayout::Stereo);
+    let src = stereo_dc(&mut tp, 0.6, 0.0, 9600);
+    let s = track_with(&mut tp, "S", ChannelLayout::Stereo, src, 9600);
+    let t = tp.project.track_mut(s).unwrap();
+    t.pan_mode = PanMode::Dual;
+    t.dual_pan = DualPan {
+        left: 1.0,
+        right: -1.0,
+    };
+    t.output = OutputRouting::None;
+    send_to(&mut tp, s, aux, SendTap::PostFader, Some(0.0));
+    let out = render(&tp, 256, 4096);
+    assert!(approx(out[0][AT], 0.6, 1e-6) && approx(out[1][AT], 0.0, 1e-6));
+}
+
+/// Giving a send its own pan while playing (and taking it back) moves its
+/// tap at once: the graph is rebuilt for it, with no glitch elsewhere.
+#[test]
+fn a_send_given_its_own_pan_while_playing_places_the_source() {
+    let mut tp = TestProject::new(SR);
+    let aux = tp.track(TrackKind::Aux, "Aux", ChannelLayout::Stereo);
+    let src = tp.dc(1, 0.5, SR as usize);
+    let a = track_with(&mut tp, "A", ChannelLayout::Mono, src, SR as usize);
+    // Into a stereo bus kept silent: only the return is heard, its
+    // post-fader image panned.
+    let silent = tp.track(TrackKind::Bus, "Silent", ChannelLayout::Stereo);
+    tp.project.track_mut(silent).unwrap().mute = true;
+    tp.route(a, silent);
+    tp.project.track_mut(a).unwrap().pan = 1.0;
+    let send = send_to(&mut tp, a, aux, SendTap::PostFader, None);
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let before = r.render(4096);
+    assert_eq!((before[0][4095], before[1][4095]), (0.0, 0.5));
+    let mut h = History::default();
+    for (pan, want) in [(Some(-1.0), (0.5, 0.0)), (None, (0.0, 0.5))] {
+        let impact = h
+            .apply(
+                &mut tp.project,
+                Command::SetSendPan {
+                    track: a,
+                    send,
+                    pan,
+                },
+            )
+            .unwrap();
+        assert_eq!(impact, faderframe_project::Impact::Params);
+        r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+        let out = r.render(4096);
+        assert!(
+            approx(out[0][4095], want.0, 1e-6) && approx(out[1][4095], want.1, 1e-6),
+            "{pan:?}: {} {}",
+            out[0][4095],
+            out[1][4095]
+        );
+    }
 }

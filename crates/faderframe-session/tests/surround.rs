@@ -66,7 +66,14 @@ fn a_51_mix_renders_with_its_speakers_or_folded_down() {
                 ..RenderSettings::defaults_for(s.project(), out.clone())
             })
             .unwrap();
-        job.join().unwrap();
+        let rendered = job.join().unwrap();
+        // Measured as written: a bed with its speakers weighed.
+        let st = rendered[0].stats.clone().unwrap().unwrap();
+        if channels == RenderChannels::Master {
+            assert_eq!(st.layout, "5.1 (L R C LFE Ls Rs)");
+            assert_eq!(st.channel_mask, Some(0x60F));
+        }
+        assert!(st.levels.unwrap().loudness.is_some());
         read_wav(&out).unwrap()
     };
     assert_eq!(

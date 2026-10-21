@@ -433,9 +433,10 @@ impl Session {
             }
             Button::Edit(e) => {
                 let action = match e {
-                    EditButton::Cut => Action::CutRange,
-                    EditButton::Copy => Action::CopyRange,
-                    EditButton::Paste => Action::PasteRange,
+                    // As Ctrl+X/C/V: the range, else the selected clips.
+                    EditButton::Cut => Action::Cut,
+                    EditButton::Copy => Action::Copy,
+                    EditButton::Paste => Action::Paste,
                     EditButton::Delete => Action::DeleteSelection,
                     EditButton::Separate => Action::Separate,
                     EditButton::Capture => Action::CaptureMidi,
@@ -444,7 +445,7 @@ impl Session {
                     EditButton::Quantize
                         if self.control.extra.held(faderframe_control::Modifier::Shift) =>
                     {
-                        Action::QuantizeClips(self.selection.clips.iter().copied().collect())
+                        Action::QuantizeClips(self.selected_arranger_clips())
                     }
                     EditButton::Quantize => {
                         Action::Transport(crate::TransportAction::ToggleInputQuantize)

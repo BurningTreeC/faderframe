@@ -251,3 +251,55 @@ fn dual_pan_is_written_side_by_side() {
     // The knob shows the lane where it plays.
     assert!(s.shown_dual_pan(s.project().track(t).unwrap()).left > -0.5);
 }
+
+/// In a running session (the dummy device, buses rendered ahead as the
+/// app has them) the returns', a bus's and a folder bus's pans — the edits
+/// the mixer's knob makes — are heard: hard left, their right meters fall
+/// silent while the left ones play on. The folder bus holds an
+/// instrument played by a MIDI track (the demo's arpeggios).
+#[test]
+fn returns_buses_and_folder_buses_pan_in_a_running_session() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.set_render_ahead(Some(Duration::from_millis(200)))
+        .unwrap();
+    s.set_render_ahead_buses(true).unwrap();
+    let id = |s: &Session, n: &str| s.project().tracks.iter().find(|t| t.name == n).unwrap().id;
+    let folder = id(&s, "Arpeggios");
+    s.dispatch(Action::SetFolderBus { folder, on: true })
+        .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Locate(
+        faderframe_timeline::MusicalTime::from_quarters_i(16),
+    )))
+    .unwrap();
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    play_for(&mut s, 1500, |_, _| {});
+    let names = ["Echo", "Space", "Drum Bus", "Arpeggios"];
+    for n in names {
+        let m = s.meter(id(&s, n));
+        assert!(
+            m.left.level_db > -60.0 && m.right.level_db > -60.0,
+            "{n} plays: {} / {}",
+            m.left.level_db,
+            m.right.level_db
+        );
+    }
+    for n in names {
+        let track = id(&s, n);
+        s.dispatch(Action::Edit(Command::SetTrackPan { track, pan: -1.0 }))
+            .unwrap();
+    }
+    // Long enough for the meters to fall from where they were.
+    play_for(&mut s, 3000, |_, _| {});
+    for n in names {
+        let m = s.meter(id(&s, n));
+        assert!(m.left.level_db > -60.0, "{n} left: {}", m.left.level_db);
+        assert!(m.right.level_db < -60.0, "{n} right: {}", m.right.level_db);
+    }
+    s.stop_audio();
+}

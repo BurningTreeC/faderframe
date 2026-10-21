@@ -98,6 +98,11 @@ pub fn install() {
         });
     }
     faderframe_plugin_sandbox::set_enabled(crate::prefs::Preferences::load().sandbox_plugins);
+    // Plugins hosted here (sandboxing off): an X error of their GUI must
+    // not end FaderFrame (Xlib's default handler exits).
+    faderframe_plugin_sandbox::xlib::tolerate_x_errors(
+        faderframe_plugin_sandbox::xlib::Process::Host,
+    );
 }
 
 /// `faderframe --plugin-sandbox`: host the one plugin FaderFrame asks for;

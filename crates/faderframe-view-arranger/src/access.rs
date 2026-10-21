@@ -1,8 +1,8 @@
 //! The arranger for screen readers and the keyboard: a group per track
-//! (its name and kind) with mute, solo, record arm and input monitoring as
-//! toggles, the volume as a slider the arrows move, and its clips as items
-//! (where they start and end; Enter selects one and puts the playhead on
-//! it, so the edit commands apply to it).
+//! (its name and kind) with mute, solo, record arm and input monitoring (a
+//! folder: its Group switch) as toggles, the volume as a slider the arrows
+//! move, and its clips as items (where they start and end; Enter selects
+//! one and puts the playhead on it, so the edit commands apply to it).
 //!
 //! Tab is the arranger's own (tab to transient / clip boundary): Ctrl+Tab
 //! moves the keyboard onto these controls, then Tab moves along them.
@@ -20,6 +20,7 @@ const ARM: u64 = 14;
 const MONITOR: u64 = 15;
 const VOLUME: u64 = 16;
 const CLIP: u64 = 17;
+const GROUP: u64 = 18;
 
 impl ArrangerView {
     pub(crate) fn access_nodes(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
@@ -31,6 +32,7 @@ impl ArrangerView {
             let row = self.row_rect(i, size);
             let header = crate::header::HeaderLayout::new(self.header_rect(model, t, row.y));
             let kind = match t.kind {
+                _ if t.is_folder_bus() => "folder bus",
                 TrackKind::Audio => "audio track",
                 TrackKind::Instrument => "instrument track",
                 TrackKind::Midi => "MIDI track",
@@ -79,6 +81,18 @@ impl ArrangerView {
                         on: !t.solo,
                     },
                 ));
+            }
+            if t.is_folder() {
+                // Its Group switch (where a track's record button is).
+                node = node.child(
+                    AccessNode::new(access_id(&[GROUP, id.0]), AccessRole::ToggleButton, "Group")
+                        .at(header.record)
+                        .checked(t.folder_group)
+                        .on_activate(Action::SetFolderGroup {
+                            folder: id,
+                            on: !t.folder_group,
+                        }),
+                );
             }
             if t.kind.has_clips() {
                 node = node.child(toggle(
@@ -150,6 +164,7 @@ impl ArrangerView {
             }
             out.push(node);
         }
+        out.push(self.arrangement_access(model));
         out
     }
 }

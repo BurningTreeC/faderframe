@@ -190,6 +190,74 @@ fn routing_and_insert_clicks_open_menus() {
 }
 
 #[test]
+fn an_empty_insert_slot_offers_the_favorites_by_category() {
+    use faderframe_session::plugin_favorites::{FavoriteKey, FavoriteOp, FavoritePlugin};
+    let mut s = session();
+    let eq = s
+        .available_plugins()
+        .into_iter()
+        .find(|p| p.plugin.id == faderframe_core::builtin::EQ)
+        .unwrap();
+    s.dispatch(Action::PluginFavorites(FavoriteOp::NewCategory {
+        name: "Mixing".into(),
+        with: Some(FavoritePlugin::of(&eq)),
+    }))
+    .unwrap();
+    // A favorite whose plugin is not installed here.
+    s.dispatch(Action::PluginFavorites(FavoriteOp::Set {
+        plugin: FavoritePlugin {
+            key: FavoriteKey {
+                format: faderframe_project::PluginFormat::Clap,
+                id: "com.example.gone".into(),
+            },
+            name: "Gone Comp".into(),
+            vendor: "Example".into(),
+        },
+        favorite: true,
+    }))
+    .unwrap();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1400.0, 760.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let first = MixerView::channel_tracks(&s)[0];
+    let slot = view.layout_of(&s, first.id, size).unwrap().inserts.unwrap()[0];
+    let (_, req) = run(&mut view, right(slot.center()), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("expected the insert menu");
+    };
+    assert_eq!(items[0].label, "Browse Plugins…");
+    let favorites = &items[1];
+    assert_eq!(favorites.label, "Favorites");
+    let labels: Vec<&str> = favorites
+        .children
+        .iter()
+        .map(|i| i.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        [eq.plugin.name.as_str(), "Gone Comp (missing)", "Mixing"]
+    );
+    assert_eq!(
+        favorites.children[0].action,
+        Some(Action::InsertPlugin {
+            track: first.id,
+            index: 0,
+            plugin: eq.plugin.clone(),
+        })
+    );
+    assert!(favorites.children[1].action.is_none(), "missing: disabled");
+    assert_eq!(favorites.children[2].children.len(), 1, "the category's");
+    // Without favorites there is no such submenu.
+    let s = session();
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let (_, req) = run(&mut view, right(slot.center()), size, &s);
+    assert!(!menu_labels(req).iter().any(|l| l == "Favorites"));
+}
+
+#[test]
 fn numeric_entry_parses_levels() {
     assert_eq!(parse_db("-3.5"), Some(-3.5));
     assert_eq!(parse_db(" 6 dB"), Some(6.0));
@@ -2165,4 +2233,273 @@ fn the_talk_button_talks_while_held_and_latches_with_shift() {
             }
         }))
     );
+}
+
+/// The Inspector's channel: one track's strip filling the view — any
+/// kind, the master too — with the console strip's controls, without its
+/// inserts (the Inspector lists the devices) or wooden cheeks.
+#[test]
+fn a_single_strip_shows_one_track_without_its_inserts() {
+    let s = session();
+    let theme = Theme::default();
+    let mut view = MixerView::single_strip(theme.clone());
+    let size = Size::new(260.0, 620.0);
+    let texts = |view: &mut MixerView| {
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &theme);
+        p.texts().iter().map(|t| t.to_string()).collect::<Vec<_>>()
+    };
+    // Nothing shown yet: an empty view, nothing to press.
+    assert!(texts(&mut view).is_empty());
+    assert_eq!(view.hit_test(Point::new(130.0, 300.0), size, &s), None);
+    let by_name = |n: &str| s.project().tracks.iter().find(|t| t.name == n).unwrap();
+    let bass = by_name("Bass");
+    view.show_track(Some(bass.id));
+    assert_eq!(view.shown_track(), Some(bass.id));
+    let t = texts(&mut view);
+    assert!(t.contains(&"Bass".to_string()), "{t:?}");
+    assert!(!t.iter().any(|x| x.starts_with("INSERTS")), "{t:?}");
+    assert!(!t.contains(&"MASTER".to_string()), "{t:?}");
+    // The whole width is the strip; its mute mutes the track shown.
+    let l = view.layout_for(view.master_rect(size), bass, s.project());
+    assert!(l.inserts.is_none());
+    assert!((l.strip.w - size.w).abs() < 0.5, "no cheeks: {}", l.strip.w);
+    assert_eq!(
+        view.hit_test(l.mute.center(), size, &s),
+        Some(Hit::Mute(bass.id))
+    );
+    let (actions, _) = run(&mut view, down(l.mute.center(), 1), size, &s);
+    assert_eq!(
+        actions,
+        vec![Action::Edit(Command::SetTrackMute {
+            track: bass.id,
+            on: true
+        })]
+    );
+    assert_eq!(view.accessible_name().as_deref(), Some("Channel"));
+    let nodes = view.accessible(size, &s);
+    assert_eq!(nodes.len(), 1);
+    assert!(nodes[0].label.starts_with("Bass"), "{}", nodes[0].label);
+    // A folder: its folder strip.
+    let folder = by_name("Arpeggios");
+    view.show_track(Some(folder.id));
+    texts(&mut view);
+    let f = folder_layout(view.master_rect(size));
+    assert_eq!(
+        view.hit_test(f.fold.center(), size, &s),
+        Some(Hit::Fold(folder.id))
+    );
+    // The master: its strip with the mono check.
+    let master = s.project().master().unwrap();
+    view.show_track(Some(master.id));
+    let t = texts(&mut view);
+    assert!(t.contains(&"MASTER".to_string()), "{t:?}");
+    let l = view.layout_for(view.master_rect(size), master, s.project());
+    assert_eq!(
+        view.hit_test(l.record.center(), size, &s),
+        Some(Hit::MonoCheck)
+    );
+}
+
+/// A folder's strip has a Group switch under its solo (a folder bus's
+/// full strip: where a track's record button is); pressing it groups or
+/// ungroups what the folder holds; it is lit, named in its tooltip and a
+/// toggle for screen readers.
+#[test]
+fn a_folder_strip_has_a_group_switch() {
+    let mut s = session();
+    let folder = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Arpeggios")
+        .unwrap()
+        .id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(4000.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"G"), "{:?}", p.texts());
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == folder)
+        .unwrap();
+    let f = folder_layout(view.strip_rect(i, size));
+    assert!(!f.group.intersects(&f.solo) && !f.group.intersects(&f.count));
+    assert_eq!(
+        view.hit_test(f.group.center(), size, &s),
+        Some(Hit::FolderGroup(folder))
+    );
+    let (actions, _) = run(&mut view, down(f.group.center(), 1), size, &s);
+    assert_eq!(actions, vec![Action::SetFolderGroup { folder, on: true }]);
+    s.dispatch(actions[0].clone()).unwrap();
+    assert!(s.folder_grouped(folder));
+    let tip = view.tooltip(f.group.center(), size, &s).unwrap();
+    assert!(tip.starts_with("Group Arpeggios: on"), "{tip}");
+    let nodes = view.accessible(size, &s);
+    let node = nodes
+        .iter()
+        .find(|n| n.label == "Arpeggios folder")
+        .expect("the folder's strip");
+    assert_eq!(node.children.len(), 1);
+    assert_eq!(
+        (node.children[0].label.as_str(), node.children[0].checked),
+        ("Group", Some(true))
+    );
+    // A folder bus: the switch where a track arms.
+    s.dispatch(Action::SetFolderBus { folder, on: true })
+        .unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let l = view.layout_of(&s, folder, size).unwrap();
+    assert_eq!(
+        view.hit_test(l.record.center(), size, &s),
+        Some(Hit::FolderGroup(folder))
+    );
+    let (actions, _) = run(&mut view, down(l.record.center(), 1), size, &s);
+    assert_eq!(actions, vec![Action::SetFolderGroup { folder, on: false }]);
+    s.dispatch(actions[0].clone()).unwrap();
+    assert!(!s.folder_grouped(folder));
+    let nodes = view.accessible(size, &s);
+    let node = nodes
+        .iter()
+        .find(|n| n.label == "Arpeggios folder bus")
+        .expect("the folder bus's strip");
+    assert!(
+        node.children
+            .iter()
+            .any(|c| c.label == "Group" && c.checked == Some(false))
+    );
+}
+
+/// A folder bus is a full strip (a bus's fader, pan, inserts, sends and
+/// meter) named as one, with a triangle in its header that folds it; the
+/// strips of what it holds name it as their output, and their output menu
+/// offers it as the default and the master by name past it. Its pan knob
+/// sets its pan, as every bus's and return's does.
+#[test]
+fn a_folder_bus_is_a_full_strip_that_folds() {
+    let mut s = session();
+    let (bass, pad) = (
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Bass")
+            .unwrap()
+            .id,
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Pad")
+            .unwrap()
+            .id,
+    );
+    s.dispatch(Action::NewFolder {
+        tracks: vec![bass, pad],
+    })
+    .unwrap();
+    // The new folder (selected).
+    let folder = *s.selection.tracks.iter().next().unwrap();
+    let name = s.project().track(folder).unwrap().name.clone();
+    s.dispatch(Action::SetFolderBus { folder, on: true })
+        .unwrap();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(2400.0, 900.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"FOLDER BUS"), "{:?}", p.texts());
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == folder)
+        .unwrap();
+    assert_eq!(
+        view.strip_rect(i, size).w,
+        theme.console.strip_width,
+        "full width"
+    );
+    let l = view.layout_of(&s, folder, size).unwrap();
+    assert!(
+        l.inserts.is_some() && l.sends.is_some(),
+        "devices and sends"
+    );
+    assert_eq!(
+        view.hit_test(l.pan_knob.center(), size, &s),
+        Some(Hit::Pan(folder))
+    );
+    assert_eq!(
+        view.hit_test(l.fader.center(), size, &s)
+            .map(|h| matches!(h, Hit::FaderTrack(_) | Hit::FaderCap(_))),
+        Some(true)
+    );
+    // Its pan knob dragged: its own pan, one gesture.
+    let from = l.pan_knob.center();
+    let mut actions = run(&mut view, down(from, 1), size, &s).0;
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(from.x, from.y + 45.0),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    actions.extend(
+        run(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: from,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &s,
+        )
+        .0,
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert!(s.project().track(folder).unwrap().pan < -0.3);
+    // What it holds names it as its output; the menu: it first (the
+    // default), the master by name.
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let label = format!("→ {name}");
+    assert!(p.texts().contains(&label.as_str()), "{:?}", p.texts());
+    let master = s.project().master_id().unwrap();
+    let to_default = s.project().track(bass).unwrap().output == OutputRouting::Master;
+    let l = view.layout_of(&s, bass, size).unwrap();
+    let (_, req) = run(&mut view, down(l.output.center(), 1), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("the output menu");
+    };
+    assert_eq!(items[0].label, format!("{name} (Folder Bus)"));
+    assert_eq!(items[0].checked, Some(to_default));
+    let named = items.iter().find(|i| i.label == "Master").unwrap();
+    assert_eq!(
+        named.action,
+        Some(Action::Edit(Command::SetTrackOutput {
+            track: bass,
+            output: OutputRouting::Track { track: master },
+        }))
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| i.label == format!("{name} (Folder Bus)") && i.label != items[0].label)
+    );
+    // Its triangle folds it: what it holds leaves the mixer.
+    let l = view.layout_of(&s, folder, size).unwrap();
+    let fold = folder_bus_fold(&l).center();
+    assert_eq!(view.hit_test(fold, size, &s), Some(Hit::Fold(folder)));
+    let (a, _) = run(&mut view, down(fold, 1), size, &s);
+    assert_eq!(a, vec![Action::ToggleFolder(folder)]);
+    s.dispatch(a[0].clone()).unwrap();
+    let shown: Vec<TrackId> = MixerView::channel_tracks(&s).iter().map(|t| t.id).collect();
+    assert!(shown.contains(&folder) && !shown.contains(&bass) && !shown.contains(&pad));
 }

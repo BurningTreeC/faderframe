@@ -1,12 +1,22 @@
-//! The Render / Export window.
+//! The Render / Export window: the master mix, stems or one track.
+//!
+//! When Render is pressed, destinations that exist are named in one
+//! question (Overwrite / Cancel; whatever a file chooser asked before);
+//! the render writes beside them and replaces them only when it has
+//! finished, and a file that appeared meanwhile is asked about then
+//! ([`faderframe_session::render::files`]). A finished render
+//! opens its report (`render_report`); a stopped or failed one says so
+//! instead.
 
 use crate::state::AppState;
 use faderframe_audio::{STANDARD_SAMPLE_RATES, format_sample_rate};
 use faderframe_audio_files::{Dither, WavFormat};
+use faderframe_core::TrackId;
 use faderframe_session::NoticeLevel;
 use faderframe_session::delivery::{DELIVERY_PRESETS, Finish, PeakHandling, describe};
 use faderframe_session::render::{
-    RenderChannels, RenderJob, RenderRange, RenderSettings, RenderSource, resolve_range,
+    Overwrite, RenderChannels, RenderError, RenderJob, RenderRange, RenderSettings, RenderSource,
+    Rendered, Staged, files, resolve_range,
 };
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -15,6 +25,10 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
+
+/// The `source` drop-down's entries after the master mix (0).
+const SOURCE_STEMS: u32 = 1;
+const SOURCE_TRACK: u32 = 2;
 
 thread_local! {
     static OPEN: RefCell<Option<glib::WeakRef<gtk::Window>>> = const { RefCell::new(None) };
@@ -35,6 +49,9 @@ struct Form {
     bar_from: gtk::SpinButton,
     bar_to: gtk::SpinButton,
     source: gtk::DropDown,
+    /// The track rendered alone, and the tracks it lists.
+    track: gtk::DropDown,
+    track_ids: Vec<TrackId>,
     format: gtk::DropDown,
     rate: gtk::DropDown,
     channels: gtk::DropDown,
@@ -50,6 +67,7 @@ struct Form {
     dither: gtk::DropDown,
     output: gtk::Entry,
     info: gtk::Label,
+    render: gtk::Button,
 }
 
 fn default_output(app: &Rc<AppState>) -> PathBuf {
@@ -64,7 +82,29 @@ fn default_output(app: &Rc<AppState>) -> PathBuf {
     base.join(format!("{}.wav", s.project().name))
 }
 
+/// "<project> - <track>.wav" beside the default output.
+fn track_output(app: &Rc<AppState>, track: TrackId) -> PathBuf {
+    let stem = faderframe_session::render::track_file_stem(app.session.borrow().project(), track);
+    default_output(app).with_file_name(format!("{stem}.wav"))
+}
+
 impl Form {
+    fn chosen_track(&self) -> Option<TrackId> {
+        self.track_ids.get(self.track.selected() as usize).copied()
+    }
+
+    /// The output for the chosen source (a folder for stems).
+    fn output_for_source(&self, app: &Rc<AppState>) -> PathBuf {
+        let path = default_output(app);
+        match self.source.selected() {
+            SOURCE_STEMS => {
+                PathBuf::from(path.with_extension("").to_string_lossy().to_string() + " stems")
+            }
+            SOURCE_TRACK => self.chosen_track().map_or(path, |t| track_output(app, t)),
+            _ => path,
+        }
+    }
+
     fn settings(&self, project_rate: u32) -> RenderSettings {
         let range = match self.range.selected() {
             1 => RenderRange::Loop,
@@ -80,10 +120,12 @@ impl Form {
         };
         RenderSettings {
             range,
-            source: if self.source.selected() == 1 {
-                RenderSource::Stems
-            } else {
-                RenderSource::Master
+            source: match self.source.selected() {
+                SOURCE_STEMS => RenderSource::Stems,
+                SOURCE_TRACK => self
+                    .chosen_track()
+                    .map_or(RenderSource::Master, RenderSource::Track),
+                _ => RenderSource::Master,
             },
             format: FORMATS[self.format.selected() as usize % FORMATS.len()],
             sample_rate,
@@ -98,6 +140,8 @@ impl Form {
             finish: self.finish(),
             dither: Dither::ALL[self.dither.selected() as usize % Dither::ALL.len()],
             report: true,
+            // Set when the render starts, from what the user agreed to.
+            overwrite: Overwrite::Never,
             keep_latency: false,
             head: None,
             output: PathBuf::from(self.output.text().as_str()),
@@ -171,6 +215,8 @@ impl Form {
         let settings = self.settings(p.sample_rate);
         self.bar_from.set_sensitive(self.range.selected() == 2);
         self.bar_to.set_sensitive(self.range.selected() == 2);
+        self.track
+            .set_visible(self.source.selected() == SOURCE_TRACK);
         self.dither.set_sensitive(settings.format.is_integer());
         let level = self.level.selected();
         for (w, modes) in &self.level_parts {
@@ -208,7 +254,7 @@ impl Form {
                     (settings.format.bits(), settings.sample_rate)
                 };
                 let files = match settings.source {
-                    RenderSource::Master => 1,
+                    RenderSource::Master | RenderSource::Track(_) => 1,
                     RenderSource::Stems => p
                         .tracks
                         .iter()
@@ -274,11 +320,55 @@ thread_local! {
     static FORM: RefCell<Option<std::rc::Weak<Form>>> = const { RefCell::new(None) };
 }
 
+fn open_form() -> Option<Rc<Form>> {
+    FORM.with(|f| f.borrow().as_ref().and_then(std::rc::Weak::upgrade))
+}
+
 /// Open the window with delivery preset `preset` (1-based; 0 = custom).
 pub fn open_with_preset(app: &Rc<AppState>, preset: u32) {
     open(app);
-    if let Some(form) = FORM.with(|f| f.borrow().as_ref().and_then(std::rc::Weak::upgrade)) {
+    if let Some(form) = open_form() {
         form.preset.set_selected(preset);
+    }
+}
+
+/// Open the window rendering `track` alone (the first one it lists when
+/// it renders nothing).
+pub fn open_for_track(app: &Rc<AppState>, track: Option<TrackId>) {
+    open(app);
+    if let Some(form) = open_form() {
+        if let Some(i) = track.and_then(|t| form.track_ids.iter().position(|x| *x == t)) {
+            form.track.set_selected(i as u32);
+        }
+        form.source.set_selected(SOURCE_TRACK);
+        form.output
+            .set_text(&form.output_for_source(app).to_string_lossy());
+    }
+}
+
+/// File → Render Selected Track…: the first selected track.
+pub fn open_for_selected_track(app: &Rc<AppState>) {
+    let track = app.session.borrow().selection.tracks.iter().next().copied();
+    open_for_track(app, track);
+}
+
+/// Press Render in the open window, to `output` when given (scripted
+/// runs; "x" or "-": the output as it is).
+pub fn render_now(output: Option<&str>) {
+    if let Some(form) = open_form() {
+        if let Some(path) = output.filter(|p| !matches!(*p, "" | "x" | "-")) {
+            form.output.set_text(path);
+        }
+        form.render.emit_clicked();
+    }
+}
+
+/// Press Stop on the render running in the window (scripted runs).
+pub fn render_stop() {
+    let run = RUNNING.with(|r| r.borrow().as_ref().and_then(std::rc::Weak::upgrade));
+    match run {
+        Some(run) => run.cancel.emit_clicked(),
+        None => tracing::warn!("render-stop: no render is running"),
     }
 }
 
@@ -331,8 +421,34 @@ pub fn open(app: &Rc<AppState>) {
     labelled(&grid, 0, "Delivery", &preset);
     labelled(&grid, 1, "Range", &range_box);
 
-    let source = gtk::DropDown::from_strings(&["Master mix", "Stems (one file per track)"]);
-    labelled(&grid, 2, "Source", &source);
+    let source = gtk::DropDown::from_strings(&[
+        "Master mix",
+        "Stems (one file per track)",
+        "One track (soloed through the mix, as its stem)",
+    ]);
+    // The tracks one can render alone; the selected one first chosen.
+    let (track_ids, track_names): (Vec<TrackId>, Vec<String>) = {
+        let s = app.session.borrow();
+        faderframe_session::render::renderable_tracks(s.project())
+            .into_iter()
+            .unzip()
+    };
+    let names: Vec<&str> = track_names.iter().map(String::as_str).collect();
+    let track = gtk::DropDown::from_strings(&names);
+    track.set_tooltip_text(Some("The track rendered"));
+    track.set_visible(false);
+    if let Some(i) = {
+        let s = app.session.borrow();
+        track_ids
+            .iter()
+            .position(|t| s.selection.tracks.contains(t))
+    } {
+        track.set_selected(i as u32);
+    }
+    let source_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    source_box.append(&source);
+    source_box.append(&track);
+    labelled(&grid, 2, "Source", &source_box);
     let format_names: Vec<&str> = FORMATS.iter().map(|f| f.label()).collect();
     let format = gtk::DropDown::from_strings(&format_names);
     labelled(&grid, 3, "Format", &format);
@@ -491,6 +607,8 @@ pub fn open(app: &Rc<AppState>) {
         bar_from,
         bar_to,
         source,
+        track,
+        track_ids,
         format,
         rate,
         channels,
@@ -505,6 +623,7 @@ pub fn open(app: &Rc<AppState>) {
         dither,
         output,
         info,
+        render: render.clone(),
     });
     form.update_info(app);
 
@@ -572,19 +691,15 @@ pub fn open(app: &Rc<AppState>) {
             r();
         });
     }
-    {
+    // The output follows the source (and the track rendered).
+    for dd in [&form.source, &form.track] {
         let r = refresh.clone();
         let weak = Rc::downgrade(app);
         let f = Rc::clone(&form);
-        form.source.connect_selected_notify(move |d| {
+        dd.connect_selected_notify(move |_| {
             if let Some(app) = weak.upgrade() {
-                let path = default_output(&app);
-                let out = if d.selected() == 1 {
-                    path.with_extension("").to_string_lossy().to_string() + " stems"
-                } else {
-                    path.to_string_lossy().to_string()
-                };
-                f.output.set_text(&out);
+                f.output
+                    .set_text(&f.output_for_source(&app).to_string_lossy());
             }
             r();
         });
@@ -601,7 +716,7 @@ pub fn open(app: &Rc<AppState>) {
             let Some(win) = win_weak.upgrade() else {
                 return;
             };
-            let stems = form.source.selected() == 1;
+            let stems = form.source.selected() == SOURCE_STEMS;
             let dialog = gtk::FileDialog::builder()
                 .title("Render to…")
                 .modal(true)
@@ -626,14 +741,21 @@ pub fn open(app: &Rc<AppState>) {
         });
     }
 
-    let job: Rc<RefCell<Option<RenderJob>>> = Rc::new(RefCell::new(None));
+    let run = Rc::new(Run {
+        job: RefCell::new(None),
+        busy: Cell::new(false),
+        render: render.clone(),
+        cancel: cancel.clone(),
+        progress,
+        info: form.info.clone(),
+        win: win.downgrade(),
+    });
     {
-        let job = Rc::clone(&job);
-        let win_weak = win.downgrade();
+        let run = Rc::clone(&run);
         cancel.connect_clicked(move |_| {
-            if let Some(j) = job.borrow().as_ref() {
+            if let Some(j) = run.job.borrow().as_ref() {
                 j.cancel();
-            } else if let Some(win) = win_weak.upgrade() {
+            } else if let Some(win) = run.win.upgrade() {
                 win.close();
             }
         });
@@ -641,15 +763,14 @@ pub fn open(app: &Rc<AppState>) {
     {
         let weak = Rc::downgrade(app);
         let form = Rc::clone(&form);
-        let job = Rc::clone(&job);
-        let cancel = cancel.clone();
-        render.connect_clicked(move |button| {
+        let run = Rc::clone(&run);
+        render.connect_clicked(move |_| {
             let Some(app) = weak.upgrade() else { return };
-            if job.borrow().is_some() {
+            if run.busy.get() {
                 return;
             }
             let mut settings = form.settings(project_rate);
-            if settings.source == RenderSource::Master && settings.output.extension().is_none() {
+            if settings.source != RenderSource::Stems && settings.output.extension().is_none() {
                 settings.output.set_extension(
                     if matches!(settings.channels, RenderChannels::Iamf(_)) {
                         "mp4"
@@ -657,6 +778,28 @@ pub fn open(app: &Rc<AppState>) {
                         "wav"
                     },
                 );
+            }
+            let what = describe_source(&app, &settings);
+            // Every file it writes; the ones there now are asked about, all
+            // in one question — here, when Render is pressed, whatever a
+            // file chooser asked before (the file may have changed since).
+            let wanted = {
+                let s = app.session.borrow();
+                faderframe_session::render::destinations(s.project(), &settings)
+            };
+            let wanted = match wanted {
+                Ok(w) => w,
+                Err(e) => {
+                    form.info.set_text(&e.to_string());
+                    return;
+                }
+            };
+            // A folder where a file goes: nothing to ask, it cannot be
+            // replaced by a file — say so before rendering.
+            if let Some(folder) = files::folder_in_the_way(&wanted) {
+                form.info
+                    .set_text(&format!("Not rendered: {}", RenderError::NotAFile(folder)));
+                return;
             }
             if let Some(dir) = settings.output.parent()
                 && !dir.as_os_str().is_empty()
@@ -666,83 +809,33 @@ pub fn open(app: &Rc<AppState>) {
                     .set_text(&format!("Cannot create {}: {e}", dir.display()));
                 return;
             }
-            let started = app.session.borrow_mut().render(settings);
-            match started {
-                Ok(j) => {
-                    *job.borrow_mut() = Some(j);
-                    button.set_sensitive(false);
-                    cancel.set_label("Stop");
-                    progress.set_fraction(0.0);
-                    progress.set_text(Some("Rendering…"));
-                    let job = Rc::clone(&job);
-                    let weak = Rc::downgrade(&app);
-                    let button = button.clone();
-                    let cancel = cancel.clone();
-                    let progress = progress.clone();
-                    let info = form.info.clone();
-                    glib::timeout_add_local(Duration::from_millis(80), move || {
-                        let finished = {
-                            let j = job.borrow();
-                            let Some(j) = j.as_ref() else {
-                                return glib::ControlFlow::Break;
-                            };
-                            progress.set_fraction(j.progress.fraction());
-                            j.is_finished()
-                        };
-                        if !finished {
-                            return glib::ControlFlow::Continue;
-                        }
-                        let Some(j) = job.borrow_mut().take() else {
-                            return glib::ControlFlow::Break;
-                        };
-                        button.set_sensitive(true);
-                        cancel.set_label("Close");
-                        let (level, text) = match j.join() {
-                            Ok(files) => {
-                                progress.set_fraction(1.0);
-                                progress.set_text(Some("Done"));
-                                let list: Vec<String> = files
-                                    .iter()
-                                    .map(|f| {
-                                        let name = f.path.file_name().map_or_else(
-                                            || f.path.display().to_string(),
-                                            |n| n.to_string_lossy().to_string(),
-                                        );
-                                        match &f.finished {
-                                            Some(done) => format!("{name}: {}", describe(done)),
-                                            None => name,
-                                        }
-                                    })
-                                    .collect();
-                                (
-                                    NoticeLevel::Info,
-                                    format!(
-                                        "Rendered {} file(s)\n{}",
-                                        files.len(),
-                                        list.join("\n")
-                                    ),
-                                )
-                            }
-                            Err(e) => {
-                                progress.set_text(Some("Stopped"));
-                                (NoticeLevel::Warning, format!("Render: {e}"))
-                            }
-                        };
-                        info.set_text(&text);
-                        if let Some(app) = weak.upgrade() {
-                            app.session.borrow_mut().notify(level, text);
-                        }
-                        glib::ControlFlow::Break
-                    });
-                }
-                Err(e) => form.info.set_text(&e.to_string()),
+            let ask = files::existing(&wanted);
+            if ask.is_empty() {
+                settings.overwrite = Overwrite::Never;
+                start(&app, &run, settings, what);
+                return;
             }
+            run.busy.set(true);
+            let weak = Rc::downgrade(&app);
+            let run2 = Rc::clone(&run);
+            let win = run.win.upgrade();
+            crate::render_report::ask_overwrite(win.as_ref(), &ask.clone(), false, move |yes| {
+                run2.busy.set(false);
+                let Some(app) = weak.upgrade() else { return };
+                if yes {
+                    settings.overwrite = Overwrite::Confirmed(ask);
+                    start(&app, &run2, settings, what);
+                } else {
+                    run2.info
+                        .set_text("Not rendered: the existing files were kept as they are.");
+                }
+            });
         });
     }
     {
-        let job = Rc::clone(&job);
+        let run = Rc::clone(&run);
         win.connect_close_request(move |_| {
-            if let Some(j) = job.borrow().as_ref() {
+            if let Some(j) = run.job.borrow().as_ref() {
                 j.cancel();
             }
             glib::Propagation::Proceed
@@ -751,4 +844,242 @@ pub fn open(app: &Rc<AppState>) {
     OPEN.with(|o| *o.borrow_mut() = Some(win.downgrade()));
     FORM.with(|f| *f.borrow_mut() = Some(Rc::downgrade(&form)));
     win.present();
+}
+
+thread_local! {
+    /// Renders waiting for an answer about a destination that appeared;
+    /// thrown away (their temporary files removed) when the program quits
+    /// before the answer.
+    static WAITING: RefCell<Vec<std::rc::Weak<RefCell<Option<Staged>>>>> =
+        const { RefCell::new(Vec::new()) };
+    /// The window's render, stopped (and its temporary files removed)
+    /// when the program quits while it runs.
+    static RUNNING: RefCell<Option<std::rc::Weak<Run>>> = const { RefCell::new(None) };
+    static CLEANS_UP: Cell<bool> = const { Cell::new(false) };
+}
+
+/// On quitting: stop a running render and throw away renders waiting for
+/// an answer, so no temporary file stays beside a destination.
+fn clean_up_on_quit(app: &Rc<AppState>) {
+    if CLEANS_UP.with(|c| c.replace(true)) {
+        return;
+    }
+    app.app.connect_shutdown(|_| {
+        if let Some(run) = RUNNING
+            .with(|r| r.borrow_mut().take())
+            .and_then(|r| r.upgrade())
+        {
+            let job = run.job.borrow_mut().take();
+            if let Some(job) = job {
+                job.cancel();
+                drop(job.join());
+            }
+        }
+        for held in WAITING.with(|w| std::mem::take(&mut *w.borrow_mut())) {
+            if let Some(h) = held.upgrade() {
+                drop(h.borrow_mut().take());
+            }
+        }
+    });
+}
+
+/// Keep `staged` until the question about it is answered (or the program
+/// quits).
+fn hold(app: &Rc<AppState>, staged: Staged) -> Rc<RefCell<Option<Staged>>> {
+    clean_up_on_quit(app);
+    let held = Rc::new(RefCell::new(Some(staged)));
+    WAITING.with(|w| {
+        let mut w = w.borrow_mut();
+        w.retain(|h| h.strong_count() > 0);
+        w.push(Rc::downgrade(&held));
+    });
+    held
+}
+
+/// A render the window runs.
+struct Run {
+    job: RefCell<Option<RenderJob>>,
+    /// Rendering, or a question about it open.
+    busy: Cell<bool>,
+    render: gtk::Button,
+    cancel: gtk::Button,
+    progress: gtk::ProgressBar,
+    info: gtk::Label,
+    win: glib::WeakRef<gtk::Window>,
+}
+
+/// "Track “Bass”", "Stems", "Master mix", "ADM master".
+fn describe_source(app: &Rc<AppState>, settings: &RenderSettings) -> String {
+    match (settings.source, settings.channels) {
+        (_, RenderChannels::Adm(_)) => "ADM master".into(),
+        (_, RenderChannels::Iamf(_)) => "IAMF master".into(),
+        (RenderSource::Stems, _) => "Stems".into(),
+        (RenderSource::Track(t), _) => {
+            let s = app.session.borrow();
+            let name = s.project().track(t).map_or("?", |t| t.name.as_str());
+            format!("Track “{name}”")
+        }
+        (RenderSource::Master, _) => "Master mix".into(),
+    }
+}
+
+/// Start the render and follow it to its end.
+fn start(app: &Rc<AppState>, run: &Rc<Run>, settings: RenderSettings, what: String) {
+    let started = app.session.borrow_mut().render(settings);
+    let j = match started {
+        Ok(j) => j,
+        Err(e) => {
+            run.info.set_text(&e.to_string());
+            return;
+        }
+    };
+    *run.job.borrow_mut() = Some(j);
+    clean_up_on_quit(app);
+    RUNNING.with(|r| *r.borrow_mut() = Some(Rc::downgrade(run)));
+    run.busy.set(true);
+    run.render.set_sensitive(false);
+    run.cancel.set_label("Stop");
+    run.progress.set_fraction(0.0);
+    run.progress.set_text(Some("Rendering…"));
+    run.info.set_text("");
+    let weak = Rc::downgrade(app);
+    let run = Rc::clone(run);
+    glib::timeout_add_local(Duration::from_millis(80), move || {
+        let finished = {
+            let j = run.job.borrow();
+            let Some(j) = j.as_ref() else {
+                return glib::ControlFlow::Break;
+            };
+            run.progress.set_fraction(j.progress.fraction());
+            if j.progress
+                .measuring
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                run.progress.set_text(Some("Measuring the written file…"));
+            }
+            j.is_finished()
+        };
+        if !finished {
+            return glib::ControlFlow::Continue;
+        }
+        let Some(j) = run.job.borrow_mut().take() else {
+            return glib::ControlFlow::Break;
+        };
+        run.cancel.set_label("Close");
+        if let Some(app) = weak.upgrade() {
+            settle(&app, &run, j.join(), what.clone());
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// A render's end: the report, a question about a file that appeared,
+/// or the cancellation or failure told as such.
+fn settle(
+    app: &Rc<AppState>,
+    run: &Rc<Run>,
+    result: Result<Vec<Rendered>, RenderError>,
+    what: String,
+) {
+    let done = |busy: bool| {
+        run.busy.set(busy);
+        run.render.set_sensitive(!busy);
+    };
+    let win = run.win.upgrade();
+    match result {
+        Ok(files) => {
+            done(false);
+            run.progress.set_fraction(1.0);
+            run.progress.set_text(Some("Done"));
+            let list: Vec<String> = files
+                .iter()
+                .map(|f| {
+                    let name = f.path.file_name().map_or_else(
+                        || f.path.display().to_string(),
+                        |n| n.to_string_lossy().to_string(),
+                    );
+                    let measured = match &f.stats {
+                        Some(Ok(st)) => st.levels.as_ref().map(|l| {
+                            use faderframe_session::render::stats::db_text;
+                            let lufs = l.loudness.map_or_else(String::new, |x| {
+                                format!(", {}", db_text(x.integrated, "LUFS"))
+                            });
+                            format!(" — {}{lufs}", db_text(l.true_peak, "dBTP"))
+                        }),
+                        _ => None,
+                    };
+                    let finished = f
+                        .finished
+                        .as_ref()
+                        .map(|d| format!(" (finishing: {})", describe(d)));
+                    format!(
+                        "{name}{}{}",
+                        measured.unwrap_or_default(),
+                        finished.unwrap_or_default()
+                    )
+                })
+                .collect();
+            let text = format!(
+                "Rendered {} file{}\n{}",
+                files.len(),
+                if files.len() == 1 { "" } else { "s" },
+                list.join("\n")
+            );
+            run.info.set_text(&text);
+            app.session.borrow_mut().notify(NoticeLevel::Info, text);
+            crate::render_report::show(app, win.as_ref(), &what, &files);
+        }
+        Err(RenderError::Exists(staged)) => {
+            done(true);
+            run.progress
+                .set_text(Some("Waiting: a destination is taken"));
+            let conflicts = staged.conflicts();
+            let held = hold(app, *staged);
+            let weak = Rc::downgrade(app);
+            let run = Rc::clone(run);
+            crate::render_report::ask_overwrite(
+                win.as_ref(),
+                &conflicts.clone(),
+                true,
+                move |yes| {
+                    let Some(app) = weak.upgrade() else { return };
+                    // Gone: the program is quitting (and threw it away).
+                    let Some(staged) = held.borrow_mut().take() else {
+                        return;
+                    };
+                    if yes {
+                        let result = staged.commit(&Overwrite::Confirmed(conflicts));
+                        settle(&app, &run, result, what);
+                    } else {
+                        staged.discard();
+                        run.busy.set(false);
+                        run.render.set_sensitive(true);
+                        run.progress.set_text(Some("Not saved"));
+                        run.info.set_text(
+                            "The render was thrown away: the files that appeared while it ran \
+                         were kept as they are.",
+                        );
+                    }
+                },
+            );
+        }
+        Err(RenderError::Cancelled) => {
+            done(false);
+            run.progress.set_text(Some("Cancelled"));
+            let text = "Render cancelled. Nothing was written; files that were there are \
+                        unchanged.";
+            run.info.set_text(text);
+            app.session.borrow_mut().notify(NoticeLevel::Info, text);
+        }
+        Err(e) => {
+            done(false);
+            run.progress.set_text(Some("Failed"));
+            let text = format!("Render failed: {e}");
+            run.info.set_text(&text);
+            app.session
+                .borrow_mut()
+                .notify(NoticeLevel::Warning, text.clone());
+            crate::render_report::show_failure(win.as_ref(), &e.to_string());
+        }
+    }
 }

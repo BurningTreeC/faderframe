@@ -346,7 +346,8 @@ impl Processor<EngineContext> for ListenOut {
             Self::hear(next, &mut self.stages, block, input, &mut self.alt, n);
             // Constant power: the two ways are different signals.
             let len = self.fade_len as f32;
-            for c in 0..out.num_channels() {
+            // (The two have the node's width; never index past either.)
+            for c in 0..out.num_channels().min(self.alt.num_channels()) {
                 let to = &self.alt.channel(c)[..n];
                 for (i, (o, &b)) in out.channel_mut(c)[..n].iter_mut().zip(to).enumerate() {
                     let t =

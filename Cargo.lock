@@ -1241,6 +1241,7 @@ dependencies = [
  "faderframe-view-devices",
  "faderframe-view-events",
  "faderframe-view-history",
+ "faderframe-view-inspector",
  "faderframe-view-launcher",
  "faderframe-view-leadsheet",
  "faderframe-view-mixer",
@@ -1257,6 +1258,7 @@ dependencies = [
  "gdk4-win32",
  "glib-unix",
  "gtk4",
+ "libc",
  "libloading 0.8.9",
  "objc2",
  "objc2-app-kit",
@@ -1424,6 +1426,19 @@ dependencies = [
  "faderframe-project",
  "faderframe-session",
  "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-inspector"
+version = "0.22.0"
+dependencies = [
+ "faderframe-automation",
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-ui-canvas",
+ "faderframe-view-mixer",
 ]
 
 [[package]]

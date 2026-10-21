@@ -4,7 +4,7 @@ use crate::canvas::CanvasWidget;
 use crate::dock::DockState;
 use crate::window::Chrome;
 use faderframe_audio::AudioBackend;
-use faderframe_session::{Action, AudioPreferences, NoticeLevel, Session, SessionError};
+use faderframe_session::{Action, NoticeLevel, Session, SessionError};
 use faderframe_ui_canvas::Theme;
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -55,6 +55,24 @@ impl BackendChoice {
                 BackendChoice::Dummy,
             ]
         }
+    }
+
+    /// The backend id a choice opens (`None`: Automatic, whichever works).
+    pub fn id(self) -> Option<&'static str> {
+        match self {
+            BackendChoice::Auto => None,
+            BackendChoice::PipeWire => Some("pipewire"),
+            BackendChoice::Jack => Some("jack"),
+            BackendChoice::System => Some("system"),
+            BackendChoice::Asio => Some("asio"),
+            BackendChoice::Dummy => Some("dummy"),
+        }
+    }
+
+    /// The backends of this choice, made again whenever the session needs
+    /// them (to reopen a device that went away, on a probing thread too).
+    pub fn factory(self) -> faderframe_session::BackendFactory {
+        std::sync::Arc::new(move || self.backends())
     }
 
     pub fn label(self) -> &'static str {
@@ -192,7 +210,10 @@ impl AppState {
             shown_rev: Cell::new(session.revision()),
             shown_display: Cell::new(session.display_revision()),
             session: RefCell::new(session),
-            theme: RefCell::new(Theme::by_id(&crate::prefs::Preferences::load().theme)),
+            theme: RefCell::new({
+                let prefs = crate::prefs::Preferences::load();
+                Theme::by_id(&prefs.theme).with_grid_strength(prefs.grid_strength)
+            }),
             options: RefCell::new(options),
             dock: RefCell::new(DockState::default()),
             window: RefCell::new(None),
@@ -220,7 +241,8 @@ impl AppState {
     /// Switch the skin: GTK's CSS and every canvas follow at once, and the
     /// choice is remembered.
     pub fn set_theme(&self, id: &str) {
-        let theme = Theme::by_id(id);
+        let strength = self.theme.borrow().grid.strength;
+        let theme = Theme::by_id(id).with_grid_strength(strength);
         crate::style::install(&theme);
         self.canvases.borrow_mut().retain(|w| match w.upgrade() {
             Some(c) => {
@@ -244,6 +266,29 @@ impl AppState {
         }
     }
 
+    /// Draw the editors' time grid at `strength` (0…1): every canvas
+    /// repaints once with it (nothing is laid out again), and it is
+    /// remembered.
+    pub fn set_grid_strength(&self, strength: f32) {
+        let theme = self.theme.borrow().clone().with_grid_strength(strength);
+        if theme.grid == self.theme.borrow().grid {
+            return;
+        }
+        self.canvases.borrow_mut().retain(|w| match w.upgrade() {
+            Some(c) => {
+                c.restyle(&theme);
+                true
+            }
+            None => false,
+        });
+        *self.theme.borrow_mut() = theme;
+        let mut prefs = crate::prefs::Preferences::load();
+        prefs.grid_strength = strength;
+        if let Err(e) = prefs.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    }
+
     pub fn redraw_all(&self) {
         self.canvases.borrow_mut().retain(|w| match w.upgrade() {
             Some(c) => {
@@ -257,6 +302,7 @@ impl AppState {
     /// Apply an action from any view or menu.
     pub fn dispatch(self: &Rc<Self>, action: Action) {
         let lanes_before = self.session.borrow().editor.lanes;
+        let objects_before = self.session.borrow().editor.snap_objects;
         let result = self.session.borrow_mut().dispatch(action);
         if let Err(e) = result {
             self.report(e, false);
@@ -271,7 +317,19 @@ impl AppState {
             // The View → Lanes ticks, wherever the change came from.
             crate::actions::sync_lane_actions(self);
         }
+        crate::actions::remember_snap_objects(self, objects_before);
         self.after_change();
+    }
+
+    /// Dispatch `action` writing to `chosen`, a path a save dialog returned:
+    /// a file there now was asked about by that dialog already (GTK's file
+    /// choosers always ask), so the export replaces it without asking
+    /// again; one that appears later is still asked about.
+    pub fn dispatch_chosen(self: &Rc<Self>, action: Action, chosen: &std::path::Path) {
+        let agreed = crate::dialogs::chooser_agreed(chosen);
+        self.session.borrow_mut().agree_to_replace(agreed);
+        self.dispatch(action);
+        self.session.borrow_mut().forget_agreement();
     }
 
     /// Run `f` on the session and report errors.
@@ -306,9 +364,11 @@ impl AppState {
         self.update_chrome(true);
         crate::recent::note_session_path(self);
         crate::listen::follow(self);
+        crate::recording::follow(self);
         crate::monitoring::follow(self);
         crate::console::follow(self);
         crate::cues::follow(self);
+        crate::favorites::follow(self);
     }
 
     /// Show an error: always in the status bar, optionally as a dialog.
@@ -327,23 +387,20 @@ impl AppState {
         }
     }
 
-    /// Start (or restart) audio with the current options.
+    /// Start (or restart) audio with the current options and the devices
+    /// chosen in Preferences.
     pub fn start_audio(self: &Rc<Self>) {
         let (choice, prefs) = {
             let o = self.options.borrow();
             (
                 o.backend,
-                AudioPreferences {
-                    sample_rate: o.sample_rate,
-                    buffer_size: o.buffer_size,
-                    threads: o.threads,
-                },
+                crate::prefs::Preferences::load().audio_preferences(&o),
             )
         };
         let result = self
             .session
             .borrow_mut()
-            .start_audio(choice.backends(), &prefs);
+            .start_audio_with(choice.factory(), &prefs);
         if let Err(e) = result {
             self.report(e, false);
         }
@@ -416,6 +473,9 @@ impl AppState {
                 faderframe_session::UiRequest::RenameGroup(group) => {
                     crate::dialogs::rename_group(self, group);
                 }
+                faderframe_session::UiRequest::RenameScratchPad(pad) => {
+                    crate::dialogs::rename_scratch_pad(self, pad);
+                }
                 faderframe_session::UiRequest::PickColor(target) => {
                     crate::dialogs::pick_color(self, target);
                 }
@@ -434,6 +494,17 @@ impl AppState {
                     end,
                     name,
                 } => crate::dialogs::save_sample(self, track, start, end, &name),
+                faderframe_session::UiRequest::AskReplace(q) => {
+                    crate::render_report::ask_replace(self, &q);
+                }
+                faderframe_session::UiRequest::RenderReport { what, files } => {
+                    let win = self
+                        .window
+                        .borrow()
+                        .clone()
+                        .map(|w| w.upcast::<gtk::Window>());
+                    crate::render_report::show(self, win.as_ref(), &what, &files);
+                }
             }
         }
         let report = self
@@ -487,6 +558,11 @@ impl AppState {
             if win.title().as_deref() != Some(title.as_str()) {
                 win.set_title(Some(&title));
             }
+        }
+        drop(session);
+        // The menus' checks, whatever changed them.
+        if full {
+            crate::toggles::follow(self);
         }
     }
 }

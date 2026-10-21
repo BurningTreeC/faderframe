@@ -58,9 +58,13 @@ pub enum EditError {
 pub enum Impact {
     /// Display-only data (names, colours, track order, markers).
     None,
+    /// The transport's settings (the loop): sent to the audio thread as
+    /// they are, nothing rebuilt — a loop resized while playing must not
+    /// make a new timeline snapshot per pointer move.
+    Transport,
     /// Continuous values (fader, pan, mute/solo, send levels).
     Params,
-    /// Timeline content (clips, notes, tempo, loop).
+    /// Timeline content (clips, notes, tempo).
     Timeline,
     /// Routing/graph structure (tracks, plugins, sends, I/O).
     Graph,
@@ -86,6 +90,7 @@ pub enum CoalesceKey {
     Tempo,
     Loop,
     Punch,
+    PlayStart,
     Automation(TrackId, AutomationLaneId),
     PluginParameter(PluginInstanceId, ParameterId),
     Marker(MarkerId),
@@ -107,6 +112,13 @@ pub struct RemovedTrack {
     pub removed_sends: Vec<(TrackId, usize, AuxSend)>,
     /// Its launcher clips, by scene.
     pub slots: Vec<(faderframe_core::SceneId, Clip)>,
+    /// Its parts of the arrangements put aside (scratch pads, the song),
+    /// with whose they are (`None`: the song's).
+    pub stashed: Vec<(
+        Option<faderframe_core::ScratchPadId>,
+        crate::scratch::StashedTrack,
+        Vec<Clip>,
+    )>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -380,6 +392,23 @@ pub enum Command {
         track: TrackId,
         folder: Option<TrackId>,
     },
+    /// Make a folder a bus (`on`: a [`TrackKind::Bus`] with
+    /// [`Track::folder_bus`], summing what it holds) or a plain folder
+    /// again ([`TrackKind::Folder`]), with `output` as its output. Its
+    /// fader, pan, devices and sends are kept either way (a plain folder
+    /// plays none of them).
+    SetFolderBus {
+        track: TrackId,
+        on: bool,
+        output: OutputRouting,
+    },
+    /// Turn a folder's Group switch on or off ([`Track::folder_group`]:
+    /// what it holds is edited and armed as one). Folders and folder buses
+    /// only.
+    SetFolderGroup {
+        track: TrackId,
+        on: bool,
+    },
     /// Freeze (`Some`) or unfreeze a track.
     SetTrackFreeze {
         track: TrackId,
@@ -589,6 +618,19 @@ pub enum Command {
     SetArrangement {
         arrangement: Box<crate::arrange::Arrangement>,
     },
+    /// Show the song (`None`) or a scratch pad: the arrangement shown is
+    /// put aside and the other takes its place (see [`crate::scratch`]).
+    ShowArrangement {
+        pad: Option<faderframe_core::ScratchPadId>,
+    },
+    /// Add (`index`: where in the list), change or remove (`value: None`)
+    /// a scratch pad. The shown pad cannot be removed; its value holds no
+    /// stash (the project's arrangement fields hold its content).
+    SetScratchPad {
+        pad: faderframe_core::ScratchPadId,
+        value: Option<Box<crate::scratch::ScratchPad>>,
+        index: usize,
+    },
     /// Replace the album (songs and delivery settings).
     SetAlbum {
         album: Box<crate::album::Album>,
@@ -611,6 +653,10 @@ pub enum Command {
     SetPunch {
         range: Option<MusicalRange>,
         enabled: bool,
+    },
+    /// Set, move, switch or remove (`None`) the Play Start Marker.
+    SetPlayStart {
+        marker: Option<crate::PlayStart>,
     },
     AddMarker {
         marker: Marker,
@@ -762,7 +808,10 @@ fn check_output(p: &Project, track: TrackId, output: OutputRouting) -> Result<()
                     "the master cannot feed itself".into(),
                 ));
             }
-            p.master_id()
+            // The default: the folder bus it is in, else the master.
+            p.folder_bus_of(src)
+                .map(|f| f.id)
+                .or_else(|| p.master_id())
                 .ok_or_else(|| EditError::InvalidRouting("project has no master".into()))?
         }
         OutputRouting::Hardware { .. } | OutputRouting::None => return Ok(()),
@@ -875,6 +924,10 @@ impl Command {
                 folder: Some(_), ..
             } => "Move to Folder".into(),
             SetTrackFolder { folder: None, .. } => "Move out of Folder".into(),
+            SetFolderBus { on: true, .. } => "Make Folder a Bus".into(),
+            SetFolderBus { on: false, .. } => "Make Folder Plain".into(),
+            SetFolderGroup { on: true, .. } => "Group Folder".into(),
+            SetFolderGroup { on: false, .. } => "Ungroup Folder".into(),
             SetTrackFreeze {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
@@ -925,11 +978,17 @@ impl Command {
             SetClipLaunch { .. } => "Clip Launch".into(),
             SetLaunchRecording { .. } => "Slot Recording".into(),
             SetArrangement { .. } => "Rearrange".into(),
+            ShowArrangement { pad: None } => "Show Song".into(),
+            ShowArrangement { .. } => "Show Scratch Pad".into(),
+            SetScratchPad { value: None, .. } => "Delete Scratch Pad".into(),
+            SetScratchPad { .. } => "Scratch Pad".into(),
             SetAlbum { .. } => "Edit Album".into(),
             SetSongInserts { .. } => "Change Song Inserts".into(),
             SetTimeSignature { .. } => "Change Time Signature".into(),
             SetLoop { .. } => "Change Loop".into(),
             SetPunch { .. } => "Change Punch Range".into(),
+            SetPlayStart { marker: None } => "Remove Play Start Marker".into(),
+            SetPlayStart { .. } => "Set Play Start Marker".into(),
             AddMarker { .. } => "Add Marker".into(),
             RemoveMarker { .. } => "Remove Marker".into(),
             UpdateMarker { .. } => "Edit Marker".into(),
@@ -964,6 +1023,7 @@ impl Command {
             SetVideo { .. } => CoalesceKey::Video,
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
+            SetPlayStart { .. } => CoalesceKey::PlayStart,
             UpdateMarker { marker } => CoalesceKey::Marker(marker.id),
             UpdateSection { section } => CoalesceKey::Section(section.id),
             SetAutomationLane { track, lane } => CoalesceKey::Automation(*track, lane.id),
@@ -1018,12 +1078,14 @@ impl Command {
             | RemoveMidiMapping { .. }
             | UpdateMidiMapping { .. }
             | SetPunch { .. }
+            | SetPlayStart { .. }
             | RenameProject { .. }
             | RenameClip { .. }
             | AddGroup { .. }
             | RemoveGroup { .. }
             | UpdateGroup { .. }
             | SetTrackGroup { .. }
+            | SetFolderGroup { .. }
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
@@ -1034,7 +1096,10 @@ impl Command {
             | SetScenes { .. }
             | SetLaunchQuantize { .. }
             | SetClipLaunch { .. }
-            | SetLaunchRecording { .. } => Impact::None,
+            | SetLaunchRecording { .. }
+            // A pad put aside plays nothing; the shown one's entry holds
+            // only its name.
+            | SetScratchPad { .. } => Impact::None,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1056,8 +1121,9 @@ impl Command {
             | SetLauncherSlot { .. }
             | SetFollowAction { .. }
             | SetArrangement { .. }
-            | SetTimeSignature { .. }
-            | SetLoop { .. } => Impact::Timeline,
+            | ShowArrangement { .. }
+            | SetTimeSignature { .. } => Impact::Timeline,
+            SetLoop { .. } => Impact::Transport,
             SetCrosstalk { .. }
             | SetConsole { .. }
             | MoveTrack { .. }
@@ -1086,10 +1152,12 @@ impl Command {
             | RemoveTrack { .. }
             | RestoreTrack(_)
             | SetTrackFreeze { .. }
+            | SetFolderBus { .. }
             | SetPluginSidechain { .. } => Impact::Graph,
             // VCA automation travels with the timeline snapshot.
             SetTrackVca { .. } => Impact::Timeline,
-            // Folder mutes and solos reach the tracks inside.
+            // Folder mutes and solos reach the tracks inside (in or out of
+            // a folder bus, the engine escalates: routing changed).
             SetTrackFolder { .. } => Impact::Params,
             // The engine's modulation table (the graph when a track gains
             // or loses its modulators: escalated by the controller).
@@ -1663,7 +1731,7 @@ impl Command {
             }
             SetTrackFolder { track, folder } => {
                 if let Some(f) = folder {
-                    let ok = p.track(f).is_some_and(|t| t.kind == TrackKind::Folder);
+                    let ok = p.track(f).is_some_and(Track::is_folder);
                     if !ok {
                         return Err(EditError::Invalid("that track is not a folder".into()));
                     }
@@ -1687,7 +1755,55 @@ impl Command {
                     ));
                 }
                 let old = std::mem::replace(&mut t.folder, folder);
+                // Into (or out of) a folder bus its default output follows:
+                // never into a loop.
+                if p.routing_loops() {
+                    track_mut(p, track)?.folder = old;
+                    return Err(EditError::FeedbackLoop);
+                }
                 SetTrackFolder { track, folder: old }
+            }
+            SetFolderBus { track, on, output } => {
+                let t = p.track(track).ok_or(EditError::UnknownTrack(track))?;
+                if !t.is_folder() {
+                    return Err(EditError::Invalid("that track is not a folder".into()));
+                }
+                let before = (t.kind, t.folder_bus, t.output);
+                let t = track_mut(p, track)?;
+                t.kind = if on {
+                    TrackKind::Bus
+                } else {
+                    TrackKind::Folder
+                };
+                t.folder_bus = on;
+                t.output = output;
+                // What it holds now plays through it (or no longer does):
+                // never into a loop, and only where a bus may go.
+                let refused = if p.routing_loops() {
+                    Some(EditError::FeedbackLoop)
+                } else if on {
+                    check_output(p, track, output).err()
+                } else {
+                    None
+                };
+                if let Some(e) = refused {
+                    let t = track_mut(p, track)?;
+                    (t.kind, t.folder_bus, t.output) = before;
+                    return Err(e);
+                }
+                SetFolderBus {
+                    track,
+                    on: before.1 && before.0 == TrackKind::Bus,
+                    output: before.2,
+                }
+            }
+            SetFolderGroup { track, on } => {
+                let t = track_mut(p, track)?;
+                if !t.is_folder() {
+                    return Err(EditError::Invalid("that track is not a folder".into()));
+                }
+                let old = std::mem::replace(&mut t.folder_group, on);
+                SetFolderGroup { track, on: old }
             }
             SetTrackFreeze { track, freeze } => {
                 let t = track_mut(p, track)?;
@@ -1794,6 +1910,7 @@ impl Command {
                         Some((k.scene, p.clips.remove(&id)?))
                     })
                     .collect();
+                let stashed = p.take_stashed_track(track);
                 RestoreTrack(Box::new(RemovedTrack {
                     track: removed,
                     index,
@@ -1801,6 +1918,7 @@ impl Command {
                     rerouted,
                     removed_sends,
                     slots,
+                    stashed,
                 }))
             }
             RestoreTrack(r) => {
@@ -1811,6 +1929,7 @@ impl Command {
                     rerouted,
                     removed_sends,
                     slots,
+                    stashed,
                 } = *r;
                 if p.track(track.id).is_some() {
                     return Err(EditError::Invalid(format!(
@@ -1833,6 +1952,7 @@ impl Command {
                         .insert(crate::launcher::SlotKey { track: id, scene }, c.id);
                     p.clips.insert(c.id, c);
                 }
+                p.put_stashed_track(id, stashed);
                 for (t, out) in rerouted {
                     if let Some(t) = p.track_mut(t) {
                         t.output = out;
@@ -1968,8 +2088,10 @@ impl Command {
                 if !p.sources.contains_key(&source) {
                     return Err(EditError::UnknownSource(source));
                 }
+                // Clips of arrangements put aside count too.
                 if p.clips
                     .values()
+                    .chain(p.stashed_clips())
                     .any(|c| c.content.sources().contains(&source))
                 {
                     return Err(EditError::SourceInUse(source));
@@ -2248,6 +2370,58 @@ impl Command {
             SetArrangement { arrangement } => SetArrangement {
                 arrangement: Box::new(arrangement.swap_into(p)),
             },
+            ShowArrangement { pad } => ShowArrangement {
+                pad: p.show_arrangement(pad)?,
+            },
+            SetScratchPad { pad, value, index } => {
+                let pads = &mut p.scratch_pads;
+                let at = pads.index_of(pad);
+                if let Some(v) = &value {
+                    if v.id != pad {
+                        return Err(EditError::Invalid("scratch pad id mismatch".into()));
+                    }
+                    if (pads.shown == Some(pad)) == v.stash.is_some() {
+                        return Err(EditError::Invalid(
+                            "a scratch pad holds its content exactly while not shown".into(),
+                        ));
+                    }
+                }
+                match (at, value) {
+                    (Some(_), None) if pads.shown == Some(pad) => {
+                        return Err(EditError::Invalid(
+                            "the scratch pad shown cannot be removed".into(),
+                        ));
+                    }
+                    (Some(i), None) => SetScratchPad {
+                        pad,
+                        value: Some(Box::new(pads.pads.remove(i))),
+                        index: i,
+                    },
+                    (Some(i), Some(v)) => {
+                        let old = pads.pads.remove(i);
+                        pads.pads.insert(index.min(pads.pads.len()), *v);
+                        SetScratchPad {
+                            pad,
+                            value: Some(Box::new(old)),
+                            index: i,
+                        }
+                    }
+                    (None, Some(v)) => {
+                        let i = index.min(pads.pads.len());
+                        pads.pads.insert(i, *v);
+                        SetScratchPad {
+                            pad,
+                            value: None,
+                            index: i,
+                        }
+                    }
+                    (None, None) => SetScratchPad {
+                        pad,
+                        value: None,
+                        index,
+                    },
+                }
+            }
             SetAlbum { album } => SetAlbum {
                 album: Box::new(std::mem::replace(&mut p.album, *album)),
             },
@@ -2281,6 +2455,9 @@ impl Command {
                     enabled: old_enabled,
                 }
             }
+            SetPlayStart { marker } => SetPlayStart {
+                marker: std::mem::replace(&mut p.play_start, marker),
+            },
             AddMarker { marker } => {
                 let id = marker.id;
                 p.markers.push(marker);

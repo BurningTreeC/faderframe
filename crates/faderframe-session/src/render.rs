@@ -4,6 +4,18 @@
 //! live playback ([`faderframe_engine::offline::OfflineRenderer`]), faster
 //! than realtime. The project is cloned for the job, so editing can continue
 //! while it runs.
+//!
+//! Its files are written beside their destinations under temporary names
+//! and move into place only when all of them are done ([`files`]: an
+//! existing destination is replaced only as [`RenderSettings::overwrite`]
+//! allows, checked again right before the move), and each is read back and
+//! measured on the worker ([`stats`]).
+
+pub mod files;
+pub mod stats;
+
+pub use files::{Overwrite, Staged};
+pub use stats::{FileStats, RenderSummary};
 
 use crate::delivery::{Finish, Finished};
 use faderframe_audio_files::{Dither, WavFormat};
@@ -12,6 +24,7 @@ use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{EngineConfig, render_generated_sources};
 use faderframe_project::{Project, TrackKind};
 use faderframe_timeline::MusicalTime;
+use files::StagedFile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -39,6 +52,9 @@ pub enum RenderSource {
     /// One file per audio-producing track (solo-in-place, so buses and
     /// returns the track feeds are included).
     Stems,
+    /// One track as its stem would be (soloed in place through the mix),
+    /// to the output file.
+    Track(TrackId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +94,12 @@ pub struct RenderSettings {
     pub finish: Finish,
     /// Dither for integer formats.
     pub dither: Dither,
-    /// Measure every written file (loudness, true peak).
+    /// Read every written file back and measure it ([`Rendered::stats`]).
     pub report: bool,
+    /// What may happen to destinations that exist when the render is
+    /// done ([`Overwrite::Never`] by default: nothing is replaced unless
+    /// the user said so).
+    pub overwrite: Overwrite,
     /// Leave the graph's latency at the front of the file (a freeze: the
     /// frozen track claims it, so it plays exactly as before). Otherwise
     /// it is taken off and the file starts where the range does.
@@ -108,6 +128,7 @@ impl RenderSettings {
             finish: Finish::default(),
             dither: Dither::Tpdf,
             report: true,
+            overwrite: Overwrite::Never,
             keep_latency: false,
             head: None,
             output,
@@ -123,8 +144,14 @@ pub enum RenderError {
     EmptyRange,
     #[error("there are no tracks to render as stems")]
     NoStems,
+    #[error("{0}")]
+    NoTrack(String),
     #[error("render cancelled")]
     Cancelled,
+    /// Rendered, but a destination is taken that the render may not
+    /// replace: the files wait aside to be committed or discarded.
+    #[error("{}", files::exists_message(.0))]
+    Exists(Box<Staged>),
     #[error("{0}")]
     Adm(String),
     #[error("{0}")]
@@ -133,6 +160,17 @@ pub enum RenderError {
     Engine(#[from] faderframe_engine::EngineError),
     #[error("cannot write {path}: {source}")]
     Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// A folder is where a file is to go: no file replaces a folder (found
+    /// before anything is rendered).
+    #[error("{} is a folder: a file cannot take its place", .0.display())]
+    NotAFile(PathBuf),
+    /// The destination's folder takes no file (read-only, missing, not a
+    /// folder): found before anything is rendered.
+    #[error("cannot write into the folder {path}: {source}")]
+    Folder {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -147,6 +185,8 @@ pub struct RenderProgress {
     /// Delay left at the front of the rendered audio (`keep_latency`), at
     /// the render rate.
     pub latency: AtomicU32,
+    /// Reading a written file back to measure it.
+    pub measuring: AtomicBool,
 }
 
 impl RenderProgress {
@@ -164,9 +204,12 @@ impl RenderProgress {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rendered {
     pub path: PathBuf,
-    /// What finishing did and how the file measures (`None` without
-    /// [`RenderSettings::report`] and finishing).
+    /// What finishing (or normalising) did, and how the audio measured
+    /// before it was written (`None` when nothing was done to the level).
     pub finished: Option<Finished>,
+    /// The file as written, read back (`None` without
+    /// [`RenderSettings::report`]; an error when it could not be read).
+    pub stats: Option<Result<FileStats, String>>,
 }
 
 pub struct RenderJob {
@@ -263,6 +306,86 @@ fn stem_tracks(project: &Project) -> Vec<(TrackId, String)> {
         .filter(|t| t.kind != TrackKind::Master && t.kind.has_audio())
         .map(|t| (t.id, t.name.clone()))
         .collect()
+}
+
+/// The tracks a render can render alone (those with stems).
+pub fn renderable_tracks(project: &Project) -> Vec<(TrackId, String)> {
+    stem_tracks(project)
+}
+
+/// "<project> - <track>.wav" in `dir`, for each stem track: names that
+/// repeat (letter case aside, as Windows and macOS compare them) get
+/// " (2)", " (3)", … so no stem overwrites another.
+fn stem_paths(project: &Project, dir: &Path) -> Vec<(TrackId, PathBuf)> {
+    let mut taken = std::collections::HashSet::new();
+    stem_tracks(project)
+        .into_iter()
+        .map(|(track, name)| {
+            let base = format!("{} - {}", sanitize(&project.name), sanitize(&name));
+            let mut file = format!("{base}.wav");
+            let mut n = 2;
+            while !taken.insert(file.to_lowercase()) {
+                file = format!("{base} ({n}).wav");
+                n += 1;
+            }
+            (track, dir.join(file))
+        })
+        .collect()
+}
+
+/// The file name a track renders to by default ("<project> - <track>").
+pub fn track_file_stem(project: &Project, track: TrackId) -> String {
+    let name = project.track(track).map_or("Track", |t| t.name.as_str());
+    format!("{} - {}", sanitize(&project.name), sanitize(name))
+}
+
+/// The tracks rendered (`None`: the master mix) and the file each goes to.
+fn render_plan(
+    project: &Project,
+    settings: &RenderSettings,
+) -> Result<Vec<(Option<TrackId>, PathBuf)>, RenderError> {
+    let whole_mix = matches!(
+        settings.channels,
+        RenderChannels::Adm(_) | RenderChannels::Iamf(_)
+    );
+    if whole_mix && settings.source != RenderSource::Master {
+        return Err(RenderError::NoTrack(
+            "ADM and IAMF masters are the whole mix: render them from the master".into(),
+        ));
+    }
+    Ok(match settings.source {
+        RenderSource::Master => vec![(None, settings.output.clone())],
+        RenderSource::Track(track) => {
+            if !stem_tracks(project).iter().any(|(t, _)| *t == track) {
+                let what = project
+                    .track(track)
+                    .map_or_else(|| "the track is gone".into(), |t| format!("'{}'", t.name));
+                return Err(RenderError::NoTrack(format!(
+                    "{what} makes no audio to render"
+                )));
+            }
+            vec![(Some(track), settings.output.clone())]
+        }
+        RenderSource::Stems => {
+            let stems = stem_paths(project, &settings.output);
+            if stems.is_empty() {
+                return Err(RenderError::NoStems);
+            }
+            stems.into_iter().map(|(t, p)| (Some(t), p)).collect()
+        }
+    })
+}
+
+/// Every file the render will write — what to check for existing files
+/// before it starts (and what [`Staged::commit`] checks again at the end).
+pub fn destinations(
+    project: &Project,
+    settings: &RenderSettings,
+) -> Result<Vec<PathBuf>, RenderError> {
+    Ok(render_plan(project, settings)?
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect())
 }
 
 /// Render `project` (absolute media paths) from `a` to `b` plus `tail`
@@ -501,13 +624,15 @@ pub(crate) fn process_through(
     Ok(out)
 }
 
-/// Write `audio` (`mask`: a surround bed's speakers) after finishing.
+/// Write `audio` (`mask`: a surround bed's speakers) after finishing to
+/// `file` (the destination's temporary file; errors name `dest`); what
+/// finishing did.
 fn finish(
     mut audio: Vec<Vec<f32>>,
     settings: &RenderSettings,
-    path: &Path,
+    file: &StagedFile,
     mask: Option<u32>,
-) -> Result<Rendered, RenderError> {
+) -> Result<Option<Finished>, RenderError> {
     if settings.channels == RenderChannels::First {
         audio.truncate(1);
     }
@@ -520,15 +645,17 @@ fn finish(
         audio = vec![mono];
     }
     let rate = settings.sample_rate;
+    // The written file is measured afterwards ([`stats`]); here only what
+    // the level processing did.
     let finished = if !settings.finish.is_none() {
         Some(settings.finish.apply(&mut audio, rate))
     } else {
-        let mut gain_db = 0.0;
+        let mut gain_db = None;
         if let Some(target) = settings.normalize_db {
             let peak = audio.iter().flatten().fold(0.0f32, |m, s| m.max(s.abs()));
             if peak > 1e-9 {
                 let g = db_to_gain(target) / peak;
-                gain_db = 20.0 * (g as f64).log10();
+                gain_db = Some(20.0 * (g as f64).log10());
                 for ch in &mut audio {
                     for s in ch.iter_mut() {
                         *s *= g;
@@ -536,7 +663,7 @@ fn finish(
                 }
             }
         }
-        settings.report.then(|| Finished {
+        gain_db.map(|gain_db| Finished {
             gain_db,
             limited_db: 0.0,
             report: faderframe_analysis::delivery::measure(&audio, rate),
@@ -548,15 +675,49 @@ fn finish(
         Dither::Off
     };
     let mask = mask.filter(|_| audio.len() > 2);
-    faderframe_audio_files::write_wav_mask(path, &audio, rate, settings.format, dither, mask)
-        .map_err(|source| RenderError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    Ok(Rendered {
-        path: path.to_path_buf(),
-        finished,
-    })
+    faderframe_audio_files::write_wav_mask(
+        file.temp(),
+        &audio,
+        rate,
+        settings.format,
+        dither,
+        mask,
+    )
+    .map_err(|source| RenderError::Io {
+        path: file.dest().to_path_buf(),
+        source,
+    })?;
+    Ok(finished)
+}
+
+/// Read a written file back and measure it when the settings ask
+/// (between rendering and committing, on the worker).
+pub(crate) fn measure_written(
+    file: &StagedFile,
+    written: &stats::Written,
+    settings: &RenderSettings,
+    render_seconds: f64,
+    progress: &RenderProgress,
+) -> Result<Option<Result<FileStats, String>>, RenderError> {
+    if !settings.report {
+        return Ok(None);
+    }
+    progress.measuring.store(true, Ordering::Relaxed);
+    let measured = stats::measure(
+        file.temp(),
+        file.dest(),
+        written,
+        render_seconds,
+        &progress.cancel,
+    );
+    progress.measuring.store(false, Ordering::Relaxed);
+    if progress.cancel.load(Ordering::Relaxed) {
+        return Err(RenderError::Cancelled);
+    }
+    if let Err(e) = &measured {
+        tracing::warn!("render: could not measure {e}");
+    }
+    Ok(Some(measured))
 }
 
 /// A project that renders only `track` after its inserts and before its
@@ -577,6 +738,7 @@ pub fn track_render_project(
         .track(track)
         .is_some_and(|t| t.chain_layout() == faderframe_core::ChannelLayout::Mono);
     let mut p = project.clone();
+    let master = p.master_id();
     for t in &mut p.tracks {
         t.solo = t.id == track;
         if t.kind == TrackKind::Master {
@@ -601,7 +763,10 @@ pub fn track_render_project(
             t.mute = false;
             t.freeze = None;
             t.sends.clear();
-            t.output = faderframe_project::OutputRouting::Master;
+            // Straight to the master, past any folder bus it is in.
+            t.output = master.map_or(faderframe_project::OutputRouting::Master, |m| {
+                faderframe_project::OutputRouting::Track { track: m }
+            });
             t.automation.lanes.retain(|l| {
                 !matches!(
                     l.target,
@@ -615,6 +780,12 @@ pub fn track_render_project(
 
 /// Start rendering `project` on a worker thread.
 pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, RenderError> {
+    let plan = render_plan(&project, &settings)?;
+    // A folder where a file is to go: refused now, not after rendering.
+    let dests: Vec<PathBuf> = plan.iter().map(|(_, p)| p.clone()).collect();
+    if let Some(folder) = files::folder_in_the_way(&dests) {
+        return Err(RenderError::NotAFile(folder));
+    }
     if let RenderChannels::Adm(profile) = settings.channels {
         return crate::adm::start(project, settings, profile);
     }
@@ -633,94 +804,86 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
     if frames == 0 {
         return Err(RenderError::EmptyRange);
     }
-    let stems = match settings.source {
-        RenderSource::Master => Vec::new(),
-        RenderSource::Stems => {
-            let s = stem_tracks(&project);
-            if s.is_empty() {
-                return Err(RenderError::NoStems);
-            }
-            s
-        }
-    };
     let progress = Arc::new(RenderProgress::default());
-    let jobs = stems.len().max(1) as u64;
     progress
         .total
-        .store(frames as u64 * jobs, Ordering::Relaxed);
+        .store(frames as u64 * plan.len() as u64, Ordering::Relaxed);
     let p = Arc::clone(&progress);
-    let handle = std::thread::Builder::new()
-        .name("faderframe-render".into())
-        .spawn(move || -> Result<Vec<Rendered>, RenderError> {
-            // File paths are absolute here (see `Session::render`). Streams
-            // are opened afresh: their page tables must not be shared with
-            // the live engine.
-            let mut sources = render_generated_sources(&project, settings.sample_rate);
-            for (_, path, e) in crate::media::open_file_sources(&project, None, &mut sources) {
-                tracing::warn!("render: {}: {e}", path.display());
-            }
-            let mut written = Vec::new();
-            // As the master is: a bed's every channel.
-            let bed = (settings.channels == RenderChannels::Master)
-                .then(|| master_bed(&project))
-                .flatten();
-            let outputs = bed.map_or(2, |f| f.channels());
-            let binaural = match settings.channels {
-                RenderChannels::Binaural(room) => Some((room, settings.head.as_ref())),
-                _ => None,
-            };
-            let mask = bed.map(faderframe_core::SurroundFormat::channel_mask);
-            if stems.is_empty() {
-                let audio = render_one(
-                    &project,
-                    settings.sample_rate,
-                    &sources,
-                    start,
-                    frames,
-                    &p,
-                    outputs,
-                    binaural,
-                    settings.keep_latency,
-                )?;
-                written.push(finish(audio, &settings, &settings.output, mask)?);
-            } else {
-                std::fs::create_dir_all(&settings.output).map_err(|source| RenderError::Io {
-                    path: settings.output.clone(),
-                    source,
-                })?;
-                for (track, name) in &stems {
-                    let mut stem = project.clone();
-                    for t in &mut stem.tracks {
-                        t.solo = t.id == *track;
+    let stems = settings.source == RenderSource::Stems;
+    RenderJob::spawn(progress, move || {
+        // File paths are absolute here (see `Session::render`). Streams
+        // are opened afresh: their page tables must not be shared with
+        // the live engine.
+        let mut sources = render_generated_sources(&project, settings.sample_rate);
+        for (_, path, e) in crate::media::open_file_sources(&project, None, &mut sources) {
+            tracing::warn!("render: {}: {e}", path.display());
+        }
+        // As the master is: a bed's every channel.
+        let bed = (settings.channels == RenderChannels::Master)
+            .then(|| master_bed(&project))
+            .flatten();
+        let outputs = bed.map_or(2, |f| f.channels());
+        let binaural = match settings.channels {
+            RenderChannels::Binaural(room) => Some((room, settings.head.as_ref())),
+            _ => None,
+        };
+        let mask = bed.map(faderframe_core::SurroundFormat::channel_mask);
+        if stems {
+            std::fs::create_dir_all(&settings.output).map_err(|source| RenderError::Io {
+                path: settings.output.clone(),
+                source,
+            })?;
+        }
+        // Every file's temporary name claimed first: a folder that cannot
+        // be written to fails now, not after rendering.
+        let mut claimed = Vec::with_capacity(plan.len());
+        for (solo, dest) in &plan {
+            claimed.push((*solo, StagedFile::new(dest)?));
+        }
+        let written = stats::Written::Wav { bed };
+        let mut staged = Vec::with_capacity(claimed.len());
+        for (solo, file) in claimed {
+            let began = std::time::Instant::now();
+            let soloed;
+            let project = match solo {
+                Some(track) => {
+                    let mut p = project.clone();
+                    for t in &mut p.tracks {
+                        t.solo = t.id == track;
                     }
-                    let audio = render_one(
-                        &stem,
-                        settings.sample_rate,
-                        &sources,
-                        start,
-                        frames,
-                        &p,
-                        outputs,
-                        binaural,
-                        settings.keep_latency,
-                    )?;
-                    let path = settings.output.join(format!(
-                        "{} - {}.wav",
-                        sanitize(&project.name),
-                        sanitize(name)
-                    ));
-                    written.push(finish(audio, &settings, &path, mask)?);
+                    soloed = p;
+                    &soloed
                 }
-            }
-            Ok(written)
-        })
-        .map_err(|source| RenderError::Io {
-            path: PathBuf::from("<thread>"),
-            source,
-        })?;
-    Ok(RenderJob {
-        progress,
-        handle: Some(handle),
+                None => &project,
+            };
+            let audio = render_one(
+                project,
+                settings.sample_rate,
+                &sources,
+                start,
+                frames,
+                &p,
+                outputs,
+                binaural,
+                settings.keep_latency,
+            )?;
+            let finished = finish(audio, &settings, &file, mask)?;
+            let seconds = began.elapsed().as_secs_f64();
+            let stats = measure_written(&file, &written, &settings, seconds, &p)?;
+            let path = file.dest().to_path_buf();
+            staged.push((
+                file,
+                Rendered {
+                    path,
+                    finished,
+                    stats,
+                },
+            ));
+        }
+        if p.cancel.load(Ordering::Relaxed) {
+            return Err(RenderError::Cancelled);
+        }
+        Staged::new(staged).commit(&settings.overwrite)
     })
 }
 

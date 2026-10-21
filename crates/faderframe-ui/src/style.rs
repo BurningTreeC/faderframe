@@ -122,6 +122,9 @@ scrollbar { background-color: @ff_bg; }
 .badge-lv2 { background-color: alpha(#c6e05c, 0.18); color: @ff_fg; }
 .edit-toggle { font-weight: 700; padding-left: 10px; padding-right: 10px; }
 .edit-toggle.edit-active { background-color: alpha(@ff_accent, 0.35); color: @ff_fg; }
+.inspector-toggle { font-family: serif; font-style: italic; font-weight: 800; padding-left: 11px; padding-right: 11px; }
+.dock-collapsed { background-color: @ff_surface; border-top: 1px solid @ff_border; padding: 0 4px; }
+.dock-collapsed button { min-height: 22px; padding: 0 10px; color: @ff_dim; }
 .badge-other { background-color: @ff_surface_alt; color: @ff_dim; }
 .plugin-detail { padding: 22px 20px 18px 20px; background-color: @ff_surface; }
 .detail-title { font-size: 16pt; font-weight: 800; color: @ff_fg; }
@@ -137,6 +140,13 @@ scrollbar { background-color: @ff_bg; }
 .check-verdict { font-weight: 700; padding: 2px 8px; border-radius: 8px; }
 .check-numbers { font-size: 8.5pt; color: @ff_dim; }
 .check-status { color: @ff_dim; font-size: 9pt; }
+.favorite-star { min-width: 26px; min-height: 26px; padding: 0; font-size: 13pt; color: @ff_faint; }
+.favorite-star.starred { color: @ff_warning; }
+.favorite-toggle.starred { color: @ff_warning; }
+.plugin-missing .plugin-name, .plugin-missing .plugin-sub { color: @ff_faint; }
+.badge-missing { background-color: alpha(@ff_error, 0.25); color: @ff_fg; }
+.favorites-section { margin-top: 10px; font-size: 9.5pt; }
+.sidebar-new { margin: 2px 6px 2px 6px; font-size: 9pt; }
 "#;
 
 fn css_color(c: Color) -> String {

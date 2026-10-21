@@ -103,9 +103,21 @@ impl VideoError {
 /// Start GStreamer once (every entry point calls it).
 pub fn init() -> Result<()> {
     static DONE: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    DONE.get_or_init(|| gst::init().map_err(|e| e.to_string()))
-        .clone()
-        .map_err(VideoError::Unavailable)
+    DONE.get_or_init(|| {
+        gst::init().map_err(|e| e.to_string())?;
+        streams::avoid_crashing_demuxers();
+        Ok(())
+    })
+    .clone()
+    .map_err(VideoError::Unavailable)
+}
+
+/// Whether MXF files are read by FFmpeg's demuxer (gst-libav) because
+/// this GStreamer's own crashes on some (before 1.28.4: Debian 13's
+/// 1.26). FFmpeg's has no uncompressed picture: such files are refused
+/// ("no picture") instead of crashing the program.
+pub fn mxf_by_ffmpeg() -> bool {
+    init().is_ok() && streams::MXF_BY_FFMPEG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether GStreamer has the element `name` (a plugin may be missing).

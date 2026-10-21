@@ -295,6 +295,54 @@ fn a_movie_is_imported_shown_saved_and_written_out() {
     let ix = faderframe_video::index::index(&out, &cancel, |_| {}).unwrap();
     let at = tc.at(clip.start + 2 * 48_000, 48_000);
     assert_eq!(ix.timecode, Some((at, tc.rate)));
+
+    // Onto the first movie: asked first; Cancel keeps it, Overwrite
+    // replaces it once the new one is written (beside it until then).
+    let first = d.join("out.mov");
+    let ask = |s: &mut Session| {
+        s.dispatch(Action::Video(VideoOp::Export {
+            clip: Some(clip.id),
+            path: first.clone(),
+            container: Container::Mov,
+        }))
+        .unwrap();
+        let q: Vec<_> = s
+            .take_ui_requests()
+            .into_iter()
+            .filter_map(|r| match r {
+                faderframe_session::UiRequest::AskReplace(q) => Some(q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].paths, std::slice::from_ref(&first));
+        q[0].id
+    };
+    let long = |p: &std::path::Path| faderframe_video::probe::probe(p).unwrap().duration_ns;
+    let id = ask(&mut s);
+    s.dispatch(Action::AnswerReplace {
+        question: id,
+        replace: false,
+    })
+    .unwrap();
+    s.wait_for_video();
+    assert!((long(&first) - 10_000_000_000).abs() < 100_000_000);
+    let id = ask(&mut s);
+    s.dispatch(Action::AnswerReplace {
+        question: id,
+        replace: true,
+    })
+    .unwrap();
+    s.wait_for_video();
+    assert!((long(&first) - 3_000_000_000).abs() < 100_000_000);
+    for e in std::fs::read_dir(&d).unwrap() {
+        let p = e.unwrap().path();
+        assert!(
+            !faderframe_session::render::files::is_temporary(&p),
+            "{}",
+            p.display()
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

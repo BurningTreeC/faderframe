@@ -201,8 +201,9 @@ impl ContainerView {
         }
     }
 
-    /// The devices to add: every effect (and instrument, on an instrument
-    /// track), built-ins first, and a container.
+    /// The devices to add: the favorites (a submenu, as on an empty mixer
+    /// slot), every effect (and instrument, on an instrument track),
+    /// built-ins first, and a container.
     fn add_menu(
         model: &Session,
         track: TrackId,
@@ -214,11 +215,19 @@ impl ContainerView {
             .project()
             .track(track)
             .is_some_and(|t| t.kind == faderframe_project::TrackKind::Instrument);
-        let mut effects: Vec<_> = model
-            .available_plugins()
-            .into_iter()
-            .filter(|p| (instruments || !p.instrument) && !model.is_midi_effect(&p.plugin))
-            .collect();
+        let available = model.available_plugins();
+        let fits = |p: &faderframe_session::AvailablePlugin| {
+            (instruments || !p.instrument) && !model.is_midi_effect(&p.plugin)
+        };
+        let insert = |plugin: PluginRef| Action::InsertIntoChain {
+            track,
+            container,
+            chain,
+            index,
+            plugin,
+        };
+        let favorites = Self::favorites_menu(model, &available, &fits, &insert);
+        let mut effects: Vec<_> = available.into_iter().filter(|p| fits(p)).collect();
         effects.sort_by(|a, b| {
             let hosted = |p: &faderframe_session::AvailablePlugin| {
                 p.plugin.format != faderframe_project::PluginFormat::Builtin
@@ -235,9 +244,11 @@ impl ContainerView {
                 ))
         });
         let mut items = Vec::new();
+        let first = favorites.is_some();
+        items.extend(favorites);
         let mut hosted_yet = false;
         let has_container = effects.iter().any(|p| p.plugin.is_container());
-        for p in effects {
+        for (i, p) in effects.into_iter().enumerate() {
             let hosted = p.plugin.format != faderframe_project::PluginFormat::Builtin;
             let mut item = MenuItem::new(
                 if hosted {
@@ -245,33 +256,52 @@ impl ContainerView {
                 } else {
                     p.plugin.name.clone()
                 },
-                Action::InsertIntoChain {
-                    track,
-                    container,
-                    chain,
-                    index,
-                    plugin: p.plugin.clone(),
-                },
+                insert(p.plugin.clone()),
             );
-            if hosted && !hosted_yet {
+            if (hosted && !hosted_yet) || (i == 0 && first) {
                 item.separator_before = true;
-                hosted_yet = true;
             }
+            hosted_yet |= hosted;
             items.push(item);
         }
         if !has_container {
             items.push(MenuItem::new(
                 "Container",
-                Action::InsertIntoChain {
-                    track,
-                    container,
-                    chain,
-                    index,
-                    plugin: PluginRef::builtin(builtin::CONTAINER, "Container"),
-                },
+                insert(PluginRef::builtin(builtin::CONTAINER, "Container")),
             ));
         }
         items
+    }
+
+    /// The favorites that fit the chain ([`PluginFavorites::menu`]: by
+    /// name, then a submenu per category; ones not installed now shown
+    /// disabled), or none without favorites.
+    ///
+    /// [`PluginFavorites::menu`]: faderframe_session::plugin_favorites::PluginFavorites::menu
+    fn favorites_menu(
+        model: &Session,
+        available: &[faderframe_session::AvailablePlugin],
+        fits: &dyn Fn(&faderframe_session::AvailablePlugin) -> bool,
+        insert: &dyn Fn(PluginRef) -> Action,
+    ) -> Option<MenuItem<Action>> {
+        use faderframe_session::plugin_favorites::MenuEntry;
+        let menu = model.plugin_favorites().menu(available, fits);
+        if menu.is_empty() {
+            return None;
+        }
+        let item = |e: &MenuEntry| match e {
+            MenuEntry::Available(p) => {
+                MenuItem::new(p.plugin.name.clone(), insert(p.plugin.clone()))
+            }
+            MenuEntry::Missing(f) => MenuItem::disabled(format!("{} (missing)", f.name)),
+        };
+        let mut children: Vec<MenuItem<Action>> = menu.all.iter().map(item).collect();
+        for (i, (name, members)) in menu.categories.iter().enumerate() {
+            let mut sub = MenuItem::submenu(name.clone(), members.iter().map(item).collect());
+            sub.separator_before = i == 0;
+            children.push(sub);
+        }
+        Some(MenuItem::submenu("Favorites", children))
     }
 
     fn device_menu(model: &Session, track: TrackId, slot: &PluginSlot) -> Vec<MenuItem<Action>> {
@@ -931,6 +961,109 @@ mod tests {
                 container
             }]
         );
+    }
+
+    /// A chain's "+" offers the favorites first, as an empty mixer slot
+    /// does: by name, then a submenu per category; one not installed now
+    /// disabled, one that does not fit the track (an instrument on an
+    /// audio track) left out. Without favorites there is no submenu.
+    #[test]
+    fn a_chains_add_menu_offers_the_favorites_by_category() {
+        use faderframe_session::plugin_favorites::{FavoriteKey, FavoriteOp, FavoritePlugin};
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let bass = s
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Bass")
+            .unwrap()
+            .id;
+        s.dispatch(Action::InsertPlugin {
+            track: bass,
+            index: 0,
+            plugin: PluginRef::builtin(builtin::CONTAINER, "Container"),
+        })
+        .unwrap();
+        let container = s.project().track(bass).unwrap().inserts[0].id;
+        let mut view = ContainerView::new(container, &Theme::default());
+        view.paint(&mut RecordingPainter::new(), SIZE, &s, &Theme::default());
+        let add_menu = |view: &mut ContainerView, s: &Session| {
+            let chains = s.container_chains(bass, container).unwrap().to_vec();
+            let col = view.column(1, &chains[1], SIZE, false);
+            let (_, req) = run(view, down(col.add.center(), 1), s);
+            let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+                panic!("no menu")
+            };
+            items
+        };
+        assert!(
+            !add_menu(&mut view, &s)
+                .iter()
+                .any(|i| i.label == "Favorites"),
+            "no favorites: no submenu"
+        );
+        let plugin = |id: &str| {
+            s.available_plugins()
+                .into_iter()
+                .find(|p| p.plugin.id == id)
+                .unwrap()
+        };
+        let (eq, synth) = (plugin(builtin::EQ), plugin(builtin::SYNTH));
+        s.dispatch(Action::PluginFavorites(FavoriteOp::NewCategory {
+            name: "Mixing".into(),
+            with: Some(FavoritePlugin::of(&eq)),
+        }))
+        .unwrap();
+        s.dispatch(Action::PluginFavorites(FavoriteOp::Set {
+            plugin: FavoritePlugin::of(&synth),
+            favorite: true,
+        }))
+        .unwrap();
+        s.dispatch(Action::PluginFavorites(FavoriteOp::Set {
+            plugin: FavoritePlugin {
+                key: FavoriteKey {
+                    format: faderframe_project::PluginFormat::Clap,
+                    id: "com.example.gone".into(),
+                },
+                name: "Gone Comp".into(),
+                vendor: "Example".into(),
+            },
+            favorite: true,
+        }))
+        .unwrap();
+        let items = add_menu(&mut view, &s);
+        let favorites = &items[0];
+        assert_eq!(favorites.label, "Favorites");
+        let labels: Vec<&str> = favorites
+            .children
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [eq.plugin.name.as_str(), "Gone Comp (missing)", "Mixing"],
+            "the synth does not fit an audio track's chain"
+        );
+        assert!(favorites.children[1].action.is_none(), "missing: disabled");
+        let mixing = &favorites.children[2];
+        assert_eq!(mixing.children.len(), 1, "the category's");
+        assert!(items[1].separator_before, "the list after the favorites");
+        // Chosen: into the chain.
+        let action = mixing.children[0].action.clone().unwrap();
+        assert_eq!(
+            action,
+            Action::InsertIntoChain {
+                track: bass,
+                container,
+                chain: 1,
+                index: 0,
+                plugin: eq.plugin.clone(),
+            }
+        );
+        s.dispatch(action).unwrap();
+        let chain = &s.container_chains(bass, container).unwrap()[1];
+        assert_eq!(chain.inserts.len(), 1);
+        assert_eq!(chain.inserts[0].plugin.id, builtin::EQ);
     }
 
     #[test]

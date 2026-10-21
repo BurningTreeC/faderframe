@@ -12,7 +12,8 @@ use super::*;
 use faderframe_project::{AudioClip, ClipFades, FadeShape, Warp, WarpAlgorithm, bend_factor};
 use faderframe_session::warping::WarpDrag;
 use faderframe_session::{
-    ClipEdge, EditMode, EditRange, EditTool, GridMode, NudgeTarget, ZoomRequest, parse_position,
+    ClipEdge, EditMode, EditRange, EditTool, GridMode, NudgeTarget, SnapSkip, ZoomRequest,
+    parse_position,
 };
 
 /// Pixels from a clip edge that trim.
@@ -21,6 +22,9 @@ const EDGE_GRAB: f32 = 6.0;
 const HANDLE: f32 = 7.0;
 /// Pick radius of handles, markers and transients.
 const PICK: f32 = 5.0;
+/// How near an object (pixels) a dragged edge snaps to it — the same at
+/// every zoom (Snap to Objects).
+pub(crate) const SNAP_PX: f32 = faderframe_session::snapping::SNAP_PX;
 
 /// Pickable points of a clip: source frame and view x.
 type Picks = Vec<(i64, f32)>;
@@ -75,6 +79,9 @@ pub(crate) enum EditDrag {
         /// Pressed in the clip's header strip: a click there selects the
         /// clip and leaves the playhead where it is.
         in_header: bool,
+        /// Begun by the Separation Grabber: the gesture it opened before
+        /// separating (one undo step with the move) closes on release.
+        separated: bool,
     },
     Trim {
         clips: Vec<ClipId>,
@@ -103,6 +110,18 @@ pub(crate) enum EditDrag {
         origin: Point,
         moved: bool,
     },
+    /// Slip editing (Ctrl+Alt+drag in a clip's body): the audio or MIDI
+    /// moves inside the clips, which stay.
+    Slip {
+        clips: Vec<ClipId>,
+        /// The clip pressed (a click without a drag toggles it, as a
+        /// Ctrl-click does).
+        pressed: (ClipId, TrackId),
+        origin: Point,
+        /// The time under the pointer at the press.
+        at: MusicalTime,
+        moved: bool,
+    },
     Range {
         anchor: MusicalTime,
         anchor_row: usize,
@@ -117,12 +136,14 @@ pub(crate) enum EditDrag {
         origin: Point,
         moved: bool,
     },
-    /// Separation grabber: the range was separated; becomes a move of the
-    /// separated clip once the model has it.
+    /// Separation grabber: pressed inside the range; the first move
+    /// separates it (in a gesture of its own), the next one becomes a move
+    /// of the separated pieces once the model has them.
     Separate {
         track: TrackId,
         at: MusicalTime,
         origin: Point,
+        separated: bool,
     },
     Zoom {
         from: f32,
@@ -430,6 +451,101 @@ impl ArrangerView {
 
     // --- snapping ----------------------------------------------------------------
 
+    /// The snap distance at this zoom ([`SNAP_PX`] in time).
+    pub(crate) fn snap_reach(&self) -> MusicalTime {
+        MusicalTime::from_quarters(f64::from(SNAP_PX) / f64::from(self.ppq))
+    }
+
+    /// Snap to Objects for a drag that puts things at `edges`: the shift
+    /// landing the edge nearest an object (within [`SNAP_PX`]) on it,
+    /// remembered as the guide line; `None` (and no guide) when none is
+    /// near, Snap to Objects is off or Alt is held.
+    pub(crate) fn object_shift(
+        &mut self,
+        edges: &[MusicalTime],
+        model: &Session,
+        mods: Modifiers,
+        skip: &SnapSkip,
+    ) -> Option<MusicalTime> {
+        let hit = if mods.alt {
+            None
+        } else {
+            model.snap_edges_to_object(edges, self.snap_reach(), skip)
+        };
+        self.snap_guide = hit.map(|(_, h)| h);
+        hit.map(|(shift, _)| shift)
+    }
+
+    /// A dragged position snapped: to an object within reach first (Snap
+    /// to Objects), else as [`Self::snap`] does (the grid or a whole
+    /// sample; Alt: free).
+    pub(crate) fn snap_point(
+        &mut self,
+        t: MusicalTime,
+        model: &Session,
+        mods: Modifiers,
+        skip: &SnapSkip,
+    ) -> MusicalTime {
+        match self.object_shift(&[t], model, mods, skip) {
+            Some(shift) => (t + shift).max(MusicalTime::ZERO),
+            None => self.snap(t, model, mods),
+        }
+    }
+
+    /// Where a moved group's edges are with the grabbed clip (`anchor`)
+    /// starting at `start`: the group's leading and trailing edges, then
+    /// the grabbed clip's start and end.
+    fn moved_edges(
+        model: &Session,
+        clips: &[ClipId],
+        anchor: ClipId,
+        start: MusicalTime,
+    ) -> Vec<MusicalTime> {
+        let p = model.project();
+        let Some(a) = p.clip(anchor) else {
+            return vec![start];
+        };
+        let end_from = |c: &Clip, at: MusicalTime| {
+            let rate = f64::from(p.sample_rate);
+            match &c.content {
+                ClipContent::Audio(x) => p.timeline.end_of_sample_span(at, x.length, rate),
+                ClipContent::Takes(f) => p.timeline.end_of_sample_span(at, f.length, rate),
+                ClipContent::Midi(m) => at + m.length,
+            }
+        };
+        let (mut lead, mut trail) = (start, end_from(a, start));
+        for c in clips.iter().filter_map(|id| p.clip(*id)) {
+            let s = start + (c.start - a.start);
+            lead = lead.min(s);
+            trail = trail.max(end_from(c, s));
+        }
+        vec![lead, trail, start, end_from(a, start)]
+    }
+
+    /// The line at the object the running drag snapped to, and its name.
+    pub(crate) fn paint_snap_guide(&self, p: &mut dyn Painter, lanes: Rect) {
+        let Some(hit) = self.snap_guide else {
+            return;
+        };
+        let x = self.x_of(hit.at);
+        if x < lanes.x - 1.0 || x > lanes.right() + 1.0 {
+            return;
+        }
+        let a = &self.theme.arranger;
+        // A logical pixel wide, on device pixels.
+        let scale = p.scale_factor().max(1.0);
+        let w = scale.round().max(1.0) / scale;
+        let left = (x * scale).floor() / scale;
+        p.fill(Rect::new(left, lanes.y, w, lanes.h), a.snap_guide);
+        let style = TextStyle::new(self.theme.fonts.tiny, a.snap_guide).bold();
+        let label = hit.object.label();
+        let tw = p.text_width(label, &style) + 10.0;
+        let tag = Rect::new(left + 4.0, lanes.y + 3.0, tw, 15.0);
+        p.fill_rounded(tag, 3.0, &Paint::Solid(a.ruler_bg.with_alpha(0.92)));
+        p.stroke_rounded(tag, 3.0, 1.0, a.snap_guide.with_alpha(0.7));
+        p.text(label, tag.inset_xy(5.0, 0.0), &style);
+    }
+
     /// Snap a moved position per edit mode: absolute grid, relative grid
     /// (keeps the offset from the grid), or free (Slip, Shuffle, Alt).
     fn snap_moved(
@@ -459,8 +575,6 @@ impl ArrangerView {
 
     // --- pressing ----------------------------------------------------------------
 
-    /// The clips an edit of `clip` applies to: all selected when it is
-    /// selected, else only it.
     /// The clips from the selection's anchor clip to `clicked`: on the
     /// tracks between theirs (as the rows show them), overlapping the time
     /// from the earlier start to the later end; and those tracks.
@@ -485,9 +599,40 @@ impl ArrangerView {
         Some((clips, tracks))
     }
 
-    fn targets(model: &Session, clip: ClipId) -> Vec<ClipId> {
+    /// The clips on `tracks` lying in the range `r` (as a separation left
+    /// them: their cuts may sit on zero crossings near its edges).
+    fn range_pieces(model: &Session, tracks: &[TrackId], r: EditRange) -> Vec<ClipId> {
+        let p = model.project();
+        let rate = f64::from(p.sample_rate);
+        // Further than a zero crossing moves a cut.
+        let near = |t: MusicalTime, by: i64| {
+            let s = p.timeline.to_samples(t, rate);
+            p.timeline.to_musical((s + by).max(0), rate)
+        };
+        let reach = (rate * 0.01) as i64;
+        let (start_lo, end_hi) = (near(r.start, -reach), near(r.end, reach));
+        let mut out = Vec::new();
+        for t in tracks {
+            for c in p.clips_of(*t) {
+                let end = c.end(&p.timeline, p.sample_rate);
+                if c.start < r.end && end > r.start && c.start >= start_lo && end <= end_hi {
+                    out.push(c.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// A range being drawn does not snap to its own bounds.
+    fn range_skip() -> SnapSkip {
+        SnapSkip::selection_bounds()
+    }
+
+    /// The clips an edit of `clip` applies to: the selected arranger
+    /// clips when it is one of them (never the launcher's), else only it.
+    pub(crate) fn targets(model: &Session, clip: ClipId) -> Vec<ClipId> {
         if model.selection.clips.contains(&clip) {
-            model.selection.clips.iter().copied().collect()
+            model.selected_arranger_clips()
         } else {
             vec![clip]
         }
@@ -550,6 +695,27 @@ impl ArrangerView {
                 tracks,
                 mode: SelectMode::Replace,
             });
+            Self::clips_not_range(model, cx);
+            return true;
+        }
+        // Ctrl+Alt on a clip's body: slip editing — the audio or MIDI
+        // slides inside the clip (all selected clips when it is one of
+        // them), the clip stays (Cubase, Studio One). Alt alone frees a
+        // move from the grid, Ctrl alone selects.
+        if clicks == 1
+            && mods.toggle()
+            && mods.alt
+            && matches!(zone, ClipZone::Move | ClipZone::Range | ClipZone::WarpBody)
+            && matches!(tool, EditTool::Smart | EditTool::Select | EditTool::Grab)
+        {
+            self.edit_drag = Some(EditDrag::Slip {
+                clips: Self::targets(model, clip),
+                pressed: (clip, track),
+                origin: pos,
+                at,
+                moved: false,
+            });
+            cx.set_cursor(Cursor::Move);
             return true;
         }
         // Ctrl on a clip's body: a click toggles it, a drag draws a
@@ -567,6 +733,25 @@ impl ArrangerView {
         if clicks >= 2 {
             return self.double_click_clip(c, zone, pos, model, cx);
         }
+        // The Separation Grabber inside the range: a drag takes the range's
+        // material out of every track of it (the selection stays as it is).
+        if tool == EditTool::GrabSeparation
+            && !additive
+            && zone == ClipZone::Move
+            && model
+                .selection
+                .range
+                .is_some_and(|r| !r.is_empty() && r.start <= at && at < r.end)
+        {
+            self.edit_drag = Some(EditDrag::Separate {
+                track,
+                at,
+                origin: pos,
+                separated: false,
+            });
+            cx.set_cursor(Cursor::Grabbing);
+            return true;
+        }
         // Selection: Shift/Ctrl add or remove; a plain press keeps a
         // selection the clip belongs to (so it can be dragged as a group).
         let targets: Vec<ClipId> = if additive {
@@ -578,6 +763,7 @@ impl ArrangerView {
                 tracks: vec![track],
                 mode: SelectMode::Add,
             });
+            Self::clips_not_range(model, cx);
             if selected {
                 // Removed from the selection: nothing to drag.
                 return true;
@@ -710,7 +896,7 @@ impl ArrangerView {
                 }
             }
             ClipZone::Range => EditDrag::Range {
-                anchor: self.snap(at, model, mods),
+                anchor: self.snap_point(at, model, mods, &Self::range_skip()),
                 anchor_row: row,
                 origin: pos,
                 moved: false,
@@ -719,19 +905,6 @@ impl ArrangerView {
             ClipZone::Move => {
                 if model.editor.edit_mode == EditMode::Spot && !additive {
                     cx.request(Self::spot_request(model, c, rect));
-                    return true;
-                }
-                if tool == EditTool::GrabSeparation
-                    && let Some(r) = model.selection.range.filter(|r| !r.is_empty())
-                    && r.start <= at
-                    && at < r.end
-                {
-                    cx.emit(Action::Separate);
-                    self.edit_drag = Some(EditDrag::Separate {
-                        track,
-                        at,
-                        origin: pos,
-                    });
                     return true;
                 }
                 EditDrag::Move {
@@ -746,6 +919,7 @@ impl ArrangerView {
                     additive,
                     ghost: None,
                     in_header: pos.y < rect.y + self.header_band(rect),
+                    separated: false,
                 }
             }
         });
@@ -983,13 +1157,27 @@ impl ArrangerView {
                 if mods.shift
                     && let Some(r) = model.selection.range
                 {
-                    // Shift extends the selection to the click.
-                    let t = self.snap(at, model, mods);
+                    // Shift extends the selection to the click: in time,
+                    // and over the rows from the selected tracks to this
+                    // one (as Shift does for clips and headers).
+                    let t = self.snap_point(at, model, mods, &Self::range_skip());
                     let anchor = if t >= r.start { r.start } else { r.end };
                     cx.emit(Action::SetEditRange(Some(EditRange::new(anchor, t))));
+                    let rows = Self::lane_tracks(model);
+                    let mut idx: Vec<usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| model.selection.tracks.contains(&t.id) || t.id == track)
+                        .map(|(i, _)| i)
+                        .collect();
+                    idx.sort_unstable();
+                    let tracks = match (idx.first(), idx.last()) {
+                        (Some(&a), Some(&b)) => rows[a..=b].iter().map(|t| t.id).collect(),
+                        _ => vec![track],
+                    };
                     cx.emit(Action::SelectTracks {
-                        tracks: vec![track],
-                        mode: SelectMode::Add,
+                        tracks,
+                        mode: SelectMode::Replace,
                     });
                     return true;
                 }
@@ -1001,8 +1189,9 @@ impl ArrangerView {
                     tracks: vec![track],
                     mode: SelectMode::Replace,
                 });
+                let anchor = self.snap_point(at, model, mods, &Self::range_skip());
                 self.edit_drag = Some(EditDrag::Range {
-                    anchor: self.snap(at, model, mods),
+                    anchor,
                     anchor_row: row,
                     origin: pos,
                     moved: false,
@@ -1186,7 +1375,20 @@ impl ArrangerView {
                 let label = if shuffle { "" } else { "Move Clip" };
                 if started(moved, *origin, cx, label) {
                     let raw = MusicalTime((t_at.ticks() - grab.ticks()).max(0));
-                    let start = self.snap_moved(raw, *origin_start, model, mods);
+                    // Shuffle moves butt where they land: not snapped to
+                    // objects. Otherwise the group's edge nearest an
+                    // object goes onto it, else the grid decides.
+                    let objects = if shuffle {
+                        self.snap_guide = None;
+                        None
+                    } else {
+                        let edges = Self::moved_edges(model, clips, *anchor, raw);
+                        self.object_shift(&edges, model, mods, &SnapSkip::clips(clips))
+                    };
+                    let start = match objects {
+                        Some(shift) => (raw + shift).max(MusicalTime::ZERO),
+                        None => self.snap_moved(raw, *origin_start, model, mods),
+                    };
                     let lanes = Self::lane_tracks(model);
                     let row = self
                         .row_at(pos.y)
@@ -1224,7 +1426,12 @@ impl ArrangerView {
                     "Trim Clip"
                 };
                 if started(moved, *origin, cx, label) {
-                    let to = self.snap_moved(t_at, *origin_edge, model, mods);
+                    // The trimmed edge onto an object near it, else the grid.
+                    let to = match self.object_shift(&[t_at], model, mods, &SnapSkip::clips(clips))
+                    {
+                        Some(shift) => (t_at + shift).max(MusicalTime::ZERO),
+                        None => self.snap_moved(t_at, *origin_edge, model, mods),
+                    };
                     cx.emit(Action::TrimClips {
                         clips: clips.clone(),
                         edge: *edge,
@@ -1298,6 +1505,30 @@ impl ArrangerView {
                     });
                 }
             }
+            EditDrag::Slip {
+                clips,
+                origin,
+                at,
+                moved,
+                ..
+            } => {
+                if started(moved, *origin, cx, "Slip Clip") {
+                    // Whole grid steps in Grid mode (Shift: free), as a
+                    // relative-grid move.
+                    let raw = t_at.ticks() - at.ticks();
+                    let e = &model.editor;
+                    let by = if e.edit_mode == EditMode::Grid && !mods.shift {
+                        let step = e.step(*at, &model.project().timeline.meter).ticks().max(1);
+                        (raw as f64 / step as f64).round() as i64 * step
+                    } else {
+                        raw
+                    };
+                    cx.emit(Action::SlipClips {
+                        clips: clips.clone(),
+                        by,
+                    });
+                }
+            }
             EditDrag::Range {
                 anchor,
                 anchor_row,
@@ -1306,7 +1537,7 @@ impl ArrangerView {
                 rows,
             } => {
                 if started(moved, *origin, cx, "") {
-                    let t = self.snap(t_at, model, mods);
+                    let t = self.snap_point(t_at, model, mods, &Self::range_skip());
                     let lanes = Self::lane_tracks(model);
                     let row = self
                         .row_at(pos.y)
@@ -1351,35 +1582,57 @@ impl ArrangerView {
                     });
                 }
             }
-            EditDrag::Separate { track, at, origin } => {
-                if pos.distance(*origin) >= DRAG_THRESHOLD {
-                    // The separated piece starts at the range start.
-                    let piece = model
-                        .project()
-                        .clips_of(*track)
-                        .into_iter()
+            EditDrag::Separate {
+                track,
+                at,
+                origin,
+                separated,
+            } => {
+                if !*separated {
+                    if pos.distance(*origin) >= DRAG_THRESHOLD {
+                        // One undo step: the separation and the move.
+                        cx.emit(Action::BeginGesture("Separate and Move".into()));
+                        cx.emit(Action::Separate);
+                        *separated = true;
+                    }
+                } else if let Some(r) = model.selection.range.filter(|r| !r.is_empty()) {
+                    // The pieces inside the range, on its tracks.
+                    let tracks: Vec<TrackId> = if model.selection.tracks.is_empty() {
+                        vec![*track]
+                    } else {
+                        model.selection.tracks.iter().copied().collect()
+                    };
+                    let pieces = Self::range_pieces(model, &tracks, r);
+                    let p = model.project();
+                    let anchor = pieces
+                        .iter()
+                        .filter_map(|id| p.clip(*id))
                         .find(|c| {
-                            let p = model.project();
-                            c.start <= *at && *at < c.end(&p.timeline, p.sample_rate)
+                            c.track == *track
+                                && c.start <= *at
+                                && *at < c.end(&p.timeline, p.sample_rate)
                         })
+                        .or_else(|| pieces.first().and_then(|id| p.clip(*id)))
                         .map(|c| (c.id, c.start));
-                    if let Some((id, start)) = piece {
+                    if let Some((id, start)) = anchor {
                         cx.emit(Action::SelectClips {
-                            clips: vec![id],
+                            clips: pieces.clone(),
                             mode: SelectMode::Replace,
                         });
                         drag = EditDrag::Move {
-                            clips: vec![id],
+                            clips: pieces,
                             anchor: id,
                             grab: *at - start,
                             click: *at,
                             origin: *origin,
                             origin_start: start,
                             origin_row: self.row_at(origin.y).unwrap_or(0),
-                            moved: false,
+                            // The gesture is open already.
+                            moved: true,
                             additive: false,
                             ghost: None,
                             in_header: false,
+                            separated: true,
                         };
                         self.edit_drag = Some(drag);
                         return self.edit_drag_move(pos, mods, model, cx);
@@ -1438,20 +1691,22 @@ impl ArrangerView {
                 additive,
                 ghost,
                 in_header,
+                separated,
                 ..
             } => {
                 if moved {
-                    match ghost {
-                        Some((track, at)) => cx.emit(Action::ShuffleClip {
+                    let shuffle = model.editor.edit_mode == EditMode::Shuffle;
+                    if let Some((track, at)) = ghost {
+                        cx.emit(Action::ShuffleClip {
                             clip: anchor,
                             track,
                             at,
-                        }),
-                        None if model.editor.edit_mode != EditMode::Shuffle => {
-                            cx.emit(Action::EndGesture)
-                        }
-                        None => {}
+                        });
                     }
+                    if !shuffle || separated {
+                        cx.emit(Action::EndGesture);
+                    }
+                    Self::clips_not_range(model, cx);
                 } else {
                     // A click: only this clip, and (in its body, not its
                     // header strip) the playhead goes there.
@@ -1470,6 +1725,21 @@ impl ArrangerView {
                     }
                 }
             }
+            EditDrag::Slip { moved, pressed, .. } => {
+                if moved {
+                    cx.emit(Action::EndGesture);
+                } else {
+                    let (clip, track) = pressed;
+                    cx.emit(Action::SelectClips {
+                        clips: vec![clip],
+                        mode: SelectMode::Toggle,
+                    });
+                    cx.emit(Action::SelectTracks {
+                        tracks: vec![track],
+                        mode: SelectMode::Add,
+                    });
+                }
+            }
             EditDrag::Trim { moved, .. }
             | EditDrag::Fade { moved, .. }
             | EditDrag::Bend { moved, .. }
@@ -1484,7 +1754,12 @@ impl ArrangerView {
                     self.click_locate(anchor, model, cx);
                 }
             }
-            EditDrag::Separate { .. } => {}
+            // Separated, not moved yet: that alone is the step.
+            EditDrag::Separate { separated, .. } => {
+                if separated {
+                    cx.emit(Action::EndGesture);
+                }
+            }
             EditDrag::Zoom { from, to, out } => {
                 if (to - from).abs() > 6.0 {
                     let a = self.time_at(from.min(to));
@@ -1531,6 +1806,15 @@ impl ArrangerView {
         }
         cx.set_cursor(Cursor::Default);
         true
+    }
+
+    /// Clips were selected (Shift/Ctrl-click, a rectangle, a move): they
+    /// are what edits work on now, so an edit range from before goes
+    /// (Delete, Copy, Cut and Duplicate take a range first).
+    pub(crate) fn clips_not_range(model: &Session, cx: &mut EventCx<'_, Action>) {
+        if model.selection.range.is_some() {
+            cx.emit(Action::SetEditRange(None));
+        }
     }
 
     /// A click (no drag): clear the range and, with Link Timeline, move
@@ -1612,10 +1896,12 @@ impl ArrangerView {
         cx: &mut EventCx<'_, Action>,
     ) -> Option<bool> {
         let ctrl = mods.ctrl || mods.meta;
-        let selected: Vec<ClipId> = model.selection.clips.iter().copied().collect();
+        // The arranger's own (never the launcher's).
+        let selected: Vec<ClipId> = model.selected_arranger_clips();
         let has_range = model.selection.range.is_some_and(|r| !r.is_empty());
         let action = match key {
-            // Edit modes and tools (Alt + digit; F5–F7, F9, F10 for tools).
+            // Edit modes and tools (Alt + digit; F5–F7, F9, F10 for tools —
+            // F10 opens the menu bar in the main window).
             Key::Char(d @ '1'..='4') if mods.alt => {
                 Action::SetEditMode(EditMode::ALL[(d as u8 - b'1') as usize])
             }
@@ -1637,11 +1923,14 @@ impl ArrangerView {
             Key::Char('q' | 'Q') if !ctrl && !mods.alt && !selected.is_empty() => {
                 Action::QuantizeClips(selected.clone())
             }
-            Key::Char('c' | 'C') if ctrl && has_range => Action::CopyRange,
-            Key::Char('x' | 'X') if ctrl && has_range => Action::CutRange,
-            Key::Char('v' | 'V') if ctrl => Action::PasteRange,
-            Key::Char('d' | 'D') if ctrl && has_range => Action::RepeatRange(1),
-            Key::Char('r' | 'R') if mods.alt && has_range => {
+            // The clipboard: the range when it has a length, else the
+            // selected clips (the session decides, `clipboard`).
+            Key::Char('c' | 'C') if ctrl && !mods.alt => Action::Copy,
+            Key::Char('x' | 'X') if ctrl && !mods.alt => Action::Cut,
+            Key::Char('v' | 'V') if ctrl && !mods.alt => Action::Paste,
+            Key::Char('d' | 'D') if ctrl && !mods.alt => Action::Repeat(1),
+            Key::Char('a' | 'A') if ctrl && !mods.alt && !mods.shift => Action::SelectAllClips,
+            Key::Char('r' | 'R') if mods.alt && (has_range || !selected.is_empty()) => {
                 let at = Rect::new(size.w * 0.5 - 60.0, self.ruler_h() + 8.0, 120.0, 24.0);
                 cx.request(HostRequest::TextInput {
                     at,
@@ -1651,18 +1940,20 @@ impl ArrangerView {
                             .parse::<u32>()
                             .ok()
                             .filter(|n| (1..=999).contains(n))
-                            .map(Action::RepeatRange)
+                            .map(Action::Repeat)
                     }),
                 });
                 return Some(true);
             }
             Key::Char('t' | 'T') if ctrl && mods.alt => Action::TrimToSelection,
+            // Alt trims the start, Ctrl (or Ctrl+Alt: Ctrl+, opens the
+            // Preferences) the end.
             Key::Char(',' | '.' | '<' | '>') => Action::Nudge {
                 forward: matches!(key, Key::Char('.' | '>')),
-                target: if mods.alt {
-                    NudgeTarget::TrimStart
-                } else if ctrl {
+                target: if ctrl {
                     NudgeTarget::TrimEnd
+                } else if mods.alt {
+                    NudgeTarget::TrimStart
                 } else {
                     NudgeTarget::Move
                 },
@@ -1886,8 +2177,10 @@ impl ArrangerView {
                 self.x_of(r.end).min(lanes.right()),
             );
             if x1 > x0 {
+                // The tracks the range edits work on (folder groups too).
+                let covered = model.edit_tracks();
                 for (i, t) in tracks.iter().enumerate() {
-                    if model.selection.tracks.contains(&t.id) {
+                    if covered.contains(&t.id) {
                         let row = self.row_rect(i, size);
                         p.fill(
                             Rect::new(x0, row.y, x1 - x0, row.h),

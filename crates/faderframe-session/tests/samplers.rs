@@ -134,6 +134,9 @@ fn samples_are_copied_in_undone_saved_relative_and_reopened() {
     );
     assert!(kick.exists());
     assert!(!media.exists(), "the scratch folder is gone");
+    // The moved paths load in the background (the sampler plays what it
+    // had meanwhile); what it shows follows once they are in.
+    s.wait_for_samples();
     assert!(loaded(&s, plugin, 0), "still plays after the move");
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(

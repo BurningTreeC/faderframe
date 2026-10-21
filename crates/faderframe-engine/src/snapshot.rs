@@ -786,7 +786,10 @@ impl TimelineSnapshot {
             .filter(|t| t.freeze.is_some())
             .map(|t| t.id)
             .collect();
-        for t in project.tracks.iter() {
+        // A freeze is the song's: in a scratch pad a frozen track is silent
+        // (its devices are unloaded).
+        let song = project.shown_pad().is_none();
+        for t in project.tracks.iter().filter(|_| song) {
             let Some(f) = &t.freeze else { continue };
             let piece = AudioPiece {
                 source: f.source,
@@ -1308,7 +1311,7 @@ impl AudioPiece {
 }
 
 /// Frames of fade at comp edges that do not crossfade (declick).
-const DECLICK: i64 = 64;
+const DECLICK: i64 = faderframe_project::COMP_DECLICK;
 
 /// The pieces a take folder's comp plays, with centred equal-power
 /// crossfades where two pieces touch.

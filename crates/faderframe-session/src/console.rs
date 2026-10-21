@@ -203,6 +203,32 @@ impl Session {
                 }
                 Command::AddTrack { track, index }
             }
+            // A folder made a bus sums through the console as buses do.
+            Command::SetFolderBus {
+                track,
+                on: true,
+                output,
+            } if self
+                .project
+                .track(track)
+                .is_some_and(|t| t.preamp.is_none() && !t.is_folder_bus()) =>
+            {
+                let slot = self.console_bus_slot(family, None);
+                Command::Batch {
+                    label: "Make Folder a Bus".into(),
+                    commands: vec![
+                        Command::SetFolderBus {
+                            track,
+                            on: true,
+                            output,
+                        },
+                        Command::SetPreamp {
+                            track,
+                            slot: Some(slot),
+                        },
+                    ],
+                }
+            }
             Command::Batch { label, commands } => Command::Batch {
                 label,
                 commands: commands

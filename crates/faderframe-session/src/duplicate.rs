@@ -45,7 +45,7 @@ impl Session {
         let has_content = tracks.iter().any(|id| {
             self.project
                 .track(*id)
-                .is_some_and(|t| t.kind.has_clips() || t.kind == TrackKind::Folder)
+                .is_some_and(|t| t.kind.has_clips() || t.is_folder())
         });
         let mut out = vec![GroupMenuEntry {
             label: if several {
@@ -104,7 +104,7 @@ impl Session {
                 .filter(|t| {
                     self.project
                         .track(*t)
-                        .is_some_and(|t| t.kind == TrackKind::Folder)
+                        .is_some_and(faderframe_project::Track::is_folder)
                 })
                 .collect();
             for f in folders {

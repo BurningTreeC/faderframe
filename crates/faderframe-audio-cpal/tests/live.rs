@@ -55,5 +55,16 @@ fn the_default_device_runs_and_closes() {
         "{info}"
     );
     assert!(stream.status().running);
+    // The latency as the device's timestamps tell it.
+    let status = stream.status();
+    eprintln!(
+        "{info} · output latency {:?} frames · routing {:?}",
+        status.output_latency,
+        stream.routing().devices
+    );
+    assert_eq!(
+        stream.routing().outputs.len(),
+        usize::from(info.output_channels)
+    );
     drop(stream);
 }

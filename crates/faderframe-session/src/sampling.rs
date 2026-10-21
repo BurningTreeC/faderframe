@@ -9,6 +9,7 @@
 //! decoding for the samplers) run on a worker thread; the session places
 //! the result in its tick, as one undo step.
 
+use crate::render::files::{self, Overwrite, StagedFile};
 use crate::render::{self, RenderChannels, RenderRange, RenderSettings};
 use crate::samples::{self, SAMPLES_FOLDER};
 use crate::{Action, NoticeLevel, Result, SelectMode, Session, SessionError, UiRequest};
@@ -32,7 +33,9 @@ pub enum SampleTarget {
     Drums,
     /// The next free pad of this Drum Sampler.
     Pad(PluginInstanceId),
-    /// A 24-bit WAV file.
+    /// A 24-bit WAV file (the user's: an existing one is asked about
+    /// first, and the file is written beside it and moved into place, see
+    /// [`crate::exports`]).
     File(PathBuf),
 }
 
@@ -41,6 +44,8 @@ pub(crate) struct PendingSample {
     track: TrackId,
     name: String,
     target: SampleTarget,
+    /// What a file target may replace.
+    overwrite: Overwrite,
     handle: Option<JoinHandle<std::result::Result<Made, String>>>,
 }
 
@@ -51,6 +56,8 @@ struct Made {
     root: Option<f64>,
     /// Keeps it decoded in the samplers' cache until a sampler has it.
     held: Option<Arc<Sample>>,
+    /// A file target's file, written beside it, to be moved into place.
+    staged: Option<StagedFile>,
 }
 
 /// The fade at an end that cuts through sound (seconds): no click, and
@@ -177,7 +184,8 @@ impl Session {
     }
 
     /// Render `track` from `start` to `end` in the background, then give
-    /// it to `target`.
+    /// it to `target` (a file the user chose: asked about first when it
+    /// exists).
     pub(crate) fn make_sample(
         &mut self,
         track: TrackId,
@@ -185,6 +193,20 @@ impl Session {
         end: MusicalTime,
         target: SampleTarget,
     ) -> Result<()> {
+        if let SampleTarget::File(path) = &target {
+            self.check_sample(track, start, end)?;
+            crate::exports::make_parent(path)?;
+            let dests = vec![path.clone()];
+            crate::exports::files_only(&dests)?;
+            return self.export_to("Sample", dests, move |s, overwrite| {
+                s.start_sample(track, start, end, target, overwrite)
+            });
+        }
+        self.start_sample(track, start, end, target, Overwrite::Always)
+    }
+
+    /// Can a sample be made of `track` from `start` to `end`?
+    fn check_sample(&self, track: TrackId, start: MusicalTime, end: MusicalTime) -> Result<()> {
         let t = self
             .project
             .track(track)
@@ -197,6 +219,22 @@ impl Session {
         if end <= start {
             return Err(SessionError::Other("select a range to sample".into()));
         }
+        Ok(())
+    }
+
+    fn start_sample(
+        &mut self,
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+        target: SampleTarget,
+        overwrite: Overwrite,
+    ) -> Result<()> {
+        self.check_sample(track, start, end)?;
+        let t = self
+            .project
+            .track(track)
+            .ok_or_else(|| SessionError::Other(format!("no track {track}")))?;
         let source = t.name.clone();
         let name = format!("{source} Sample");
         let mono = t.layout == ChannelLayout::Mono;
@@ -228,8 +266,17 @@ impl Session {
         std::fs::create_dir_all(&dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
         let scratch = crate::media::unique_path(&dir, &format!("{name} (rendering)"));
+        // A file target: a temporary beside it claimed now (a folder that
+        // cannot be written to fails before rendering).
+        let mut staged = None;
         let file = match &target {
-            SampleTarget::File(path) => path.clone(),
+            SampleTarget::File(path) => {
+                let f = StagedFile::new(path)
+                    .map_err(|e| SessionError::Other(format!("sample: {e}")))?;
+                let temp = f.temp().to_path_buf();
+                staged = Some(f);
+                temp
+            }
             _ => {
                 let path = crate::media::unique_path(&dir, &name);
                 // Taken now, so a second sample made meanwhile gets its own.
@@ -251,6 +298,8 @@ impl Session {
             format: WavFormat::Float32,
             dither: Dither::Off,
             report: false,
+            // Its own file (a name the session chose): no one to ask.
+            overwrite: crate::render::Overwrite::Always,
             ..RenderSettings::defaults_for(&copy, scratch.clone())
         };
         let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;
@@ -281,8 +330,9 @@ impl Session {
                 } else {
                     (WavFormat::Float32, Dither::Off)
                 };
+                let named = staged.as_ref().map_or(file.as_path(), |f| f.dest());
                 write_wav_with(&file, &channels, wav.sample_rate, format, dither)
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
+                    .map_err(|e| format!("{}: {e}", named.display()))?;
                 let held = if to_file {
                     None
                 } else {
@@ -294,6 +344,7 @@ impl Session {
                     path: file,
                     root,
                     held,
+                    staged,
                 })
             })
             .map_err(|e| SessionError::Other(e.to_string()))?;
@@ -301,6 +352,7 @@ impl Session {
             track,
             name,
             target,
+            overwrite,
             handle: Some(handle),
         });
         self.notify(NoticeLevel::Info, "making a sample…".to_string());
@@ -340,7 +392,15 @@ impl Session {
         let file = made.path.to_string_lossy().into_owned();
         match &p.target {
             SampleTarget::File(path) => {
-                self.notify(NoticeLevel::Info, format!("saved {}", path.display()));
+                let Some(written) = made.staged else {
+                    return Err(SessionError::Other("the sample's file went".into()));
+                };
+                let shown = path.clone();
+                let staged = render::Staged::new(vec![files::written(written)]);
+                self.commit_export("Sample", staged, &p.overwrite, move |s, _| {
+                    s.notify(NoticeLevel::Info, format!("saved {}", shown.display()));
+                    Ok(())
+                })?;
             }
             SampleTarget::Sampler | SampleTarget::Drums => {
                 let is_sampler = p.target == SampleTarget::Sampler;

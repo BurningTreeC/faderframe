@@ -1,7 +1,7 @@
 use super::*;
 use faderframe_engine::EngineConfig;
 use faderframe_session::ClipEdge;
-use faderframe_ui_canvas::RecordingPainter;
+use faderframe_ui_canvas::{DrawOp, RecordingPainter};
 
 fn session() -> Session {
     Session::demo(EngineConfig::default()).unwrap()
@@ -1405,6 +1405,182 @@ fn folders_indent_their_tracks_and_close_by_their_triangle() {
     assert!(!ids(&s).contains(&bass));
 }
 
+/// A folder's menu makes it a bus (a checked entry, and back); its header
+/// then says so with a badge, stays a folder header (its triangle folds
+/// it) and what it holds plays through it.
+#[test]
+fn a_folder_becomes_a_bus_from_its_menu_and_says_so() {
+    let mut s = bare_session();
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    s.dispatch(Action::NewFolder { tracks: vec![bass] })
+        .unwrap();
+    let folder = *s.selection.tracks.iter().next().unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let menu = |view: &mut ArrangerView, s: &Session| {
+        let fl = view.header_layout(s, folder, size).unwrap();
+        let ev = ViewEvent::PointerDown {
+            pos: folder_name_rect(&fl).center(),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        };
+        let (_, req) = run(view, ev, size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+            panic!("no menu");
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Folder Is a Bus")
+            .expect("the folder bus entry")
+    };
+    let item = menu(&mut view, &s);
+    assert_eq!(item.checked, Some(false));
+    assert_eq!(item.action, Some(Action::SetFolderBus { folder, on: true }));
+    s.dispatch(item.action.unwrap()).unwrap();
+    assert!(s.project().track(folder).unwrap().is_folder_bus());
+    let p = s.project();
+    if p.track(bass).unwrap().output == faderframe_project::OutputRouting::Master {
+        assert_eq!(p.output_target(p.track(bass).unwrap()), Some(folder));
+    }
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.texts().contains(&"BUS"), "the badge");
+    let item = menu(&mut view, &s);
+    assert_eq!(item.checked, Some(true));
+    assert_eq!(
+        item.action,
+        Some(Action::SetFolderBus { folder, on: false })
+    );
+    // Still folded by its triangle.
+    let fl = view.header_layout(&s, folder, size).unwrap();
+    assert_eq!(
+        view.hit_test(fold_rect(&fl).center(), size, &s),
+        Some(Hit::Header(folder, HeaderPart::Fold))
+    );
+    let rows: Vec<TrackId> = ArrangerView::lane_tracks(&s).iter().map(|t| t.id).collect();
+    let at = rows.iter().position(|t| *t == folder).unwrap();
+    assert_eq!(rows[at + 1], bass, "what it holds right under it");
+}
+
+/// A folder's header has a Group switch (G, where a track's record button
+/// is; its menu has the same entry, checked): pressing it groups the
+/// folder's tracks; then a range drawn on one of them is painted on every
+/// member, and the switch says so in its tooltip.
+#[test]
+fn a_folder_header_groups_its_tracks() {
+    let mut s = bare_session();
+    let id = |s: &Session, name: &str| {
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .id
+    };
+    let (bass, pad) = (id(&s, "Bass"), id(&s, "Pad"));
+    s.dispatch(Action::NewFolder {
+        tracks: vec![bass, pad],
+    })
+    .unwrap();
+    let folder = *s.selection.tracks.iter().next().unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    assert!(p.texts().contains(&"G"), "the switch is painted");
+    let fl = view.header_layout(&s, folder, size).unwrap();
+    let g = folder_group_rect(&fl);
+    assert!(!g.intersects(&fl.solo) && !g.intersects(&folder_bus_badge(&fl)));
+    assert_eq!(
+        view.hit_test(g.center(), size, &s),
+        Some(Hit::Header(folder, HeaderPart::Group))
+    );
+    assert!(
+        view.tooltip(g.center(), size, &s)
+            .unwrap()
+            .starts_with("Group off")
+    );
+    let (actions, _) = run(&mut view, down(g.center()), size, &s);
+    assert!(actions.contains(&Action::SetFolderGroup { folder, on: true }));
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert!(s.folder_grouped(folder));
+    assert!(
+        view.tooltip(g.center(), size, &s)
+            .unwrap()
+            .starts_with("Group on")
+    );
+    // Its menu: the same switch, checked.
+    let ev = ViewEvent::PointerDown {
+        pos: folder_name_rect(&fl).center(),
+        button: PointerButton::Secondary,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    };
+    let (_, req) = run(&mut view, ev, size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("no menu");
+    };
+    let item = items
+        .into_iter()
+        .find(|i| i.label == "Group Its Tracks")
+        .expect("the group entry");
+    assert_eq!(item.checked, Some(true));
+    assert_eq!(
+        item.action,
+        Some(Action::SetFolderGroup { folder, on: false })
+    );
+    // The accessible tree has it too.
+    let nodes = view.accessible(size, &s);
+    let folder_node = nodes
+        .iter()
+        .find(|n| n.label.ends_with(" folder"))
+        .expect("the folder's node");
+    let switch = folder_node
+        .children
+        .iter()
+        .find(|c| c.label == "Group")
+        .expect("its Group switch");
+    assert_eq!(switch.checked, Some(true));
+    // A range on the bass track is painted on the pad track too (and not
+    // on the other rows).
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![bass],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    let (a, b) = (
+        MusicalTime::from_quarters(4.0),
+        MusicalTime::from_quarters(8.0),
+    );
+    s.dispatch(Action::SetEditRange(Some(
+        faderframe_session::EditRange::new(a, b),
+    )))
+    .unwrap();
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let rows: Vec<TrackId> = ArrangerView::lane_tracks(&s).iter().map(|t| t.id).collect();
+    let painted = |i: usize| {
+        let row = view.row_rect(i, size);
+        let (x0, x1) = (view.x_of(a), view.x_of(b));
+        p.ops
+            .iter()
+            .any(|o| *o == DrawOp::Rect(Rect::new(x0, row.y, x1 - x0, row.h)))
+    };
+    for (i, t) in rows.iter().enumerate() {
+        assert_eq!(painted(i), *t == bass || *t == pad, "row {i}");
+    }
+}
+
 #[test]
 fn the_wheel_over_the_track_headers_never_scrolls() {
     let s = session();
@@ -2139,4 +2315,184 @@ fn menus_offer_lead_sheets_of_several_clips_and_scores_of_several_tracks() {
     })
     .unwrap();
     assert_eq!(entries(ArrangerView::track_menu(&s, &track, at)).len(), 1);
+}
+
+/// Ctrl+C/X/V/D/A are the context-aware clipboard and selection commands:
+/// with clips selected and no range they work on the clips (the session
+/// decides), so they no longer need a range.
+#[test]
+fn clipboard_and_select_all_keys_need_no_range() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let clip = clip_of(&s, "Bass");
+    s.dispatch(Action::SelectClips {
+        clips: vec![clip],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    assert_eq!(s.selection.range, None);
+    let ctrl = with(false, true);
+    let key = |k: char| ViewEvent::Key {
+        key: Key::Char(k),
+        modifiers: ctrl,
+    };
+    for (k, want) in [
+        ('c', Action::Copy),
+        ('x', Action::Cut),
+        ('v', Action::Paste),
+        ('d', Action::Repeat(1)),
+        ('a', Action::SelectAllClips),
+    ] {
+        assert_eq!(run(&mut view, key(k), size, &s).0, vec![want], "Ctrl+{k}");
+    }
+    // Alt+R asks how many repeats of the selected clips.
+    let alt_r = ViewEvent::Key {
+        key: Key::Char('r'),
+        modifiers: Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        },
+    };
+    let (_, requests) = run(&mut view, alt_r, size, &s);
+    assert!(matches!(
+        requests.as_slice(),
+        [HostRequest::TextInput { .. }]
+    ));
+    // Through the session: Ctrl+A selects every clip shown.
+    for a in run(&mut view, key('a'), size, &s).0 {
+        s.dispatch(a).unwrap();
+    }
+    let shown: usize = ArrangerView::lane_tracks(&s)
+        .iter()
+        .map(|t| t.clips.len())
+        .sum();
+    assert_eq!(s.selection.clips.len(), shown);
+}
+
+/// Ctrl+Alt+drag in a clip's body slips its audio (by grid steps in Grid
+/// mode): one gesture, the clip stays where it is; a Ctrl+Alt-click
+/// without a drag toggles the clip like a Ctrl-click.
+#[test]
+fn ctrl_alt_drag_slips_the_audio_inside_the_clip() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let clip = clip_of(&s, "Bass");
+    let before = s.project().clip(clip).unwrap().clone();
+    let offset = before.as_audio().unwrap().source_offset;
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let from = Point::new(rect.x + rect.w * 0.5, rect.y + rect.h * 0.8);
+    let ctrl_alt = Modifiers {
+        ctrl: true,
+        alt: true,
+        ..Modifiers::NONE
+    };
+    // A beat and a bit to the right: whole beats in Grid mode.
+    let to = Point::new(from.x + view.ppq * 1.3, from.y);
+    let actions = drag(
+        &mut view,
+        &mut s,
+        size,
+        from,
+        &[Point::new(from.x + 10.0, from.y), to],
+        ctrl_alt,
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a, Action::BeginGesture(_)))
+            .count(),
+        1
+    );
+    assert_eq!(actions.last(), Some(&Action::EndGesture));
+    let quarter = MusicalTime::from_quarters_i(1).ticks();
+    assert!(actions.contains(&Action::SlipClips {
+        clips: vec![clip],
+        by: quarter
+    }));
+    let after = s.project().clip(clip).unwrap().clone();
+    assert_eq!(after.start, before.start, "the clip stays");
+    let a = after.as_audio().unwrap();
+    assert_eq!(a.length, before.as_audio().unwrap().length);
+    let p = s.project();
+    let rate = f64::from(p.sample_rate);
+    let beat = p
+        .timeline
+        .to_samples(before.start + MusicalTime::from_quarters_i(1), rate)
+        - p.timeline.to_samples(before.start, rate);
+    assert_eq!(
+        a.source_offset,
+        offset - beat,
+        "the audio a beat later: it plays from earlier in the source"
+    );
+    assert!(view.marquee.is_none(), "no rectangle was drawn");
+    // A click toggles the clip.
+    let selected = s.selection.clips.contains(&clip);
+    drag(&mut view, &mut s, size, from, &[], ctrl_alt);
+    assert_eq!(s.selection.clips.contains(&clip), !selected);
+}
+
+/// The ruler's menu sets the Play Start Marker where it was clicked
+/// (snapped), switches it and removes it; the ruler draws it.
+#[test]
+fn the_ruler_sets_switches_and_removes_the_play_start_marker() {
+    let mut s = bare_session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    let paths = |view: &mut ArrangerView, s: &Session| {
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, s, &theme);
+        p.ops.iter().filter(|o| matches!(o, DrawOp::Path)).count()
+    };
+    let without = paths(&mut view, &s);
+    let q = MusicalTime::from_quarters_i;
+    // A little after quarter 8: snapped to it (the grid is a beat).
+    let at = Point::new(view.x_of(q(8)) + 2.0, LOOP_BAND + 6.0);
+    let menu = |view: &mut ArrangerView, s: &Session| {
+        let ev = ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        };
+        let (_, req) = run(view, ev, size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+            panic!("no menu");
+        };
+        items
+    };
+    let pick = |items: &[MenuItem<Action>], label: &str| {
+        items
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.action.clone())
+            .unwrap_or_else(|| panic!("no {label}"))
+    };
+    let items = menu(&mut view, &s);
+    assert!(items.iter().all(|i| i.label != "Remove Play Start Marker"));
+    s.dispatch(pick(&items, "Set Play Start Marker Here"))
+        .unwrap();
+    assert_eq!(
+        s.project().play_start,
+        Some(faderframe_project::PlayStart::at(q(8)))
+    );
+    assert_eq!(paths(&mut view, &s), without + 1, "the flag is drawn");
+    let items = menu(&mut view, &s);
+    let play_from = items
+        .iter()
+        .find(|i| i.label == "Play from Play Start Marker")
+        .unwrap();
+    assert_eq!(play_from.checked, Some(true));
+    s.dispatch(pick(&items, "Play from Play Start Marker"))
+        .unwrap();
+    assert!(!s.project().play_start.unwrap().on);
+    assert_eq!(paths(&mut view, &s), without + 1, "hollow, still drawn");
+    s.dispatch(pick(&menu(&mut view, &s), "Remove Play Start Marker"))
+        .unwrap();
+    assert_eq!(s.project().play_start, None);
+    assert_eq!(paths(&mut view, &s), without);
 }

@@ -15,6 +15,7 @@ pub mod edit_bar;
 mod global;
 mod harmony;
 mod header;
+mod scratch;
 mod video_lane;
 
 pub use automation::AUTO_LANE_H;
@@ -31,13 +32,13 @@ use faderframe_project::{
 };
 use faderframe_session::{Action, SelectMode, Session, TransportAction};
 use faderframe_timeline::{
-    GridDivision, GridLineKind, MusicalTime, for_each_grid_line, snap_floor,
+    GridDensity, GridDivision, GridLineKind, MusicalTime, bar_stride, snap_floor, visible_lines,
 };
 use faderframe_ui_canvas::controls::{self, KnobLook, MeterLevel};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, Cursor, EventCx, FontFamily, HostRequest, Key, MenuItem, Modifiers,
-    Paint, Painter, Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle,
-    Theme, ViewEvent,
+    Align, CanvasView, Color, Cursor, EventCx, FontFamily, GridEmphasis, HostRequest, Key,
+    MenuItem, Modifiers, Paint, Painter, Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo,
+    Size, TextStyle, Theme, ViewEvent,
 };
 
 const MIN_PPQ: f32 = 1.5;
@@ -45,6 +46,77 @@ const MIN_PPQ: f32 = 1.5;
 /// 48 kHz) for redrawing them with the Pencil.
 const MAX_PPQ: f32 = 400_000.0;
 const LOOP_BAND: f32 = 11.0;
+/// Ruler labels are at least this far apart.
+const RULER_LABEL_PX: f32 = 44.0;
+/// Below the bars, a level of grid lines is labelled in the ruler once its
+/// lines (with the stronger ones) are this far apart.
+const RULER_FINE_LABEL_PX: f32 = 76.0;
+
+/// A grid line kind's place in the hierarchy (0: bars … 3: fine lines).
+fn grid_level(kind: GridLineKind) -> usize {
+    match kind {
+        GridLineKind::Bar => 0,
+        GridLineKind::Beat => 1,
+        GridLineKind::Subdivision => 2,
+        GridLineKind::Fine => 3,
+    }
+}
+
+/// The lines below the bars the ruler labels once every bar is labelled
+/// (`every` is 1, so zoomed in): beats first, then the grid's lines, then
+/// fine lines, each where it is at least [`RULER_FINE_LABEL_PX`] from
+/// every label already placed (the bars' included) — so labels never
+/// crowd and, zoomed in to single samples, still name the positions.
+fn ruler_labels(
+    lines: &[(MusicalTime, GridLineKind)],
+    x_of: impl Fn(MusicalTime) -> f32,
+    every: i32,
+) -> Vec<MusicalTime> {
+    if every != 1 {
+        return Vec::new();
+    }
+    let mut placed: Vec<f32> = lines
+        .iter()
+        .filter(|l| l.1 == GridLineKind::Bar)
+        .map(|l| x_of(l.0))
+        .collect();
+    let mut out = Vec::new();
+    for kind in [
+        GridLineKind::Beat,
+        GridLineKind::Subdivision,
+        GridLineKind::Fine,
+    ] {
+        for &(t, k) in lines {
+            let x = x_of(t);
+            if k == kind && placed.iter().all(|p| (p - x).abs() >= RULER_FINE_LABEL_PX) {
+                placed.push(x);
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// A ruler label below the bars: "bar.beat", or with display ticks (960 a
+/// quarter, decimals when finer) for lines between the beats.
+fn ruler_label(
+    meter: &faderframe_timeline::TimeSignatureMap,
+    t: MusicalTime,
+    kind: GridLineKind,
+) -> String {
+    let b = meter.to_bbt(t);
+    if kind == GridLineKind::Beat || b.tick == 0 {
+        return format!("{}.{}", b.bar + 1, b.beat + 1);
+    }
+    let ticks = b.tick as f64 * 960.0 / faderframe_timeline::TICKS_PER_QUARTER as f64;
+    let text = if ticks.fract().abs() < 1e-9 {
+        format!("{:03}", ticks as i64)
+    } else {
+        let s = format!("{ticks:07.3}");
+        s.trim_end_matches('0').to_string()
+    };
+    format!("{}.{}.{text}", b.bar + 1, b.beat + 1)
+}
 const DRAG_THRESHOLD: f32 = 3.0;
 /// Height of one take lane under an open take folder.
 const LANE_H: f32 = 30.0;
@@ -84,17 +156,23 @@ pub enum HeaderPart {
     Color,
     /// A folder's triangle: opens or closes it.
     Fold,
+    /// A folder's Group switch: what it holds is edited and armed as one.
+    Group,
     Body,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Hit {
     Corner,
+    /// The arrangement switcher in the corner (the song or a scratch pad).
+    Arrangement,
     /// The markers, arranger, signature and tempo lanes.
     Global(GlobalHit),
     LoopBand(MusicalTime),
     LoopStart,
     LoopEnd,
+    /// The Play Start Marker's flag (in the loop band).
+    PlayStart,
     Ruler(MusicalTime),
     Header(TrackId, HeaderPart),
     Clip {
@@ -162,6 +240,13 @@ enum Drag {
         start: bool,
         range: MusicalRange,
         offset: MusicalTime,
+    },
+    /// The Play Start Marker's flag; `offset`: from the marker to where it
+    /// was grabbed.
+    PlayStart {
+        offset: MusicalTime,
+        moved: bool,
+        origin: Point,
     },
     Volume {
         track: TrackId,
@@ -331,11 +416,50 @@ pub struct ArrangerView {
     video_drag: Option<video_lane::VideoDrag>,
     /// Rows of the Video lane (a video track each).
     video_rows: usize,
+    /// The object the running drag snapped to (Snap to Objects): its guide
+    /// line is drawn.
+    snap_guide: Option<faderframe_session::SnapHit>,
+    /// The arrangement shown when last looked (song or scratch pad).
+    arrangement_seen: Option<Option<faderframe_core::ScratchPadId>>,
+    /// Each arrangement's scroll, zoom and vertical scroll when it was
+    /// left.
+    places: std::collections::HashMap<Option<faderframe_core::ScratchPadId>, (f64, f32, f32)>,
 }
 
 /// A folder header's triangle.
 fn fold_rect(l: &HeaderLayout) -> Rect {
     Rect::new(l.name.x - 2.0, l.name.y, 16.0, l.name.h)
+}
+
+/// A folder's Group switch, right of its solo button (where a track's
+/// record button is).
+fn folder_group_rect(l: &HeaderLayout) -> Rect {
+    l.record
+}
+
+/// A folder bus's badge, right of its Group switch (a folder's header has
+/// no other buttons there).
+fn folder_bus_badge(l: &HeaderLayout) -> Rect {
+    let g = folder_group_rect(l);
+    Rect::new(g.right() + 6.0, g.center().y - 6.5, 28.0, 13.0)
+}
+
+/// The tooltip of a folder's Group switch.
+fn group_tip(model: &Session, t: &Track) -> String {
+    let p = model.project();
+    let outer = p
+        .edit_group(t)
+        .filter(|g| g.id != t.id)
+        .map(|g| g.name.clone());
+    let state = match (t.folder_group, outer) {
+        (_, Some(o)) => format!("Grouped with the tracks of '{o}' (its Group is on)"),
+        (true, None) => "Group on: its tracks are edited and armed as one".into(),
+        (false, None) => "Group off".into(),
+    };
+    format!(
+        "{state} · Click to switch · When on, arming, selecting and editing clips or a range on \
+         one of its tracks reach the others"
+    )
 }
 
 /// A folder's name, right of its triangle.
@@ -490,6 +614,9 @@ impl ArrangerView {
             global_drag: None,
             video_drag: None,
             video_rows: 1,
+            snap_guide: None,
+            arrangement_seen: None,
+            places: std::collections::HashMap::new(),
         }
     }
 
@@ -501,6 +628,7 @@ impl ArrangerView {
 
     /// Pick up the saved header width (called before painting/events).
     fn update_header_width(&mut self, model: &Session) {
+        self.follow_arrangement(model);
         self.lanes = model.editor.lanes;
         // The Lyrics lane shows once there are lyrics, the Video lane once
         // there is video.
@@ -567,11 +695,8 @@ impl ArrangerView {
     /// Height of a track's main lane (without take lanes).
     fn base_h(&self, model: &Session, track: TrackId) -> f32 {
         model.track_height(track).unwrap_or_else(|| {
-            // Folders are compact unless sized.
-            let folder = model
-                .project()
-                .track(track)
-                .is_some_and(|t| t.kind == TrackKind::Folder);
+            // Folders (folder buses too) are compact unless sized.
+            let folder = model.project().track(track).is_some_and(Track::is_folder);
             if folder {
                 FOLDER_ROW_H.min(self.row_h())
             } else {
@@ -717,7 +842,7 @@ impl ArrangerView {
         let i = (0..n).find(|&i| y < rect(i).bottom()).unwrap_or(n - 1);
         let r = rect(i);
         let t = tracks[i];
-        if t.kind == TrackKind::Folder
+        if t.is_folder()
             && !block(t)
             && (r.y + r.h * 0.3..r.y + r.h * 0.7).contains(&y)
             && moving.folder != Some(t.id)
@@ -762,23 +887,34 @@ impl ArrangerView {
         self.scroll_y = self.scroll_y.clamp(0.0, max_y);
     }
 
-    /// Grid shown at the current zoom and how many bars per ruler label.
-    fn display_grid(&self) -> (GridDivision, i32) {
-        let grid = if self.ppq >= 140.0 {
-            GridDivision::Note(16)
-        } else if self.ppq >= 60.0 {
-            GridDivision::Note(8)
-        } else if self.ppq >= 16.0 {
-            GridDivision::Beat
-        } else {
-            GridDivision::Bar
-        };
-        let bar_px = self.ppq * 4.0;
-        let mut every = 1;
-        while (every as f32) * bar_px < 44.0 && every < 256 {
-            every *= 2;
-        }
-        (grid, every)
+    /// The grid lines drawn over `[start, end)` at this zoom: bars, beats
+    /// and the edit grid's lines — the positions snapping goes to — thinned
+    /// zoomed out, with finer lines (nothing snaps to) zoomed in, down to
+    /// single samples ([`faderframe_timeline::for_each_visible_line`]).
+    pub(crate) fn grid_lines(
+        &self,
+        start: MusicalTime,
+        end: MusicalTime,
+        model: &Session,
+    ) -> Vec<(MusicalTime, GridLineKind)> {
+        visible_lines(
+            start,
+            end,
+            model.editor.grid,
+            &model.project().timeline.meter,
+            f64::from(self.ppq),
+            GridDensity::default(),
+        )
+    }
+
+    /// Bars per ruler label (labels at least [`RULER_LABEL_PX`] apart).
+    fn ruler_every(&self, model: &Session) -> i32 {
+        bar_stride(
+            self.time_at(self.header_w()).max(MusicalTime::ZERO),
+            &model.project().timeline.meter,
+            f64::from(self.ppq),
+            f64::from(RULER_LABEL_PX),
+        )
     }
 
     /// Clip rect in view coordinates (may extend beyond the viewport).
@@ -805,18 +941,32 @@ impl ArrangerView {
         }
         if pos.y < self.ruler_h() {
             return Some(if pos.x < self.header_w() {
-                Hit::Corner
+                if self.arrangement_rect(model).contains(pos) {
+                    Hit::Arrangement
+                } else {
+                    Hit::Corner
+                }
             } else if pos.y < LOOP_BAND {
+                // The flag (its line and the pennant right of it) before
+                // a loop edge, except where the edge is closer than its
+                // line.
+                let flag = model.project().play_start.map(|m| pos.x - self.x_of(m.at));
+                let on_flag = flag.is_some_and(|d| (-3.0..=10.0).contains(&d));
                 if let Some(range) = model.project().loop_range {
                     let left = (pos.x - self.x_of(range.start)).abs();
                     let right = (pos.x - self.x_of(range.end)).abs();
-                    if left.min(right) <= 6.0 {
+                    let edge = left.min(right);
+                    let flag_first = on_flag && flag.is_some_and(|d| d > 3.0 || d.abs() <= edge);
+                    if edge <= 6.0 && !flag_first {
                         return Some(if left <= right {
                             Hit::LoopStart
                         } else {
                             Hit::LoopEnd
                         });
                     }
+                }
+                if on_flag {
+                    return Some(Hit::PlayStart);
                 }
                 Hit::LoopBand(at)
             } else {
@@ -844,11 +994,12 @@ impl ArrangerView {
         }
         if pos.x < self.header_w() {
             let l = HeaderLayout::new(self.header_rect(model, t, row.y));
-            if t.kind == TrackKind::Folder {
+            if t.is_folder() {
                 let part = [
                     (fold_rect(&l), HeaderPart::Fold),
                     (l.mute, HeaderPart::Mute),
                     (l.solo, HeaderPart::Solo),
+                    (folder_group_rect(&l), HeaderPart::Group),
                     (folder_name_rect(&l), HeaderPart::Name),
                     (
                         Rect::new(l.stripe.x, l.stripe.y, l.stripe.w + 3.0, l.stripe.h),
@@ -1034,24 +1185,23 @@ impl ArrangerView {
 
     fn paint_grid(&self, p: &mut dyn Painter, lanes: Rect, model: &Session) {
         let a = &self.theme.arranger;
-        let meter = &model.project().timeline.meter;
-        let (grid, every) = self.display_grid();
+        let look = self.theme.grid;
+        let scale = p.scale_factor();
         let start = self.time_at(lanes.x).max(MusicalTime::ZERO);
         let end = self.time_at(lanes.right());
-        for_each_grid_line(start, end, grid, meter, |t, kind| {
-            let x = self.x_of(t);
-            let color = match kind {
-                GridLineKind::Bar => {
-                    if meter.bar_at(t) % every.max(1) != 0 && self.ppq * 4.0 < 10.0 {
-                        return;
-                    }
-                    a.bar_line
-                }
-                GridLineKind::Beat => a.beat_line,
-                GridLineKind::Subdivision => a.sub_line,
-            };
-            p.vline(x, lanes.y, lanes.bottom(), color);
-        });
+        let styles = [
+            (look.color(a.bar_line), GridEmphasis::Bar),
+            (look.color(a.beat_line), GridEmphasis::Beat),
+            (look.color(a.sub_line), GridEmphasis::Subdivision),
+            (look.color(a.fine_line), GridEmphasis::Fine),
+        ];
+        for (t, kind) in self.grid_lines(start, end, model) {
+            let (color, e) = styles[grid_level(kind)];
+            p.fill(
+                look.line_rect(self.x_of(t), lanes.y, lanes.bottom(), e, scale),
+                color,
+            );
+        }
     }
 
     /// Waveform of a clip or a part of a take, clipped to `vis`.
@@ -1647,9 +1797,24 @@ impl ArrangerView {
         path.line_to(tri[2]);
         path.close();
         p.fill_path(&path, ink);
+        let name = folder_name_rect(l);
+        if t.is_folder_bus() {
+            // A folder bus: a badge after its mute and solo (what it holds
+            // plays through its strip).
+            let badge = folder_bus_badge(l);
+            p.fill_rounded(badge, 3.0, &Paint::Solid(c.fader_cap_bus.with_alpha(0.85)));
+            p.text(
+                "BUS",
+                badge,
+                &TextStyle::new(th.fonts.tiny, th.ui.text)
+                    .family(FontFamily::Condensed)
+                    .bold()
+                    .center(),
+            );
+        }
         p.text(
             &t.name,
-            folder_name_rect(l),
+            name,
             &TextStyle::new(th.fonts.normal, th.ui.text).bold(),
         );
         if let Some(info) = l.info {
@@ -1657,13 +1822,15 @@ impl ArrangerView {
             let n = model
                 .folder_contents(t.id)
                 .iter()
-                .filter(|id| {
-                    project
-                        .track(**id)
-                        .is_some_and(|t| t.kind != TrackKind::Folder)
-                })
+                .filter(|id| project.track(**id).is_some_and(|t| !t.is_folder()))
                 .count();
-            let text = format!("Folder · {n} track{}", if n == 1 { "" } else { "s" });
+            // A folder bus says so: what it holds plays through it.
+            let what = if t.is_folder_bus() {
+                "Folder Bus"
+            } else {
+                "Folder"
+            };
+            let text = format!("{what} · {n} track{}", if n == 1 { "" } else { "s" });
             p.text(
                 &text,
                 Rect::new(folder_name_rect(l).x, info.y, info.w - 16.0, info.h),
@@ -1672,6 +1839,15 @@ impl ArrangerView {
         }
         controls::led_button(p, l.mute, "M", model.shown_mute(t), c.led.mute, th);
         controls::led_button(p, l.solo, "S", t.solo, c.led.solo, th);
+        // Its Group switch, lit in the folder's colour.
+        controls::led_button(
+            p,
+            folder_group_rect(l),
+            "G",
+            t.folder_group,
+            color_of(t.color).lighten(0.15),
+            th,
+        );
     }
 
     /// What a folder holds, at a glance: each track's clips as a thin bar.
@@ -1747,7 +1923,7 @@ impl ArrangerView {
             self.theme.ui.text.with_alpha(0.05),
         );
 
-        if t.kind == TrackKind::Folder {
+        if t.is_folder() {
             self.paint_folder_header(p, l, t, model);
             return;
         }
@@ -1962,12 +2138,24 @@ impl ArrangerView {
             p.fill(r, col);
         }
         let meter = &project.timeline.meter;
-        let (grid, every) = self.display_grid();
+        let every = self.ruler_every(model);
         let start = self.time_at(ruler.x).max(MusicalTime::ZERO);
         let end = self.time_at(ruler.right());
         let label = TextStyle::new(th.fonts.small, a.ruler_text).family(FontFamily::Mono);
-        for_each_grid_line(start, end, grid, meter, |t, kind| {
+        let lines = self.grid_lines(start, end, model);
+        // Zoomed in, beats and finer lines get labels too.
+        let labelled = ruler_labels(&lines, |t| self.x_of(t), every);
+        let fine_label =
+            TextStyle::new(th.fonts.tiny, a.ruler_text.with_alpha(0.8)).family(FontFamily::Mono);
+        for &(t, kind) in &lines {
             let x = self.x_of(t);
+            if labelled.contains(&t) {
+                p.text(
+                    &ruler_label(meter, t, kind),
+                    Rect::new(x + 3.0, band.bottom(), 90.0, ruler.h - band.h - 2.0),
+                    &fine_label,
+                );
+            }
             match kind {
                 GridLineKind::Bar => {
                     let bar = meter.bar_at(t);
@@ -2004,8 +2192,15 @@ impl ArrangerView {
                     ruler.bottom(),
                     a.ruler_text.with_alpha(0.15),
                 ),
+                GridLineKind::Fine => p.vline(
+                    x,
+                    ruler.bottom() - 2.0,
+                    ruler.bottom(),
+                    a.ruler_text.with_alpha(0.1),
+                ),
             }
-        });
+        }
+        self.paint_play_start(p, band, model);
         // Playhead marker.
         let x = self.x_of(model.playhead());
         let mut tri = Path::new();
@@ -2023,6 +2218,27 @@ impl ArrangerView {
         );
     }
 
+    /// The Play Start Marker: a flag in the theme's "playing" green over
+    /// the loop band, hollow while playback does not start from it.
+    fn paint_play_start(&self, p: &mut dyn Painter, band: Rect, model: &Session) {
+        let Some(m) = model.project().play_start else {
+            return;
+        };
+        let x = self.x_of(m.at);
+        let col = self.theme.arranger.launch_playing;
+        let mut flag = Path::new();
+        flag.move_to(Point::new(x, band.y))
+            .line_to(Point::new(x + 9.0, band.y + band.h * 0.5))
+            .line_to(Point::new(x, band.bottom()))
+            .close();
+        if m.on {
+            p.fill_path(&flag, col);
+        } else {
+            p.stroke_path(&flag, 1.0, col);
+        }
+        p.vline(x, band.y, band.bottom() + 6.0, col.with_alpha(0.9));
+    }
+
     fn paint_corner(&self, p: &mut dyn Painter, corner: Rect, model: &Session) {
         let th = &self.theme;
         p.fill_rect(
@@ -2034,13 +2250,24 @@ impl ArrangerView {
             ),
         );
         let ed = &model.editor;
-        let text = format!(
-            "GRID {}  ·  SNAP {}  ·  FOLLOW {}",
-            ed.grid.label().to_uppercase(),
-            if ed.snap { "ON" } else { "OFF" },
-            if ed.follow_playhead { "ON" } else { "OFF" }
-        );
-        controls::engraved(p, &text, corner.inset_xy(10.0, 0.0), th, Align::Start);
+        let on = |b: bool| if b { "ON" } else { "OFF" };
+        let grid = ed.grid.label().to_uppercase();
+        let (snap, follow) = (on(ed.snap), on(ed.follow_playhead));
+        // After the arrangement switcher; shorter when a pad's long name
+        // leaves less room.
+        let from = self.arrangement_rect(model).right() + 8.0;
+        let text_rect = Rect::new(from, corner.y, (corner.right() - from).max(0.0), corner.h);
+        let mut text = format!("GRID {grid}  ·  SNAP {snap}  ·  FOLLOW {follow}");
+        let engraved = TextStyle::new(th.fonts.tiny, th.console.panel_label)
+            .family(FontFamily::Condensed)
+            .weight(faderframe_ui_canvas::FontWeight::Bold)
+            .tracking(0.6);
+        if p.text_width(&text, &engraved) > text_rect.w {
+            text = format!("{grid} · SNAP {snap} · FOLLOW {follow}");
+        }
+        p.push_clip(text_rect);
+        controls::engraved(p, &text, text_rect, th, Align::Start);
+        p.pop_clip();
         p.hline(
             corner.x,
             corner.right(),
@@ -2317,7 +2544,7 @@ impl ArrangerView {
         // A sample of the selection (audio tracks).
         items.extend(sample_items(model, t.id, None));
         // Folders: what this one holds; into and out of folders.
-        if t.kind == TrackKind::Folder {
+        if t.is_folder() {
             let open = model.folder_open(t.id);
             items.push(
                 MenuItem::new(
@@ -2333,7 +2560,28 @@ impl ArrangerView {
                     mode: SelectMode::Replace,
                 },
             ));
-            items.push(MenuItem::new("Sum into a New Bus", Action::SumFolder(t.id)));
+            // The folder itself sums what it holds (or no longer does).
+            items.push(
+                MenuItem::new(
+                    "Folder Is a Bus",
+                    Action::SetFolderBus {
+                        folder: t.id,
+                        on: !t.is_folder_bus(),
+                    },
+                )
+                .checked(t.is_folder_bus()),
+            );
+            // What it holds is edited and armed as one (or no longer is).
+            items.push(
+                MenuItem::new(
+                    "Group Its Tracks",
+                    Action::SetFolderGroup {
+                        folder: t.id,
+                        on: !t.folder_group,
+                    },
+                )
+                .checked(t.folder_group),
+            );
         }
         items.extend(
             model
@@ -2762,14 +3010,33 @@ impl ArrangerView {
         HostRequest::ContextMenu { at, items }
     }
 
+    /// The ruler's Play Start Marker items (`at`: where it was clicked,
+    /// snapped).
+    fn play_start_items(model: &Session, at: MusicalTime) -> Vec<MenuItem<Action>> {
+        let marker = model.project().play_start;
+        let mut items = vec![MenuItem::new(
+            "Set Play Start Marker Here",
+            Action::Transport(TransportAction::SetPlayStart(Some(at))),
+        )];
+        if let Some(m) = marker {
+            items.push(
+                MenuItem::new(
+                    "Play from Play Start Marker",
+                    Action::Transport(TransportAction::TogglePlayStart),
+                )
+                .checked(m.on),
+            );
+            items.push(MenuItem::new(
+                "Remove Play Start Marker",
+                Action::Transport(TransportAction::SetPlayStart(None)),
+            ));
+        }
+        items
+    }
+
     fn clip_menu(model: &Session, clip: &Clip, at: Point) -> HostRequest<Action> {
         // Edits apply to the whole selection when the clip is part of it.
-        let selected = model.selection.clips.contains(&clip.id);
-        let targets: Vec<ClipId> = if selected {
-            model.selection.clips.iter().copied().collect()
-        } else {
-            vec![clip.id]
-        };
+        let targets = Self::targets(model, clip.id);
         let many = targets.len() > 1;
         let mut items = vec![];
         if clip.as_takes().is_some() {
@@ -2841,7 +3108,13 @@ impl ArrangerView {
             };
             items.push(MenuItem::new(
                 "Send to Clip Launcher",
-                Action::Launcher(faderframe_session::launcher::LauncherOp::SendClips(clips)),
+                Action::Launcher(faderframe_session::launcher::LauncherOp::SendClips(
+                    clips.clone(),
+                )),
+            ));
+            items.extend(scratch::material_items(
+                model,
+                faderframe_session::scratch::PadMaterial::Clips(clips),
             ));
         }
         {
@@ -2980,11 +3253,15 @@ impl ArrangerView {
         items.push(
             MenuItem::new(
                 if many { "Delete Clips" } else { "Delete" },
-                if selected {
-                    Action::DeleteSelection
-                } else {
-                    Action::Edit(Command::RemoveClip { clip: clip.id })
-                },
+                // The clips, even with an edit range (Delete would clear
+                // that).
+                Action::Edit(Command::Batch {
+                    label: if many { "Delete Clips" } else { "Delete Clip" }.into(),
+                    commands: targets
+                        .iter()
+                        .map(|&clip| Command::RemoveClip { clip })
+                        .collect(),
+                }),
             )
             .separated(),
         );
@@ -3080,6 +3357,30 @@ impl ArrangerView {
             Hit::Automation { .. } => {}
             Hit::Global(g) => return self.global_press(g, pos, clicks, mods, size, model, cx),
             Hit::Corner => cx.request(Self::grid_menu(model, pos)),
+            Hit::Arrangement => {
+                // Double-click a pad's name: rename it there.
+                if let (true, Some(id)) = (clicks >= 2, model.shown_pad()) {
+                    cx.request(HostRequest::TextInput {
+                        at: self.arrangement_rect(model),
+                        initial: model.shown_arrangement_name(),
+                        commit: Box::new(move |text| {
+                            let name = text.trim();
+                            (!name.is_empty()).then(|| {
+                                Action::ScratchPad(faderframe_session::scratch::ScratchOp::Rename {
+                                    pad: id,
+                                    name: name.to_string(),
+                                })
+                            })
+                        }),
+                    });
+                } else {
+                    let r = self.arrangement_rect(model);
+                    cx.request(HostRequest::ContextMenu {
+                        at: Point::new(r.x, r.bottom()),
+                        items: scratch::arrangement_menu(model),
+                    });
+                }
+            }
             Hit::AddTrack => {
                 let r = self.add_track_rect(Self::lane_tracks(model).len(), size);
                 cx.request(Self::add_track_menu(model, Point::new(r.x, r.bottom())));
@@ -3095,6 +3396,16 @@ impl ArrangerView {
                     anchor: self.snap(t, model, mods),
                     moved: false,
                 });
+            }
+            Hit::PlayStart => {
+                if let Some(m) = model.project().play_start {
+                    self.drag = Some(Drag::PlayStart {
+                        offset: self.time_at(pos.x) - m.at,
+                        moved: false,
+                        origin: pos,
+                    });
+                    cx.set_cursor(Cursor::ResizeHorizontal);
+                }
             }
             Hit::LoopStart | Hit::LoopEnd => {
                 if let Some(range) = model.project().loop_range {
@@ -3216,12 +3527,16 @@ impl ArrangerView {
                         )));
                     }
                     HeaderPart::Fold => cx.emit(Action::ToggleFolder(id)),
-                    HeaderPart::Body if clicks >= 2 && t.kind == TrackKind::Folder => {
+                    HeaderPart::Group if t.is_folder() => cx.emit(Action::SetFolderGroup {
+                        folder: id,
+                        on: !t.folder_group,
+                    }),
+                    HeaderPart::Body if clicks >= 2 && t.is_folder() => {
                         cx.emit(Action::ToggleFolder(id));
                     }
                     HeaderPart::Name if clicks >= 2 => {
                         if let Some(l) = self.header_layout(model, id, size) {
-                            let at = if t.kind == TrackKind::Folder {
+                            let at = if t.is_folder() {
                                 folder_name_rect(&l)
                             } else {
                                 l.name
@@ -3298,7 +3613,15 @@ impl ArrangerView {
                 let Some(t) = model.project().track(track) else {
                     return false;
                 };
-                if clicks >= 2 && matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+                // (Not with the Zoom or Scrub tool: their double-clicks are
+                // two zooms, two scrubs.)
+                if clicks >= 2
+                    && matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
+                    && !matches!(
+                        model.editor.tool,
+                        faderframe_session::EditTool::Zoom | faderframe_session::EditTool::Scrub
+                    )
+                {
                     let meter = &model.project().timeline.meter;
                     let start = snap_floor(at, GridDivision::Bar, meter);
                     let length = meter.bar_start(meter.bar_at(start) + 1) - start;
@@ -3458,10 +3781,13 @@ impl ArrangerView {
                         tracks: vec![track],
                         mode: SelectMode::Add,
                     });
+                    Self::clips_not_range(model, cx);
                 }
                 (None, Some(at)) => self.click_locate(at, model, cx),
                 (None, None) => {}
             }
+        } else {
+            Self::clips_not_range(model, cx);
         }
         cx.set_cursor(Cursor::Default);
         true
@@ -3540,7 +3866,13 @@ impl ArrangerView {
                 }));
             }
             Some(Drag::Loop { anchor, .. }) => {
-                let t = self.snap(self.time_at(pos.x).max(MusicalTime::ZERO), model, mods);
+                let skip = faderframe_session::SnapSkip::loop_bounds();
+                let t = self.snap_point(
+                    self.time_at(pos.x).max(MusicalTime::ZERO),
+                    model,
+                    mods,
+                    &skip,
+                );
                 if t != anchor {
                     if let Some(Drag::Loop { moved, .. }) = &mut self.drag {
                         if !*moved {
@@ -3552,15 +3884,48 @@ impl ArrangerView {
                     cx.emit(Action::Transport(TransportAction::SetLoop(range)));
                 }
             }
+            Some(Drag::PlayStart {
+                offset,
+                moved,
+                origin,
+            }) => {
+                let Some(m) = model.project().play_start else {
+                    return;
+                };
+                if !moved && pos.distance(origin) < DRAG_THRESHOLD {
+                    return;
+                }
+                if !moved {
+                    cx.emit(Action::BeginGesture("Move Play Start Marker".into()));
+                    self.drag = Some(Drag::PlayStart {
+                        offset,
+                        moved: true,
+                        origin,
+                    });
+                }
+                let at = self.snap_point(
+                    (self.time_at(pos.x) - offset).max(MusicalTime::ZERO),
+                    model,
+                    mods,
+                    &faderframe_session::SnapSkip::play_start_marker(),
+                );
+                if at != m.at {
+                    // Moving it keeps whether playback starts there.
+                    cx.emit(Action::Edit(Command::SetPlayStart {
+                        marker: Some(faderframe_project::PlayStart { at, ..m }),
+                    }));
+                }
+            }
             Some(Drag::LoopEdge {
                 start,
                 range,
                 offset,
             }) => {
-                let at = self.snap(
+                let at = self.snap_point(
                     (self.time_at(pos.x) - offset).max(MusicalTime::ZERO),
                     model,
                     mods,
+                    &faderframe_session::SnapSkip::loop_bounds(),
                 );
                 let tick = MusicalTime::from_ticks(1);
                 let range = if start {
@@ -3663,6 +4028,9 @@ impl ArrangerView {
     }
 
     fn release(&mut self, model: &Session, size: Size, cx: &mut EventCx<'_, Action>) {
+        if self.snap_guide.take().is_some() {
+            cx.redraw();
+        }
         if self.marquee_release(model, cx) {
             return;
         }
@@ -3720,7 +4088,8 @@ impl ArrangerView {
                 | Drag::Pan { .. }
                 | Drag::DualPan { .. }
                 | Drag::LoopEdge { .. }
-                | Drag::Loop { moved: true, .. },
+                | Drag::Loop { moved: true, .. }
+                | Drag::PlayStart { moved: true, .. },
             ) => {
                 cx.emit(Action::EndGesture);
             }
@@ -3845,7 +4214,7 @@ impl CanvasView<Session, Action> for ArrangerView {
         for i in rows.clone() {
             let row = self.row_rect(i, size);
             let t = tracks[i];
-            if t.kind == TrackKind::Folder {
+            if t.is_folder() {
                 self.paint_folder_lane(p, row, lanes, t, model);
                 continue;
             }
@@ -3890,6 +4259,7 @@ impl CanvasView<Session, Action> for ArrangerView {
         if px >= lanes.x {
             p.fill(Rect::new(px - 0.75, lanes.y, 1.5, lanes.h), a.playhead);
         }
+        self.paint_snap_guide(p, lanes);
         if let Some((target, at)) = self.drop_at {
             self.paint_drop_hint(p, lanes, size, &tracks, target, at);
         }
@@ -4039,6 +4409,17 @@ impl CanvasView<Session, Action> for ArrangerView {
             Rect::new(0.0, 0.0, self.header_w(), self.base_ruler_h()),
             model,
         );
+        self.paint_pad_tint(
+            p,
+            Rect::new(
+                self.header_w(),
+                0.0,
+                size.w - self.header_w(),
+                self.base_ruler_h(),
+            ),
+            model,
+        );
+        self.paint_arrangement(p, model);
         self.paint_global_lanes(p, size, model);
         // The selection rectangle being drawn (Ctrl+drag).
         if let Some(m) = self.marquee.as_ref().filter(|m| m.moved) {
@@ -4092,6 +4473,13 @@ impl CanvasView<Session, Action> for ArrangerView {
                 ..
             } => {
                 match self.hit_test(pos, size, model) {
+                    Some(Hit::Arrangement) => {
+                        let r = self.arrangement_rect(model);
+                        cx.request(HostRequest::ContextMenu {
+                            at: Point::new(r.x, r.bottom()),
+                            items: scratch::arrangement_menu(model),
+                        });
+                    }
                     Some(Hit::Header(id, _)) => {
                         if let Some(t) = model.project().track(id) {
                             cx.request(Self::track_menu(model, t, pos));
@@ -4115,13 +4503,29 @@ impl CanvasView<Session, Action> for ArrangerView {
                         }
                     }
                     Some(
-                        Hit::Corner
+                        hit @ (Hit::Corner
                         | Hit::Ruler(_)
                         | Hit::LoopBand(_)
                         | Hit::LoopStart
-                        | Hit::LoopEnd,
+                        | Hit::LoopEnd
+                        | Hit::PlayStart),
                     ) => {
-                        cx.request(Self::grid_menu(model, pos));
+                        let mut menu = Self::grid_menu(model, pos);
+                        // On the ruler: the Play Start Marker there, first
+                        // (the grid's choices are a long list).
+                        let t = match hit {
+                            Hit::Ruler(t) | Hit::LoopBand(t) => Some(t),
+                            Hit::PlayStart => model.project().play_start.map(|m| m.at),
+                            _ => None,
+                        };
+                        if let (Some(t), HostRequest::ContextMenu { items, .. }) = (t, &mut menu) {
+                            let at = self.snap(t, model, Modifiers::default());
+                            if let Some(first) = items.first_mut() {
+                                first.separator_before = true;
+                            }
+                            items.splice(0..0, Self::play_start_items(model, at));
+                        }
+                        cx.request(menu);
                     }
                     Some(Hit::Global(g)) => cx.request(self.global_menu(g, model, pos)),
                     Some(Hit::TakeLane { clip, take, .. }) => {
@@ -4206,7 +4610,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::Header(_, HeaderPart::Body | HeaderPart::Name)) | None => {
                             Cursor::Default
                         }
-                        Some(Hit::Header(..)) | Some(Hit::Corner) => Cursor::Pointer,
+                        Some(Hit::Header(..) | Hit::Corner | Hit::Arrangement) => Cursor::Pointer,
                         _ => Cursor::Default,
                     });
                 }
@@ -4326,7 +4730,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                     return handled;
                 }
                 let action = match key {
-                    Key::Delete | Key::Backspace => Some(Action::DeleteSelection),
+                    Key::Delete | Key::Backspace => Some(Action::DeleteInArranger),
                     Key::Char('s') | Key::Char('S') if !modifiers.ctrl => {
                         Some(Action::SplitSelectedAtPlayhead)
                     }
@@ -4379,7 +4783,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                 let c = p.clip(clip)?;
                 let end = c.end(&p.timeline, p.sample_rate);
                 Some(format!(
-                    "{}\n{} – {}{}",
+                    "{}\n{} – {}{}\nCtrl+Alt+drag slips the {} inside the clip",
                     c.name,
                     p.timeline.format_bbt(c.start),
                     p.timeline.format_bbt(end),
@@ -4387,13 +4791,31 @@ impl CanvasView<Session, Action> for ArrangerView {
                         "\nDouble-click to edit notes"
                     } else {
                         ""
-                    }
+                    },
+                    if c.as_midi().is_some() { "notes" } else { "audio" }
                 ))
             }
             Hit::Ruler(_) => Some("Click or drag to move the playhead".into()),
             Hit::LoopBand(_) => Some("Drag to set the loop range · Click to toggle looping".into()),
             Hit::LoopStart | Hit::LoopEnd => Some("Drag to resize the loop range".into()),
+            Hit::PlayStart => Some(
+                if model.project().play_start.is_some_and(|m| m.on) {
+                    "Play Start Marker · Drag to move it · Right-click for its menu"
+                } else {
+                    "Play Start Marker (off) · Drag to move it · Right-click for its menu"
+                }
+                .into(),
+            ),
             Hit::Corner => Some("Grid, snap and follow settings".into()),
+            Hit::Arrangement => Some(format!(
+                "Showing {}: click to show the song or a scratch pad, make pads and bring one \
+                 back to the song · Double-click a pad's name to rename it",
+                if model.shown_pad().is_some() {
+                    format!("the scratch pad ‘{}’", model.shown_arrangement_name())
+                } else {
+                    "the song".into()
+                }
+            )),
             Hit::AddTrack => Some("Add a track".into()),
             Hit::HeaderEdge => Some("Drag to resize the track headers · Double-click to reset".into()),
             Hit::Header(id, part) => {
@@ -4427,6 +4849,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                     }
                     .into(),
                     HeaderPart::Automation => "Show / hide automation lanes".into(),
+                    HeaderPart::Group => group_tip(model, t),
                     HeaderPart::Color => {
                         "Track colour · Click to choose (the selected tracks follow)".into()
                     }
@@ -4504,7 +4927,16 @@ impl CanvasView<Session, Action> for ArrangerView {
     }
 
     fn cancel_drag(&mut self, cx: &mut EventCx<'_, Action>) {
-        if let Some(clip_edit::EditDrag::Move { moved: true, .. }) = self.edit_drag.take() {
+        if self.snap_guide.take().is_some() {
+            cx.redraw();
+        }
+        if let Some(
+            clip_edit::EditDrag::Move { moved: true, .. }
+            | clip_edit::EditDrag::Separate {
+                separated: true, ..
+            },
+        ) = self.edit_drag.take()
+        {
             cx.emit(Action::CancelGesture);
         }
     }
@@ -4579,6 +5011,15 @@ impl CanvasView<Session, Action> for ArrangerView {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod snap_tests;
+
+#[cfg(test)]
+mod audit_tests;
+
+#[cfg(test)]
+mod scratch_tests;
 
 /// The launcher clips a payload carries (arrangement clips move inside the
 /// arranger's own drag).

@@ -892,3 +892,82 @@ fn the_toolbar_zooms_and_alt_wheel_sizes_the_rows() {
     wheel(&mut view, &mut s, -1.0);
     assert!(view.row_h > smaller);
 }
+
+/// Snap to Objects in the piano roll: a note moved (grid off) to a few
+/// pixels from another note's start lands on it, with a guide naming it;
+/// Shift moves freely; a resized end snaps to the next note's start.
+#[test]
+fn notes_snap_to_other_notes_and_objects() {
+    let mut s = session();
+    s.dispatch(Action::SetEditMode(faderframe_session::EditMode::Slip))
+        .unwrap();
+    let mut view = PianoRollView::new(Theme::default());
+    let all = notes(&s);
+    let n = all[0];
+    // Another note starting later than `n` ends.
+    let o = *all
+        .iter()
+        .filter(|o| o.id != n.id && o.start > n.end() + MusicalTime::QUARTER)
+        .min_by_key(|o| o.start)
+        .unwrap();
+    let y = row_y(&mut view, &s, n.key);
+    let grab = Point::new(view.x_of(n.start) + 9.0, y);
+    let press = |view: &mut PianoRollView, s: &mut Session, m: Modifiers| {
+        run(view, down(grab, m, 1), s);
+        // Its start 3 px past `o`'s.
+        let to = Point::new(view.x_of(o.start) + 9.0 + 3.0, y);
+        run(view, drag(Point::new(grab.x + 20.0, y), m), s);
+        run(view, drag(to, m), s);
+        let guide = view.snap_guide;
+        run(view, up(to, m), s);
+        assert_eq!(view.snap_guide, None, "the guide goes with the drag");
+        guide
+    };
+    let guide = press(&mut view, &mut s, Modifiers::NONE);
+    let moved = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    assert_eq!(moved.start, o.start, "onto the other note's start");
+    assert_eq!(
+        guide.map(|g| g.object),
+        Some(faderframe_session::SnapObject::NoteStart(o.id))
+    );
+    let mut painted = RecordingPainter::new();
+    s.dispatch(Action::Undo).unwrap();
+    // Shift: free, 3 px past.
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::NONE
+    };
+    assert_eq!(press(&mut view, &mut s, shift), None);
+    let moved = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    let px = (moved.start - o.start).quarters() * f64::from(view.ppq);
+    assert!((px - 3.0).abs() < 0.5, "{px}");
+    s.dispatch(Action::Undo).unwrap();
+    // A resize of `n`'s end to 4 px short of `o`'s start lands on the
+    // note edge nearest the pointer (`o`'s start or another note's end).
+    let end_x = view.x_of(n.end()) - 1.0;
+    run(
+        &mut view,
+        down(Point::new(end_x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    let to = Point::new(view.x_of(o.start) - 4.0, y);
+    run(&mut view, drag(to, Modifiers::NONE), &mut s);
+    let hit = view.snap_guide.expect("snapped");
+    assert!(matches!(
+        hit.object,
+        faderframe_session::SnapObject::NoteStart(_) | faderframe_session::SnapObject::NoteEnd(_)
+    ));
+    let clip_start = s.project().clip(s.editor_clip().unwrap()).unwrap().start;
+    let pointer = clip_start + view.time_at(to.x);
+    let px = |t: MusicalTime| ((t - pointer).quarters() * f64::from(view.ppq)).abs();
+    assert!(px(hit.at) <= px(clip_start + o.start) + 1e-3, "the nearest");
+    view.paint(&mut painted, SIZE, &s, &Theme::default());
+    let texts = painted.texts();
+    assert!(
+        texts.contains(&"Note Start") || texts.contains(&"Note End"),
+        "the guide is named: {texts:?}"
+    );
+    run(&mut view, up(to, Modifiers::NONE), &mut s);
+    let resized = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    assert_eq!(clip_start + resized.end(), hit.at);
+}

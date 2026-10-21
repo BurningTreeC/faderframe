@@ -240,7 +240,10 @@ impl InputRouting {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum OutputRouting {
-    /// The project's master track.
+    /// The default destination: the nearest folder bus the track is in
+    /// (see [`Track::folder_bus`]), else the project's master track. To
+    /// reach the master past a folder bus, a track names it
+    /// (`Track { track: master }`).
     #[default]
     Master,
     /// A bus/aux/master track — or, for MIDI tracks, an instrument track.
@@ -479,6 +482,26 @@ pub struct Track {
     /// The folder track this track is in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folder: Option<TrackId>,
+    /// A bus that is a folder (a *folder bus*, only with
+    /// [`TrackKind::Bus`]): it holds tracks as a folder does (they show
+    /// under it, it opens and closes, its mute and solo reach them) and
+    /// sums them — what it holds with the default output
+    /// ([`OutputRouting::Master`]) plays through it (see
+    /// [`crate::Project::output_target`]). A plain folder is
+    /// [`TrackKind::Folder`]; turning the bus on and off is
+    /// [`crate::Command::SetFolderBus`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder_bus: bool,
+    /// A folder's Group switch (folders and folder buses only; Studio
+    /// One's folder group): the tracks with clips it holds, at every
+    /// level, are edited and armed as one — arming one arms them all,
+    /// selecting a clip selects the clips at the same place on the others,
+    /// a range covers them all, and edits of the selection reach them (see
+    /// [`crate::Project::edit_group`]). A grouped folder inside a grouped
+    /// folder is part of the outer group while that is on. Off by
+    /// default; [`crate::Command::SetFolderGroup`] switches it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder_group: bool,
     /// Sources that move the track's parameters (LFOs, followers, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modulators: Vec<crate::modulation::Modulator>,
@@ -591,8 +614,29 @@ impl Track {
             vca: None,
             group: None,
             folder: None,
+            folder_bus: false,
+            folder_group: false,
             modulators: Vec::new(),
             containers: Default::default(),
+        }
+    }
+
+    /// Holds tracks: a folder, or a folder bus (see [`Track::folder_bus`]).
+    pub fn is_folder(&self) -> bool {
+        self.kind == TrackKind::Folder || self.is_folder_bus()
+    }
+
+    /// A folder that is a bus: it sums what it holds.
+    pub fn is_folder_bus(&self) -> bool {
+        self.kind == TrackKind::Bus && self.folder_bus
+    }
+
+    /// Its kind as the editors name it ("Folder Bus" for a folder bus).
+    pub fn kind_label(&self) -> &'static str {
+        if self.is_folder_bus() {
+            "Folder Bus"
+        } else {
+            self.kind.label()
         }
     }
 

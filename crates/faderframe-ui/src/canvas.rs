@@ -242,7 +242,7 @@ fn device_scale(widget: &gtk::Widget) -> f32 {
         .map_or(widget.scale_factor() as f64, |s| s.scale()) as f32
 }
 
-fn modifiers(state: gdk::ModifierType) -> Modifiers {
+pub(crate) fn modifiers(state: gdk::ModifierType) -> Modifiers {
     Modifiers {
         shift: state.contains(gdk::ModifierType::SHIFT_MASK),
         ctrl: state.contains(gdk::ModifierType::CONTROL_MASK),
@@ -260,7 +260,7 @@ fn button(b: u32) -> PointerButton {
     }
 }
 
-fn map_key(key: gdk::Key) -> Key {
+pub(crate) fn map_key(key: gdk::Key) -> Key {
     match key {
         gdk::Key::space => Key::Space,
         gdk::Key::Return | gdk::Key::KP_Enter => Key::Enter,
@@ -313,6 +313,16 @@ impl CanvasWidget {
             view.set_theme(theme);
         }
         self.queue_resize();
+        self.queue_draw();
+    }
+
+    /// A theme that changes only how things look, not their sizes (the
+    /// grid strength): the view takes it and repaints, nothing is laid out
+    /// again.
+    pub fn restyle(&self, theme: &faderframe_ui_canvas::Theme) {
+        if let Some(view) = self.imp().view.borrow_mut().as_mut() {
+            view.set_theme(theme);
+        }
         self.queue_draw();
     }
 
@@ -982,9 +992,19 @@ impl CanvasWidget {
                             .initial_name(name.as_str())
                             .filters(&list)
                             .build();
+                        // The dialog asks before choosing a file that is
+                        // there: the export replaces it without asking again.
+                        let weak = Rc::downgrade(app);
                         dialog.save(window.as_ref(), gio::Cancellable::NONE, move |res| {
                             if let Some(p) = res.ok().and_then(|f| f.path()) {
+                                let agreed = crate::dialogs::chooser_agreed(&p);
+                                if let Some(app) = weak.upgrade() {
+                                    app.session.borrow_mut().agree_to_replace(agreed);
+                                }
                                 finish(vec![p]);
+                                if let Some(app) = weak.upgrade() {
+                                    app.session.borrow_mut().forget_agreement();
+                                }
                             }
                         });
                     }
@@ -1016,6 +1036,10 @@ impl CanvasWidget {
             move |g, n, x, y| {
                 let b = g.current_button();
                 w.imp().drag_button.set(b);
+                // An editor pressed becomes the editing context.
+                if let Some(app) = w.app() {
+                    crate::edit_keys::worked_in(&app, &w);
+                }
                 // The pointer takes over from the keyboard.
                 if std::mem::take(&mut w.imp().access.borrow_mut().keyboard) {
                     w.queue_draw();

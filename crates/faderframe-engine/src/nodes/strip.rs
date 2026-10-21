@@ -28,6 +28,13 @@ use faderframe_realtime::{MeterRange, ParamSlot};
 ///   mix has them, in the destination layout) without the mute
 /// * a bus's cue path has a strip of its own (`solo_safe`): the mute,
 ///   the solos and VCA mutes never reach any of its outputs
+/// * after those (only for a track with a post-fader send that has a pan
+///   of its own, [`ChannelStrip::with_unpanned`]) — post-fader and
+///   unpanned, in the track layout: the fader, VCAs, mute and polarity as
+///   output 0 has them, the source as it is (that send places it itself);
+///   and its never-muted twin ([`ChannelStrip::with_cue_unpanned`]) for
+///   the cue paths' copies of those sends and the cue sends of a
+///   post-fader stereo cue mix (they place the source by their own pan)
 ///
 /// All gain changes are ramped linearly, so fader moves, mutes and solos
 /// never click. Automated volume, pan and mute are evaluated every
@@ -73,6 +80,11 @@ pub struct ChannelStrip {
     /// The cue mixes' post-fader image (output 3: the same, never muted),
     /// with ramps of its own.
     cue: Option<Stage>,
+    /// The post-fader, unpanned output (its port and ramps), for sends
+    /// with a pan of their own, and its never-muted twin for the cue
+    /// paths' copies of those sends.
+    unpanned: Option<(usize, Stage)>,
+    cue_unpanned: Option<(usize, Stage)>,
     /// Rendered ahead: no meters, scope or shown values (a [`StripEcho`]
     /// publishes them when the audio is heard).
     quiet: bool,
@@ -257,6 +269,8 @@ impl ChannelStrip {
             cue_pre: f32::NAN,
             main: Stage::new(ChannelLayout::Stereo, ChannelLayout::Stereo),
             cue: None,
+            unpanned: None,
+            cue_unpanned: None,
             quiet: false,
             solo_safe: false,
             trim: None,
@@ -289,8 +303,41 @@ impl ChannelStrip {
             layouts: (input, output),
             main: Stage::new(input, output),
             cue: self.cue.map(|_| Stage::new(input, output)),
+            unpanned: self
+                .unpanned
+                .map(|(port, _)| (port, Stage::new(input, input))),
+            cue_unpanned: self
+                .cue_unpanned
+                .map(|(port, _)| (port, Stage::new(input, input))),
             ..self
         }
+    }
+
+    /// With the never-muted post-fader unpanned output on `port` (the cue
+    /// paths' copies of the sends placing the source themselves).
+    pub fn with_cue_unpanned(self, port: usize) -> Self {
+        let (input, _) = self.layouts;
+        Self {
+            cue_unpanned: Some((port, Stage::new(input, input))),
+            ..self
+        }
+    }
+
+    /// With the post-fader, unpanned output on `port` (after the others;
+    /// call after `with_layouts`): what a post-fader send with a pan of
+    /// its own places, rather than the panned image.
+    pub fn with_unpanned(self, port: usize) -> Self {
+        let (input, _) = self.layouts;
+        Self {
+            unpanned: Some((port, Stage::new(input, input))),
+            ..self
+        }
+    }
+
+    /// Output 2 is the cue mixes' pre-fader tap (a strip with cue taps, a
+    /// bus's cue path's).
+    fn has_cue_pre(&self) -> bool {
+        self.cue.is_some() || self.solo_safe
     }
 
     /// With the cue mixes' post-fader image (output 3): the post-fader
@@ -348,6 +395,9 @@ impl ChannelStrip {
         m: usize,
         polarity: f32,
     ) {
+        if !self.has_cue_pre() {
+            return;
+        }
         let Some(out) = outs.get_mut(2) else {
             return;
         };
@@ -529,8 +579,13 @@ impl Processor<EngineContext> for ChannelStrip {
         if let Some(post) = io.audio_out.first_mut() {
             post.clear();
         }
-        if let Some(image) = io.audio_out.get_mut(3) {
+        if let Some(image) = io.audio_out.get_mut(3).filter(|_| self.cue.is_some()) {
             image.clear();
+        }
+        for (port, _) in self.unpanned.iter().chain(self.cue_unpanned.iter()) {
+            if let Some(out) = io.audio_out.get_mut(*port) {
+                out.clear();
+            }
         }
         let step = if automated { AUTOMATION_STEP } else { n.max(1) };
         // The modulation its audio passed the modulators with.
@@ -605,6 +660,25 @@ impl Processor<EngineContext> for ChannelStrip {
             };
             self.render_cue_pre(input, io.audio_out, off, m, polarity);
             self.render_pre(input, io.audio_out, off, m, audible);
+            // The source as it is (a stereo one at its own balance), muted
+            // as the main mix has it, and never muted for the cue paths.
+            for (twin, gain) in [
+                (&mut self.unpanned, audible),
+                (&mut self.cue_unpanned, polarity),
+            ] {
+                if let Some((port, stage)) = twin.as_mut()
+                    && let Some(out) = io.audio_out.get_mut(*port)
+                {
+                    stage.render(
+                        input,
+                        out,
+                        off,
+                        m,
+                        fader_m * vca * gain,
+                        Placement::Balance { pan: 0.0 },
+                    );
+                }
+            }
             if self.main.mix.is_some() {
                 let mut pan = surround_at(&self.slots.surround, params, surround_lanes, at);
                 if self.object {

@@ -136,6 +136,11 @@ pub struct GpuRenderer {
     /// [`Self::render_ahead`]).
     #[cfg(target_os = "linux")]
     in_flight: std::collections::HashMap<u64, (dmabuf::DmabufFrame, wgpu::SubmissionIndex)>,
+    /// The first error no error scope caught, or the device lost (a GPU
+    /// reset, out of memory, a driver update, sleep): wgpu's default
+    /// would panic — inside GTK's paint, the end of the program. Kept here
+    /// instead; the next render fails with it and the toolkit draws.
+    fault: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl GpuRenderer {
@@ -222,6 +227,23 @@ impl GpuRenderer {
             None => pollster::block_on(adapter.request_device(&desc))
                 .map_err(|e| GpuError::Device(e.to_string()))?,
         };
+        let fault: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
+        {
+            let fault = std::sync::Arc::clone(&fault);
+            device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+                if let Ok(mut f) = fault.lock() {
+                    f.get_or_insert_with(|| describe(&e));
+                }
+            }));
+        }
+        {
+            let fault = std::sync::Arc::clone(&fault);
+            device.set_device_lost_callback(move |reason, message| {
+                if let Ok(mut f) = fault.lock() {
+                    f.get_or_insert_with(|| format!("device lost ({reason:?}): {message}"));
+                }
+            });
+        }
         #[cfg(target_os = "linux")]
         let dmabuf = dmabuf::Exporter::new(&device);
         #[cfg(windows)]
@@ -265,7 +287,14 @@ impl GpuRenderer {
             pool: Default::default(),
             #[cfg(target_os = "linux")]
             in_flight: std::collections::HashMap::new(),
+            fault,
         })
+    }
+
+    /// The error the device reported outside error scopes, if any (the
+    /// renderer is unusable after it).
+    pub fn fault(&self) -> Option<String> {
+        self.fault.lock().ok().and_then(|f| f.clone())
     }
 
     /// Which GPU renders (for logs).
@@ -369,6 +398,27 @@ impl GpuRenderer {
     }
 
     fn render_with(
+        &mut self,
+        ahead: Option<u64>,
+        width: u32,
+        height: u32,
+        scale: f32,
+        dmabuf: bool,
+        paint: impl FnOnce(&mut dyn Painter),
+    ) -> Result<Output, GpuError> {
+        if let Some(e) = self.fault() {
+            return Err(GpuError::Device(e));
+        }
+        let output = self.render_unchecked(ahead, width, height, scale, dmabuf, paint);
+        // Anything the device reported meanwhile makes this frame (and
+        // the renderer) unusable.
+        match self.fault() {
+            Some(e) => Err(GpuError::Device(e)),
+            None => output,
+        }
+    }
+
+    fn render_unchecked(
         &mut self,
         ahead: Option<u64>,
         width: u32,
@@ -761,5 +811,40 @@ fn d3d12_adapter(instance: &wgpu::Instance, luid: Option<[u8; 8]>) -> Option<wgp
         None => adapters
             .into_iter()
             .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu),
+    }
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+
+    /// An error the GPU reports outside an error scope (here a buffer it
+    /// refuses; in use a device lost on a GPU reset, out of memory) is no
+    /// panic — that would end the program from inside GTK's paint — but
+    /// the end of this renderer: the next frame fails and the toolkit
+    /// draws instead.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_device_error_fails_the_next_frame_instead_of_panicking() {
+        let mut r = match GpuRenderer::new_any() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipped: {e}");
+                return;
+            }
+        };
+        assert!(r.render(16, 16, 1.0, |_| {}).is_ok());
+        let _refused = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("refused"),
+            size: 4,
+            // Both mapped ways at once: invalid without a native feature.
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        });
+        assert!(r.fault().is_some(), "the error was kept");
+        assert!(matches!(
+            r.render(16, 16, 1.0, |_| {}),
+            Err(GpuError::Device(_))
+        ));
     }
 }

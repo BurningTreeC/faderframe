@@ -770,6 +770,169 @@ fn panning_does_not_allocate() {
     assert_eq!(allocs, 0, "allocations while panning");
 }
 
+/// Folder buses (nested, with a lane, a device and a send) and a send
+/// placing its source itself (its strip's unpanned outputs, the cue
+/// path's twin with a cue mix): playing, and every edit of them (moving
+/// tracks in and out, the bus off and on, pans) swapping the graph.
+#[test]
+fn folder_buses_and_sends_placing_their_source_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, SendId};
+    use faderframe_project::{
+        AuxSend, CueMix, OutputRouting, PluginRef, PluginSlot, SendTap, TrackColor, TrackKind,
+    };
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let outer = tp.track(TrackKind::Bus, "Band", ChannelLayout::Stereo);
+    let inner = tp.track(TrackKind::Bus, "Drums", ChannelLayout::Stereo);
+    for f in [outer, inner] {
+        tp.project.track_mut(f).unwrap().folder_bus = true;
+    }
+    tp.project.track_mut(inner).unwrap().folder = Some(outer);
+    let aux = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    let kick = tp.track(TrackKind::Audio, "Kick", ChannelLayout::Mono);
+    let src = tp.dc(1, 0.3, 400_000);
+    tp.clip(kick, src, MusicalTime::ZERO, 400_000);
+    let gtr = tp.track(TrackKind::Audio, "Guitar", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.2, 400_000);
+    tp.clip(gtr, src, MusicalTime::ZERO, 400_000);
+    tp.project.track_mut(kick).unwrap().folder = Some(inner);
+    tp.project.track_mut(gtr).unwrap().folder = Some(outer);
+    let send = SendId(tp.project.ids.allocate::<SendId>().raw());
+    let t = tp.project.track_mut(kick).unwrap();
+    t.pan = 0.8;
+    t.sends.push(AuxSend {
+        id: send,
+        target: aux,
+        level_db: -6.0,
+        tap: SendTap::PostFader,
+        enabled: true,
+        pan: Some(-0.5),
+    });
+    let gain = tp.project.ids.allocate();
+    tp.project
+        .track_mut(inner)
+        .unwrap()
+        .inserts
+        .push(PluginSlot {
+            id: gain,
+            plugin: PluginRef::builtin(faderframe_core::builtin::GAIN, "Utility"),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        });
+    let lane = tp.project.ids.allocate();
+    tp.project
+        .track_mut(outer)
+        .unwrap()
+        .automation
+        .lanes
+        .push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::TrackVolume,
+            curve: AutomationCurve::from_points(
+                (0..20)
+                    .map(|i| AutomationPoint {
+                        time: MusicalTime::from_quarters(i as f64 * 0.25),
+                        value: if i % 2 == 0 { -6.0 } else { 0.0 },
+                        shape: CurveShape::Linear,
+                    })
+                    .collect(),
+            ),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+    let cue = tp.project.ids.allocate();
+    tp.project.cue_mixes.push(CueMix::new(
+        cue,
+        "Phones",
+        TrackColor::palette(4),
+        2,
+        ChannelLayout::Stereo,
+    ));
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 4).unwrap();
+    r.controller.plugins().set_realtime(true);
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 4, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut h = History::default();
+    let (_, mut allocs) = armed(|| {
+        for _ in 0..60 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    for cmd in [
+        Command::SetTrackPan {
+            track: inner,
+            pan: -0.7,
+        },
+        Command::SetSendPan {
+            track: kick,
+            send,
+            pan: Some(0.4),
+        },
+        Command::SetSendPan {
+            track: kick,
+            send,
+            pan: None,
+        },
+        Command::SetSendPan {
+            track: kick,
+            send,
+            pan: Some(1.0),
+        },
+        Command::SetTrackFolder {
+            track: gtr,
+            folder: Some(inner),
+        },
+        Command::SetTrackFolder {
+            track: gtr,
+            folder: None,
+        },
+        Command::SetFolderBus {
+            track: inner,
+            on: false,
+            output: OutputRouting::None,
+        },
+        Command::SetFolderBus {
+            track: inner,
+            on: true,
+            output: OutputRouting::Master,
+        },
+        Command::SetTrackMute {
+            track: outer,
+            on: true,
+        },
+    ] {
+        let impact = h.apply(&mut tp.project, cmd).unwrap();
+        r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+        allocs += armed(|| {
+            for _ in 0..60 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+        r.controller.collect_garbage();
+    }
+    assert_eq!(allocs, 0, "allocations with folder buses");
+}
+
 #[test]
 fn spatial_panning_does_not_allocate() {
     let _serial = serial();
@@ -1954,14 +2117,23 @@ fn render_ahead_without_allocating(buses: bool) {
         std::thread::sleep(pace);
     }
     let mut total = 0;
-    for cmd in [
-        TransportCommand::Play,
-        TransportCommand::Locate(96_000),
-        TransportCommand::Stop,
-        TransportCommand::Play,
+    let range = |a, b| faderframe_transport::LoopRange::new(a, b);
+    for (cmd, callbacks) in [
+        (TransportCommand::Play, 40),
+        (TransportCommand::Locate(96_000), 40),
+        (TransportCommand::Stop, 40),
+        (TransportCommand::Play, 40),
+        // Loop changes while playing: amends at a frame ahead (in the
+        // middle of a callback), the playhead inside, then past the end.
+        (TransportCommand::SetLoopRange(range(90_000, 150_000)), 10),
+        (TransportCommand::SetLoopEnabled(true), 10),
+        (TransportCommand::SetLoopRange(range(90_000, 150_511)), 3),
+        (TransportCommand::SetLoopRange(range(90_000, 151_022)), 3),
+        (TransportCommand::SetLoopRange(range(100_000, 120_000)), 30),
+        (TransportCommand::SetLoopEnabled(false), 20),
     ] {
         r.controller.transport(cmd).unwrap();
-        for _ in 0..40 {
+        for _ in 0..callbacks {
             let (_, n) = armed(|| r.processor.process_device(&mut bufs));
             total += n;
             std::thread::sleep(pace);
@@ -3721,6 +3893,9 @@ fn cue_mixes_do_not_allocate() {
     for (first, layout, tap) in [
         (2, ChannelLayout::Stereo, SendTap::PreFader),
         (4, ChannelLayout::Mono, SendTap::PostFader),
+        // Post-fader into stereo: the sends place their sources from the
+        // strips' never-muted unpanned outputs.
+        (6, ChannelLayout::Stereo, SendTap::PostFader),
     ] {
         let id: CueId = tp.project.ids.allocate();
         let mut c = CueMix::new(id, "Cue", TrackColor::palette(1), first, layout);
@@ -3740,7 +3915,7 @@ fn cue_mixes_do_not_allocate() {
         sample_rate: SR,
         ..EngineConfig::default()
     };
-    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 5).unwrap();
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 8).unwrap();
     r.controller.plugins().set_realtime(true);
     let mut talk = faderframe_engine::Talkback {
         on: false,
@@ -3755,7 +3930,7 @@ fn cue_mixes_do_not_allocate() {
     r.controller.metronome().set_mode(MetronomeMode::Always);
     r.controller.metronome().set_main(false);
     r.play_from(0).unwrap();
-    let mut bufs = OwnedBuffers::new(2, 5, 256);
+    let mut bufs = OwnedBuffers::new(2, 8, 256);
     for _ in 0..4 {
         r.processor.process_device(&mut bufs);
     }
@@ -3826,6 +4001,20 @@ fn cue_mixes_do_not_allocate() {
             cue: cues[0],
             on: false,
         },
+        Command::SetCueSendPan {
+            track: vox,
+            cue: cues[2],
+            pan: -1.0,
+        },
+        Command::SetCueSendPan {
+            track: bus,
+            cue: cues[2],
+            pan: 0.8,
+        },
+        Command::SetTrackPan {
+            track: vox,
+            pan: 1.0,
+        },
     ] {
         let impact = h.apply(&mut tp.project, cmd).unwrap();
         r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
@@ -3837,6 +4026,6 @@ fn cue_mixes_do_not_allocate() {
         .1;
     }
     assert_eq!(allocs, 0, "allocations in the cue mixes");
-    let heard = (2..5).any(|c| bufs.output_ref(c).iter().any(|v| v.abs() > 1e-4));
+    let heard = (2..8).any(|c| bufs.output_ref(c).iter().any(|v| v.abs() > 1e-4));
     assert!(heard, "the cue mixes play");
 }

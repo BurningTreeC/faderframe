@@ -36,9 +36,11 @@ pub mod album;
 mod album_master;
 mod aliases;
 pub mod analysis;
+pub mod audio_device;
 pub mod capture;
 pub mod cleanup;
 pub mod clip_fx;
+pub mod clipboard;
 pub mod conform;
 pub mod console;
 pub mod containers;
@@ -50,6 +52,8 @@ pub mod delivery;
 pub mod detect;
 mod duplicate;
 pub mod editing;
+pub mod exports;
+mod folder_groups;
 mod folders;
 mod freeze;
 pub mod groove;
@@ -64,11 +68,13 @@ pub mod listening;
 mod merge;
 pub mod metronome;
 pub mod outputs;
+pub mod plugin_favorites;
 mod programs;
 mod redraw;
 pub mod samples;
 pub mod sampling;
 mod sandbox;
+pub mod scratch;
 pub mod speech;
 pub mod to_midi;
 pub mod vinyl;
@@ -80,6 +86,8 @@ pub mod record;
 pub mod render;
 mod selection;
 pub mod shuttle;
+pub mod slip;
+pub mod snapping;
 pub mod sync;
 mod sysex;
 pub mod templates;
@@ -101,15 +109,15 @@ pub use editing::{
 pub use faderframe_workspace::{
     DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE,
 };
+pub use snapping::{SnapHit, SnapObject, SnapSkip};
 pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
 
 pub use meters::{METER_FLOOR_DB, MeterChannel, MeterDisplay};
 pub use selection::{SelectMode, Selection};
 
+pub use audio_device::{Applied, AudioDeviceStatus, AudioHealth, BackendFactory};
 pub use automation::{AutomationParam, ParamKind};
-use faderframe_audio::{
-    AudioBackend, AudioError, AudioStream, StreamConfig, StreamInfo, StreamStatus,
-};
+use faderframe_audio::{AudioBackend, AudioError, AudioStream, StreamInfo, StreamStatus};
 use faderframe_audio_files::PeakCache;
 pub use faderframe_automation::{AutomationMode, AutomationTarget};
 use faderframe_core::{AudioSourceId, ClipId, NoteId, TrackId};
@@ -198,6 +206,18 @@ pub enum TransportAction {
     SetPunch(Option<MusicalRange>),
     /// Move the playhead by whole bars.
     NudgeBars(i32),
+    /// Set (and switch on) or remove (`None`) the Play Start Marker.
+    SetPlayStart(Option<MusicalTime>),
+    /// Play from the Play Start Marker or not (none yet: one at the
+    /// playhead, on).
+    TogglePlayStart,
+    /// Throw the take being recorded away: playback stops, nothing of the
+    /// pass reaches the project (its files are deleted), the playhead goes
+    /// back to where recording began. Not recording: Stop.
+    AbortRecording,
+    /// [`Self::AbortRecording`], then record again from there at once, with
+    /// the same pre-roll and count-in.
+    AbortAndRestartRecording,
 }
 
 /// Layout changes requested by views or menus.
@@ -262,7 +282,13 @@ pub enum Action {
     RemoveSelectedTracks,
     /// Toggle record arm on the selected audio/MIDI tracks.
     ToggleArmSelected,
+    /// Delete what is selected: the edit range when it has a length, else
+    /// the piano roll's selected notes, else the selected clips (control
+    /// surfaces' Delete button).
     DeleteSelection,
+    /// Delete in the arranger: the edit range when it has a length, else
+    /// the selected clips — never the piano roll's notes.
+    DeleteInArranger,
     SplitSelectedAtPlayhead,
     /// Insert a plugin into a track's insert chain (the session allocates ids).
     SetPreamp {
@@ -418,6 +444,12 @@ pub enum Action {
     Transcribe(ClipId),
     /// Write the lyrics as LRC and SRT next to the project.
     ExportLyrics,
+    /// The user's answer to a [`UiRequest::AskReplace`] question: replace
+    /// the files (`true`) or keep them and drop the export.
+    AnswerReplace {
+        question: u64,
+        replace: bool,
+    },
     /// Change (`Some`) or remove (`None`) a lyric line's words.
     EditLyric {
         index: usize,
@@ -473,6 +505,9 @@ pub enum Action {
     },
     /// Edit the setlist.
     Setlist(setlist::SetlistOp),
+    /// Make, show, change or remove scratch pads, and move material into
+    /// them and back into the song.
+    ScratchPad(scratch::ScratchOp),
     /// Make, remove or change a cue mix, or show one in the mixer.
     Cue(cues::CueOp),
     /// The TALK button (the talkback microphone into the cue mixes).
@@ -619,8 +654,22 @@ pub enum Action {
     },
     /// Open or close a folder (not undoable, kept with the layout).
     ToggleFolder(TrackId),
-    /// Sum a folder's tracks in a new bus inside it.
+    /// Sum a folder's tracks: the folder itself becomes their bus (as
+    /// [`Action::SetFolderBus`] on; it used to make a separate bus).
     SumFolder(TrackId),
+    /// Make a folder a bus — what it holds with the default output plays
+    /// through its strip — or (`on: false`) a plain folder again; one undo
+    /// step.
+    SetFolderBus {
+        folder: TrackId,
+        on: bool,
+    },
+    /// Switch a folder's Group on (what it holds is edited and armed as
+    /// one: see [`folder_groups`]) or off; one undo step.
+    SetFolderGroup {
+        folder: TrackId,
+        on: bool,
+    },
     /// Ask where to save such a sample, then make it.
     PromptSaveSample {
         track: TrackId,
@@ -892,6 +941,9 @@ pub enum Action {
         plugin: faderframe_core::PluginInstanceId,
         values: Vec<(String, f64)>,
     },
+    /// Change the favorite plugins or their categories: a preference of
+    /// the user's, never the project's (no undo step, nothing to save).
+    PluginFavorites(plugin_favorites::FavoriteOp),
     /// Ask the shell to show a plugin's editor: its own GUI, or (`generic`,
     /// or when it has none) the generic parameter window.
     OpenPluginEditor {
@@ -1003,13 +1055,33 @@ pub enum Action {
     TrimToSelection,
     /// Delete the selection range on the selected tracks.
     ClearRange,
+    /// Copy the edit range on the selected tracks (only a range).
     CopyRange,
     CutRange,
-    /// Paste the copied range at the playhead.
+    /// Paste the clipboard (as [`Action::Paste`]).
     PasteRange,
-    /// Copies right after the selection (1 = duplicate).
+    /// Copies of the range right after it (1 = duplicate).
     RepeatRange(u32),
     InsertSilence,
+    /// Copy the edit selection: its range on the selected tracks when it
+    /// has a length, else the selected clips ([`clipboard`]).
+    Copy,
+    /// Copy, then clear the range or remove the copied clips.
+    Cut,
+    /// Paste the clipboard at the insertion point.
+    Paste,
+    /// Copies of the selection (range or clips) right after it, end to
+    /// end, `n` times (1 = Duplicate).
+    Repeat(u32),
+    /// Select All in the arranger: every clip it shows.
+    SelectAllClips,
+    /// Slip editing: move the audio or MIDI inside clips by `by` ticks
+    /// from where the gesture started; their place, length, fades and
+    /// gain stay ([`slip`]).
+    SlipClips {
+        clips: Vec<ClipId>,
+        by: i64,
+    },
     Nudge {
         forward: bool,
         target: NudgeTarget,
@@ -1133,6 +1205,9 @@ pub struct EditorSettings {
     pub snap_samples: bool,
     /// Cuts and trims of audio clips move to the nearest zero crossing.
     pub zero_crossings: bool,
+    /// Drags snap to clip edges, markers, sections, the loop, the
+    /// selection and the playhead ([`snapping`]).
+    pub snap_objects: bool,
     /// The Pitch editor finds every note, chords too (off: one line of
     /// notes, played live with formants kept).
     pub pitch_polyphonic: bool,
@@ -1177,6 +1252,7 @@ impl Default for EditorSettings {
             show_edit_toolbar: false,
             snap_samples: true,
             zero_crossings: false,
+            snap_objects: true,
             pitch_polyphonic: true,
             stop_to_start: false,
             counter_unit: CounterUnit::BarsBeats,
@@ -1226,7 +1302,8 @@ impl EditorSettings {
 /// Folder next to the project file that imported and recorded media go to.
 pub const MEDIA_FOLDER: &str = "Audio";
 
-/// Audio startup preferences.
+/// Audio device settings (Preferences → Audio): `None`/empty means the
+/// backend's default. See [`audio_device`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioPreferences {
     pub sample_rate: Option<u32>,
@@ -1234,6 +1311,52 @@ pub struct AudioPreferences {
     /// Threads processing the graph, the audio thread included (`None`:
     /// one per core; 1: the audio thread alone).
     pub threads: Option<u16>,
+    /// The devices chosen for each backend (by [`AudioBackend::id`]): a
+    /// backend without a choice uses its defaults.
+    pub devices: std::collections::BTreeMap<String, DeviceChoice>,
+    /// Channels to open (`None`: as many as the devices have). The project
+    /// can ask for more (hardware inserts, cue mixes, a surround master).
+    pub input_channels: Option<u16>,
+    pub output_channels: Option<u16>,
+    /// Hold the server's graph at the rate and buffer size while running
+    /// (PipeWire), instead of asking.
+    pub force_format: bool,
+}
+
+impl AudioPreferences {
+    /// The devices chosen for backend `id`.
+    pub fn devices_for(&self, id: &str) -> DeviceChoice {
+        self.devices.get(id).cloned().unwrap_or_default()
+    }
+
+    /// These settings with devices chosen for backend `id`.
+    pub fn with_devices(mut self, id: &str, outputs: &[&str], inputs: &[&str]) -> Self {
+        self.devices.insert(
+            id.into(),
+            DeviceChoice {
+                outputs: outputs.iter().map(|s| s.to_string()).collect(),
+                inputs: inputs.iter().map(|s| s.to_string()).collect(),
+            },
+        );
+        self
+    }
+}
+
+/// The devices a backend's stream plays on and records from (device ids).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DeviceChoice {
+    /// Several where the backend takes them, their channels one after
+    /// another. Empty: the default output.
+    pub outputs: Vec<String>,
+    /// Empty: the output device where it records, else the default input.
+    pub inputs: Vec<String>,
+}
+
+impl DeviceChoice {
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty() && self.inputs.is_empty()
+    }
 }
 
 /// A position shown before the engine got there (see
@@ -1252,6 +1375,9 @@ struct ShownPosition {
 struct ActiveRecording {
     /// Audio takes (none when only MIDI tracks are armed).
     writer: Option<record::RecordWriter>,
+    /// The files the writer creates (one per audio target, once audio
+    /// comes): what an abort deletes.
+    paths: Vec<PathBuf>,
     /// MIDI takes.
     midi: Option<midi::MidiTake>,
     from: i64,
@@ -1343,6 +1469,8 @@ pub struct Session {
     hardware_ping: Option<hardware::Ping>,
     /// The channels (inputs, outputs) the device was last reopened for.
     reopened_for: Option<(u16, u16)>,
+    /// The audio device's settings, backends and recovery.
+    device: audio_device::AudioDevice,
     metrics: MetricsSnapshot,
     last_metrics: Instant,
     path: Option<PathBuf>,
@@ -1382,15 +1510,36 @@ pub struct Session {
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
     ui_requests: Vec<UiRequest>,
+    /// Export questions waiting for answers ([`exports`]).
+    exports: exports::Exports,
     /// Device editors' own settings ([`Action::SetDeviceView`]).
     device_views: HashMap<(faderframe_core::PluginInstanceId, String), f64>,
+    /// The user's favorite plugins (the shell loads and saves them).
+    plugin_favorites: plugin_favorites::PluginFavorites,
+    /// Counts their changes (the shell saves when it moved).
+    favorites_revision: u64,
     /// Notes copied in the piano roll (relative to the earliest).
     note_clipboard: Vec<MidiNote>,
-    range_clipboard: editing::RangeClipboard,
+    /// The arranger's clipboard (copied clips or a copied range).
+    clipboard: clipboard::Clipboard,
     /// Where playback last started (for "insertion follows playback" off).
     play_started_at: Option<i64>,
+    /// Aborted recordings whose files go once their writers let go.
+    discarding: Vec<ActiveRecording>,
+    /// Play and Record start from the playhead, not the Play Start Marker
+    /// (a programmatic start that put the playhead somewhere first).
+    play_here: bool,
+    /// An abort-and-restart: record again from here once playback has
+    /// stopped (until when it was asked).
+    restart_recording: Option<(i64, Instant)>,
+    /// Where each arrangement's playhead was left (the song's: `None`).
+    pad_positions: HashMap<Option<faderframe_core::ScratchPadId>, MusicalTime>,
     /// The engine stops after a punch-out's post-roll.
     postroll_armed: bool,
+    /// Play or Stop asked of the engine and not seen in its snapshot yet:
+    /// held so that a second transport press in the meantime (Record and
+    /// Play together on a control surface, Play then Stop) sees it.
+    requested_play: Option<(bool, Instant)>,
     transients: transients::TransientCache,
     pitch: pitch::PitchCache,
     /// Polyphonic pitch edits: detections and renders.
@@ -1407,6 +1556,10 @@ pub struct Session {
     /// Threads of the audio path that could not take their priority
     /// (`faderframe_realtime::priority`), as last reported.
     priority_failures: u64,
+    /// When the realtime time limit was last looked after, and the threads
+    /// it demoted as last reported (`priority::rttime_demotions`).
+    rttime_checked: Option<std::time::Instant>,
+    rttime_demotions: u64,
     speech: speech::SpeechState,
     launcher: launcher::LauncherState,
     control: control::ControlState,
@@ -1459,6 +1612,9 @@ pub struct Session {
     /// Clips as the running gesture first saw them (drags recompute from
     /// these).
     gesture_base: HashMap<ClipId, faderframe_project::Clip>,
+    /// The clips a running gesture's edits named and those they reach in
+    /// folder groups (see [`folder_groups`]): kept for the whole drag.
+    grouped_targets: Option<(Vec<ClipId>, Vec<ClipId>)>,
     /// Expression of the clipboard's notes (by their original ids).
     note_clipboard_expressions: Vec<faderframe_project::NoteExpression>,
     perf: performance::PerformanceMonitor,
@@ -1509,6 +1665,8 @@ pub enum UiRequest {
     DeletePreset { path: PathBuf, name: String },
     /// Ask for a group's new name.
     RenameGroup(faderframe_core::GroupId),
+    /// Ask for a scratch pad's new name.
+    RenameScratchPad(faderframe_core::ScratchPadId),
     /// Pick a colour (track or section).
     PickColor(ColorTarget),
     /// Ask for a version's name, then save it.
@@ -1532,6 +1690,15 @@ pub enum UiRequest {
         start: MusicalTime,
         end: MusicalTime,
         name: String,
+    },
+    /// Ask whether existing files may be replaced (Overwrite / Cancel),
+    /// then send [`Action::AnswerReplace`].
+    AskReplace(exports::ReplaceQuestion),
+    /// Show what an export wrote, measured from the files as written
+    /// (the render report): `what` names it ("Album “Live”").
+    RenderReport {
+        what: String,
+        files: Vec<render::Rendered>,
     },
 }
 
@@ -1646,6 +1813,7 @@ impl Session {
             picture_out: None,
             hardware_ping: None,
             reopened_for: None,
+            device: Default::default(),
             metrics: MetricsSnapshot::default(),
             last_metrics: Instant::now(),
             path: None,
@@ -1673,11 +1841,19 @@ impl Session {
             presets: Vec::new(),
             automation_writer: Default::default(),
             ui_requests: Vec::new(),
+            exports: Default::default(),
             device_views: HashMap::new(),
+            plugin_favorites: Default::default(),
+            favorites_revision: 0,
             note_clipboard: Vec::new(),
-            range_clipboard: editing::RangeClipboard::default(),
+            clipboard: clipboard::Clipboard::default(),
             play_started_at: None,
+            discarding: Vec::new(),
+            play_here: false,
+            restart_recording: None,
+            pad_positions: HashMap::new(),
             postroll_armed: false,
+            requested_play: None,
             transients: transients::TransientCache::default(),
             pitch: pitch::PitchCache::default(),
             poly: polypitch::PolyState::default(),
@@ -1691,11 +1867,14 @@ impl Session {
             spectral: spectral::SpectralState::default(),
             redraw: redraw::RedrawState::default(),
             priority_failures: 0,
+            rttime_checked: None,
+            rttime_demotions: 0,
             speech: speech::SpeechState::default(),
             launcher: launcher::LauncherState::default(),
             control: control::ControlState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
+            grouped_targets: None,
             bounces: Vec::new(),
             mono_check: false,
             mixer_cue: None,
@@ -1844,6 +2023,13 @@ impl Session {
     /// playback stopped, shown in between).
     pub(crate) fn show_position(&mut self, position: i64) {
         self.hold_position(position, true);
+    }
+
+    /// The transport asked to play (or stop): so it is, for the session,
+    /// until the engine's snapshot agrees (see `requested_play`).
+    pub(crate) fn requested_playing(&mut self, on: bool) {
+        self.transport.playing = on;
+        self.requested_play = Some((on, Instant::now()));
     }
 
     /// [`Self::show_position`] for a jump that lands near `position`, not
@@ -2197,6 +2383,8 @@ impl Session {
         self.apply_talkback()?;
         self.apply_low_latency_limit();
         self.reapply_metronome();
+        // The record settings' count-in lives in the engine too.
+        self.engine.set_count_in(self.record.count_in)?;
         // A new meter bank: quasi-peak metering applied again.
         self.ppm_meters.clear();
         self.engine.set_midi_input(self.midi.renew_queue())?;
@@ -2249,65 +2437,15 @@ impl Session {
         Ok(())
     }
 
-    /// Open an audio stream on the first backend that works.
+    /// Open an audio stream on the first backend that works (see
+    /// [`Self::start_audio_with`] for a session that also reopens the
+    /// device after it went away).
     pub fn start_audio(
         &mut self,
         backends: Vec<Box<dyn AudioBackend>>,
         prefs: &AudioPreferences,
     ) -> Result<StreamInfo> {
-        self.stop_audio();
-        let mut last_err: Option<SessionError> = None;
-        for mut backend in backends {
-            if !backend.is_available() {
-                last_err = Some(SessionError::Audio(AudioError::BackendUnavailable(
-                    format!("{} is not available", backend.display_name()),
-                )));
-                continue;
-            }
-            if self.pending.is_none() {
-                self.recreate_engine()?;
-            }
-            let Some(mut processor) = self.pending.take() else {
-                continue;
-            };
-            processor.set_worker_pool(self.worker_pool(prefs.threads));
-            let (inputs, outputs) = self.wanted_channels();
-            let config = StreamConfig {
-                sample_rate: prefs.sample_rate,
-                buffer_size: prefs.buffer_size,
-                input_channels: inputs,
-                output_channels: outputs,
-                ..StreamConfig::default()
-            };
-            match backend.open_stream(config, Box::new(processor)) {
-                Ok(stream) => {
-                    let info = stream.info();
-                    // macOS: the workers join the device's audio workgroup,
-                    // and so do sandboxed plugins' audio threads.
-                    let workgroup = stream.io_workgroup();
-                    faderframe_realtime::set_process_workgroup(workgroup.clone());
-                    if let Some(pool) = &self.pool {
-                        pool.set_workgroup(workgroup);
-                    }
-                    self.audio = Some(ActiveAudio {
-                        stream,
-                        backend: backend.id(),
-                        _wake: faderframe_realtime::priority::CpuWakeLatency::hold(),
-                    });
-                    self.set_engine_rate(info.sample_rate)?;
-                    self.notify(NoticeLevel::Info, format!("audio: {info}"));
-                    return Ok(info);
-                }
-                Err(e) => {
-                    self.notify(
-                        NoticeLevel::Warning,
-                        format!("{}: {e}", backend.display_name()),
-                    );
-                    last_err = Some(e.into());
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| SessionError::Other("no audio backend available".into())))
+        self.open_audio(backends, prefs)
     }
 
     /// The worker pool for `threads` processing threads in total (reused
@@ -2538,10 +2676,13 @@ impl Session {
         1 + self.pool.as_ref().map_or(0, |p| p.threads())
     }
 
-    /// Worker threads that could not get the audio thread's realtime
-    /// priority (no permission): they still work, but may be preempted.
-    pub fn worker_priority_failures(&self) -> u64 {
-        self.pool.as_ref().map_or(0, |p| p.priority_failures())
+    /// Worker threads without the audio thread's realtime priority while it
+    /// has it (no permission, RealtimeKit's limits, a grant still to come):
+    /// they still work, but may be preempted.
+    pub fn workers_without_realtime(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map_or(0, |p| p.workers_without_realtime())
     }
 
     /// While no stream runs, the processor is owned here; drain its queues
@@ -2578,7 +2719,8 @@ impl Session {
 
     /// The project as a render needs it: plugin states captured (the render
     /// thread creates its own instances from the slots), media paths
-    /// absolute.
+    /// absolute, the song shown (renders and exports are of the song
+    /// whichever scratch pad is shown).
     pub(crate) fn render_copy(&mut self) -> Project {
         self.capture_plugin_states();
         // Renders have no interface: outboard gear is passed by.
@@ -2594,7 +2736,7 @@ impl Session {
                 "Renders pass hardware inserts by (the gear plays only in real time): record its return to a track first",
             );
         }
-        let mut project = self.project.clone();
+        let mut project = self.project.song().into_owned();
         let dir = self.project_dir();
         for s in project.sources.values_mut() {
             if let SourceSpec::File { path, .. } = &mut s.spec {
@@ -2604,29 +2746,80 @@ impl Session {
         project
     }
 
-    /// Close the stream (the engine processor goes with it).
+    /// Close the stream (the engine processor goes with it); a device that
+    /// went away is not looked for any more.
     pub fn stop_audio(&mut self) {
-        self.stop_voice();
-        self.audio = None;
-        faderframe_realtime::set_process_workgroup(None);
-        if let Some(pool) = &self.pool {
-            pool.set_workgroup(None);
-        }
+        self.close_stream();
+        self.device.stop_watching();
     }
 
+    /// Ask the running stream for another buffer size (JACK, PipeWire and
+    /// the dummy device take it without reopening).
     pub fn request_buffer_size(&mut self, frames: u32) -> Result<()> {
         match &mut self.audio {
-            Some(a) => Ok(a.stream.request_buffer_size(frames)?),
+            Some(a) => {
+                a.stream.request_buffer_size(frames)?;
+                self.device.asked_buffer_size(frames);
+                Ok(())
+            }
             None => Err(SessionError::Other("no audio stream is running".into())),
         }
     }
 
     // --- periodic --------------------------------------------------------------
 
+    /// Once a second: keep the margin under the realtime time limit (others
+    /// in the process may set it again), and say when a thread of the
+    /// audio path ran too long without a break and lost its priority.
+    fn tick_rttime(&mut self) {
+        if self
+            .rttime_checked
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.rttime_checked = Some(std::time::Instant::now());
+        faderframe_realtime::priority::note_rttime_limit();
+        let (demoted, tid) = faderframe_realtime::priority::rttime_demotions();
+        if demoted > self.rttime_demotions {
+            let name = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| format!("thread {tid}"));
+            tracing::warn!(
+                "{name} ran realtime past the time limit without a break ({} so far): \
+                 back to normal priority",
+                demoted
+            );
+            if self.rttime_demotions == 0 {
+                self.notify(
+                    NoticeLevel::Warning,
+                    format!(
+                        "An audio thread ({name}) ran without a pause for longer than the system \
+                         allows realtime threads (an overload, or a plugin computing for a long \
+                         time): it was set back to normal priority instead of the system ending \
+                         FaderFrame, so dropouts are likely. Audio → Restart Audio (or, for a \
+                         helper thread, restarting FaderFrame) gives it its priority again."
+                    ),
+                );
+            }
+            self.rttime_demotions = demoted;
+        }
+    }
+
     /// Poll the engine (call once per UI frame). `dt` is in seconds.
     pub fn tick(&mut self, dt: f32) {
-        let failures = faderframe_realtime::priority::priority_failures();
+        // (Threads demoted for running too long are told apart:
+        // `tick_rttime`.)
+        let failures = faderframe_realtime::priority::priority_failures()
+            .saturating_sub(faderframe_realtime::priority::rttime_demotions().0);
         if failures > self.priority_failures {
+            // What RealtimeKit's broker did so far (asked, granted, refused
+            // and retried, waiting).
+            #[cfg(target_os = "linux")]
+            tracing::warn!(
+                "{failures} audio-path thread(s) without their realtime priority; RealtimeKit: {:?}",
+                faderframe_realtime::rtkit::stats()
+            );
             if self.priority_failures == 0 {
                 self.notify(
                     NoticeLevel::Warning,
@@ -2638,6 +2831,7 @@ impl Session {
             }
             self.priority_failures = failures;
         }
+        self.tick_rttime();
         self.tick_metronome();
         self.poll_jobs();
         self.poll_bounces();
@@ -2670,6 +2864,15 @@ impl Session {
                 self.transport.position = target;
             }
         }
+        // Play or Stop the engine has not applied yet (render-ahead primes
+        // first): as asked, until it has.
+        if let Some((on, at)) = self.requested_play {
+            if self.transport.playing == on || at.elapsed() > std::time::Duration::from_secs(2) {
+                self.requested_play = None;
+            } else {
+                self.transport.playing = on;
+            }
+        }
         self.tick_shuttle(!was_playing && self.transport.playing);
         self.tick_adr();
         self.tick_hardware_ping();
@@ -2681,6 +2884,7 @@ impl Session {
         }
         self.poll_launcher(was_playing);
         self.poll_slot_recording();
+        self.tick_restart_recording();
         if self.album_state.is_playing() {
             // The project started playing: it has the outputs back.
             if !was_playing && self.transport.playing {
@@ -2769,21 +2973,7 @@ impl Session {
             self.apply_manual_speed();
         }
         self.tick_control();
-        let status = self.stream_status();
-        if let Some(status) = status {
-            if status.shut_down {
-                self.audio = None;
-                self.notify(NoticeLevel::Error, "the audio server shut down the stream");
-                if let Err(e) = self.recreate_engine() {
-                    self.notify(NoticeLevel::Error, e.to_string());
-                }
-            } else if status.sample_rate != 0
-                && status.sample_rate != self.engine.sample_rate()
-                && let Err(e) = self.set_engine_rate(status.sample_rate)
-            {
-                self.notify(NoticeLevel::Error, e.to_string());
-            }
-        }
+        self.tick_audio_device();
     }
 
     // --- project lifecycle ---------------------------------------------------
@@ -3217,6 +3407,8 @@ impl Session {
     }
 
     fn replace_project(&mut self, project: Project, workspace: Option<WorkspaceSet>) -> Result<()> {
+        // A take still being recorded belongs to neither project.
+        self.end_recordings_for_close();
         self.forget_video();
         self.project = project;
         if let Some(ws) = workspace {
@@ -3225,6 +3417,7 @@ impl Session {
         self.history.clear();
         self.saved_revision = self.history.revision();
         self.selection.clear();
+        self.pad_positions.clear();
         self.mixer_cue = None;
         self.meters.clear();
         self.meter_queue.clear();
@@ -3434,7 +3627,8 @@ impl Session {
             self.open_media();
         }
         self.engine.sync(&self.project, &self.sources, impact)?;
-        if impact >= Impact::Timeline {
+        // The loader keeps the loop's start resident too.
+        if impact >= Impact::Transport {
             self.update_loader();
         }
         self.pump_idle();
@@ -3475,6 +3669,8 @@ impl Session {
                 commands: std::iter::once(cmd).chain(linked).collect(),
             }
         };
+        // Arming a member of a folder group arms the group.
+        let cmd = self.folder_group_arms(cmd);
         // Removing a folder keeps its tracks; removing the track taking a
         // plugin's main gives the plugin's track its routing back.
         let cmd = self.keep_folder_contents(cmd);
@@ -3506,6 +3702,9 @@ impl Session {
     }
 
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
+        // Edits of clips in a folder group reach the clips at the same
+        // place on the group's other tracks.
+        let action = self.grouped_action(action);
         match action {
             Action::Edit(cmd) => {
                 // Mapping a modulator: the touched parameter is taken.
@@ -3522,10 +3721,16 @@ impl Session {
                     r?;
                 }
             }
-            Action::BeginGesture(label) => self.history.begin(label),
+            Action::BeginGesture(label) => {
+                if !self.history.in_gesture() {
+                    self.grouped_targets = None;
+                }
+                self.history.begin(label);
+            }
             Action::CancelGesture => {
                 let impact = self.history.cancel(&mut self.project)?;
                 self.gesture_base.clear();
+                self.grouped_targets = None;
                 self.follow_base.clear();
                 self.sync(impact)?;
                 self.revision += 1;
@@ -3534,6 +3739,7 @@ impl Session {
                 self.mapping_gesture_ended();
                 self.history.end();
                 self.gesture_base.clear();
+                self.grouped_targets = None;
                 self.follow_base.clear();
                 self.automation_gesture_ended();
                 self.revision += 1;
@@ -3606,7 +3812,8 @@ impl Session {
                 }
             }
             Action::SelectClips { clips, mode } => {
-                self.selection.select_clips(&clips, mode);
+                // With the clips at the same place in a folder group.
+                self.select_clips_grouped(&clips, mode);
                 self.revision += 1;
             }
             Action::SelectNotes { notes, mode } => {
@@ -3682,6 +3889,11 @@ impl Session {
                 // A time range is cleared; otherwise the selected objects go.
                 if !self.clear_range()? {
                     self.delete_selection()?;
+                }
+            }
+            Action::DeleteInArranger => {
+                if !self.clear_range()? {
+                    self.delete_selected_clips()?;
                 }
             }
             Action::SplitSelectedAtPlayhead => self.split_at_playhead()?,
@@ -3857,6 +4069,7 @@ impl Session {
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::SongStructure { clips } => self.song_structure(&clips)?,
             Action::Setlist(op) => self.edit_setlist(op)?,
+            Action::ScratchPad(op) => self.scratch_op(op)?,
             Action::Cue(op) => self.cue_op(op)?,
             Action::Talkback(op) => self.talk(op)?,
             Action::Show(op) => self.show_op(op)?,
@@ -3876,6 +4089,9 @@ impl Session {
             Action::Transcribe(clip) => self.transcribe(clip)?,
             Action::ExportLyrics => {
                 self.export_lyrics()?;
+            }
+            Action::AnswerReplace { question, replace } => {
+                self.answer_replace(question, replace)?;
             }
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
@@ -3954,7 +4170,7 @@ impl Session {
             }
             Action::MergeClips(clips) => {
                 let clips = if clips.is_empty() {
-                    self.selection.clips.iter().copied().collect()
+                    self.selected_arranger_clips()
                 } else {
                     clips
                 };
@@ -3974,9 +4190,9 @@ impl Session {
                 before,
             } => self.place_track(track, after, before)?,
             Action::ToggleFolder(folder) => self.toggle_folder(folder),
-            Action::SumFolder(folder) => {
-                self.sum_folder(folder)?;
-            }
+            Action::SumFolder(folder) => self.set_folder_bus(folder, true)?,
+            Action::SetFolderBus { folder, on } => self.set_folder_bus(folder, on)?,
+            Action::SetFolderGroup { folder, on } => self.set_folder_group(folder, on)?,
             Action::PromptSaveSample { track, start, end } => {
                 self.prompt_save_sample(track, start, end)?;
             }
@@ -4245,6 +4461,14 @@ impl Session {
                 }
                 self.revision += 1;
             }
+            Action::PluginFavorites(op) => match self.plugin_favorites.apply(op) {
+                Ok(true) => {
+                    self.favorites_revision += 1;
+                    self.revision += 1;
+                }
+                Ok(false) => {}
+                Err(e) => self.notify(NoticeLevel::Warning, e.to_string()),
+            },
             Action::OpenPluginEditor {
                 track,
                 plugin,
@@ -4407,6 +4631,7 @@ impl Session {
                     EditFlag::EditToolbar => e.show_edit_toolbar = on,
                     EditFlag::SnapToSamples => e.snap_samples = on,
                     EditFlag::SnapToZeroCrossings => e.zero_crossings = on,
+                    EditFlag::SnapToObjects => e.snap_objects = on,
                     EditFlag::PolyphonicPitch => e.pitch_polyphonic = on,
                     EditFlag::StopToStart => e.stop_to_start = on,
                 }
@@ -4455,11 +4680,18 @@ impl Session {
             Action::CopyRange => self.copy_range()?,
             Action::CutRange => {
                 self.copy_range()?;
-                self.clear_range()?;
+                self.clear_range_as("Cut")?;
             }
-            Action::PasteRange => self.paste_range()?,
+            Action::PasteRange | Action::Paste => self.paste()?,
             Action::RepeatRange(n) => self.repeat_range(n)?,
             Action::InsertSilence => self.insert_silence()?,
+            Action::Copy => {
+                self.copy()?;
+            }
+            Action::Cut => self.cut()?,
+            Action::Repeat(n) => self.repeat(n)?,
+            Action::SelectAllClips => self.select_all_clips(),
+            Action::SlipClips { clips, by } => self.slip_clips(&clips, by)?,
             Action::Nudge { forward, target } => self.nudge(forward, target)?,
             Action::TrimClip { clip, edge, to } => self.trim_clip(clip, edge, to)?,
             Action::SetClipFades {
@@ -4469,7 +4701,7 @@ impl Session {
             } => self.set_clip_fades(clip, fade_in, fade_out)?,
             Action::SetClipGain { clip, db } => self.set_clip_gain(clip, db)?,
             Action::SpotClip { clip, start } => self.spot_clip(clip, start)?,
-            Action::ShuffleClip { clip, track, at } => self.shuffle_clip(clip, track, at)?,
+            Action::ShuffleClip { clip, track, at } => self.shuffle_grouped(clip, track, at)?,
             Action::TabTo { forward, extend } => self.tab_to(forward, extend)?,
             Action::MoveClips { clips, by, tracks } => self.move_clips(&clips, by, tracks)?,
             Action::TrimClips {
@@ -4545,12 +4777,30 @@ impl Session {
         if self.shuttle_transport(&action)? {
             return Ok(());
         }
+        // The user takes the transport over: no retake is started for an
+        // abort just before.
+        if matches!(
+            action,
+            TransportAction::Play
+                | TransportAction::Stop
+                | TransportAction::TogglePlay
+                | TransportAction::ToggleRecord
+                | TransportAction::Locate(_)
+                | TransportAction::Scrub(_)
+                | TransportAction::ReturnToStart
+        ) {
+            self.restart_recording = None;
+        }
         match action {
-            TransportAction::Play => self.play()?,
+            TransportAction::Play => {
+                self.locate_play_start()?;
+                self.play()?;
+            }
             TransportAction::Stop => {
                 self.disarm_postroll()?;
                 if self.transport.playing {
                     self.engine.transport(TransportCommand::Stop)?;
+                    self.requested_playing(false);
                     self.stop_recording()?;
                     self.automation_stop_sent();
                     self.after_stop()?;
@@ -4560,14 +4810,26 @@ impl Session {
                     self.engine.transport(TransportCommand::Locate(0))?;
                 }
             }
+            // Show mode: Space (and the play button) are the show's play
+            // and stop — a stop cues the song's start again, a start from
+            // outside the current song cues it first.
+            TransportAction::TogglePlay
+                if self.show.on
+                    && !self.recording_in_progress()
+                    && !self.project.setlist.songs.is_empty() =>
+            {
+                self.show_op(crate::setlist::ShowOp::PlayStop)?;
+            }
             TransportAction::TogglePlay => {
                 if self.transport.playing {
                     self.disarm_postroll()?;
                     self.engine.transport(TransportCommand::Stop)?;
+                    self.requested_playing(false);
                     self.stop_recording()?;
                     self.automation_stop_sent();
                     self.after_stop()?;
                 } else {
+                    self.locate_play_start()?;
                     self.play()?;
                 }
             }
@@ -4625,9 +4887,16 @@ impl Session {
                 if self.recording.is_some() {
                     self.stop_recording()?;
                 } else {
-                    let from = self.transport.position;
+                    // Stopped: from where playback starts (the Play Start
+                    // Marker, when on).
+                    let from = if self.transport.playing {
+                        self.transport.position
+                    } else {
+                        self.play_start_position()
+                    };
                     self.start_recording(from)?;
                     if self.recording.is_some() && !self.transport.playing {
+                        self.locate_play_start()?;
                         self.play()?;
                     }
                 }
@@ -4647,6 +4916,24 @@ impl Session {
                 let pos = meter.bar_start(bar.max(0));
                 self.transport_action(TransportAction::Locate(pos))?;
             }
+            TransportAction::SetPlayStart(at) => {
+                let marker =
+                    at.map(|at| faderframe_project::PlayStart::at(at.max(MusicalTime::ZERO)));
+                if marker != self.project.play_start {
+                    self.edit(Command::SetPlayStart { marker })?;
+                }
+            }
+            TransportAction::TogglePlayStart => {
+                let marker = match self.project.play_start {
+                    Some(m) => faderframe_project::PlayStart { on: !m.on, ..m },
+                    None => faderframe_project::PlayStart::at(self.playhead()),
+                };
+                self.edit(Command::SetPlayStart {
+                    marker: Some(marker),
+                })?;
+            }
+            TransportAction::AbortRecording => self.abort_recording(false)?,
+            TransportAction::AbortAndRestartRecording => self.abort_recording(true)?,
         }
         Ok(())
     }
@@ -4925,6 +5212,33 @@ impl Session {
         plugin: faderframe_core::PluginInstanceId,
     ) -> Option<(&faderframe_project::album::Song, &PluginSlot)> {
         self.project.album.insert(plugin)
+    }
+
+    /// The user's favorite plugins and their categories.
+    pub fn plugin_favorites(&self) -> &plugin_favorites::PluginFavorites {
+        &self.plugin_favorites
+    }
+
+    /// Changes whenever the favorites change ([`Action::PluginFavorites`],
+    /// renamed plugins): the shell saves them then.
+    pub fn favorites_revision(&self) -> u64 {
+        self.favorites_revision
+    }
+
+    /// The favorites as the shell loaded them (start-up).
+    pub fn set_plugin_favorites(&mut self, favorites: plugin_favorites::PluginFavorites) {
+        self.plugin_favorites = favorites;
+        self.note_favorite_names();
+        self.revision += 1;
+    }
+
+    /// Favorites take the names the catalogue has for their plugins now (a
+    /// plugin renamed in an update; call after rescans).
+    pub fn note_favorite_names(&mut self) {
+        let available = self.available_plugins();
+        if self.plugin_favorites.note_names(&available) {
+            self.favorites_revision += 1;
+        }
     }
 
     /// A device editor's own setting, if it has been set.
@@ -5600,8 +5914,32 @@ impl Session {
         self.revision += 1;
     }
 
-    /// Save `track` as a preset file at `path`.
-    pub fn export_track_preset(&self, track: TrackId, path: &Path) -> Result<()> {
+    /// Save `track` as a preset file at `path` the user chose (an
+    /// existing file is asked about first; staged and moved into place,
+    /// see [`exports`]), then the library is scanned again.
+    pub fn export_track_preset(&mut self, track: TrackId, path: &Path) -> Result<()> {
+        let t = self
+            .project
+            .track(track)
+            .ok_or(EditError::UnknownTrack(track))?;
+        let preset = faderframe_project::TrackPreset::capture(&self.project, t);
+        let text = serde_json::to_string_pretty(&preset)
+            .map_err(|e| SessionError::Other(e.to_string()))?;
+        exports::make_parent(path)?;
+        let shown = path.to_path_buf();
+        self.write_export(
+            "Track preset",
+            vec![(path.to_path_buf(), text.into_bytes())],
+            move |s, _| {
+                s.rescan_track_presets();
+                s.notify(NoticeLevel::Info, format!("exported {}", shown.display()));
+            },
+        )
+    }
+
+    /// Save `track` as a preset in the library at `path` (a name the
+    /// session chose, or one the user agreed to replace).
+    fn save_track_preset_file(&self, track: TrackId, path: &Path) -> Result<()> {
         let t = self
             .project
             .track(track)
@@ -5686,7 +6024,7 @@ impl Session {
             }
             None => faderframe_audio_files::import::unique_path(&self.preset_dir, &name, ext),
         };
-        self.export_track_preset(track, &path)?;
+        self.save_track_preset_file(track, &path)?;
         self.rescan_track_presets();
         self.notify(
             NoticeLevel::Info,
@@ -5894,11 +6232,16 @@ impl Session {
                     .collect(),
             });
         }
-        let clips: Vec<ClipId> = self.selection.clips.iter().copied().collect();
+        self.delete_selected_clips()
+    }
+
+    /// Delete the selected arranger clips (launcher clips go through
+    /// their slots); the selection goes with them once they are gone.
+    fn delete_selected_clips(&mut self) -> Result<()> {
+        let clips = self.selected_arranger_clips();
         if clips.is_empty() {
             return Ok(());
         }
-        self.selection.clips.clear();
         self.edit(Command::Batch {
             label: if clips.len() == 1 {
                 "Delete Clip".into()
@@ -5906,10 +6249,14 @@ impl Session {
                 "Delete Clips".into()
             },
             commands: clips
-                .into_iter()
-                .map(|clip| Command::RemoveClip { clip })
+                .iter()
+                .map(|&clip| Command::RemoveClip { clip })
                 .collect(),
-        })
+        })?;
+        for c in &clips {
+            self.selection.clips.remove(c);
+        }
+        Ok(())
     }
 
     /// "Insertion follows playback" off: stopping returns to where
@@ -5937,38 +6284,62 @@ impl Session {
         Ok(())
     }
 
-    fn split_at_playhead(&mut self) -> Result<()> {
+    /// Split the selected clips at the playhead. Every piece of every
+    /// selected clip stays selected (across tracks), so splitting again
+    /// further on cuts them all again; clips the playhead does not cross
+    /// (starting or ending there) stay as they are, selected.
+    pub(crate) fn split_at_playhead(&mut self) -> Result<()> {
         let at = self.playhead();
-        let targets: Vec<ClipId> = self
-            .selection
-            .clips
-            .iter()
-            .copied()
-            .filter(|c| {
-                self.project.clip(*c).is_some_and(|clip| {
-                    clip.start < at
-                        && clip.end(&self.project.timeline, self.project.sample_rate) > at
-                })
-            })
+        let mut targets: Vec<Clip> = self
+            .selected_arranger_clips()
+            .into_iter()
+            .filter_map(|c| self.project.clip(c))
+            .filter(|c| self.cuts_inside(c, at))
+            .cloned()
             .collect();
-        if targets.is_empty() {
-            return Ok(());
-        }
+        // In a folder group the other members are cut there too (their
+        // pieces are selected only where they share a selected piece's
+        // place).
+        let selected = targets.len();
+        targets.extend(self.grouped_cuts(&targets, at));
         let mut commands = Vec::new();
-        for clip in targets {
+        let mut pieces = Vec::new();
+        for (i, c) in targets.into_iter().enumerate() {
+            // A zero crossing (when that option is on) where the cut stays
+            // inside the clip, else the playhead itself.
+            let cut = self.cut_at(&c, at);
+            let cut = if self.cuts_inside(&c, cut) { cut } else { at };
             let new_clip: ClipId = self.project.ids.allocate();
-            let at = self.project.clip(clip).map_or(at, |c| self.cut_at(c, at));
-            commands.push(Command::SplitClip { clip, at, new_clip });
+            commands.push(Command::SplitClip {
+                clip: c.id,
+                at: cut,
+                new_clip,
+            });
+            if i < selected {
+                pieces.push(new_clip);
+            }
+        }
+        if commands.is_empty() {
+            return Ok(());
         }
         self.edit(Command::Batch {
             label: "Split Clips".into(),
             commands,
-        })
+        })?;
+        self.selection.select_clips(&pieces, SelectMode::Add);
+        // The pieces at the same place in a folder group go with them.
+        let grouped = self.grouped_selection();
+        self.selection.clips.extend(grouped);
+        self.revision += 1;
+        Ok(())
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Writers let go of their files (an aborted take's are deleted)
+        // before the scratch media may go.
+        self.end_recordings_for_close();
         self.cancel_imports();
         // The album rendered to play it.
         self.album_state.discard_preview();

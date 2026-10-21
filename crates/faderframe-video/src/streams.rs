@@ -335,6 +335,57 @@ pub(crate) fn full_range(caps: &gst::CapsRef) -> Option<gst::Caps> {
     Some(caps)
 }
 
+/// Whether `version` (a GStreamer plugin's, "1.26.2") is one of the MXF
+/// demuxers that crash: before 1.28.4, `find_edit_entry` read the reverse
+/// temporal offsets of an index table without reordering (an empty array:
+/// a NULL read, `SIGSEGV`) for a track whose index delta it had not
+/// matched yet — on seeks, and when the file's end came while another
+/// track was behind. Debian 13 has 1.26.2 (the Linux tarball bundles
+/// it): a GStreamer-made MXF with an uncompressed picture crashed
+/// FaderFrame on import there, nearly every time.
+pub(crate) fn mxf_demuxer_crashes(version: &str) -> bool {
+    let mut parts = version
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    let v = (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    );
+    v < (1, 28, 4)
+}
+
+/// Whether [`avoid_crashing_demuxers`] put FFmpeg's MXF demuxer in place.
+pub(crate) static MXF_BY_FFMPEG: AtomicBool = AtomicBool::new(false);
+
+/// Where GStreamer's MXF demuxer [crashes](mxf_demuxer_crashes), FFmpeg's
+/// (`avdemux_mxf`, from gst-libav) reads MXF files instead, if there is
+/// one: `parsebin` plugs only demuxers ranked marginal or higher, and
+/// `mxfdemux` goes below (in this process only). Without it MXF files are
+/// still read by `mxfdemux`, and some may crash.
+pub(crate) fn avoid_crashing_demuxers() {
+    use gst::prelude::PluginFeatureExtManual;
+    let Some(mxf) = gst::ElementFactory::find("mxfdemux") else {
+        return;
+    };
+    let Some(version) = mxf.plugin().map(|p| p.version().to_string()) else {
+        return;
+    };
+    if !mxf_demuxer_crashes(&version) {
+        return;
+    }
+    if gst::ElementFactory::find("avdemux_mxf").is_some() {
+        mxf.set_rank(gst::Rank::NONE);
+        MXF_BY_FFMPEG.store(true, Ordering::Relaxed);
+        tracing::info!("MXF read by FFmpeg's demuxer (GStreamer {version}'s mxfdemux crashes)");
+    } else {
+        tracing::warn!(
+            "GStreamer {version}'s mxfdemux crashes on some MXF files (fixed in 1.28.4); \
+             gst-libav's avdemux_mxf would be used instead"
+        );
+    }
+}
+
 /// A stream nobody wants ends in a fakesink (an unlinked stream would stop
 /// the others) behind a leaky one-buffer queue: a paused sink holds its
 /// first buffer, which would stall a demuxer's one streaming thread before
@@ -361,5 +412,20 @@ fn discard(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     let _ = queue.sync_state_with_parent();
     if let Some(sinkpad) = queue.static_pad("sink") {
         let _ = pad.link(&sinkpad);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mxf_demuxer_crashes;
+
+    #[test]
+    fn mxf_demuxers_before_1_28_4_are_known_to_crash() {
+        for v in ["1.26.2", "1.26.11", "1.28.0", "1.28.3", "1.22.0"] {
+            assert!(mxf_demuxer_crashes(v), "{v}");
+        }
+        for v in ["1.28.4", "1.28.8", "1.29.2", "1.30.0", "2.0.0", "1.28.4.1"] {
+            assert!(!mxf_demuxer_crashes(v), "{v}");
+        }
     }
 }

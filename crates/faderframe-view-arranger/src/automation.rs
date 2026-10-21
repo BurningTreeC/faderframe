@@ -4,8 +4,9 @@
 //! lane and take lanes. Its header (in the header column) shows the
 //! parameter (click: choose which parameters are shown), the mode (click:
 //! Off/Read/Touch/Latch/Write) and a close button. In the lane: click to
-//! add a point and drag it, drag points to move them (snapped; Alt for
-//! free), double-click a point to delete it, Ctrl+drag to draw freehand,
+//! add a point and drag it, drag points to move them (snapped to the grid
+//! or, with Snap to Objects, an object near them; Alt for free),
+//! double-click a point to delete it, Ctrl+drag to draw freehand,
 //! right-click for curve shapes, clearing and modes.
 
 use crate::{ArrangerView, DRAG_THRESHOLD};
@@ -14,7 +15,7 @@ use faderframe_automation::{
 };
 use faderframe_core::{AutomationLaneId, TrackId};
 use faderframe_project::{Command, Track};
-use faderframe_session::{Action, AutomationParam, Session};
+use faderframe_session::{Action, AutomationParam, Session, SnapSkip};
 use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{
     Color, EventCx, HostRequest, MenuItem, Modifiers, Paint, Painter, Path, Point, Rect, TextStyle,
@@ -431,7 +432,12 @@ impl ArrangerView {
                     return true;
                 }
                 // Add a point here and drag it.
-                let time = self.snap(self.time_at(pos.x).max(MusicalTime::ZERO), model, mods);
+                let time = self.snap_point(
+                    self.time_at(pos.x).max(MusicalTime::ZERO),
+                    model,
+                    mods,
+                    &SnapSkip::default(),
+                );
                 let value = Self::y_value(&param, area, pos.y);
                 let mut l = lane;
                 // A first point keeps the static value before it.
@@ -504,7 +510,17 @@ impl ArrangerView {
         let area = g.value_area(header_w, lanes_right);
         let value = Self::y_value(&param, area, pos.y.clamp(area.y, area.bottom()));
         let raw_time = self.time_at(pos.x).max(MusicalTime::ZERO);
-        let time = self.snap(raw_time, model, mods);
+        // A moved point snaps (to an object near it, else as set); drawing
+        // follows the pointer.
+        let point = matches!(
+            self.auto_drag.as_ref().map(|d| &d.kind),
+            Some(AutoDragKind::Point(_))
+        );
+        let time = if point {
+            self.snap_point(raw_time, model, mods, &SnapSkip::default())
+        } else {
+            raw_time
+        };
         let Some(d) = self.auto_drag.as_mut() else {
             return true;
         };

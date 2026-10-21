@@ -193,6 +193,10 @@ enum Drag {
 
 pub struct PianoRollView {
     theme: Theme,
+    /// The object the running move or resize snapped to (Snap to Objects:
+    /// another note's start or end, a clip edge, a marker…), drawn as a
+    /// guide line.
+    pub(crate) snap_guide: Option<faderframe_session::SnapHit>,
     /// Pixels per quarter note.
     ppq: f32,
     /// Pixels per key row.
@@ -253,6 +257,7 @@ impl PianoRollView {
         let lane_h = theme.piano.velocity_height;
         Self {
             theme,
+            snap_guide: None,
             ppq: 90.0,
             row_h,
             scroll_x: 0.0,

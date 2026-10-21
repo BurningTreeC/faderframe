@@ -268,6 +268,16 @@ pub(crate) struct MidiTake {
     /// Per-note expression per track (MIDI 2.0 inputs).
     pub expressions: Vec<Vec<RecExpression>>,
     pub last: i64,
+    /// The record window (timeline samples, as the take is placed): what
+    /// Replace mode clears, where notes held past it end.
+    pub window: (i64, i64),
+    /// Loop recording: where a pass wraps (a note held across the wrap
+    /// ends there).
+    pub loop_end: Option<i64>,
+    /// The last position seen in each pass.
+    pass_last: HashMap<u32, i64>,
+    /// The newest pass seen.
+    latest_pass: u32,
 }
 
 /// A recorded controller move: (position, controller, channel, value, pass).
@@ -286,7 +296,23 @@ impl MidiTake {
             sysex: vec![Vec::new(); n],
             expressions: vec![Vec::new(); n],
             last: i64::MIN,
+            window: (i64::MIN, i64::MAX),
+            loop_end: None,
+            pass_last: HashMap::new(),
+            latest_pass: 0,
         }
+    }
+
+    /// Where a note held from `start` in `pass` ends when that pass ended
+    /// before its release: at the loop's wrap, else at the pass's last
+    /// event — and never past the record window.
+    fn held_end(&self, start: i64, pass: u32) -> i64 {
+        let end = self
+            .loop_end
+            .filter(|e| *e > start)
+            .or_else(|| self.pass_last.get(&pass).copied())
+            .unwrap_or(start + 1);
+        end.min(self.window.1).max(start + 1)
     }
 
     /// Take what the engine recorded so far.
@@ -298,6 +324,9 @@ impl MidiTake {
             }
             let pos = r.position - self.shift;
             self.last = self.last.max(pos);
+            let seen = self.pass_last.entry(r.pass).or_insert(pos);
+            *seen = (*seen).max(pos);
+            self.latest_pass = self.latest_pass.max(r.pass);
             match r.event {
                 MidiEvent::NoteOn {
                     channel,
@@ -343,7 +372,7 @@ impl MidiTake {
                         let end = if pass == r.pass {
                             pos
                         } else {
-                            self.last.max(start + 1)
+                            self.held_end(start, pass)
                         };
                         self.close(t, start, end, key, vel, channel, pass, release);
                     }
@@ -377,11 +406,19 @@ impl MidiTake {
     }
 
     /// End held notes at `at` (recording stopped).
+    /// The end of recording at `at`: notes still held end there (those
+    /// held since an earlier loop pass at its wrap; none past the record
+    /// window — a key held at a punch-out ends at the punch-out).
     pub(crate) fn close_all(&mut self, at: i64) {
         for t in 0..self.tracks.len() {
             let open: Vec<_> = self.open[t].drain().collect();
             for ((channel, key), (start, vel, pass)) in open {
-                self.close(t, start, at.max(start + 1), key, vel, channel, pass, None);
+                let end = if pass == self.latest_pass {
+                    at.min(self.window.1).max(start + 1)
+                } else {
+                    self.held_end(start, pass)
+                };
+                self.close(t, start, end, key, vel, channel, pass, None);
             }
         }
     }
@@ -1653,6 +1690,8 @@ impl Session {
                 TransportControl::Loop => TransportAction::ToggleLoop,
                 TransportControl::ToStart => TransportAction::ReturnToStart,
                 TransportControl::InputQuantize => TransportAction::ToggleInputQuantize,
+                TransportControl::AbortRecording => TransportAction::AbortRecording,
+                TransportControl::AbortAndRestart => TransportAction::AbortAndRestartRecording,
             };
             if let Err(e) = self.dispatch(Action::Transport(action)) {
                 self.notify(NoticeLevel::Error, e.to_string());
@@ -2121,13 +2160,38 @@ impl Session {
             let Some(clip) = self.midi_take_clip(take, i, None) else {
                 continue;
             };
+            let mut clip = clip;
             if self.record.mode == crate::RecordMode::Replace {
-                let end = clip.end(&self.project.timeline, self.project.sample_rate);
+                // Tape style: the take replaces what lies inside the record
+                // window (its clip, rounded to bars around the notes, is cut
+                // to the window: nothing outside it goes).
+                let p = &self.project;
+                let end = clip.end(&p.timeline, p.sample_rate);
+                let (from, to) = take.window;
+                let musical = |s: i64| self.engine.samples_to_musical(p, s.max(0));
+                let a = if from > i64::MIN {
+                    clip.start.max(musical(from))
+                } else {
+                    clip.start
+                };
+                let b = if to < i64::MAX {
+                    end.min(musical(to))
+                } else {
+                    end
+                };
+                if b <= a {
+                    continue;
+                }
+                if (a, b) != (clip.start, end)
+                    && let Some(part) = clip.slice(a, b, clip.id, &p.timeline, p.sample_rate)
+                {
+                    clip = part;
+                }
                 commands.extend(crate::record::carve_midi(
                     &mut self.project,
                     clip.track,
-                    clip.start,
-                    end,
+                    a,
+                    b,
                 ));
             }
             placed.push(clip.id);
@@ -2200,5 +2264,93 @@ mod mpe_tests {
         // Master-channel controllers stay lanes; member expression is gone.
         assert_eq!(ccs.len(), 2);
         assert!(ccs.iter().all(|c| c.2 == 0));
+    }
+}
+
+#[cfg(test)]
+mod take_tests {
+    use super::*;
+    use faderframe_engine::midi::RecordedMidi;
+
+    fn take(events: &[(i64, u32, MidiEvent)]) -> MidiTake {
+        let (mut tx, rx) = rtrb::RingBuffer::new(64);
+        for &(position, pass, event) in events {
+            tx.push(RecordedMidi {
+                target: 0,
+                position,
+                pass,
+                event,
+            })
+            .unwrap();
+        }
+        MidiTake::new(rx, vec![TrackId(1)], 0)
+    }
+
+    fn on(key: u8) -> MidiEvent {
+        MidiEvent::NoteOn {
+            channel: 0,
+            key,
+            velocity: 100,
+        }
+    }
+
+    fn off(key: u8) -> MidiEvent {
+        MidiEvent::NoteOff {
+            channel: 0,
+            key,
+            velocity: 0,
+        }
+    }
+
+    /// Loop 0…48 000: a note held across the wrap ends at the wrap, not at
+    /// the furthest event of another pass; one still held at Stop after a
+    /// wrap ends at its pass's wrap too.
+    #[test]
+    fn notes_held_across_a_loop_wrap_end_at_the_wrap() {
+        let mut t = take(&[
+            // Pass 0 reaches far (a late CC), pass 1 holds a note over the
+            // wrap, released early in pass 2.
+            (
+                40_000,
+                0,
+                MidiEvent::ControlChange {
+                    channel: 0,
+                    controller: 1,
+                    value: 10,
+                },
+            ),
+            (10_000, 1, on(60)),
+            (2_000, 2, off(60)),
+            // Held from pass 2 when recording stops in pass 3.
+            (30_000, 2, on(64)),
+            (5_000, 3, on(67)),
+        ]);
+        t.loop_end = Some(48_000);
+        t.drain();
+        let n = &t.notes[0];
+        assert_eq!((n[0].start, n[0].end), (10_000, 48_000));
+        t.close_all(9_000);
+        let mut held: Vec<(u8, i64, i64)> =
+            t.notes[0].iter().map(|n| (n.key, n.start, n.end)).collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                (60, 10_000, 48_000),
+                (64, 30_000, 48_000),
+                (67, 5_000, 9_000)
+            ]
+        );
+    }
+
+    /// A key still down at the punch-out ends there, not at Stop (which
+    /// may be a post-roll later).
+    #[test]
+    fn a_note_held_at_the_punch_out_ends_there() {
+        let mut t = take(&[(10_000, 0, on(60))]);
+        t.window = (5_000, 20_000);
+        t.drain();
+        t.close_all(70_000);
+        assert_eq!((t.notes[0][0].start, t.notes[0][0].end), (10_000, 20_000));
     }
 }

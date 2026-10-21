@@ -187,9 +187,14 @@ pub struct ArrangerTheme {
     pub header_border: Color,
     pub ruler_bg: Color,
     pub ruler_text: Color,
+    /// Grid lines at the default strength (see [`GridLook`]): bars,
+    /// beats, the grid between beats, finer lines nothing snaps to.
     pub bar_line: Color,
     pub beat_line: Color,
     pub sub_line: Color,
+    pub fine_line: Color,
+    /// The line at the object a drag snapped to (Snap to Objects).
+    pub snap_guide: Color,
     pub loop_on: Color,
     pub loop_off: Color,
     pub playhead: Color,
@@ -285,9 +290,11 @@ pub struct PianoRollTheme {
     pub white_row: Color,
     pub black_row: Color,
     pub octave_line: Color,
+    /// Grid lines at the default strength (see [`GridLook`]).
     pub bar_line: Color,
     pub beat_line: Color,
     pub sub_line: Color,
+    pub fine_line: Color,
     pub key_white: Color,
     pub key_white_shade: Color,
     pub key_black: Color,
@@ -411,6 +418,9 @@ pub struct Theme {
     pub perf: PerformanceTheme,
     pub tools: ToolsTheme,
     pub device: DeviceTheme,
+    /// How strongly the editors draw their time grid (a preference laid
+    /// over every skin, [`Theme::with_grid_strength`]).
+    pub grid: GridLook,
 }
 
 impl Default for Theme {
@@ -531,9 +541,11 @@ impl Theme {
                 header_border: Color::hex(0x101113),
                 ruler_bg: Color::hex(0x202226),
                 ruler_text: Color::hex(0xb3b0a9),
-                bar_line: Color::rgba(1.0, 1.0, 1.0, 0.10),
-                beat_line: Color::rgba(1.0, 1.0, 1.0, 0.045),
-                sub_line: Color::rgba(1.0, 1.0, 1.0, 0.022),
+                bar_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[0]),
+                beat_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[1]),
+                sub_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[2]),
+                fine_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[3]),
+                snap_guide: Color::hex(0x6fc3ff),
                 loop_on: accent.with_alpha(0.22),
                 loop_off: Color::rgba(1.0, 1.0, 1.0, 0.07),
                 playhead: accent,
@@ -557,9 +569,10 @@ impl Theme {
                 white_row: Color::hex(0x202226),
                 black_row: Color::hex(0x1a1b1e),
                 octave_line: Color::rgba(1.0, 1.0, 1.0, 0.09),
-                bar_line: Color::rgba(1.0, 1.0, 1.0, 0.12),
-                beat_line: Color::rgba(1.0, 1.0, 1.0, 0.05),
-                sub_line: Color::rgba(1.0, 1.0, 1.0, 0.025),
+                bar_line: Color::rgba(1.0, 1.0, 1.0, PIANO_GRID_ALPHAS[0]),
+                beat_line: Color::rgba(1.0, 1.0, 1.0, PIANO_GRID_ALPHAS[1]),
+                sub_line: Color::rgba(1.0, 1.0, 1.0, PIANO_GRID_ALPHAS[2]),
+                fine_line: Color::rgba(1.0, 1.0, 1.0, PIANO_GRID_ALPHAS[3]),
                 key_white: Color::hex(0xe8e5de),
                 key_white_shade: Color::hex(0xc4c1ba),
                 key_black: Color::hex(0x1b1c1f),
@@ -647,6 +660,160 @@ impl Theme {
                 key_white: Color::hex(0xd9d6cf),
                 key_black: Color::hex(0x24262b),
             },
+            grid: GridLook::default(),
+        }
+    }
+
+    /// This skin with its time grid drawn at `strength` (0…1, see
+    /// [`GridLook`]).
+    pub fn with_grid_strength(mut self, strength: f32) -> Self {
+        self.grid = GridLook::new(strength);
+        self
+    }
+}
+
+/// Opacity of the arranger's grid lines at the default strength — bars,
+/// beats, subdivisions, fine lines — for a white line on a dark skin
+/// (skins scale them by their line strength).
+pub const GRID_ALPHAS: [f32; 4] = [0.19, 0.11, 0.075, 0.055];
+/// The piano roll's (its rows are lighter than the arranger's lanes).
+pub const PIANO_GRID_ALPHAS: [f32; 4] = [0.21, 0.12, 0.08, 0.06];
+
+/// The kinds of grid line, strongest first (an editor maps its timeline's
+/// line kinds onto them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridEmphasis {
+    Bar,
+    Beat,
+    Subdivision,
+    Fine,
+}
+
+/// How the editors draw their time grid. The skin gives the colours at
+/// the default strength (`ArrangerTheme::{bar,beat,sub,fine}_line`, the
+/// piano roll's); `strength` — Preferences → Editing → Grid lines, the
+/// same for every skin — scales their opacity and, when strong, widens
+/// bar lines. Lines are whole device pixels on device-pixel edges, so they
+/// stay crisp (not smeared over two pixels at half strength) on every
+/// display, and bars and beats are a logical pixel wide on HiDPI screens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridLook {
+    /// 0 (faintest) … 1 (strongest).
+    pub strength: f32,
+}
+
+impl Default for GridLook {
+    fn default() -> Self {
+        Self {
+            strength: Self::DEFAULT,
+        }
+    }
+}
+
+impl GridLook {
+    /// The default strength (the middle of the slider).
+    pub const DEFAULT: f32 = 0.5;
+    /// From this strength on bar lines are a device pixel wider.
+    pub const WIDE_FROM: f32 = 0.8;
+
+    pub fn new(strength: f32) -> Self {
+        Self {
+            strength: if strength.is_finite() {
+                strength.clamp(0.0, 1.0)
+            } else {
+                Self::DEFAULT
+            },
+        }
+    }
+
+    /// The factor on the skin's grid opacities: ⅓ at 0, 1 at the default,
+    /// 3 at 1 (even steps of loudness between).
+    pub fn gain(self) -> f32 {
+        3f32.powf((self.strength - Self::DEFAULT) * 2.0)
+    }
+
+    /// `base` (a skin's grid colour) at this strength.
+    pub fn color(self, base: Color) -> Color {
+        base.with_alpha((base.a * self.gain()).min(1.0))
+    }
+
+    /// Width of a line in device pixels on a display with `scale` device
+    /// pixels per logical pixel: a logical pixel for bars and beats (so
+    /// HiDPI screens show them as plainly), a hairline for the rest; bars
+    /// one device pixel more from [`GridLook::WIDE_FROM`].
+    pub fn device_width(self, e: GridEmphasis, scale: f32) -> f32 {
+        let scale = scale.max(1.0);
+        let base = match e {
+            GridEmphasis::Bar | GridEmphasis::Beat => scale.round(),
+            GridEmphasis::Subdivision | GridEmphasis::Fine => 1.0,
+        };
+        let wide = e == GridEmphasis::Bar && self.strength >= Self::WIDE_FROM;
+        base + if wide { 1.0 } else { 0.0 }
+    }
+
+    /// The rectangle of a vertical grid line at `x` (logical pixels) from
+    /// `y0` to `y1`: [`GridLook::device_width`] wide, its left edge on a
+    /// device pixel.
+    pub fn line_rect(self, x: f32, y0: f32, y1: f32, e: GridEmphasis, scale: f32) -> crate::Rect {
+        let scale = scale.max(1.0);
+        let w = self.device_width(e, scale);
+        let left = (x * scale - (w - 1.0) * 0.5).floor() / scale;
+        crate::Rect::new(left, y0, w / scale, y1 - y0)
+    }
+
+    /// Draw a vertical grid line of colour `base` (the skin's, at the
+    /// default strength).
+    pub fn vline(
+        self,
+        p: &mut dyn crate::Painter,
+        x: f32,
+        y0: f32,
+        y1: f32,
+        base: Color,
+        e: GridEmphasis,
+    ) {
+        let rect = self.line_rect(x, y0, y1, e, p.scale_factor());
+        p.fill(rect, self.color(base));
+    }
+}
+
+#[cfg(test)]
+mod grid_look_tests {
+    use super::*;
+
+    #[test]
+    fn the_grid_strength_scales_opacity_and_widens_bars_on_device_pixels() {
+        let base = Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[0]);
+        let d = GridLook::default();
+        assert_eq!(d.color(base), base, "the skin's colour at the default");
+        let faint = GridLook::new(0.0).color(base).a;
+        let strong = GridLook::new(1.0).color(base).a;
+        assert!((faint - base.a / 3.0).abs() < 1e-4 && (strong - base.a * 3.0).abs() < 1e-4);
+        assert!(GridLook::new(0.25).color(base).a < base.a);
+        assert_eq!(GridLook::new(7.0).strength, 1.0);
+        assert_eq!(GridLook::new(f32::NAN), d);
+        // Hairlines stay one device pixel; bars and beats a logical pixel.
+        assert_eq!(d.device_width(GridEmphasis::Fine, 2.0), 1.0);
+        assert_eq!(d.device_width(GridEmphasis::Bar, 1.0), 1.0);
+        assert_eq!(d.device_width(GridEmphasis::Beat, 2.0), 2.0);
+        assert_eq!(GridLook::new(0.9).device_width(GridEmphasis::Bar, 1.0), 2.0);
+        assert_eq!(
+            GridLook::new(0.9).device_width(GridEmphasis::Beat, 1.0),
+            1.0
+        );
+        // On device-pixel edges, whatever x is.
+        for scale in [1.0f32, 2.0] {
+            for x in [10.0f32, 10.3, 10.5, 10.75] {
+                let r = d.line_rect(x, 0.0, 5.0, GridEmphasis::Fine, scale);
+                assert_eq!((r.x * scale).fract(), 0.0);
+                assert!((r.w * scale - 1.0).abs() < 1e-6);
+                assert!(r.x <= x && x < r.x + 1.0 / scale + 1e-6, "{x} at {scale}");
+            }
+        }
+        // Every skin starts at the default and keeps a set strength.
+        for t in Theme::all() {
+            assert_eq!(t.grid, d);
+            assert_eq!(t.with_grid_strength(0.8).grid.strength, 0.8);
         }
     }
 }

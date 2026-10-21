@@ -390,6 +390,7 @@ pub fn create_with_epoch(
     };
     let controller = EngineController {
         config,
+        count_in: false,
         live_sysex,
         readback,
         tx,
@@ -410,7 +411,7 @@ pub fn create_with_epoch(
         warnings: Vec::new(),
         voices: Vec::new(),
         launch_tracks: Vec::new(),
-        diffuse_tracks: Vec::new(),
+        param_shape: crate::build::ParamShape::default(),
         meter_delays: std::collections::HashMap::new(),
         track_latencies: std::collections::HashMap::new(),
         low_latency: false,
@@ -446,6 +447,7 @@ pub fn create_with_epoch(
         graph_device_outputs: 0,
         ahead_misses: Arc::new(AtomicU64::new(0)),
         varispeed: false,
+        sent_loop: None,
     };
     (controller, processor)
 }
@@ -595,6 +597,11 @@ impl EngineProcessor {
             match msg {
                 Message::Transport(cmd) => self.transport_command(cmd),
                 Message::Ahead(mut link) => {
+                    // What the old link was waiting for (a command, a loop
+                    // change) is in force now: the new one starts there.
+                    if let Some(old) = self.ahead.as_deref_mut() {
+                        old.settle(&mut self.transport);
+                    }
                     link.begin(&self.transport);
                     if let Some(old) = self.ahead.replace(link) {
                         self.retire(Garbage::AheadLink(old));
@@ -606,7 +613,8 @@ impl EngineProcessor {
                     }
                 }
                 Message::AheadOff => {
-                    if let Some(old) = self.ahead.take() {
+                    if let Some(mut old) = self.ahead.take() {
+                        old.settle(&mut self.transport);
                         self.retire(Garbage::AheadLink(old));
                     }
                 }
@@ -665,6 +673,16 @@ impl EngineProcessor {
                     }
                 }
                 Message::BeginMidiRecord(r) => {
+                    // Without an audio recording the window is the MIDI
+                    // take's (a count-in keeps the arrangement silent).
+                    if self.recorder.is_none() {
+                        let (from, to) = r.window();
+                        self.ctx.recording = crate::record::RecordingNow::window_only(
+                            from,
+                            to,
+                            self.ctx.recording.count_in,
+                        );
+                    }
                     if let Some(old) = self.midi_recorder.replace(r) {
                         self.retire(Garbage::MidiRecorder(old));
                     }
@@ -712,6 +730,11 @@ impl EngineProcessor {
                     }
                 }
                 Message::EndMidiRecord => {
+                    if self.recorder.is_none() {
+                        let count_in = self.ctx.recording.count_in;
+                        self.ctx.recording = Default::default();
+                        self.ctx.recording.count_in = count_in;
+                    }
                     if let Some(old) = self.midi_recorder.take() {
                         self.retire(Garbage::MidiRecorder(old));
                     }
@@ -1018,9 +1041,18 @@ impl EngineProcessor {
         let mut offset = 0;
         let frame_cb = self.ctx.history.end();
         while offset < frames {
+            // A loop change rendered ahead is taken on at its frame, where
+            // the anticipators take it on.
+            let until_amend = self
+                .ahead
+                .as_deref_mut()
+                .and_then(|l| l.amend_due(&mut self.transport, offset));
             let mut n = self
                 .transport
                 .frames_until_wrap((frames - offset).min(max_block));
+            if let Some(k) = until_amend {
+                n = n.min(k).max(1);
+            }
             // A stop on the exact frame: the chunk ends there.
             if let Some(at) = self.stop_at
                 && self.transport.playing()
@@ -1445,6 +1477,8 @@ pub struct EngineController {
     /// Live SysEx to the tracks playing from an input port.
     live_sysex: crate::midi::LiveSysexSender,
     config: EngineConfig,
+    /// The count-in last sent ([`Self::set_count_in`]).
+    count_in: bool,
     tx: Producer<Message>,
     graph_tx: MailboxSender<CompiledGraph<EngineContext>>,
     timeline_tx: MailboxSender<Arc<TimelineSnapshot>>,
@@ -1481,9 +1515,10 @@ pub struct EngineController {
     voices: Vec<(faderframe_core::TrackId, crate::nodes::StretchVoices)>,
     /// The tracks with launcher clips in the installed graph.
     launch_tracks: Vec<faderframe_core::TrackId>,
-    /// The tracks whose spread is diffuse in the installed graph (their
-    /// decorrelation filters are made with it: a change rebuilds).
-    diffuse_tracks: Vec<faderframe_core::TrackId>,
+    /// What parameter edits can change of the installed graph (diffuse
+    /// spreads, folder buses' tracks, sends placing their source): a
+    /// change rebuilds.
+    param_shape: crate::build::ParamShape,
     /// Frames from where each track is metered to the graph's outputs
     /// (the latency after its strip: buses, the master's devices,
     /// compensation).
@@ -1535,6 +1570,8 @@ pub struct EngineController {
     ahead_misses: Arc<AtomicU64>,
     /// Varispeed is on.
     varispeed: bool,
+    /// The loop as last sent to the transport (samples, switch).
+    sent_loop: Option<(Option<LoopRange>, bool)>,
 }
 
 /// The tracks with launcher clips (sorted).
@@ -2181,12 +2218,20 @@ impl EngineController {
         self.collect_listening();
         match impact {
             Impact::None => Ok(()),
+            // The loop: to the transport as it is (no snapshot, nothing
+            // rebuilt; rendering ahead, no new sequence either).
+            Impact::Transport => self.send_loop(project),
             // A spread made diffuse (or no longer): its filters are made
-            // with the graph.
-            Impact::Params if crate::build::diffuse_tracks(project) != self.diffuse_tracks => {
+            // with the graph. A track into (or out of) a folder bus, a send
+            // given (or no longer) a pan of its own: routing.
+            Impact::Params if crate::build::param_shape(project) != self.param_shape => {
                 self.sync(project, sources, Impact::Graph)
             }
-            Impact::Params => self.update_params(project),
+            Impact::Params => {
+                // A batch may carry a loop change too.
+                self.send_loop(project)?;
+                self.update_params(project)
+            }
             Impact::Timeline
                 if voice_needs(project) != self.voices
                     || launch_tracks(project) != self.launch_tracks =>
@@ -2360,7 +2405,7 @@ impl EngineController {
         self.ahead_tracks = sets.tracks;
         self.ahead_strips = sets.strips;
         self.voices = voice_needs(project);
-        self.diffuse_tracks = crate::build::diffuse_tracks(project);
+        self.param_shape = crate::build::param_shape(project);
         self.launch_tracks = launch_tracks(project);
         self.mod_shape = crate::modulation::shape(project);
         // Parameters must be valid before the new graph's processors read them.
@@ -2430,19 +2475,39 @@ impl EngineController {
             drop(a.timeline_tx.send(Box::new(Arc::clone(&snapshot))));
         }
         self.timeline = snapshot;
-        // A loop is at least `MIN_LOOP_SECONDS` long: every wrap splits the
-        // callback into another pass through the whole graph, and a loop of
-        // a few frames would make dozens of them in one callback.
+        // The loop in samples follows the tempo.
+        self.send_loop(project)
+    }
+
+    /// The project's loop in samples, as the transport takes it: at least
+    /// `MIN_LOOP_SECONDS` long (every wrap splits the callback into another
+    /// pass through the whole graph, and a loop of a few frames would make
+    /// dozens of them in one callback), switched on only with a range.
+    pub fn loop_in_samples(&self, project: &Project) -> (Option<LoopRange>, bool) {
         let shortest = (f64::from(self.config.sample_rate) * MIN_LOOP_SECONDS) as i64;
         let range = project.loop_range.and_then(|r| {
             let start = self.musical_to_samples(project, r.start);
             let end = self.musical_to_samples(project, r.end);
             LoopRange::new(start, end.max(start + shortest))
         });
+        (range, project.loop_enabled && range.is_some())
+    }
+
+    /// Send the project's loop to the transport when it differs from what
+    /// was sent last (a loop dragged while playing: one command per
+    /// change, nothing else).
+    pub fn send_loop(&mut self, project: &Project) -> Result<(), EngineError> {
+        let wanted = self.loop_in_samples(project);
+        if self.sent_loop == Some(wanted) {
+            return Ok(());
+        }
+        let (range, enabled) = wanted;
         self.send(Message::Transport(TransportCommand::SetLoopRange(range)))?;
         self.send(Message::Transport(TransportCommand::SetLoopEnabled(
-            project.loop_enabled && range.is_some(),
-        )))
+            enabled,
+        )))?;
+        self.sent_loop = Some(wanted);
+        Ok(())
     }
 
     pub fn transport(&mut self, cmd: TransportCommand) -> Result<(), EngineError> {
@@ -2510,7 +2575,14 @@ impl EngineController {
     /// in case the writer stalls. Returns the ends for the writer thread.
     /// Whether the pre-roll before a recording plays the click alone.
     pub fn set_count_in(&mut self, on: bool) -> Result<(), EngineError> {
-        self.send(Message::CountIn(on))
+        self.send(Message::CountIn(on))?;
+        self.count_in = on;
+        Ok(())
+    }
+
+    /// Whether a take's pre-roll plays the click alone (as last set).
+    pub fn count_in(&self) -> bool {
+        self.count_in
     }
 
     pub fn begin_recording(
@@ -2522,6 +2594,8 @@ impl EngineController {
     ) -> Result<RecordStreams, EngineError> {
         let (rt, streams) =
             crate::record::rings(targets, from, to, self.config.sample_rate, seconds);
+        // Each take counts its own dropped frames (`record_counters`).
+        self.shared.record_overruns.store(0, Ordering::Relaxed);
         self.send(Message::BeginRecord(Box::new(rt)))?;
         Ok(streams)
     }

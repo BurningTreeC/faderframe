@@ -156,10 +156,42 @@ pub fn prefault<T: Copy>(buf: &mut [T]) {
     }
 }
 
+/// Stack kept free below what [`prefault_stack`] maps (the guard page, the
+/// system's stack guarantee for exception handling, the frames of the
+/// mapping itself).
+const STACK_MARGIN: usize = 64 * 1024;
+
+/// Bytes of the calling thread's stack below the caller's frame, where the
+/// system says (`None`: it does not).
+#[inline(never)]
+pub fn stack_left() -> Option<usize> {
+    // A local's address: about where the stack pointer is.
+    let marker = std::hint::black_box(0u8);
+    let here = std::hint::black_box(&marker) as *const u8 as usize;
+    let lowest = stack::lowest()?;
+    Some(here.saturating_sub(lowest))
+}
+
 /// Map `bytes` of this thread's stack below the caller's frame now, so
-/// that deep calls on a realtime thread do not fault the stack in.
+/// that deep calls on a realtime thread do not fault the stack in. At most
+/// the stack the thread has left (less a margin): audio callbacks run on
+/// threads other programs made — CoreAudio's, ASIO drivers', PipeWire's —
+/// whose stacks may be smaller than asked for, and going past one is a
+/// crash.
 #[inline(never)]
 pub fn prefault_stack(bytes: usize) {
+    let bytes = match stack_left() {
+        Some(left) => bytes.min(left.saturating_sub(STACK_MARGIN)),
+        None => bytes,
+    };
+    if bytes == 0 {
+        return;
+    }
+    prefault_stack_unchecked(bytes);
+}
+
+#[inline(never)]
+fn prefault_stack_unchecked(bytes: usize) {
     const CHUNK: usize = 16 * 1024;
     fn go(left: usize) {
         let mut chunk = [0u8; CHUNK];
@@ -176,6 +208,62 @@ pub fn prefault_stack(bytes: usize) {
         }
     }
     go(bytes);
+}
+
+/// The lowest usable address of the calling thread's stack (above its
+/// guard).
+mod stack {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn lowest() -> Option<usize> {
+        // SAFETY: the attributes of the calling thread, read into a struct
+        // we own and destroyed after.
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+                return None;
+            }
+            let mut addr: *mut libc::c_void = std::ptr::null_mut();
+            let mut size = 0usize;
+            let mut guard = 0usize;
+            let ok = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+            libc::pthread_attr_getguardsize(&attr, &mut guard);
+            libc::pthread_attr_destroy(&mut attr);
+            (ok && !addr.is_null()).then(|| addr as usize + guard)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn lowest() -> Option<usize> {
+        // SAFETY: plain queries about the calling thread.
+        let (top, size) = unsafe {
+            let me = libc::pthread_self();
+            (
+                libc::pthread_get_stackaddr_np(me) as usize,
+                libc::pthread_get_stacksize_np(me),
+            )
+        };
+        (top > size).then(|| top - size)
+    }
+
+    #[cfg(windows)]
+    pub fn lowest() -> Option<usize> {
+        let (mut low, mut high) = (0usize, 0usize);
+        // SAFETY: two valid out pointers.
+        unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high)
+        };
+        (low != 0).then_some(low)
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        windows
+    )))]
+    pub fn lowest() -> Option<usize> {
+        None
+    }
 }
 
 /// What [`lock_process_memory`] did.
@@ -311,37 +399,69 @@ mod imp {
         total
     }
 
-    /// Map `start..end` (copying it now when `write`: private data).
-    fn populate(start: usize, end: usize, write: bool) -> usize {
+    /// Whether the kernel populates mappings on request
+    /// (`MADV_POPULATE_READ`/`WRITE`, Linux 5.14): asked once, on a page
+    /// of our own.
+    fn kernel_populates() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // 0: not asked yet, 1: yes, 2: no.
+        static KNOWN: AtomicU8 = AtomicU8::new(0);
+        match KNOWN.load(Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+        // SAFETY: a fresh private anonymous page, unmapped below.
+        let page = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                super::PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if page == libc::MAP_FAILED {
+            return false;
+        }
+        // SAFETY: advice on the page just mapped.
+        let yes = unsafe { libc::madvise(page, super::PAGE, libc::MADV_POPULATE_READ) } == 0;
+        // SAFETY: mapped above with this length.
+        unsafe { libc::munmap(page, super::PAGE) };
+        KNOWN.store(if yes { 1 } else { 2 }, Ordering::Relaxed);
+        yes
+    }
+
+    /// Map `start..end` (copying it now when `write`: private data). The
+    /// range comes from a reading of `/proc/self/maps` that other threads
+    /// may have made stale meanwhile (a library unloaded, memory freed and
+    /// mapped again, a guard page put there): the kernel is asked, and
+    /// refuses what is no longer mapped or no longer readable (`ENOMEM`,
+    /// `EINVAL` — incompatible or inaccessible mappings), and nothing is
+    /// ever touched directly — a read of a range gone `PROT_NONE` would be
+    /// a `SIGSEGV`.
+    pub(super) fn populate(start: usize, end: usize, write: bool) -> usize {
         let len = end - start;
+        if !kernel_populates() {
+            // A kernel before 5.14: the files' pages read in, at least
+            // (a hint; mapped on first use, from memory).
+            // SAFETY: advice only; the kernel checks the range.
+            unsafe { libc::madvise(start as *mut libc::c_void, len, libc::MADV_WILLNEED) };
+            return 0;
+        }
         let advice = if write {
             libc::MADV_POPULATE_WRITE
         } else {
             libc::MADV_POPULATE_READ
         };
-        // SAFETY: a range of this process's mappings; populating changes
-        // no contents.
+        // SAFETY: a range of this process's mappings (or what replaced them:
+        // the kernel checks); populating changes no contents.
         if unsafe { libc::madvise(start as *mut libc::c_void, len, advice) } == 0 {
-            return len;
+            len
+        } else {
+            0
         }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) {
-            return 0;
-        }
-        // A kernel before 5.14: touch each page (written back as it was
-        // for private data).
-        let mut at = start;
-        while at < end {
-            // SAFETY: inside a readable mapping; a writable private one
-            // gets its own byte back.
-            unsafe {
-                let b = std::ptr::read_volatile(at as *const u8);
-                if write {
-                    std::ptr::write_volatile(at as *mut u8, b);
-                }
-            }
-            at += super::PAGE;
-        }
-        len
     }
 
     pub fn lock() -> MemoryLock {
@@ -374,6 +494,43 @@ mod imp {
 
     pub fn prefault_code() -> usize {
         0
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod stack_tests {
+    use super::*;
+
+    /// Audio callbacks run on threads other programs made (CoreAudio's,
+    /// an ASIO driver's), whose stacks may be smaller than the stack mapped
+    /// for deep calls: the mapping keeps within the stack left.
+    #[test]
+    fn prefaulting_a_small_stack_stays_within_it() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                // (Systems round small stacks up: Windows to its own
+                // granularity.)
+                let left = stack_left().unwrap();
+                assert!(left > 32 * 1024, "{left}");
+                // More than the thread has.
+                prefault_stack(left + (256 << 10));
+                prefault_stack(256 << 10);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // A thread with room maps all of it.
+        let left = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                prefault_stack(256 * 1024);
+                stack_left().unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(left > 1 << 20, "{left}");
     }
 }
 
@@ -473,5 +630,28 @@ mod tests {
         let faults = minor_faults() - before;
         assert!(faults < 4, "{faults}");
         prefault_stack(256 * 1024);
+    }
+
+    /// `prefault_code` populates ranges read from `/proc/self/maps`, which
+    /// other threads may have changed since: a range gone `PROT_NONE` (a
+    /// guard page, an allocator's reservation where freed memory was) is
+    /// refused by the kernel and must never be touched (that is a
+    /// `SIGSEGV`).
+    #[test]
+    fn a_range_gone_inaccessible_is_not_touched() {
+        let fresh = Fresh::new(1 << 20);
+        // SAFETY: our mapping, made inaccessible.
+        assert_eq!(
+            unsafe { libc::mprotect(fresh.0.cast(), fresh.1, libc::PROT_NONE) },
+            0
+        );
+        let start = fresh.0 as usize;
+        assert_eq!(imp::populate(start, start + fresh.1, false), 0);
+        assert_eq!(imp::populate(start, start + fresh.1, true), 0);
+        // And a range no longer mapped at all.
+        let gone = Fresh::new(1 << 16);
+        let at = gone.0 as usize;
+        drop(gone);
+        assert_eq!(imp::populate(at, at + (1 << 16), false), 0);
     }
 }

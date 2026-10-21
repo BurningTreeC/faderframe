@@ -299,11 +299,23 @@ fn imports_dmabufs(snapshot: &gtk::Snapshot) -> bool {
     let _ = snapshot;
     std::env::var("FADERFRAME_GPU_DMABUF").as_deref() != Ok("0")
         && gtk::gdk::Display::default().is_some_and(|d| {
-            d.dmabuf_formats().contains(
-                faderframe_ui_gpu::FOURCC_AB24,
-                faderframe_ui_gpu::MODIFIER_LINEAR,
-            )
+            takes_gpu_dmabufs(d.type_().name())
+                && d.dmabuf_formats().contains(
+                    faderframe_ui_gpu::FOURCC_AB24,
+                    faderframe_ui_gpu::MODIFIER_LINEAR,
+                )
         })
+}
+
+/// Whether a display of this GDK type can use a dmabuf in the GPU's own
+/// memory. Its dmabuf formats are no answer: they include what GTK can
+/// read with `mmap`, and the painter's buffers (device-local, not mapped
+/// for the CPU) cannot be: Broadway, with no GL or Vulkan to take them
+/// with, sent every one as nothing ("Failed to mmap dmabuf: Operation not
+/// permitted", the dense views empty — GTK 4.18 and 4.24 alike).
+#[cfg(all(feature = "gpu-painter", target_os = "linux"))]
+fn takes_gpu_dmabufs(display_type: &str) -> bool {
+    display_type != "GdkBroadwayDisplay"
 }
 
 #[cfg(all(feature = "gpu-painter", not(target_os = "linux")))]
@@ -355,4 +367,14 @@ pub fn paint(
 #[cfg(not(feature = "gpu-painter"))]
 pub fn behind(_widget: &gtk::Widget) -> bool {
     false
+}
+
+#[cfg(all(test, feature = "gpu-painter", target_os = "linux"))]
+mod tests {
+    #[test]
+    fn broadway_has_the_gpu_painters_frames_read_back() {
+        assert!(!super::takes_gpu_dmabufs("GdkBroadwayDisplay"));
+        assert!(super::takes_gpu_dmabufs("GdkWaylandDisplay"));
+        assert!(super::takes_gpu_dmabufs("GdkX11Display"));
+    }
 }

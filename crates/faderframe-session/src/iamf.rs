@@ -188,6 +188,10 @@ pub fn start(
     let path = settings.output.clone();
     let label = project.name.clone();
     RenderJob::spawn(progress, move || {
+        // Written beside the destination (same extension: the container
+        // follows it), moved there when complete.
+        let file = crate::render::files::StagedFile::new(&path)?;
+        let began = std::time::Instant::now();
         let mut sources = faderframe_engine::render_generated_sources(&project, rate);
         for (_, file, e) in crate::media::open_file_sources(&project, None, &mut sources) {
             tracing::warn!("render: {}: {e}", file.display());
@@ -220,9 +224,13 @@ pub fn start(
             loudness: measure(plan.layout, &refs, rate),
         };
         let done = p.done.load(Ordering::Relaxed);
-        faderframe_iamf::write_file(&path, &mut master, &refs, Container::for_path(&path), |n| {
-            p.done.store(done + n, Ordering::Relaxed)
-        })
+        faderframe_iamf::write_file(
+            file.temp(),
+            &mut master,
+            &refs,
+            Container::for_path(&path),
+            |n| p.done.store(done + n, Ordering::Relaxed),
+        )
         .map_err(|e| match e {
             faderframe_iamf::IamfError::Io(source) => RenderError::Io {
                 path: path.clone(),
@@ -230,10 +238,26 @@ pub fn start(
             },
             other => RenderError::Iamf(other.to_string()),
         })?;
-        Ok(vec![Rendered {
-            path: path.clone(),
-            finished,
-        }])
+        if p.cancel.load(Ordering::Relaxed) {
+            return Err(RenderError::Cancelled);
+        }
+        let written = crate::render::stats::Written::Iamf {
+            codec,
+            layout: plan.layout,
+            sample_rate: rate,
+            frames: frames as u64,
+        };
+        let seconds = began.elapsed().as_secs_f64();
+        let stats = crate::render::measure_written(&file, &written, &settings, seconds, &p)?;
+        crate::render::Staged::new(vec![(
+            file,
+            Rendered {
+                path: path.clone(),
+                finished,
+                stats,
+            },
+        )])
+        .commit(&settings.overwrite)
     })
 }
 

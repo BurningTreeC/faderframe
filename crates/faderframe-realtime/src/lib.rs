@@ -53,6 +53,8 @@ mod pool;
 pub mod priority;
 #[cfg(target_os = "linux")]
 pub mod rtkit;
+#[cfg(target_os = "linux")]
+mod rttime;
 mod scope;
 mod slots;
 mod trycell;

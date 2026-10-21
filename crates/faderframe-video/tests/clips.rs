@@ -1051,7 +1051,15 @@ fn an_mxf_clip_is_read() {
     for (name, encoder) in kinds {
         let clip = d.join(format!("{name}.mxf"));
         make_clip(&clip, encoder, "mxfmux", true);
-        let info = probe::probe(&clip).unwrap();
+        let info = probe::probe(&clip);
+        if faderframe_video::mxf_by_ffmpeg() && !info.as_ref().is_ok_and(|i| i.video.is_some()) {
+            // GStreamer's own demuxer crashed on this file (before 1.28.4:
+            // Debian 13's 1.26); FFmpeg's, in its place, has no
+            // uncompressed picture: refused, and the program lives.
+            eprintln!("{name}: no picture through FFmpeg's MXF demuxer");
+            continue;
+        }
+        let info = info.unwrap();
         let v = info.video.as_ref().expect("a picture");
         assert_eq!(info.audio.len(), 1, "{name}: its sound");
         let cancel = AtomicBool::new(false);

@@ -6,7 +6,8 @@
 use crate::render::{self, RenderChannels, RenderJob, RenderRange, RenderSettings};
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_audio_files::WavFormat;
-use faderframe_core::{ChannelLayout, ClipId, TrackId};
+use faderframe_automation::AutomationSet;
+use faderframe_core::{ChannelLayout, ClipId, ScratchPadId, TrackId};
 use faderframe_project::{
     AudioClip, AudioSource, Clip, ClipContent, ClipFades, Command, Freeze, SourceSpec,
     StretchSettings, Track, TrackColor, TrackKind,
@@ -64,7 +65,10 @@ impl Session {
         // What the chain makes: a mono track widened by a device (the
         // Guitar Station) freezes and bounces stereo.
         let mono = t.chain_layout() == ChannelLayout::Mono;
+        // A freeze is of the song (it plays there), a bounce of what is
+        // shown (its clip goes there).
         let project = self.absolute_copy();
+        let project = if freeze { project.into_song() } else { project };
         let (copy, start, end) = render::track_render_project(&project, track)
             .ok_or_else(|| SessionError::Other(format!("'{name}' has no clips to render")))?;
         std::fs::create_dir_all(&self.media_dir)
@@ -84,6 +88,8 @@ impl Session {
             format: WavFormat::Float32,
             dither: faderframe_audio_files::Dither::Off,
             report: false,
+            // Its own file (a name the session chose): no one to ask.
+            overwrite: crate::render::Overwrite::Always,
             // A freeze plays its file with the latency it was made with
             // (exactly as the track did); a bounce starts on time.
             keep_latency: freeze,
@@ -259,14 +265,46 @@ impl Session {
     /// The frozen track an edit would change (edits of frozen tracks are
     /// refused until they are unfrozen).
     pub(crate) fn frozen_target(&self, cmd: &Command) -> Option<String> {
+        let mut shown = self.project.scratch_pads.shown;
+        self.frozen_in(cmd, &mut shown)
+    }
+
+    /// [`Self::frozen_target`] with `shown` = the arrangement shown where
+    /// `cmd` applies (a batch can switch it on the way). A freeze is the
+    /// song's: in a scratch pad a frozen track is silent, and its clips
+    /// and automation there are the pad's, so editing them leaves the
+    /// song's freeze right. Its devices are shared, so those edits are
+    /// refused wherever they come from.
+    fn frozen_in(&self, cmd: &Command, shown: &mut Option<ScratchPadId>) -> Option<String> {
         let track_of_clip = |c: &ClipId| self.project.clip(*c).map(|c| c.track);
         let frozen = |t: Option<TrackId>| {
             t.and_then(|t| self.project.track(t))
                 .filter(|t| t.freeze.is_some())
                 .map(|t| t.name.clone())
         };
+        let in_pad = shown.is_some();
         match cmd {
-            Command::Batch { commands, .. } => commands.iter().find_map(|c| self.frozen_target(c)),
+            Command::Batch { commands, .. } => {
+                commands.iter().find_map(|c| self.frozen_in(c, shown))
+            }
+            Command::ShowArrangement { pad } => {
+                *shown = *pad;
+                None
+            }
+            Command::AddClip { .. }
+            | Command::MoveClip { .. }
+            | Command::RemoveClip { .. }
+            | Command::SetClipContent { .. }
+            | Command::SetClipMuted { .. }
+            | Command::SplitClip { .. }
+            | Command::AddNote { .. }
+            | Command::RemoveNote { .. }
+            | Command::UpdateNote { .. }
+            | Command::SetArrangement { .. }
+                if in_pad =>
+            {
+                None
+            }
             Command::AddClip { clip } => frozen(Some(clip.track)),
             Command::MoveClip { clip, track, .. } => {
                 frozen(track_of_clip(clip)).or_else(|| frozen(Some(*track)))
@@ -283,6 +321,44 @@ impl Session {
             | Command::SetPreamp { track, .. }
             | Command::SetInstrument { track, .. }
             | Command::SetPluginState { track, .. } => frozen(Some(*track)),
+            // A rearrangement of the song (section moves, conform, material
+            // brought back from a pad) that would move a frozen track's
+            // clips or automation: its frozen audio would stay where it
+            // was. Compared with the song as it is now: in place, or put
+            // aside while a pad is shown.
+            Command::SetArrangement { arrangement } => {
+                let song_in_place = self.project.scratch_pads.shown.is_none();
+                let stash = self.project.scratch_pads.song.as_deref();
+                let no_automation = AutomationSet::default();
+                let song_clip = |c: &ClipId| {
+                    if song_in_place {
+                        self.project.clips.get(c)
+                    } else {
+                        stash.and_then(|s| s.clips.get(c))
+                    }
+                };
+                arrangement
+                    .tracks
+                    .iter()
+                    .find_map(|(id, clips, automation)| {
+                        let t = self.project.track(*id).filter(|t| t.freeze.is_some())?;
+                        let (old_clips, old_automation): (&[ClipId], &AutomationSet) =
+                            if song_in_place {
+                                (&t.clips, &t.automation)
+                            } else {
+                                match stash.and_then(|s| s.tracks.get(id)) {
+                                    Some(st) => (&st.clips, &st.automation),
+                                    None => (&[], &no_automation),
+                                }
+                            };
+                        let changed = old_clips != clips.as_slice()
+                            || old_automation != automation
+                            || clips
+                                .iter()
+                                .any(|c| arrangement.clips.get(c) != song_clip(c));
+                        changed.then(|| t.name.clone())
+                    })
+            }
             _ => None,
         }
     }

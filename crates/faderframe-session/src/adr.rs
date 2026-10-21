@@ -337,11 +337,15 @@ impl Session {
         }
         let at = self.project.timeline.to_musical(from, r);
         self.dispatch(Action::Transport(TransportAction::Locate(at)))?;
-        self.dispatch(Action::Transport(if record {
+        // From the cue's pre-roll, not the Play Start Marker.
+        self.play_here = true;
+        let started = self.dispatch(Action::Transport(if record {
             TransportAction::ToggleRecord
         } else {
             TransportAction::Play
-        }))?;
+        }));
+        self.play_here = false;
+        started?;
         self.adr_run = Some(AdrRun {
             cue: id,
             record,

@@ -21,8 +21,16 @@ impl Session {
     /// least 8 in and 2 out, more for the master's bed, tracks routed to
     /// interface outputs, and hardware inserts' sends and returns.
     pub fn wanted_channels(&self) -> (u16, u16) {
+        let (ins, outs) = self.required_channels();
+        (ins.max(8), outs.max(2))
+    }
+
+    /// The device channels the project cannot do without (inputs,
+    /// outputs): the master's bed, tracks routed to interface outputs,
+    /// hardware inserts' sends and returns, cue mixes and talkback.
+    pub fn required_channels(&self) -> (u16, u16) {
         let p = &self.project;
-        let (mut ins, mut outs) = (8usize, 2usize);
+        let (mut ins, mut outs) = (0usize, 0usize);
         for t in &p.tracks {
             let width = t.chain_layout().channel_count().max(1);
             if let faderframe_project::OutputRouting::Hardware { first_channel } = t.output {
@@ -66,7 +74,7 @@ impl Session {
         let Some(info) = self.stream_info() else {
             return;
         };
-        let want = self.wanted_channels();
+        let want = self.required_channels();
         let short = want.0 > info.input_channels || want.1 > info.output_channels;
         if !short || self.reopened_for == Some(want) || self.recording.is_some() {
             return;

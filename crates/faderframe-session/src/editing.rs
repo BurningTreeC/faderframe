@@ -10,8 +10,10 @@
 //!   single tools do one thing everywhere.
 //! * **The edit selection** is a time range on the selected tracks
 //!   ([`EditRange`]); with *Link Timeline and Edit Selection* the playhead
-//!   follows it. Operations — separate, trim to selection, clear, copy/cut/
-//!   paste, duplicate, repeat, insert silence, nudge, Tab — work on it.
+//!   follows it. Operations — separate, trim to selection, clear, insert
+//!   silence, nudge, Tab — work on it; copy/cut/paste, duplicate and repeat
+//!   take it when it has a length, else the selected clips
+//!   ([`crate::clipboard`]).
 //!
 //! Every operation is one undoable [`Command::Batch`] built from the
 //! project's clip commands (split, move, remove, add, set content), with
@@ -214,6 +216,10 @@ pub enum EditFlag {
     SnapToSamples,
     /// Cuts and trims of audio clips move to the nearest zero crossing.
     SnapToZeroCrossings,
+    /// Drags snap to clip starts and ends, markers, section bounds, the
+    /// loop and selection bounds and the playhead within a few pixels,
+    /// ahead of the grid ([`crate::snapping`]).
+    SnapToObjects,
     /// The Pitch editor finds every note, chords too.
     PolyphonicPitch,
     /// Stop puts the playhead at the start of the project (off: back to
@@ -226,6 +232,19 @@ pub enum EditFlag {
 pub const ZERO_CROSSING_REACH: f64 = 0.005;
 
 /// A time range (start ≤ end; a cursor when equal).
+/// A clip with one edge trimmed (or stretched), before it is placed:
+/// [`Session::trims_commands`] places several at once.
+#[derive(Clone, Debug)]
+pub(crate) struct Trimmed {
+    /// The clip as the gesture first saw it.
+    pub base: Clip,
+    /// Its start after the trim (Shuffle: as it was).
+    pub start: MusicalTime,
+    pub content: ClipContent,
+    /// Whether, in Shuffle mode, what follows moves with its end.
+    pub shuffles: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct EditRange {
     pub start: MusicalTime,
@@ -276,14 +295,6 @@ pub enum NudgeTarget {
     Move,
     TrimStart,
     TrimEnd,
-}
-
-/// A copied time range: clip parts per track (index among the copied
-/// tracks), positions relative to the range start.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RangeClipboard {
-    pub(crate) length: MusicalTime,
-    pub(crate) parts: Vec<(usize, Clip)>,
 }
 
 impl Session {
@@ -359,9 +370,21 @@ impl Session {
         c.end(&self.project.timeline, self.project.sample_rate)
     }
 
-    /// Tracks the range operations work on: the selected tracks in project
-    /// order (else the tracks of the selected clips).
-    pub(crate) fn edit_tracks(&self) -> Vec<TrackId> {
+    /// Does a cut at `at` fall inside `c` (a whole sample from both edges,
+    /// for audio), so that splitting there leaves two clips?
+    pub(crate) fn cuts_inside(&self, c: &Clip, at: MusicalTime) -> bool {
+        let end = self.clip_end(c);
+        at > c.start
+            && at < end
+            && (!c.content.is_audio()
+                || (self.frames_between(c.start, at) > 0 && self.frames_between(at, end) > 0))
+    }
+
+    /// Tracks the range operations work on (and the arranger paints the
+    /// range on): the selected tracks in project order (else the tracks of
+    /// the selected clips), then the tracks grouped with them in folder
+    /// groups ([`crate::folder_groups`]).
+    pub fn edit_tracks(&self) -> Vec<TrackId> {
         let sel = &self.selection;
         let mut out: Vec<TrackId> = self
             .project
@@ -379,7 +402,7 @@ impl Session {
                 }
             }
         }
-        out
+        self.with_grouped_tracks(out)
     }
 
     /// The selection range, if it has a length.
@@ -417,14 +440,18 @@ impl Session {
             let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
             for c in clips {
                 let end = self.clip_end(&c);
-                if c.start >= b {
+                // Audio is cut on whole samples: a clip less than a sample
+                // past an edge is on that edge's side (splitting there
+                // would leave nothing and refuse the whole batch).
+                let audio = c.content.is_audio();
+                if c.start >= b || (audio && self.frames_between(c.start, b) <= 0) {
                     after.push((c.id, track, c.start));
                     continue;
                 }
-                if end <= a {
+                if end <= a || (audio && self.frames_between(a, end) <= 0) {
                     continue;
                 }
-                match (c.start < a, end > b) {
+                match (self.cuts_inside(&c, a), self.cuts_inside(&c, b)) {
                     // Entirely inside.
                     (false, false) => cmds.push(Command::RemoveClip { clip: c.id }),
                     // Across the whole range: keep both ends.
@@ -484,6 +511,12 @@ impl Session {
     /// Delete the selection range on the selected tracks (Shuffle closes
     /// the gap).
     pub(crate) fn clear_range(&mut self) -> Result<bool> {
+        self.clear_range_as("Clear")
+    }
+
+    /// [`Self::clear_range`] as the undo step `label`: the clips' parts in
+    /// the range and the tracks' automation of it go (as Copy takes both).
+    pub(crate) fn clear_range_as(&mut self, label: &str) -> Result<bool> {
         let Some(r) = self.range() else {
             return Ok(false);
         };
@@ -499,7 +532,18 @@ impl Session {
                 });
             }
         }
-        self.batch("Clear", cmds)?;
+        // The tracks' automation of the range goes too: the time itself in
+        // Shuffle, else the points in it (the values outside stay).
+        let mut lanes = crate::clipboard::LaneWork::default();
+        for &track in &tracks {
+            if self.editor.edit_mode == EditMode::Shuffle {
+                lanes.remove_time(&mut self.project, track, r.start, r.end);
+            } else {
+                lanes.clear_time(&mut self.project, track, r.start, r.end);
+            }
+        }
+        cmds.extend(lanes.commands());
+        self.batch(label, cmds)?;
         self.selection.clips.clear();
         Ok(true)
     }
@@ -512,41 +556,60 @@ impl Session {
         };
         let tracks = self.edit_tracks();
         let mut cmds = Vec::new();
+        // Pieces of selected clips stay selected.
+        let mut pieces = Vec::new();
         for track in tracks {
             let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
             for c in clips {
-                let end = self.clip_end(&c);
-                let cut_a = c.start < r.start && end > r.start;
-                let cut_b = c.start < r.end && end > r.end;
+                let selected = self.selection.clips.contains(&c.id);
+                // At a zero crossing when that is on and stays inside.
+                let cut = |s: &Self, at: MusicalTime| {
+                    let z = s.cut_at(&c, at);
+                    if s.cuts_inside(&c, z) { z } else { at }
+                };
+                let cut_a = self.cuts_inside(&c, r.start);
+                let cut_b = self.cuts_inside(&c, r.end);
                 match (cut_a, cut_b) {
                     (true, true) => {
                         let mid: ClipId = self.project.ids.allocate();
                         let right: ClipId = self.project.ids.allocate();
                         cmds.push(Command::SplitClip {
                             clip: c.id,
-                            at: self.cut_at(&c, r.start),
+                            at: cut(self, r.start),
                             new_clip: mid,
                         });
                         cmds.push(Command::SplitClip {
                             clip: mid,
-                            at: self.cut_at(&c, r.end),
+                            at: cut(self, r.end),
                             new_clip: right,
                         });
+                        if selected {
+                            pieces.extend([mid, right]);
+                        }
                     }
                     (true, false) | (false, true) => {
-                        let at = self.cut_at(&c, if cut_a { r.start } else { r.end });
+                        let at = cut(self, if cut_a { r.start } else { r.end });
                         let new_clip: ClipId = self.project.ids.allocate();
                         cmds.push(Command::SplitClip {
                             clip: c.id,
                             at,
                             new_clip,
                         });
+                        if selected {
+                            pieces.push(new_clip);
+                        }
                     }
                     (false, false) => {}
                 }
             }
         }
-        self.batch("Separate", cmds)
+        if cmds.is_empty() {
+            return Ok(());
+        }
+        self.batch("Separate", cmds)?;
+        self.selection.select_clips(&pieces, crate::SelectMode::Add);
+        self.revision += 1;
+        Ok(())
     }
 
     /// Keep only what is inside the range of the clips it touches.
@@ -563,22 +626,37 @@ impl Session {
                 if end <= r.start || c.start >= r.end {
                     continue;
                 }
+                // At a zero crossing that stays inside the clip, else at
+                // the edge itself; an edge less than a sample inside it
+                // cuts nothing.
+                let cut = |s: &Self, at: MusicalTime| {
+                    let z = s.cut_at(&c, at);
+                    if s.cuts_inside(&c, z) {
+                        Some(z)
+                    } else {
+                        s.cuts_inside(&c, at).then_some(at)
+                    }
+                };
                 let mut keep = c.id;
-                if c.start < r.start {
+                if c.start < r.start
+                    && let Some(at) = cut(self, r.start)
+                {
                     let mid: ClipId = self.project.ids.allocate();
                     cmds.push(Command::SplitClip {
                         clip: c.id,
-                        at: self.cut_at(&c, r.start),
+                        at,
                         new_clip: mid,
                     });
                     cmds.push(Command::RemoveClip { clip: c.id });
                     keep = mid;
                 }
-                if end > r.end {
+                if end > r.end
+                    && let Some(at) = cut(self, r.end)
+                {
                     let right: ClipId = self.project.ids.allocate();
                     cmds.push(Command::SplitClip {
                         clip: keep,
-                        at: self.cut_at(&c, r.end),
+                        at,
                         new_clip: right,
                     });
                     cmds.push(Command::RemoveClip { clip: right });
@@ -586,111 +664,6 @@ impl Session {
             }
         }
         self.batch("Trim to Selection", cmds)
-    }
-
-    /// Copy the range on the selected tracks.
-    pub(crate) fn copy_range(&mut self) -> Result<()> {
-        let Some(r) = self.range() else {
-            return Ok(());
-        };
-        let tracks = self.edit_tracks();
-        let mut parts = Vec::new();
-        for (i, track) in tracks.iter().enumerate() {
-            for c in self.project.clips_of(*track) {
-                if let Some(mut part) = c.slice(
-                    r.start,
-                    r.end,
-                    c.id,
-                    &self.project.timeline,
-                    self.project.sample_rate,
-                ) {
-                    part.start -= r.start;
-                    parts.push((i, part));
-                }
-            }
-        }
-        self.range_clipboard = RangeClipboard {
-            length: r.length(),
-            parts,
-        };
-        Ok(())
-    }
-
-    /// Commands placing the clipboard at `at` on `tracks` (overwriting).
-    fn paste_commands(&mut self, at: MusicalTime, tracks: &[TrackId]) -> Vec<Command> {
-        let clip = self.range_clipboard.clone();
-        if clip.parts.is_empty() {
-            return Vec::new();
-        }
-        let used: Vec<TrackId> = (0..tracks.len())
-            .filter(|i| clip.parts.iter().any(|(t, _)| t == i))
-            .map(|i| tracks[i])
-            .collect();
-        let (mut cmds, _) = self.clear_commands(at, at + clip.length, &used);
-        for (i, part) in clip.parts {
-            let Some(&track) = tracks.get(i) else {
-                continue;
-            };
-            let fits = self
-                .project
-                .track(track)
-                .is_some_and(|t| match part.content {
-                    ClipContent::Audio(_) | ClipContent::Takes(_) => {
-                        t.kind == faderframe_project::TrackKind::Audio
-                    }
-                    ClipContent::Midi(_) => matches!(
-                        t.kind,
-                        faderframe_project::TrackKind::Instrument
-                            | faderframe_project::TrackKind::Midi
-                    ),
-                });
-            if !fits {
-                continue;
-            }
-            let id: ClipId = self.project.ids.allocate();
-            cmds.push(Command::AddClip {
-                clip: Box::new(Clip {
-                    id,
-                    track,
-                    start: at + part.start,
-                    ..part
-                }),
-            });
-        }
-        cmds
-    }
-
-    /// Paste the copied range at the playhead on the selected tracks.
-    pub(crate) fn paste_range(&mut self) -> Result<()> {
-        let at = self.playhead();
-        let tracks = self.edit_tracks();
-        let cmds = self.paste_commands(at, &tracks);
-        self.batch("Paste", cmds)?;
-        let len = self.range_clipboard.length;
-        self.selection.range = Some(EditRange::new(at, at + len));
-        self.revision += 1;
-        Ok(())
-    }
-
-    /// Copies of the range right after it, `times` times; the selection
-    /// moves onto the last copy.
-    pub(crate) fn repeat_range(&mut self, times: u32) -> Result<()> {
-        let Some(r) = self.range() else {
-            return Ok(());
-        };
-        let saved = std::mem::take(&mut self.range_clipboard);
-        self.copy_range()?;
-        let tracks = self.edit_tracks();
-        let len = r.length();
-        let mut cmds = Vec::new();
-        let mut at = r.end;
-        for _ in 0..times.max(1) {
-            cmds.extend(self.paste_commands(at, &tracks));
-            at += len;
-        }
-        self.range_clipboard = saved;
-        self.batch(if times <= 1 { "Duplicate" } else { "Repeat" }, cmds)?;
-        self.set_edit_range(Some(EditRange::new(at - len, at)))
     }
 
     /// Move everything at or after the range start on the selected tracks
@@ -702,31 +675,13 @@ impl Session {
         let tracks = self.edit_tracks();
         let len = r.length();
         let mut cmds = Vec::new();
+        // The tracks' automation makes room too (holding the value there).
+        let mut lanes = crate::clipboard::LaneWork::default();
         for track in tracks {
-            let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
-            for c in clips {
-                let end = self.clip_end(&c);
-                if c.start >= r.start {
-                    cmds.push(Command::MoveClip {
-                        clip: c.id,
-                        track,
-                        start: c.start + len,
-                    });
-                } else if end > r.start {
-                    let right: ClipId = self.project.ids.allocate();
-                    cmds.push(Command::SplitClip {
-                        clip: c.id,
-                        at: r.start,
-                        new_clip: right,
-                    });
-                    cmds.push(Command::MoveClip {
-                        clip: right,
-                        track,
-                        start: r.start + len,
-                    });
-                }
-            }
+            cmds.extend(self.insert_time_commands(track, r.start, len));
+            lanes.insert_time(&mut self.project, track, r.start, len);
         }
+        cmds.extend(lanes.commands());
         self.batch("Insert Silence", cmds)
     }
 
@@ -751,10 +706,9 @@ impl Session {
     /// Nudge the selected clips (move or trim), or the range.
     pub(crate) fn nudge(&mut self, forward: bool, target: NudgeTarget) -> Result<()> {
         let clips: Vec<Clip> = self
-            .selection
-            .clips
-            .iter()
-            .filter_map(|c| self.project.clip(*c).cloned())
+            .selected_arranger_clips()
+            .into_iter()
+            .filter_map(|c| self.project.clip(c).cloned())
             .collect();
         if clips.is_empty() {
             // The range moves.
@@ -771,6 +725,14 @@ impl Session {
             return Ok(());
         }
         let mut cmds = Vec::new();
+        let mut trims = Vec::new();
+        // Backwards, the group moves together and stops at zero (its
+        // spacing kept).
+        let room = clips
+            .iter()
+            .map(|c| c.start)
+            .min()
+            .unwrap_or(MusicalTime::ZERO);
         for c in clips {
             let d = self.nudge_delta(c.start);
             match target {
@@ -778,7 +740,7 @@ impl Session {
                     let start = if forward {
                         c.start + d
                     } else {
-                        (c.start - d).max(MusicalTime::ZERO)
+                        c.start - d.min(room)
                     };
                     cmds.push(Command::MoveClip {
                         clip: c.id,
@@ -786,6 +748,9 @@ impl Session {
                         start,
                     });
                 }
+                // Take folders are not trimmed (as by a drag).
+                NudgeTarget::TrimStart | NudgeTarget::TrimEnd
+                    if matches!(c.content, ClipContent::Takes(_)) => {}
                 NudgeTarget::TrimStart | NudgeTarget::TrimEnd => {
                     let (edge, base) = if target == NudgeTarget::TrimStart {
                         (ClipEdge::Start, c.start)
@@ -797,10 +762,11 @@ impl Session {
                     } else {
                         (base - d).max(MusicalTime::ZERO)
                     };
-                    cmds.extend(self.trim_commands(&c, edge, to)?);
+                    trims.push(self.trim_part(&c, edge, to)?);
                 }
             }
         }
+        cmds.extend(self.trims_commands(trims)?);
         self.batch("Nudge", cmds)
     }
 
@@ -813,6 +779,18 @@ impl Session {
         edge: ClipEdge,
         to: MusicalTime,
     ) -> Result<Vec<Command>> {
+        let t = self.trim_part(c, edge, to)?;
+        self.trims_commands(vec![t])
+    }
+
+    /// `c` (as the gesture first saw it) with one edge moved to `to`, not
+    /// yet placed (see [`Self::trims_commands`]).
+    pub(crate) fn trim_part(
+        &mut self,
+        c: &Clip,
+        edge: ClipEdge,
+        to: MusicalTime,
+    ) -> Result<Trimmed> {
         let rate = self.project.sample_rate as f64;
         let end = self.clip_end(c);
         let min_len = MusicalTime::from_quarters(1.0 / 64.0);
@@ -890,23 +868,78 @@ impl Session {
                 ));
             }
         }
-        let shuffle = self.editor.edit_mode == EditMode::Shuffle;
-        if shuffle {
+        if self.editor.edit_mode == EditMode::Shuffle {
             // The clip stays where it is; what follows closes up or opens.
             start = c.start;
         }
-        let new_end = self.clip_end(&Clip {
-            content: content.clone(),
+        Ok(Trimmed {
+            base: c.clone(),
             start,
-            ..c.clone()
-        });
-        let mut cmds = vec![Command::SetClipContent {
-            clip: c.id,
-            start,
-            content: Box::new(content),
-        }];
+            content,
+            shuffles: true,
+        })
+    }
+
+    /// The commands placing trimmed clips. In Shuffle mode every clip
+    /// after a trimmed one's end (on its track, as the gesture first saw
+    /// them) moves by as much as that end moved — the trimmed ones too, so
+    /// several trims on one track add up instead of overlapping.
+    pub(crate) fn trims_commands(&mut self, trims: Vec<Trimmed>) -> Result<Vec<Command>> {
+        let shuffle = self.editor.edit_mode == EditMode::Shuffle;
+        // (track, old end, how far it moved) of each shuffling trim.
+        let mut moves: Vec<(TrackId, MusicalTime, i64)> = Vec::new();
         if shuffle {
-            cmds.extend(self.shuffle_later(c, end, new_end)?);
+            for t in trims.iter().filter(|t| t.shuffles) {
+                let old_end = self.clip_end(&t.base);
+                let new_end = self.clip_end(&Clip {
+                    content: t.content.clone(),
+                    start: t.start,
+                    ..t.base.clone()
+                });
+                moves.push((t.base.track, old_end, (new_end - old_end).ticks()));
+            }
+        }
+        let shift = |track: TrackId, start: MusicalTime, own: ClipId, trims: &[Trimmed]| {
+            moves
+                .iter()
+                .zip(trims.iter().filter(|t| t.shuffles))
+                .filter(|((t, old_end, _), x)| *t == track && *old_end <= start && x.base.id != own)
+                .map(|((_, _, d), _)| *d)
+                .sum::<i64>()
+        };
+        let mut cmds = Vec::new();
+        for t in &trims {
+            let by = shift(t.base.track, t.base.start, t.base.id, &trims);
+            cmds.push(Command::SetClipContent {
+                clip: t.base.id,
+                start: MusicalTime((t.start.ticks() + by).max(0)),
+                content: Box::new(t.content.clone()),
+            });
+        }
+        if shuffle && !moves.is_empty() {
+            let mut tracks: Vec<TrackId> = moves.iter().map(|m| m.0).collect();
+            tracks.sort_unstable();
+            tracks.dedup();
+            for track in tracks {
+                let ids: Vec<ClipId> = self
+                    .project
+                    .clips_of(track)
+                    .into_iter()
+                    .map(|o| o.id)
+                    .filter(|id| !trims.iter().any(|t| t.base.id == *id))
+                    .collect();
+                for id in ids {
+                    let o = self.gesture_clip(id)?;
+                    let by = shift(track, o.start, id, &trims);
+                    if by != 0 {
+                        cmds.push(Command::MoveClip {
+                            clip: id,
+                            track: o.track,
+                            start: MusicalTime((o.start.ticks() + by).max(0)),
+                        });
+                    }
+                }
+            }
         }
         Ok(cmds)
     }
@@ -1118,12 +1151,12 @@ impl Session {
         // Nothing moves before the timeline start.
         let earliest = base.iter().map(|c| c.start.ticks()).min().unwrap_or(0);
         let by = by.max(-earliest);
-        let lanes: Vec<&faderframe_project::Track> = self
-            .project
-            .tracks
+        // The arranger's rows (folder order, closed folders' tracks left
+        // out): `tracks` counts them, as the arranger shows them.
+        let rows = self.arranger_rows();
+        let lanes: Vec<&faderframe_project::Track> = rows
             .iter()
-            // The arranger's rows: every track but the master.
-            .filter(|t| t.kind != faderframe_project::TrackKind::Master)
+            .filter_map(|id| self.project.track(*id))
             .collect();
         let target = |c: &Clip| -> Option<TrackId> {
             let i = lanes.iter().position(|t| t.id == c.track)? as i32 + tracks;
@@ -1160,7 +1193,7 @@ impl Session {
         by: i64,
         stretch: bool,
     ) -> Result<()> {
-        let mut cmds = Vec::new();
+        let mut parts = Vec::new();
         for id in clips {
             let c = self.gesture_clip(*id)?;
             if matches!(c.content, ClipContent::Takes(_)) {
@@ -1172,12 +1205,13 @@ impl Session {
             };
             let to = MusicalTime((edge_at.ticks() + by).max(0));
             if stretch {
-                cmds.extend(self.stretch_commands(*id, edge, to)?);
+                parts.push(self.stretch_part(*id, edge, to)?);
             } else {
                 let to = self.cut_at(&c, to);
-                cmds.extend(self.trim_commands(&c, edge, to)?);
+                parts.push(self.trim_part(&c, edge, to)?);
             }
         }
+        let cmds = self.trims_commands(parts)?;
         self.batch(if stretch { "Time Stretch" } else { "Trim Clip" }, cmds)
     }
 

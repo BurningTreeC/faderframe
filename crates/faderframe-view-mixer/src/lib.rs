@@ -100,6 +100,8 @@ struct FolderLayout {
     fold: Rect,
     mute: Rect,
     solo: Rect,
+    /// Its Group switch.
+    group: Rect,
     count: Rect,
     scribble: Rect,
 }
@@ -111,7 +113,8 @@ fn folder_layout(rect: Rect) -> FolderLayout {
         fold: Rect::new(x, rect.y + 16.0, w, 24.0),
         mute: Rect::new(x, rect.y + 48.0, w, 18.0),
         solo: Rect::new(x, rect.y + 70.0, w, 18.0),
-        count: Rect::new(rect.x + 2.0, rect.y + 94.0, rect.w - 4.0, 28.0),
+        group: Rect::new(x, rect.y + 92.0, w, 18.0),
+        count: Rect::new(rect.x + 2.0, rect.y + 114.0, rect.w - 4.0, 28.0),
         scribble: Rect::new(rect.x + 2.0, rect.bottom() - 24.0, rect.w - 4.0, 20.0),
     }
 }
@@ -197,6 +200,9 @@ pub enum Hit {
     Scribble(TrackId),
     /// A folder's triangle: opens or closes it.
     Fold(TrackId),
+    /// A folder's Group switch (a folder bus: where a track's record
+    /// button is): what it holds is edited and armed as one.
+    FolderGroup(TrackId),
     Meter(TrackId),
     /// The gain-reduction stripe left of the meter (shows, does nothing).
     Reduction(TrackId),
@@ -302,8 +308,14 @@ pub struct MixerView {
     /// The project has groups or VCAs: strips show a tag row.
     show_tags: bool,
     expanded_preamps: bool,
-    /// Only the master strip, filling the view (the side panel).
+    /// Only the master strip, filling the view (the side panel) — or,
+    /// with `single`, one track's strip.
     master_only: bool,
+    /// One track's strip filling the view (the Inspector's channel): the
+    /// track `shown` (set by its host), its inserts left out (the
+    /// Inspector lists the devices itself).
+    single: bool,
+    shown: Option<TrackId>,
     /// Where each channel strip starts (content x) and, last, where they
     /// end; and each one's width.
     offsets: Vec<f32>,
@@ -343,6 +355,39 @@ pub fn menu_item(e: faderframe_session::GroupMenuEntry) -> MenuItem<Action> {
         m = m.separated();
     }
     m
+}
+
+/// A strip's kind as its header names it (a folder bus by what it is,
+/// shortened on a narrow strip).
+fn strip_tag(t: &Track, width: f32) -> &'static str {
+    match t.is_folder_bus() {
+        true if width >= 80.0 => "FOLDER BUS",
+        true => "F-BUS",
+        false => kind_tag(t.kind),
+    }
+}
+
+/// A folder bus's triangle in its header (opens and closes it).
+fn folder_bus_fold(l: &StripLayout) -> Rect {
+    Rect::new(l.header.x + 14.0, l.header.y, 14.0, l.header.h)
+}
+
+/// The folder's triangle: right when closed, down when open.
+fn fold_triangle(center: Point, r: f32, open: bool) -> [Point; 3] {
+    let (cx, cy) = (center.x, center.y);
+    if open {
+        [
+            Point::new(cx - r, cy - r * 0.55),
+            Point::new(cx + r, cy - r * 0.55),
+            Point::new(cx, cy + r * 0.65),
+        ]
+    } else {
+        [
+            Point::new(cx - r * 0.55, cy - r),
+            Point::new(cx - r * 0.55, cy + r),
+            Point::new(cx + r * 0.65, cy),
+        ]
+    }
 }
 
 fn kind_tag(kind: TrackKind) -> &'static str {
@@ -446,6 +491,8 @@ impl MixerView {
             show_tags: false,
             expanded_preamps: false,
             master_only: false,
+            single: false,
+            shown: None,
             hide_master: false,
             offsets: vec![0.0],
             widths: Vec::new(),
@@ -461,6 +508,55 @@ impl MixerView {
             master_only: true,
             ..Self::new(theme)
         }
+    }
+
+    /// One track's strip alone, filling the view (the Inspector's
+    /// channel): the track given to [`Self::show_track`] — any kind, the
+    /// master too — without its inserts and wooden cheeks. Everything
+    /// else is the console's strip: the same controls, menus and MIDI
+    /// learn.
+    pub fn single_strip(theme: Theme) -> Self {
+        Self {
+            master_only: true,
+            single: true,
+            ..Self::new(theme)
+        }
+    }
+
+    /// The track a [`Self::single_strip`] view shows (`None`: nothing).
+    pub fn show_track(&mut self, track: Option<TrackId>) {
+        if self.shown != track {
+            self.drag = None;
+            self.hover = None;
+        }
+        self.shown = track;
+    }
+
+    /// The track a [`Self::single_strip`] view shows.
+    pub fn shown_track(&self) -> Option<TrackId> {
+        self.shown
+    }
+
+    /// The strip pinned at the right edge (or filling the view): the
+    /// master, or a single-strip view's track.
+    fn pinned<'m>(&self, model: &'m Session) -> Option<&'m Track> {
+        if self.single {
+            self.shown.and_then(|id| model.project().track(id))
+        } else {
+            model.project().master()
+        }
+    }
+
+    /// A pinned channel's number, as the mixer shows it (folders are not
+    /// numbered; the master has none).
+    fn number_of(model: &Session, t: &Track) -> usize {
+        model
+            .project()
+            .folder_order()
+            .into_iter()
+            .filter(|x| !matches!(x.kind, TrackKind::Master | TrackKind::Folder))
+            .position(|x| x.id == t.id)
+            .map_or(0, |i| i + 1)
     }
 
     fn pitch(&self) -> f32 {
@@ -480,7 +576,7 @@ impl MixerView {
 
     /// Width of the wooden end cheeks (0 without wood).
     fn cheek(&self) -> f32 {
-        if self.theme.console.look.wood.is_some() {
+        if self.theme.console.look.wood.is_some() && !self.single {
             CHEEK_W
         } else {
             0.0
@@ -612,7 +708,11 @@ impl MixerView {
             ) || t.input.plugin_output().is_some(),
             t.kind != TrackKind::Master && !vca,
             self.send_rows,
-            if vca { 0 } else { self.insert_slots.max(1) },
+            if vca || self.single {
+                0
+            } else {
+                self.insert_slots.max(1)
+            },
             self.show_tags,
             if t.kind.has_audio() || t.kind == TrackKind::Midi {
                 if self.expanded_preamps { 84.0 } else { 20.0 }
@@ -631,13 +731,17 @@ impl MixerView {
         self.insert_slots = model.mixer_insert_slots();
         let p = model.project();
         self.show_tags = !p.groups.is_empty() || p.tracks.iter().any(|t| t.kind == TrackKind::Vca);
-        self.max_sends = model
-            .project()
-            .tracks
-            .iter()
-            .map(|t| t.sends.len())
-            .max()
-            .unwrap_or(0);
+        self.max_sends = if self.single {
+            self.pinned(model).map_or(0, |t| t.sends.len())
+        } else {
+            model
+                .project()
+                .tracks
+                .iter()
+                .map(|t| t.sends.len())
+                .max()
+                .unwrap_or(0)
+        };
         self.send_rows = (self.max_sends + 1)
             .div_ceil(SENDS_PER_ROW)
             .clamp(1, MAX_SEND_ROWS);
@@ -657,7 +761,7 @@ impl MixerView {
             .visible_range(tracks.len(), size)
             .map(|i| (self.strip_rect(i, size), tracks[i]))
             .collect();
-        if let Some(m) = model.project().master()
+        if let Some(m) = self.pinned(model)
             && !self.hide_master
         {
             out.push((self.master_rect(size), m));
@@ -683,14 +787,13 @@ impl MixerView {
                 }
             }
         }
+        let pinned = self.pinned(model).map(|t| t.id);
         for (rect, t) in self.visible_strips(model, size) {
             if !rect.contains(pos) {
                 continue;
             }
             // Channel strips are clipped by the master section.
-            if t.kind != TrackKind::Master
-                && (pos.x >= master.x - MASTER_GAP || pos.x < self.cheek())
-            {
+            if Some(t.id) != pinned && (pos.x >= master.x - MASTER_GAP || pos.x < self.cheek()) {
                 continue;
             }
             if t.kind == TrackKind::Folder {
@@ -702,6 +805,7 @@ impl MixerView {
                         (f.fold, Hit::Fold(id)),
                         (f.mute, Hit::Mute(id)),
                         (f.solo, Hit::Solo(id)),
+                        (f.group, Hit::FolderGroup(id)),
                         (f.scribble, Hit::Scribble(id)),
                     ]
                     .into_iter()
@@ -743,7 +847,11 @@ impl MixerView {
                     }
                 }
             }
-            let checks: [(Option<Rect>, Hit); 15] = [
+            let checks: [(Option<Rect>, Hit); 16] = [
+                (
+                    t.is_folder_bus().then(|| folder_bus_fold(&l)),
+                    Hit::Fold(id),
+                ),
                 ((!cue_master).then_some(color), Hit::Color(id)),
                 (Some(geo.cap_rect(pos_now).inset(-2.0)), Hit::FaderCap(id)),
                 (
@@ -760,6 +868,8 @@ impl MixerView {
                     audio.map(|_| l.record),
                     if t.kind == TrackKind::Master {
                         Hit::MonoCheck
+                    } else if t.is_folder_bus() && model.mixer_cue().is_none() {
+                        Hit::FolderGroup(id)
                     } else {
                         Hit::Record(id)
                     },
@@ -849,7 +959,7 @@ impl MixerView {
     }
 
     /// The instrument tracks a MIDI track can play.
-    fn plays_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn plays_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let items = model
             .midi_instrument_choices(t.id)
             .into_iter()
@@ -866,7 +976,7 @@ impl MixerView {
     }
 
     /// The external MIDI device (and channel) a MIDI track plays.
-    fn midi_out_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn midi_out_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let items = model
             .midi_output_choices(t.id)
             .into_iter()
@@ -906,34 +1016,18 @@ impl MixerView {
         // The triangle: right when closed, down when open.
         let open = model.folder_open(t.id);
         p.fill_rounded(f.fold, 3.0, &faderframe_ui_canvas::Paint::Solid(c.well));
-        let (cx, cy, r) = (f.fold.center().x, f.fold.center().y, 5.0);
-        let tri = if open {
-            [
-                Point::new(cx - r, cy - r * 0.55),
-                Point::new(cx + r, cy - r * 0.55),
-                Point::new(cx, cy + r * 0.65),
-            ]
-        } else {
-            [
-                Point::new(cx - r * 0.55, cy - r),
-                Point::new(cx - r * 0.55, cy + r),
-                Point::new(cx + r * 0.65, cy),
-            ]
-        };
+        let tri = fold_triangle(f.fold.center(), 5.0, open);
         let mut path = faderframe_ui_canvas::Path::new();
         path.move_to(tri[0]).line_to(tri[1]).line_to(tri[2]).close();
         p.fill_path(&path, color.lighten(0.2));
         controls::led_button(p, f.mute, "M", t.mute, c.led.mute, th);
         controls::led_button(p, f.solo, "S", t.solo, c.led.solo, th);
+        // Its Group switch, lit in the folder's colour.
+        controls::led_button(p, f.group, "G", t.folder_group, color.lighten(0.15), th);
         let n = model
             .folder_contents(t.id)
             .iter()
-            .filter(|id| {
-                model
-                    .project()
-                    .track(**id)
-                    .is_some_and(|x| x.kind != TrackKind::Folder)
-            })
+            .filter(|id| model.project().track(**id).is_some_and(|x| !x.is_folder()))
             .count();
         let style = faderframe_ui_canvas::TextStyle::new(th.fonts.tiny, c.panel_label).center();
         p.text(
@@ -997,7 +1091,14 @@ impl MixerView {
             controls::engraved(p, "MASTER", l.header, th, Align::Center);
         } else {
             controls::engraved(p, &format!("{number}"), l.header, th, Align::Start);
-            controls::engraved(p, kind_tag(t.kind), l.header, th, Align::End);
+            controls::engraved(p, strip_tag(t, l.header.w), l.header, th, Align::End);
+            if t.is_folder_bus() {
+                // It holds tracks: its triangle opens and closes it.
+                let tri = fold_triangle(folder_bus_fold(&l).center(), 3.5, model.folder_open(t.id));
+                let mut path = faderframe_ui_canvas::Path::new();
+                path.move_to(tri[0]).line_to(tri[1]).line_to(tri[2]).close();
+                p.fill_path(&path, color.lighten(0.2));
+            }
         }
         if let Some(tags) = l.tags {
             self.paint_tags(p, tags, t, model);
@@ -1219,6 +1320,9 @@ impl MixerView {
             );
         } else if t.kind.has_clips() {
             controls::led_button(p, l.record, "R", t.record_arm, c.led.record, th);
+        } else if t.is_folder_bus() && sets == Sets::Main {
+            // A folder bus: its Group switch (it records nothing itself).
+            controls::led_button(p, l.record, "G", t.folder_group, color.lighten(0.15), th);
         } else {
             controls::led_button(p, l.record, "·", false, c.led.record, th);
         }
@@ -1289,7 +1393,11 @@ impl MixerView {
         }
 
         let out = match t.output {
-            OutputRouting::Master => "→ Master".to_string(),
+            // The default: the folder bus it is in, else the master.
+            OutputRouting::Master => model
+                .project()
+                .folder_bus_of(t)
+                .map_or_else(|| "→ Master".to_string(), |f| format!("→ {}", f.name)),
             OutputRouting::Track { track } => model
                 .project()
                 .track(track)
@@ -1703,7 +1811,7 @@ impl MixerView {
         }
     }
 
-    fn output_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn output_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let p = model.project();
         let mut items = Vec::new();
         let set = |output| {
@@ -1713,18 +1821,40 @@ impl MixerView {
             })
         };
         if t.kind != TrackKind::Master {
-            items.push(
-                MenuItem::new("Master", set(OutputRouting::Master))
+            let master = p.master_id();
+            let named_master = master.map(|m| OutputRouting::Track { track: m });
+            let folder_bus = p.folder_bus_of(t);
+            if let Some(f) = folder_bus {
+                // In a folder bus the default is the bus; the master is
+                // named to go past it.
+                items.push(
+                    MenuItem::new(
+                        format!("{} (Folder Bus)", f.name),
+                        set(OutputRouting::Master),
+                    )
                     .checked(t.output == OutputRouting::Master),
-            );
+                );
+                if let Some(out) =
+                    named_master.filter(|_| master.is_some_and(|m| !p.would_cycle(t.id, m)))
+                {
+                    items.push(MenuItem::new("Master", set(out)).checked(t.output == out));
+                }
+            } else {
+                items.push(
+                    MenuItem::new("Master", set(OutputRouting::Master)).checked(
+                        t.output == OutputRouting::Master || Some(t.output) == named_master,
+                    ),
+                );
+            }
             for dst in p.tracks.iter().filter(|d| {
                 matches!(d.kind, TrackKind::Bus | TrackKind::Aux)
                     && d.id != t.id
+                    && Some(d.id) != folder_bus.map(|f| f.id)
                     && !p.would_cycle(t.id, d.id)
             }) {
                 let out = OutputRouting::Track { track: dst.id };
                 items.push(
-                    MenuItem::new(format!("{} ({})", dst.name, dst.kind.label()), set(out))
+                    MenuItem::new(format!("{} ({})", dst.name, dst.kind_label()), set(out))
                         .checked(t.output == out),
                 );
             }
@@ -1796,7 +1926,7 @@ impl MixerView {
     }
 
     /// MIDI learn for any mapping target (and removing its mappings).
-    fn learn_target_menu(
+    pub fn learn_target_menu(
         model: &Session,
         target: faderframe_project::MappingTarget,
         at: Point,
@@ -1809,7 +1939,7 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn input_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let notes = matches!(t.kind, TrackKind::Instrument | TrackKind::Midi);
         let choices = if notes {
             model.midi_input_choices(t.id)
@@ -1860,7 +1990,7 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn insert_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
+    pub fn insert_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
         let mut items = Vec::new();
         match t.inserts.get(slot) {
             Some(s) => {
@@ -2099,12 +2229,13 @@ impl MixerView {
                         },
                     },
                 ));
+                let available = model.available_plugins();
+                // The user's favorites (and their categories) first.
+                if let Some(item) = Self::favorites_menu(model, &available, t, slot) {
+                    items.push(item);
+                }
                 // Every effect: built-ins first, then hosted plugins by vendor.
-                let mut effects: Vec<_> = model
-                    .available_plugins()
-                    .into_iter()
-                    .filter(|p| !p.instrument)
-                    .collect();
+                let mut effects: Vec<_> = available.into_iter().filter(|p| !p.instrument).collect();
                 effects.sort_by(|a, b| {
                     let builtin = |p: &faderframe_session::AvailablePlugin| {
                         p.plugin.format != faderframe_project::PluginFormat::Builtin
@@ -2149,7 +2280,40 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn send_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
+    /// An empty insert slot's "Favorites" submenu: the favorite effects by
+    /// name, then a submenu per category; missing ones shown, disabled.
+    fn favorites_menu(
+        model: &Session,
+        available: &[faderframe_session::AvailablePlugin],
+        t: &Track,
+        slot: usize,
+    ) -> Option<MenuItem<Action>> {
+        use faderframe_session::plugin_favorites::MenuEntry;
+        let menu = model.plugin_favorites().menu(available, |p| !p.instrument);
+        if menu.is_empty() {
+            return None;
+        }
+        let item = |e: &MenuEntry| match e {
+            MenuEntry::Available(p) => MenuItem::new(
+                p.plugin.name.clone(),
+                Action::InsertPlugin {
+                    track: t.id,
+                    index: slot,
+                    plugin: p.plugin.clone(),
+                },
+            ),
+            MenuEntry::Missing(f) => MenuItem::disabled(format!("{} (missing)", f.name)),
+        };
+        let mut children: Vec<MenuItem<Action>> = menu.all.iter().map(item).collect();
+        for (i, (name, members)) in menu.categories.iter().enumerate() {
+            let mut sub = MenuItem::submenu(name.clone(), members.iter().map(item).collect());
+            sub.separator_before = i == 0;
+            children.push(sub);
+        }
+        Some(MenuItem::submenu("Favorites", children))
+    }
+
+    pub fn send_menu(model: &Session, t: &Track, slot: usize, at: Point) -> HostRequest<Action> {
         let p = model.project();
         let mut items = Vec::new();
         match t.sends.get(slot) {
@@ -2252,7 +2416,7 @@ impl MixerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
+    pub fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let mut items: Vec<MenuItem<Action>> = model
             .duplicate_menu(t.id)
             .into_iter()
@@ -2643,7 +2807,7 @@ impl MixerView {
         let x = pos.x.clamp(left, left + self.viewport_w(size)) - left + self.scroll_x;
         if let Some(i) = (0..tracks.len()).find(|&i| {
             let (a, w) = (self.offset(i), self.width(i));
-            tracks[i].kind == TrackKind::Folder && x >= a + w * 0.2 && x < a + w * 0.8
+            tracks[i].is_folder() && x >= a + w * 0.2 && x < a + w * 0.8
         }) && !block(tracks[i])
             && moving.folder != Some(tracks[i].id)
         {
@@ -3081,6 +3245,14 @@ impl MixerView {
             }
             Hit::Meter(_) => cx.emit(Action::ResetClipIndicators),
             Hit::Fold(id) => cx.emit(Action::ToggleFolder(id)),
+            Hit::FolderGroup(id) => {
+                if let Some(t) = Self::track(model, id).filter(|t| t.is_folder()) {
+                    cx.emit(Action::SetFolderGroup {
+                        folder: id,
+                        on: !t.folder_group,
+                    });
+                }
+            }
             Hit::Reduction(_) => {}
         }
         true
@@ -3419,6 +3591,15 @@ impl MixerView {
                 name(id)
             ),
             Hit::Solo(id) => format!("Solo {}", name(id)),
+            Hit::FolderGroup(id) => {
+                let t = Self::track(model, id)?;
+                format!(
+                    "Group {}: {} · When on, arming, selecting and editing clips or a range on one \
+                     of its tracks reach the others",
+                    t.name,
+                    if t.folder_group { "on" } else { "off" }
+                )
+            }
             Hit::Record(id) => format!("Record-arm {}", name(id)),
             Hit::MonoCheck => "Mono check: hear the mix summed to mono (listening only, renders stay as mixed) · Right-click the strip: Listen (headphones)".into(),
             Hit::Phase(_) => "Invert polarity".into(),
@@ -3556,7 +3737,7 @@ impl MixerView {
             }
         }
         if !self.hide_master
-            && let Some(m) = model.project().master()
+            && let Some(m) = self.pinned(model)
         {
             let r = self.master_rect(body);
             out.push((m.id, r.x, r.w));
@@ -3586,7 +3767,7 @@ impl MixerView {
         let reference = model.vu_reference();
         let viewport = Rect::new(self.cheek(), 0.0, self.viewport_w(body), h);
         for (track, x, w) in self.bridge_columns(body, model) {
-            let master = model.project().master().is_some_and(|m| m.id == track);
+            let master = self.pinned(model).is_some_and(|m| m.id == track);
             if !master {
                 p.push_clip(viewport);
             }
@@ -3634,7 +3815,7 @@ impl MixerView {
         let mut shown = std::mem::take(&mut self.reduction);
         for t in Self::channel_tracks(model)
             .into_iter()
-            .chain(model.project().master())
+            .chain(self.pinned(model))
         {
             if let Some(now) = model.gain_reduction(t.id) {
                 let was = shown.get(&t.id).copied().unwrap_or(0.0);
@@ -3761,10 +3942,14 @@ impl MixerView {
             p.fill(gap, theme.ui.border);
             p.shadow(master, 0.0, Color::rgba(0.0, 0.0, 0.0, 0.6), -2.0, 0.0, 6.0);
         }
-        if let Some(m) = model.project().master()
+        if let Some(m) = self.pinned(model)
             && !self.hide_master
         {
-            self.paint_strip(p, master, m, 0, model);
+            if m.kind == TrackKind::Folder {
+                self.paint_folder_strip(p, master, m, model);
+            } else {
+                self.paint_strip(p, master, m, Self::number_of(model, m), model);
+            }
             self.paint_cue_mark(p, master, m, model);
         }
         if cheek > 0.0 {
@@ -4132,7 +4317,16 @@ impl CanvasView<Session, Action> for MixerView {
     }
 
     fn accessible_name(&self) -> Option<String> {
-        Some(if self.master_only { "Master" } else { "Mixer" }.into())
+        Some(
+            if self.single {
+                "Channel"
+            } else if self.master_only {
+                "Master"
+            } else {
+                "Mixer"
+            }
+            .into(),
+        )
     }
 
     fn set_theme(&mut self, theme: &Theme) {

@@ -735,11 +735,17 @@ impl ArrangerView {
             } => {
                 if *moved || pos.distance(*origin) >= DRAG_THRESHOLD {
                     *moved = true;
-                    marker.position = self.snap(t_at, model, mods);
+                    let skip = faderframe_session::SnapSkip {
+                        marker: Some(marker.id),
+                        ..Default::default()
+                    };
+                    marker.position = self.snap_point(t_at, model, mods, &skip);
                     cx.set_cursor(Cursor::Grabbing);
                 }
             }
-            GlobalDrag::NewSection { to, .. } => *to = self.snap(t_at, model, mods),
+            GlobalDrag::NewSection { to, .. } => {
+                *to = self.snap_point(t_at, model, mods, &Default::default());
+            }
             GlobalDrag::NewChord { .. }
             | GlobalDrag::Chord { .. }
             | GlobalDrag::NewKey { .. }
@@ -769,26 +775,34 @@ impl ArrangerView {
                         *to = (*copy || drop < orig.start || drop > orig.end).then_some(drop);
                         cx.set_cursor(Cursor::Grabbing);
                     }
+                    let (orig_start, orig_end) = (orig.start, orig.end);
+                    let skip = faderframe_session::SnapSkip {
+                        section: Some(section.id),
+                        ..Default::default()
+                    };
                     match part {
                         SectionPart::Body => {
-                            let len = orig.end - orig.start;
-                            let start = self.snap(
-                                (orig.start + (self.time_at(pos.x) - *grab)).max(MusicalTime::ZERO),
-                                model,
-                                mods,
-                            );
+                            let len = orig_end - orig_start;
+                            let raw =
+                                (orig_start + (self.time_at(pos.x) - *grab)).max(MusicalTime::ZERO);
+                            // Either edge onto an object near it, else the grid.
+                            let start =
+                                match self.object_shift(&[raw, raw + len], model, mods, &skip) {
+                                    Some(shift) => (raw + shift).max(MusicalTime::ZERO),
+                                    None => self.snap(raw, model, mods),
+                                };
                             section.start = start;
                             section.end = start + len;
                         }
                         SectionPart::Start => {
                             section.start = self
-                                .snap(t_at, model, mods)
-                                .min(orig.end - MusicalTime::from_ticks(1));
+                                .snap_point(t_at, model, mods, &skip)
+                                .min(orig_end - MusicalTime::from_ticks(1));
                         }
                         SectionPart::End => {
                             section.end = self
-                                .snap(t_at, model, mods)
-                                .max(orig.start + MusicalTime::from_ticks(1));
+                                .snap_point(t_at, model, mods, &skip)
+                                .max(orig_start + MusicalTime::from_ticks(1));
                         }
                     }
                 }
@@ -823,7 +837,9 @@ impl ArrangerView {
                             .clamp(TempoMap::MIN_BPM, TempoMap::MAX_BPM);
                         }
                     }
-                    Some(false) => *position = self.snap(t_at, model, mods),
+                    Some(false) => {
+                        *position = self.snap_point(t_at, model, mods, &Default::default());
+                    }
                     None => {}
                 }
                 cx.set_cursor(match *axis {
@@ -1035,6 +1051,10 @@ impl ArrangerView {
                 items.push(MenuItem::new(
                     "Remove Section (Keep Content)",
                     Action::Edit(Command::RemoveSection { section: id }),
+                ));
+                items.extend(crate::scratch::material_items(
+                    model,
+                    faderframe_session::scratch::PadMaterial::Section(id),
                 ));
                 HostRequest::ContextMenu { at: pos, items }
             }

@@ -3,6 +3,8 @@
 //! `Project::folder_order`), it opens and closes (a view setting, kept
 //! with the layout), and its mute and solo reach what it holds. Removing
 //! a folder keeps its tracks: they move up a level, in the same undo step.
+//! A folder can be a bus ([`Session::set_folder_bus`]): then it sums what
+//! it holds through a strip of its own.
 
 use crate::{Action, Result, SelectMode, Session, SessionError};
 use faderframe_core::TrackId;
@@ -152,12 +154,7 @@ impl Session {
                     .position(|t| t.kind == TrackKind::Master)
                     .unwrap_or(p.tracks.len())
             });
-        let n = p
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Folder)
-            .count()
-            + 1;
+        let n = p.tracks.iter().filter(|t| t.is_folder()).count() + 1;
         let color = moved
             .first()
             .and_then(|t| p.track(*t))
@@ -191,7 +188,7 @@ impl Session {
     ) -> Result<()> {
         let p = &self.project;
         if let Some(f) = folder
-            && !p.track(f).is_some_and(|t| t.kind == TrackKind::Folder)
+            && !p.track(f).is_some_and(Track::is_folder)
         {
             return Err(SessionError::Other("that track is not a folder".into()));
         }
@@ -252,7 +249,7 @@ impl Session {
         for f in p
             .folder_order()
             .into_iter()
-            .filter(|f| f.kind == TrackKind::Folder && f.id != track)
+            .filter(|f| f.is_folder() && f.id != track)
             .filter(|f| !p.in_folder(f, track) && t.folder != Some(f.id))
         {
             out.push((
@@ -277,45 +274,53 @@ impl Session {
         out
     }
 
-    /// Sum a folder's tracks in a new bus inside it: the tracks that went
-    /// to the master go to the bus instead.
-    pub(crate) fn sum_folder(&mut self, folder: TrackId) -> Result<TrackId> {
+    /// Make `folder` a bus (`on`) or a plain folder again, one undo step.
+    /// A folder bus sums what it holds: every track in it (in plain
+    /// folders inside it too, not in folder buses inside it) whose output
+    /// is the default plays through its strip — fader, pan, devices, sends
+    /// — and on to where it goes (the folder bus it is in, else the
+    /// master); explicit routings elsewhere stay. Made a bus, it takes the
+    /// channel format of where it goes (its tracks pan into the format
+    /// they panned into before). A plain folder again, it keeps its
+    /// settings for the next time.
+    pub(crate) fn set_folder_bus(&mut self, folder: TrackId, on: bool) -> Result<()> {
         let p = &self.project;
         let f = p
             .track(folder)
-            .filter(|t| t.kind == TrackKind::Folder)
+            .filter(|t| t.is_folder())
             .ok_or_else(|| SessionError::Other("that track is not a folder".into()))?;
-        let name = format!("{} Bus", f.name);
-        let color = f.color;
-        let inside: Vec<TrackId> = self
-            .folder_contents(folder)
-            .into_iter()
-            .filter(|id| {
-                p.track(*id).is_some_and(|t| {
-                    t.kind.has_audio()
-                        && t.kind != TrackKind::Master
-                        && t.output == OutputRouting::Master
-                })
-            })
-            .collect();
-        let index = p
-            .tracks
-            .iter()
-            .position(|t| t.kind == TrackKind::Master)
-            .unwrap_or(p.tracks.len());
-        let id: TrackId = self.project.ids.allocate();
-        let mut bus = Track::new(id, TrackKind::Bus, name, color);
-        bus.folder = Some(folder);
-        let mut commands = vec![Command::AddTrack {
-            track: Box::new(bus),
-            index,
+        if f.is_folder_bus() == on {
+            return Ok(());
+        }
+        let mut commands = vec![Command::SetFolderBus {
+            track: folder,
+            on,
+            output: if on {
+                OutputRouting::Master
+            } else {
+                OutputRouting::None
+            },
         }];
-        commands.extend(inside.into_iter().map(|track| Command::SetTrackOutput {
-            track,
-            output: OutputRouting::Track { track: id },
-        }));
-        self.batch("Sum Folder into a Bus", commands)?;
-        Ok(id)
+        if on {
+            let dest = p
+                .folder_chain(f)
+                .into_iter()
+                .find(|x| x.is_folder_bus())
+                .or_else(|| p.master())
+                .map(|d| d.layout);
+            if let Some(layout) = dest.filter(|l| *l != f.layout) {
+                commands.push(Command::SetTrackLayout {
+                    track: folder,
+                    layout,
+                });
+            }
+        }
+        let label = if on {
+            "Make Folder a Bus"
+        } else {
+            "Make Folder Plain"
+        };
+        self.batch(label, commands)
     }
 
     /// Removing a folder keeps what it holds: its tracks move up a level
@@ -338,7 +343,7 @@ impl Session {
         let folders: HashSet<TrackId> = gone
             .iter()
             .copied()
-            .filter(|t| p.track(*t).is_some_and(|t| t.kind == TrackKind::Folder))
+            .filter(|t| p.track(*t).is_some_and(Track::is_folder))
             .collect();
         if folders.is_empty() {
             return cmd;

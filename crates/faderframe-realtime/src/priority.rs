@@ -22,7 +22,10 @@
 //! ([`note_audio_thread`], one system call every few thousand callbacks);
 //! helpers re-apply theirs when it changes (an atomic load per loop).
 //! macOS: CoreAudio's thread is realtime already; helpers keep the system's
-//! choice.
+//! choice. Linux without `RLIMIT_RTPRIO`: a thread asks RealtimeKit through
+//! the process's broker (`rtkit`) and carries on — never waits for it —;
+//! disk streaming and the recording writer do not ask (rtkit's realtime
+//! threads are few).
 
 use crate::pool::sched;
 use std::cell::Cell;
@@ -72,14 +75,46 @@ thread_local! {
 pub const OWN_AUDIO_PRIORITY: i32 = 80;
 
 /// On the audio callback's thread (once, at stream start: a system call):
-/// make it realtime if it is not already. Returns whether it is now.
+/// make it realtime if it is not already. Returns whether it is now —
+/// where RealtimeKit has to grant it, it is asked for (never waited for:
+/// [`crate::rtkit`]) and published for the helpers once granted.
 pub fn make_audio_thread_realtime() -> bool {
-    let ok = imp::make_audio_thread_realtime();
-    if !ok {
+    let applied = imp::make_audio_thread_realtime();
+    if applied == Applied::Failed {
         FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     note_audio_thread();
-    ok
+    applied == Applied::Now
+}
+
+/// Start what grants realtime where the process may not take it itself
+/// (Linux: RealtimeKit's broker thread, `rtkit::start`); a control
+/// thread, at start-up — later calls do nothing. Elsewhere nothing.
+pub fn start_requests() {
+    #[cfg(target_os = "linux")]
+    crate::rtkit::start();
+}
+
+/// How a thread's scheduling was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// It has it now.
+    Now,
+    /// Asked for (RealtimeKit grants it through the broker, or not).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Asked,
+    /// It could not be had.
+    Failed,
+}
+
+/// The audio thread was made realtime from outside (RealtimeKit, asked
+/// by the broker): its scheduling published as [`note_audio_thread`]
+/// would, so the helpers follow without waiting for its next note.
+#[cfg(target_os = "linux")]
+pub(crate) fn audio_thread_granted(packed: u64) {
+    if crate::pool::sched::is_realtime(packed) && AUDIO.swap(packed, Ordering::Relaxed) != packed {
+        GENERATION.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// On the audio thread: publish its scheduling (a system call — call it
@@ -91,10 +126,29 @@ pub fn note_audio_thread() {
     }
 }
 
-/// How often the audio thread's scheduling changed (pools re-read their
-/// caller's when it does).
+/// How often the audio thread's scheduling changed (helpers follow it when
+/// it does).
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
+}
+
+/// Threads made realtime from outside (RealtimeKit's grants, asked by the
+/// broker): a pool's caller may be one.
+static GRANTS: AtomicU64 = AtomicU64::new(0);
+
+/// A grant came (the broker; one atomic).
+#[cfg(target_os = "linux")]
+pub(crate) fn note_grant() {
+    GRANTS.fetch_add(1, Ordering::Release);
+}
+
+/// Changes whenever the audio thread's scheduling changes or a thread was
+/// made realtime from outside: pools re-read their caller's scheduling
+/// then (a render-ahead tier granted after its pool's first run).
+pub(crate) fn scheduling_epoch() -> u64 {
+    GENERATION
+        .load(Ordering::Acquire)
+        .wrapping_add(GRANTS.load(Ordering::Acquire))
 }
 
 /// Whether the audio thread is known to run realtime.
@@ -115,7 +169,7 @@ pub fn follow_audio(helper: Helper) {
     // The realtime time limit may have come with the audio thread (set by
     // RealtimeKit's users: PipeWire's client, ours).
     note_rttime_limit();
-    if !imp::follow(AUDIO.load(Ordering::Relaxed), helper) {
+    if imp::follow(AUDIO.load(Ordering::Relaxed), helper) == Applied::Failed {
         FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -135,12 +189,24 @@ thread_local! {
 
 /// Read the process's realtime time limit (`RLIMIT_RTTIME`: a realtime
 /// thread running that long without blocking gets `SIGXCPU`, at the hard
-/// limit `SIGKILL`) and pace breaths by it ([`breathe`]). Helpers do it
-/// when the audio thread's scheduling changes; call it after setting the
-/// limit yourself.
+/// limit the process `SIGKILL`), keep a margin under it (Linux: the soft
+/// limit below the hard one and `SIGXCPU` caught — the thread that ran too
+/// long returns to normal scheduling instead of the process being killed;
+/// see `rttime`) and pace breaths by it ([`breathe`]). Helpers do it when
+/// the audio thread's scheduling changes; call it at start-up, after
+/// opening an audio stream (PipeWire's client sets the limit again with
+/// every context: soft = hard) and now and then from a control thread
+/// (a system call or two).
 pub fn note_rttime_limit() {
-    let us = imp::rttime_soft_limit_us().map_or(0, |soft| (soft / 4).max(1_000));
+    let us = imp::guard_rttime().map_or(0, |soft| (soft / 4).max(1_000));
     BREATHE_US.store(us, Ordering::Relaxed);
+}
+
+/// Threads of this process returned to normal scheduling because they ran
+/// realtime past the time limit without sleeping (Linux; counted with
+/// [`priority_failures`] too), and the system's id of the last one.
+pub fn rttime_demotions() -> (u64, i32) {
+    imp::rttime_demotions()
 }
 
 /// Whether this thread is due a breath (under a realtime time limit, a
@@ -225,20 +291,16 @@ impl CpuWakeLatency {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::Helper;
+    use super::{Applied, Helper};
     use crate::pool::sched;
 
-    /// The `RLIMIT_RTTIME` soft limit (µs), if there is one.
-    pub fn rttime_soft_limit_us() -> Option<u64> {
-        // SAFETY: getrlimit fills the struct it is given.
-        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid pointer to an rlimit.
-        if unsafe { libc::getrlimit(libc::RLIMIT_RTTIME, &mut lim) } != 0
-            || lim.rlim_cur == libc::RLIM_INFINITY
-        {
-            return None;
-        }
-        Some(lim.rlim_cur as u64)
+    /// The `RLIMIT_RTTIME` soft limit kept (µs), if there is a limit.
+    pub fn guard_rttime() -> Option<u64> {
+        crate::rttime::guard()
+    }
+
+    pub fn rttime_demotions() -> (u64, i32) {
+        crate::rttime::demotions()
     }
 
     fn rtprio_limit() -> i32 {
@@ -256,47 +318,74 @@ mod imp {
     }
 
     /// The calling thread's scheduling; a realtime one RealtimeKit grants
-    /// where the process may not take it itself.
-    fn set(policy: i32, priority: i32) -> bool {
+    /// where the process may not take it itself, asked for through the
+    /// broker when `ask` (never waited for).
+    fn set(policy: i32, priority: i32, ask: bool) -> Applied {
         let param = libc::sched_param {
             sched_priority: priority,
         };
         // SAFETY: sets the calling thread's scheduling with a valid param.
-        let done =
-            unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) == 0 };
-        done || (sched::is_realtime(sched::pack(policy, priority))
-            && crate::rtkit::make_thread_realtime(priority))
+        if unsafe { libc::pthread_setschedparam(libc::pthread_self(), policy, &param) == 0 } {
+            Applied::Now
+        } else if ask
+            && sched::is_realtime(sched::pack(policy, priority))
+            && crate::rtkit::request_for_this_thread(priority, false)
+        {
+            Applied::Asked
+        } else {
+            Applied::Failed
+        }
     }
 
-    pub fn make_audio_thread_realtime() -> bool {
+    pub fn make_audio_thread_realtime() -> Applied {
         if sched::is_realtime(sched::current().0) {
-            return true;
+            return Applied::Now;
         }
         let policy = libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK;
         let priority = super::OWN_AUDIO_PRIORITY.min(rtprio_limit());
         if priority > 0 {
-            set(policy, priority)
+            set(policy, priority, true)
+        } else if crate::rtkit::request_for_this_thread(super::OWN_AUDIO_PRIORITY, true) {
+            // No realtime of its own: RealtimeKit's, asked by the broker
+            // (and published for the helpers once granted).
+            Applied::Asked
         } else {
-            // No realtime of its own: RealtimeKit's.
-            crate::rtkit::make_thread_realtime(super::OWN_AUDIO_PRIORITY)
+            Applied::Failed
         }
     }
 
-    pub fn follow(audio: u64, helper: Helper) -> bool {
+    pub fn follow(audio: u64, helper: Helper) -> Applied {
         if !sched::is_realtime(audio) {
-            // Back to normal (the audio thread is not realtime, or not yet).
-            return !sched::is_realtime(sched::current().0) || set(libc::SCHED_OTHER, 0);
+            // Back to normal (the audio thread is not realtime, or not yet),
+            // the reset-on-fork flag kept: an unprivileged thread may not
+            // clear it, and rtkit's threads have it.
+            return if sched::is_realtime(sched::current().0) {
+                set(libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK, 0, false)
+            } else {
+                Applied::Now
+            };
         }
         let audio_priority = (audio - 1) as u32 as i32;
         let priority = (audio_priority - helper.below()).max(1);
-        // Threads (and processes) these start are not realtime.
-        set(libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK, priority)
+        // Threads (and processes) these start are not realtime. Disk
+        // streaming and the recording writer, with seconds of slack, do
+        // not use up RealtimeKit's few realtime threads (it grants a user
+        // 25, PipeWire's among them): realtime where the process may take
+        // it itself, else normal.
+        match set(
+            libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK,
+            priority,
+            helper != Helper::Feeder,
+        ) {
+            Applied::Failed if helper == Helper::Feeder => Applied::Now,
+            applied => applied,
+        }
     }
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::Helper;
+    use super::{Applied, Helper};
     use windows_sys::Win32::System::Threading::{
         AVRT_PRIORITY, AVRT_PRIORITY_CRITICAL, AVRT_PRIORITY_HIGH, AVRT_PRIORITY_LOW,
         AVRT_PRIORITY_NORMAL, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority,
@@ -316,26 +405,35 @@ mod imp {
         0,
     ];
 
-    fn join(priority: AVRT_PRIORITY) -> bool {
+    fn join(priority: AVRT_PRIORITY) -> Applied {
         let mut index = 0u32;
         // SAFETY: a NUL-terminated task name and a valid out pointer; the
         // registration lasts for the thread's life.
-        unsafe {
+        let joined = unsafe {
             let task = AvSetMmThreadCharacteristicsW(TASK.as_ptr(), &mut index);
             !task.is_null() && AvSetMmThreadPriority(task, priority) != 0
+        };
+        if joined {
+            Applied::Now
+        } else {
+            Applied::Failed
         }
     }
 
     /// No realtime time limit here.
-    pub fn rttime_soft_limit_us() -> Option<u64> {
+    pub fn guard_rttime() -> Option<u64> {
         None
     }
 
-    pub fn make_audio_thread_realtime() -> bool {
+    pub fn rttime_demotions() -> (u64, i32) {
+        (0, 0)
+    }
+
+    pub fn make_audio_thread_realtime() -> Applied {
         join(AVRT_PRIORITY_CRITICAL)
     }
 
-    pub fn follow(_audio: u64, helper: Helper) -> bool {
+    pub fn follow(_audio: u64, helper: Helper) -> Applied {
         join(match helper {
             Helper::Near => AVRT_PRIORITY_HIGH,
             Helper::Ahead => AVRT_PRIORITY_NORMAL,
@@ -346,21 +444,29 @@ mod imp {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 mod imp {
-    use super::Helper;
+    use super::{Applied, Helper};
     use crate::pool::sched;
 
     /// CoreAudio's IO thread has its time-constraint policy already.
     /// No realtime time limit here.
-    pub fn rttime_soft_limit_us() -> Option<u64> {
+    pub fn guard_rttime() -> Option<u64> {
         None
     }
 
-    pub fn make_audio_thread_realtime() -> bool {
-        sched::is_realtime(sched::current().0)
+    pub fn rttime_demotions() -> (u64, i32) {
+        (0, 0)
     }
 
-    pub fn follow(_audio: u64, _helper: Helper) -> bool {
-        true
+    pub fn make_audio_thread_realtime() -> Applied {
+        if sched::is_realtime(sched::current().0) {
+            Applied::Now
+        } else {
+            Applied::Failed
+        }
+    }
+
+    pub fn follow(_audio: u64, _helper: Helper) -> Applied {
+        Applied::Now
     }
 }
 
@@ -369,11 +475,11 @@ mod tests {
     use super::*;
 
     fn current() -> (i32, i32) {
-        let mut policy = 0;
-        // SAFETY: plain query with valid out pointers.
-        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-        unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
-        (policy & !libc::SCHED_RESET_ON_FORK, param.sched_priority)
+        let v = sched::current().0 - 1;
+        (
+            (v >> 32) as i32 & !libc::SCHED_RESET_ON_FORK,
+            v as u32 as i32,
+        )
     }
 
     /// With realtime permission (`RLIMIT_RTPRIO`): an audio thread of our

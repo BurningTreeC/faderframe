@@ -227,6 +227,9 @@ enum Done {
     },
     Exported {
         out: PathBuf,
+        /// The muxed file beside it, to be moved into place.
+        file: crate::render::files::StagedFile,
+        overwrite: crate::render::Overwrite,
     },
     SyncTest {
         video: PathBuf,
@@ -951,9 +954,16 @@ impl crate::Session {
                 );
                 Ok(())
             }
-            Done::Exported { out } => {
-                self.notify(NoticeLevel::Info, format!("wrote {}", out.display()));
-                Ok(())
+            Done::Exported {
+                out,
+                file,
+                overwrite,
+            } => {
+                let staged = crate::render::Staged::new(vec![crate::render::files::written(file)]);
+                self.commit_export("Movie", staged, &overwrite, move |s, _| {
+                    s.notify(NoticeLevel::Info, format!("wrote {}", out.display()));
+                    Ok(())
+                })
             }
             Done::SyncTest { video, sound } => {
                 self.import_video(video, false);
@@ -1480,7 +1490,6 @@ impl crate::Session {
         let zero = c.start - ns_to_samples(c.offset, rate);
         let seg_start = zero + ns_to_samples(k0, rate);
         let end = zero + ns_to_samples(span_end, rate);
-        let lead = (-seg_start).max(0) as usize;
         let from = seg_start.max(0);
         if end <= from {
             return Err(SessionError::Other(
@@ -1495,6 +1504,42 @@ impl crate::Session {
         };
         let start = self.engine.samples_to_musical(&self.project, from);
         let stop = self.engine.samples_to_musical(&self.project, end);
+        let movie = Movie {
+            path,
+            container,
+            source: source.path,
+            options,
+            span: (start, stop),
+            lead: (-seg_start).max(0) as usize,
+            frames: (end - from) as usize,
+        };
+        // The user's file: an existing one is asked about first.
+        crate::exports::make_parent(&movie.path)?;
+        let dests = vec![movie.path.clone()];
+        crate::exports::files_only(&dests)?;
+        self.export_to("Movie", dests, move |s, overwrite| {
+            s.write_movie(movie, overwrite)
+        })
+    }
+
+    /// Render the mix for `movie`'s span and mux it with the picture into
+    /// a file beside its destination (a video job); the file moves into
+    /// place as `overwrite` allows when the job is done.
+    fn write_movie(&mut self, movie: Movie, overwrite: crate::render::Overwrite) -> Result<()> {
+        let Movie {
+            path,
+            container,
+            source,
+            options,
+            span: (start, stop),
+            lead,
+            frames,
+        } = movie;
+        let rate = self.project.sample_rate;
+        // Claimed now: a folder that cannot be written to fails before
+        // anything is rendered.
+        let file = crate::render::files::StagedFile::new(&path)
+            .map_err(|e| SessionError::Other(format!("movie: {e}")))?;
         std::fs::create_dir_all(cache_dir()).map_err(|e| SessionError::Other(e.to_string()))?;
         let wav = cache_dir().join(format!("export-{}.wav", std::process::id()));
         let copy = self.render_copy();
@@ -1507,6 +1552,8 @@ impl crate::Session {
             format: WavFormat::Float32,
             dither: Dither::Off,
             report: false,
+            // Its own file (a name the session chose): no one to ask.
+            overwrite: crate::render::Overwrite::Always,
             ..RenderSettings::defaults_for(&copy, wav.clone())
         };
         let job =
@@ -1514,7 +1561,6 @@ impl crate::Session {
         let name = path
             .file_name()
             .map_or_else(|| "movie".into(), |n| n.to_string_lossy().into_owned());
-        let frames = (end - from) as usize;
         self.spawn_video(format!("Writing {name}"), None, move |share, cancel| {
             let progress = Arc::clone(&job.progress);
             let watch = std::thread::scope(|scope| {
@@ -1551,9 +1597,9 @@ impl crate::Session {
             faderframe_audio_files::write_wav_with(&wav, &data.channels, rate, format, dither)
                 .map_err(|e| e.to_string())?;
             let r = faderframe_video::mux::mux(
-                &source.path,
+                &source,
                 std::slice::from_ref(&wav),
-                &path,
+                file.temp(),
                 container,
                 options,
                 cancel,
@@ -1561,7 +1607,11 @@ impl crate::Session {
             );
             let _ = std::fs::remove_file(&wav);
             r.map_err(|e| e.to_string())?;
-            Ok(Done::Exported { out: path })
+            Ok(Done::Exported {
+                out: path,
+                file,
+                overwrite,
+            })
         });
         Ok(())
     }
@@ -1590,6 +1640,22 @@ impl crate::Session {
         }
         self.video.known.clear();
     }
+}
+
+/// A movie to write: the picture's file and the span it is cut at, the
+/// mix's span on the timeline, the silence before the project's start and
+/// the span's length (frames at the project rate).
+struct Movie {
+    path: PathBuf,
+    container: Container,
+    source: PathBuf,
+    options: faderframe_video::mux::MuxOptions,
+    span: (
+        faderframe_timeline::MusicalTime,
+        faderframe_timeline::MusicalTime,
+    ),
+    lead: usize,
+    frames: usize,
 }
 
 fn fps_label(fps: (u32, u32)) -> String {

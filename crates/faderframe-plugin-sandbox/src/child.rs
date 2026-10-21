@@ -53,6 +53,13 @@ pub fn run(registry: PluginRegistry) -> i32 {
         eprintln!("faderframe plugin helper: started without its connections");
         return 2;
     };
+    // The plugin's GUI may make X errors (a window gone under it): Xlib's
+    // default handler would end the helper for each.
+    crate::xlib::tolerate_x_errors(crate::xlib::Process::Helper);
+    // The audio thread takes FaderFrame's priority; where RealtimeKit has to
+    // grant it, a thread of this process asks for it (the audio thread
+    // only posts its request: its first block is not held up).
+    faderframe_realtime::priority::start_requests();
     let mut h = Helper {
         registry,
         instance: None,
@@ -636,6 +643,9 @@ fn audio_loop(
         last = seq;
         let s = h.sched.load(Ordering::Acquire);
         if s != 0 && s != sched {
+            // A system call — or, where RealtimeKit grants realtime, a
+            // request posted to this process's broker: never a wait in the
+            // block FaderFrame is waiting for.
             faderframe_realtime::apply_thread_scheduling(s, h.sched_extra.load(Ordering::Relaxed));
             sched = s;
         }

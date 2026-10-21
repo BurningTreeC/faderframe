@@ -12,6 +12,7 @@
 pub mod chroma;
 pub mod delivery;
 mod dynamics;
+pub mod levels;
 mod loudness;
 pub mod melody;
 pub mod pitch;
@@ -23,7 +24,9 @@ pub mod vinyl;
 pub mod voice;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
-pub use loudness::{Loudness, LoudnessMeter, integrated_weighted, speaker_weight};
+pub use loudness::{
+    Loudness, LoudnessMeter, WeightedLoudness, integrated_weighted, speaker_weight,
+};
 pub use spectrum::{FLOOR_DB, Spectrum, fft};
 
 use std::collections::VecDeque;

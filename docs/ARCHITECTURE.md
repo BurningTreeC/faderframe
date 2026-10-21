@@ -140,14 +140,22 @@ each:
   programs install `faderframe_realtime::memory::Prefaulting` as global
   allocator: every allocation is touched page by page where it is made.
   RT threads map their stacks at start (`prefault_stack`: DSP workers,
-  the PipeWire data loop's and cpal's first callback). Code and constants
+  the PipeWire data loop's and cpal's first callback) — at most the stack
+  the thread has left less 64 KiB (`stack_left`): callbacks run on threads
+  others made (CoreAudio's, an ASIO driver's), and mapping past a stack's
+  end is a crash. Code and constants
   fault in too, the first time a path runs (found as a fault in one run of
   five: the recorder's ring write, run first when recording starts, on a
   code page nothing had mapped yet): `prefault_code` maps the program's,
   the C/C++ runtimes', the audio libraries' (PipeWire and its SPA plugins,
   JACK, ALSA) and the plugin binaries' code and data — at start-up, after
   each graph build (plugins just loaded; only new mappings) and in the
-  sandbox helper — locked with the rest. `tests/realtime_faults.rs`
+  sandbox helper — locked with the rest. Only the kernel touches them
+  (`MADV_POPULATE_READ`/`WRITE`; before Linux 5.14 a `MADV_WILLNEED`
+  hint): the ranges come from a reading of `/proc/self/maps` that other
+  threads may have made stale, and the touch-every-page fallback once
+  taken on any `EINVAL` read ranges gone `PROT_NONE` (`SIGSEGV`;
+  `a_range_gone_inaccessible_is_not_touched`). `tests/realtime_faults.rs`
   counts the audio thread's page faults (`RUSAGE_THREAD`): playing, after a
   graph swap, recording — 0 (40 runs of 40).
 * **Nothing it needs is swapped out.** With an unlimited memory-lock limit
@@ -175,26 +183,110 @@ each:
   memory locked; no page faults on any audio-path thread. The UI and other work stay normal:
   at realtime they would compete with the audio. Threads that cannot get
   their priority are counted and the session says so once
-  (`priority_failures`); a realtime caller whose pool workers could not
-  follow it runs serially (a preempted worker would stall it). Where the
-  process may not take realtime itself (no `RLIMIT_RTPRIO`), a thread asks
-  RealtimeKit (`faderframe_realtime::rtkit`: `rtkit-daemon` on the system
-  bus, else the desktop portal's Realtime interface — the way out of a
-  Flatpak), through a small D-Bus client of its own (no library): `SCHED_RR`
-  at the priority wanted, capped by rtkit's maximum (20 by default). rtkit
+  (`priority_failures`); the Audio preferences' performance line says how
+  many DSP workers run without it. A realtime caller's cycles are for the
+  workers that run realtime: the others sit out until they do (`pool::
+  helpers_for`) — 0.22.0 ran such a caller serially as soon as one worker
+  had been refused. Never mixed: everyone in a cycle spins while it waits
+  for a job someone holds, and a normal worker preempted while it holds
+  one can wait behind the spinning realtime threads as long as the
+  scheduler leaves it there. End to end (FaderFrame under PipeWire,
+  realtime only through a stand-in rtkit, a machine busy with builds), 7
+  realtime + 8 normal workers all used had the data loop and the realtime
+  workers spin into the realtime time limit: 8 `SIGXCPU` demotions in the
+  first second (before playing), 16 in 25 s, nothing realtime left;
+  realtime workers only: none. (A synthetic
+  cycle — `cycles_with_workers_refused_realtime`, release, load average
+  70–110: 48 items of ~25 µs every 2.67 ms, serial p50 0.4–1.2 ms, 7
+  workers 0.07–0.2 ms; 64 items of ~250 µs with 16 busy threads in the
+  process, serial late in every cycle, 7 normal workers in 13–14 %, 3
+  realtime + 4 normal in none, 3 realtime alone p50 1.9–2.4 ms — did not
+  show the inversion.) Where the process may not take realtime itself (no
+  `RLIMIT_RTPRIO`), a thread asks RealtimeKit (`faderframe_realtime::rtkit`:
+  `rtkit-daemon` on the system bus, else the desktop portal's Realtime
+  interface — the way out of a Flatpak), through a small D-Bus client of
+  its own (no library): `SCHED_RR` at the priority wanted, capped by
+  rtkit's maximum (20 by default). The thread does not ask itself — it
+  posts its thread id and priority (`rtkit::request`: atomics and a futex
+  wake, no allocation; the audio thread may) and carries on; the process's
+  broker thread (`ff-rtkit`, `rtkit::start`, started at start-up, by every
+  `WorkerPool` and in the sandbox helper) asks *for* it
+  (`MakeThreadRealtime` takes any thread of the caller's process, as
+  PipeWire's own client asks from a thread of its own), over one
+  connection it keeps. Asking inline cost the round trips where they hurt:
+  a sandboxed plugin's audio thread on its first block (late, silent),
+  cpal's audio thread in its first callback, workers on their first job.
+  The broker keeps within rtkit's limits, which count every program of the
+  user (PipeWire's threads too): 25 + 1 requests in 20 s, 25 realtime
+  threads, 15 processes, answered `AccessDenied` ("Device or resource
+  busy") beyond — a refusal for now, which 0.22.0 took for an absent
+  service, failing every later request of the process. It sends at most 16
+  requests in any 20 s (counted from their answers), highest priority
+  first (requests posted together are gathered for 20 ms), keeps at most
+  16 threads realtime through rtkit (a higher priority takes the place of
+  the lowest grant, which goes back to normal and waits for room), pauses
+  21 s after a refusal (doubling while they go on, up to 336 s) and asks
+  again — never gives up —, forgets threads that went and notes grants
+  lost (the watchdog, the `SIGXCPU` demotion: not asked again until the
+  thread asks); a thread still waiting after 30 s counts as a priority
+  failure. Fewer ask: workers past the physical cores (SMT siblings) and
+  the disk and recording writers (seconds of slack) do not — they run
+  realtime only where the process may set it itself (the SMT siblings sit
+  out a realtime caller's cycles under rtkit). Measured against a
+  stand-in rtkit with its default limits, time shrunk 33× (rtkit
+  `a_sessions_requests_against_rtkits_limits`; a 16-thread machine,
+  PipeWire, 4 realtime threads held elsewhere, Restart Audio after 10 s):
+  0.22.0 asked 22 times, the 22nd refused (rtkit's thread limit), and so
+  nothing more — reservoirs, the deep tier and its workers normal, and
+  after the restart no thread realtime at all, the pools serial; the
+  broker asked 16 + 12 times, none refused: the 7 DSP workers within the
+  cores, the shallow tier and its 4 workers, the reservoirs, MIDI —
+  everything on the callback's path — realtime at once, the restarted
+  ones one window (20 s) later, the deep tier waiting for room. rtkit
   wants `RLIMIT_RTTIME`: set to its maximum (hard) and half of it (soft);
   a thread realtime that long without sleeping gets `SIGXCPU`, whose
-  handler returns it to normal scheduling and counts it, before the hard
-  limit's `SIGKILL`. So that none gets there, helpers breathe under any
-  such limit (ours, or PipeWire's client asking rtkit in our process):
-  `priority::breathe` (in `follow_audio`, which every helper loop calls)
-  blocks 50 µs once a quarter of the soft limit has passed since the
-  thread last did — the kernel counts realtime time only since a thread
-  last slept — and pool workers take the same breath while idle when
-  cycles come too close for them to sleep (`tests/rttime.rs`: against the
-  kernel, a spinning `SCHED_FIFO` thread gets `SIGXCPU`, a breathing one
-  not). A thread already where rtkit would put it does not ask (rtkit
-  allows 25 requests in 20 s by default). rtkit caps priorities at its
+  handler (`faderframe_realtime::rttime`) returns it to normal scheduling
+  and counts it, before the hard limit's `SIGKILL` — which kills the whole
+  process, with no log and no core dump. Two things made that kill the
+  usual outcome in 0.22.0 (Debian and other systems where rtkit grants
+  realtime): the handler's `sched_setscheduler(SCHED_OTHER)` failed with
+  `EPERM` on every thread rtkit, PipeWire or FaderFrame make realtime —
+  they carry `SCHED_RESET_ON_FORK`, which an unprivileged thread may not
+  clear — so the thread kept running and was killed at the hard limit; and
+  PipeWire's client sets the limit again with every context it makes
+  (`module-rt` under rtkit: soft = hard = 200 ms, so no `SIGXCPU` comes
+  before the `SIGKILL`). Now the handler demotes with the flag kept, and
+  `priority::note_rttime_limit` keeps the margin whoever set the limit
+  (soft half the hard one, the handler installed): at start-up of every
+  FaderFrame process (sandbox helpers inherit the limit), after each audio
+  stream opens and once a second from the session's tick, which also logs
+  each thread demoted and says so once (`rttime_demotions`; Restart Audio
+  gives the audio thread its priority back). End to end
+  (`rt_e2e`-style run: a private PipeWire daemon, the limit as rtkit's
+  users set it given with `prlimit --rttime=200000:200000`, the audio
+  thread overloaded — render-ahead off, one thread, 32 frames, 70 devices):
+  0.22.0 was `SIGKILL`ed without a word ten seconds in; now the data loop
+  is demoted, logged, and the session plays on. Helpers going back to normal
+  (`follow_audio` with no realtime audio thread, pool workers following a
+  normal caller) keep the flag for the same reason. Thread scheduling is
+  read from the kernel (`sched_getscheduler`), not glibc's
+  `pthread_getschedparam`, which answers from a cache that rtkit's changes
+  from outside and the handler's never reach. `tests/rttime_guard.rs`,
+  against the kernel in child processes: a reset-on-fork thread running
+  past the limit as PipeWire sets it, and as FaderFrame sets it, is
+  demoted and the process lives (both were killed before); helpers and
+  pool workers return to normal. So that no thread gets there, helpers
+  breathe under any such limit: `priority::breathe` (in `follow_audio`,
+  which every helper loop calls, and per page in the disk loader and per
+  block in the recording writer, whose catch-up never sleeps) blocks 50 µs
+  once a quarter of the soft limit has passed since the thread last did —
+  the kernel counts realtime time only since a thread last slept — and
+  pool workers take the same breath while idle when cycles come too close
+  for them to sleep (`tests/rttime.rs`: against the kernel, a spinning
+  `SCHED_FIFO` thread gets `SIGXCPU`, a breathing one not). Work that is
+  not ours can still run that long on a realtime thread (a plugin's first
+  `process` loading a model): it is demoted now, not killed. A thread
+  already where rtkit would put it is not asked for. rtkit caps priorities at its
   `MaxRealtimePriority` (20 unless its daemon is started with another
   `--max-realtime-priority`): the order below the audio thread is kept
   (19/15/10 under 20); higher needs the `realtime` group.
@@ -325,8 +417,15 @@ persistent data:
   (length + notes relative to the clip). Clip starts are `MusicalTime`.
 * `sources` — files or deterministic generators (the demo session).
 * `timeline` (tempo map with constant and linearly ramped segments, meter
-  map), markers, arrangement `sections` (named, coloured ranges: Intro,
+  map), markers, the Play Start Marker (`play_start`, §6), arrangement
+  `sections` (named, coloured ranges: Intro,
   Verse, …), loop and punch ranges, MIDI mappings, `IdAllocator`.
+* `scratch_pads` — other arrangements of the same tracks
+  (`faderframe_project::scratch`, see "Scratch pads" in §10). The
+  arrangement fields above (`clips` but the launcher's, each track's
+  `clips` and `automation`, `timeline`, markers, sections, keys, chords,
+  lyrics, loop, Play Start Marker) always hold the arrangement *shown*;
+  the others are put aside by value as `Stash`es.
 
 Routing validity is checked when a command is applied: targets must exist
 and be summing tracks (instrument tracks for MIDI tracks), and
@@ -356,7 +455,10 @@ ID allocations are deliberately not rolled back, so IDs stay unique.
 `workspace`). Loading parses into an untyped value, runs the migration chain
 (`MIGRATIONS[v]` upgrades `v → v+1`), deserialises, then `Project::repair()`
 fixes dangling references. Newer versions are rejected. Saving writes a
-temporary file and renames it.
+temporary file and renames it. A file always holds the song in place: with
+a scratch pad shown, `to_string` writes `Project::song()` and names the pad
+in `ScratchPads::open`, which loading shows again (older versions open the
+song and leave the pads out; files without pads have no such field).
 
 ## 4. Time
 
@@ -445,7 +547,13 @@ fixed ring of 64 runs, no allocation. Reading back across a loop wrap, a
 locate or a stop gives the position from before it
 (`PlayHistory::pieces` splits a block where a run starts; plugin
 parameter events follow each run). The render-ahead graphs keep their own
-history.
+history: each anticipator records every chunk it renders, as the audio
+thread does. (Until 0.22.x they recorded none: everything behind latency
+on a track rendered ahead — a plugin after a latent one in the deep tier,
+the strip of a latent track in the shallow tier — read its automation and
+modulation at position 0 for ever, a mute that never came, a fader shut
+at its first value; `automation_behind_latency_renders_ahead_as_it_plays`
+compares both tiers with the audio thread sample for sample.)
 
 **Modulation behind latency.** Modulators are evaluated where the track's
 input is (`ModNode`) and stamped with the graph frame of the audio they
@@ -713,9 +821,38 @@ device buffer and spikes are absorbed by the lookahead.
   hands the commanded state over (`AheadLink::command`, wait-free) and
   carries on until the rings hold two blocks of it (`ready`), at most
   250 ms, then switches — play, stop and locate take effect a few
-  milliseconds later, without a gap. Commands that change nothing (the
-  loop range sent again with every timeline update) start none;
-  recording on/off is applied at once.
+  milliseconds later, without a gap. Commands that change nothing start
+  none; recording on/off is applied at once.
+* **Loop changes** start no sequence either (a loop dragged while
+  playing used to start one per pointer move, and each switch put the
+  playhead back by the frames played while the anticipators primed — a
+  callback of audio repeated per move; measured with 256-frame callbacks:
+  40 of 40 changes repeated one, `resizing_the_loop_while_playing_…` in
+  `engine/tests/ahead.rs`). What is rendered stays valid up to where the
+  anticipators are, so the audio thread hands the new range over as an
+  *amend* of the current sequence at a frame beyond all of them (their
+  progress plus two of their blocks, `AheadLink::amend_frame`); every
+  tier and the audio thread itself take it on exactly there — their
+  blocks and the callback's chunks end at that frame
+  (`AheadLink::amend_due`) — so all follow one path: nothing repeats,
+  drops out or is rendered twice, and stateful effects run on undisturbed.
+  The new range is in force about the lookahead after the change: a wrap
+  already rendered still happens once (pushing the end out just before the
+  playhead reaches it), an end pulled in further ahead wraps there, one
+  pulled in behind the playhead lets it play on. Stopped or scrubbing, a
+  loop change moves nothing that plays and applies at once. An
+  anticipator that has already passed the frame (a preempted audio thread
+  between reading progress and handing over) keeps what it rendered when
+  neither range wraps in between (`amend_late_is_equal`), else reports it
+  and the audio thread starts a sequence after all; a full channel (32
+  changes in flight) does the same. A new link (rebuilt anticipators)
+  takes over what the old one was waiting for (`AheadLink::settle`).
+  Tests `resizing_the_loop_while_playing_neither_repeats_nor_drops_out`,
+  `loop_changes_near_the_playhead_land_beyond_the_lookahead`,
+  `rapid_loop_changes_while_playing_stay_seamless` (deep and shallow
+  tier), `a_loop_changed_while_stopped_holds_from_the_first_pass`, the
+  link's unit tests, `rendering_ahead_does_not_allocate_on_the_audio_thread`
+  (loop changes mid-callback).
 * **Rings** (`AheadRing`, one per track, kept across rebuilds) carry
   interleaved frames and segments tagged (sequence, position, playing).
   The reader skips older sequences and passed positions, waits (silence,
@@ -906,9 +1043,22 @@ signal. Buses and the master pan their own sum once with their own control
 Pre-fader output 1 is after the mute and the solos (a muted or solo-muted
 track's pre-fader sends are silent); the cue mixes' taps, outputs 2 and 3,
 are not (see *Cue mixes*). A send with a pan of its own
-(`AuxSend::pan`) places its tap by it. Into a surround bed the surround
-panner takes over (below). A strip's
+(`AuxSend::pan`) places its source by it (see *Send pan*). Into a surround
+bed the surround panner takes over (below). A strip's
 meters show its post-fader, post-pan output in the destination layout.
+
+**Returns and buses** pan as every strip does — verified on the output
+samples, not the control: a stereo aux return by its balance (or dual
+pan), a mono one by the law, whatever feeds it (mono or stereo tracks,
+pre-FX, pre-fader and post-fader sends), its pan lane on time, into a
+bed by its own spatial model (a mono return by the panner, a stereo one
+balanced into the bed when set to); buses, folder buses and nested buses
+each once (`aux_returns_pan_whatever_feeds_them`,
+`an_aux_returns_pan_lane_moves_it`, `aux_returns_pan_into_a_surround_bed`,
+`tracks_and_buses_sum_with_each_pan_applied_once`, `folder_buses.rs`), and
+in a running session with buses rendered ahead (the shallow tier's strips
+read the same slots) the knob's edit is heard there
+(`returns_buses_and_folder_buses_pan_in_a_running_session`).
 
 **Compatibility.** `pan_mode`, `dual_pan` and `pan_law` are new optional
 fields (written only when not the default), so files from before load as
@@ -1332,6 +1482,161 @@ the node's as last built.
   mono check) over to a new engine. Dev action
   `bass-management:<on|off>[@<Hz>]`.
 
+### Folders and folder buses
+
+A folder (`TrackKind::Folder`, `Track::folder` = the folder a track is
+in) holds tracks: the editors show them under it (`Project::folder_order`),
+it opens and closes (`WorkspaceSet::closed_folders`), its mute and solo
+reach what it holds (`folder_chain` in `slots::write_params` and
+`solo_audible`), and it has no audio. A **folder bus** is a folder that is
+a bus: `TrackKind::Bus` with `Track::folder_bus` (written only when set;
+older files and builds see plain folders and buses as before). Being a
+`Bus`, it is one everywhere a bus is — its strip, devices and the
+console's bus amplifier, sends, lanes, meters, cue path
+(`build::has_cue_path`), render-ahead (`build::ahead_sets`), stems, the
+mixer's full strip — and `Track::is_folder()` makes it a folder wherever
+folders are (`folder_chain`, `folder_order`, `SetTrackFolder`'s target,
+the session's folder actions, the editors' fold triangles).
+
+**Routing rule.** `OutputRouting::Master` is *the default output*:
+`Project::output_target` resolves it, for a track with audio (audio,
+instrument, bus, aux, folder bus — not MIDI tracks, VCAs or plain
+folders), to the nearest folder bus the track is in
+(`Project::folder_bus_of`, plain folders between passed by), else to the
+master. So what a folder bus holds plays through it once, nested folder
+buses chain, moving a track in or out reroutes it, and an explicit
+routing stays where it is: `Track { track }` to another bus, a hardware
+output, none — and the master *by name* (`Track { track: master }`, the
+output menu's "Master" inside a folder bus) passes the folder bus by.
+Everything downstream reads `output_target` (graph, PDC, solo, cue
+paths, render-ahead, `path_to_master`), so no other code knows folder
+buses. A loop through one is refused: `SetTrackFolder` and `SetFolderBus`
+check `Project::routing_loops` after the change, `SetTrackOutput`'s
+default resolves before `would_cycle`. Track renders (freeze, bounce,
+merge, clip effects, samples: `render::track_render_project`) route the
+track to the master by name, past its folder bus.
+
+**Commands and actions.** `Command::SetFolderBus { track, on, output }`
+(`Impact::Graph`; kind, flag and output swapped back by its inverse; fader,
+pan, devices and sends kept while it is plain);
+`Session::set_folder_bus` (`Action::SetFolderBus`; `Action::SumFolder`,
+which used to add a separate "<folder> Bus" and reroute the tracks to it,
+now makes the folder itself the bus) also gives it its destination's
+channel format (a bed in a surround project: its tracks pan into the
+format they panned into before) and, with a console set, the console's
+bus amplifier — one undo step. `SetTrackFolder` stays `Impact::Params`
+(folder mutes): the controller rebuilds when the folder buses' tracks
+change (`build::ParamShape::folder_routes`). The cue mixes keep hearing a
+new folder bus's tracks by their own sends ("Copy Main" moves them onto
+the bus by the console rule).
+
+**Editors.** The mixer shows a folder bus as a full bus strip tagged
+FOLDER BUS (F-BUS when narrow) with a fold triangle in its header
+(`Hit::Fold`); strips dropped on its middle go into it; what it holds
+names it as its output ("→ <folder>") and offers it first in the output
+menu. The arranger draws its header as a folder's with a BUS badge
+("Folder Bus · n tracks"), and its menu's "Folder Is a Bus" (checked)
+switches it. Dev action `folder-bus:<folder>=<on|off>` (and `pan:<track>=<v>`).
+Tests: `engine/tests/folder_buses.rs` (once, no doubling; pan, mute,
+solo, device, send, lane; nesting; explicit routings; PDC; moved while
+playing; loops; a bed folder bus), `a_folder_bus_renders_ahead_as_it_plays`,
+`a_folder_bus_in_a_cue_mix_is_solo_safe_and_mute_safe`,
+`folder_buses_and_sends_placing_their_source_do_not_allocate`,
+`project::tests::folder_buses_take_their_tracks_default_outputs`,
+`session/tests/folders.rs` (on and off, undo, Sum Folder, save and open,
+the console, loops, stems and track renders), the mixer's
+`a_folder_bus_is_a_full_strip_that_folds`, the arranger's
+`a_folder_becomes_a_bus_from_its_menu_and_says_so`. Grouping edits across a
+folder's tracks is the folder's Group switch (next section).
+
+### Folder groups (edit and record groups)
+
+A folder's **Group** switch (`Track::folder_group`, folders and folder
+buses; written only when set, older files open with it off;
+`Command::SetFolderGroup` — `Impact::None`, labels "Group Folder" /
+"Ungroup Folder"; `Action::SetFolderGroup`, `Session::set_folder_group`)
+makes the tracks with clips it holds one for recording and editing (Studio
+One's folder group; the dry and wet guitar recorded on two tracks of issue
+#5). It is an implicit edit group beside the mix groups of
+`session::groups`; it links no faders, mutes or solos (a folder's mute
+and solo already reach what it holds) and never changes the track
+selection, so the multi-selection followers of `group_edits` do not start
+moving members' faders together. All of it is in `session::folder_groups`.
+
+* **Members** — `Project::edit_group(track)`: the *outermost* grouped
+  folder among the folders a track is in (a folder: itself too);
+  `edit_group_members` = its audio, instrument and MIDI tracks at every
+  level (folders, buses, auxes and VCAs inside are skipped);
+  `grouped_with(track)` = the other members. A grouped folder inside a
+  grouped folder is part of the outer group; its own switch counts again
+  once the outer one is off. Every track is in one group at most, so an
+  expansion happens once and never travels from group to group.
+* **Record arm** — `Session::folder_group_arms` in `Session::edit` (after
+  `group_edits`): every `SetTrackRecordArm` in the command, batches too
+  (Shift+R's Toggle Arm Selected, Arm All, a surface, MIDI learn), adds the
+  same arm for the other members not already set — one command, one undo
+  step.
+* **Corresponding clips** — `Session::grouped_clips`: clips on two members
+  share their place when they overlap by at least half of the shorter one
+  (`shares_place`: the same take, a piece of a longer clip — not a
+  neighbour touching it in a crossfade); a clip's corresponding clips are
+  the closure of that relation across the members (the pieces of a clip
+  cut up on one track only all go with the whole clip on the other). So
+  the set is the same whichever of its clips is clicked, expanding twice
+  changes nothing, and moves keep the members aligned. Inside a gesture
+  the clips are measured where the gesture found them (`gesture_base`), and
+  the first event's expansion is kept for the whole drag
+  (`Session::grouped_targets`); launcher clips are never expanded.
+* **Selection** — `Action::SelectClips` goes through
+  `select_clips_grouped` (Replace/Add take the corresponding clips, Toggle
+  switches them with the clicked clip; the anchor stays the clicked clip);
+  switching a group on extends the current selection. A **range** on a
+  member covers every member: `Session::edit_tracks` (now public) adds the
+  grouped tracks, and every range operation (separate, clear, trim to
+  selection, insert silence, copy/cut/duplicate/repeat of a range, Tab
+  stops) and the arranger's range painting use it.
+* **Edits** — one place for edits naming their clips:
+  `Session::grouped_action` at the top of `dispatch` extends
+  `MoveClips`, `TrimClips` (and stretch), `ClipGain`, `SetClipsGain`,
+  `SetFade`, `SlipClips`, `SetClipsMuted`, and turns a grouped `SpotClip`
+  into a `MoveClips` of all of them by as far; `ShuffleClip` shuffles the
+  others on their own tracks by as far (`shuffle_grouped`, one history
+  step) when the clip stays on its track. Edits of the selection read
+  `grouped_selection()` (delete, nudge, split at the playhead) or
+  `selected_arranger_clips()` (copy, cut, duplicate, repeat), so a
+  selection made before the switch was on still works on the whole place.
+  A split at the playhead also cuts every member's clip the playhead
+  crosses on a member a selected clip is cut on (`grouped_cuts`); the
+  pieces sharing a selected piece's place are selected. Every one stays
+  one undo step. Paste follows the clipboard's lanes (a copy of a grouped
+  place holds a lane per member, so it lands on the members again); a
+  single lane is never multiplied. Operations that do not apply to a clip
+  skip it as before (fades and gain of MIDI clips); per-clip analyses
+  (quantize, warp, transients, pitch) are not expanded. A frozen member
+  refuses the group's clip edits as it refuses its own (`frozen_target`
+  sees the whole batch), so the members never drift apart.
+
+**Editors.** The arranger's folder header has a **G** button where a
+track's record button is (`HeaderPart::Group`, lit in the folder's
+colour; the folder bus badge moved right of it), its menu "Group Its
+Tracks" (checked), the tooltip names the outer group when the folder is
+part of one; the mixer's folder strip has a G under its solo
+(`FolderLayout::group`) and a folder bus's full strip has it in the
+record slot (`Hit::FolderGroup`); the Inspector's Track section shows a
+"Grouped" toggle for folders and folder buses (`Field::FolderGroup`;
+"with ‘<outer>’" when inside a grouped folder). All three are toggles in
+the accessibility trees. Dev action `folder-group:<folder>=<on|off>`.
+Tests: `project::tests::grouped_folders_edit_their_tracks_together`,
+`session/tests/folder_groups.rs` (arm and disarm, batches; selection and
+toggling; a range on all members; split, drag move, trim, gain, fades,
+slip, delete, cut/paste, duplicate as one undo step each; different
+boundaries and crossfades; nesting; incompatible tracks; a frozen member;
+save and reopen; Spot and Shuffle), `folder_groups::tests` (the place
+rule), the arranger's
+`a_folder_header_groups_its_tracks`, the mixer's
+`a_folder_strip_has_a_group_switch`, the Inspector's
+`a_folder_shows_its_group_switch`.
+
 ### Cue mixes (the performers' headphones)
 
 A cue mix is a headphone mix on its own device outputs, apart from the
@@ -1371,10 +1676,22 @@ track's strip at the cue taps (`ChannelStrip` outputs 2 and 3, only while
 the project has cue mixes): the signal after the inserts with its
 polarity, before the fader (2, the chain layout, unpanned) or the
 *post-fader image* (3: output 0 — fader, VCAs, modulation, panning, the
-destination layout — without the mute), never muted: the track's mute
+destination layout — without the mute; into a stereo cue mix the
+never-muted *unpanned* twin instead, so the cue send's pan places the
+source: see *Send pan*), never muted: the track's mute
 and the solos of the main mix (`solo_mute`, folder and VCA mutes) do not
 reach a performer's headphones, unlike an ordinary pre-fader send (strip
-output 1 is post-mute). Every bus and return (`build::has_cue_path`) has
+output 1 is post-mute). The strip's node key says whether it has the cue
+taps (and whether it is quiet), so a cue mix added or the last one removed
+while playing makes every strip anew: carried over by `adopt_state_from`,
+a strip made without them left them unwritten (the cue mix without the
+track) and wrote its unpanned output (a send placing its source) on what
+is now cue tap 2 — the return silent in the main mix too
+(`cue_mixes_added_and_removed_while_playing_sound_as_built_with_them`).
+A pre-FX send keeps its track on the audio thread (`ahead_eligible`), so
+a bus's cue path takes it from the track's input there, also when it is
+added while the track renders ahead
+(`a_pre_fx_send_added_to_a_track_rendered_ahead_builds_and_plays`). Every bus and return (`build::has_cue_path`) has
 a **cue path** beside its main path: a second sum of its sources *as the
 cue hears them* — the post-fader images of the tracks feeding it, the cue
 paths of sub-buses, and every send into it taken from the never-muted
@@ -1492,8 +1809,43 @@ source/destination pair ramped (NaN: as tapped — the graph's channel
 rule). Cue sends always pan; an ordinary send pans when
 `AuxSend::pan` is `Some` (`Command::SetSendPan`, `Impact::Params`, slot
 `SlotRegistry::send_pan`; carried by track presets) — older sends are
-`None` and play as before. Post-fader taps are already panned into the
-destination: a send's pan balances them.
+`None` and play as before. A *post-fader* send with a pan of its own into
+a stereo destination places the track's **source** (`build::places_itself`):
+it taps the strip's post-fader *unpanned* output (fader, VCAs, mute and
+polarity as output 0 has them, the source in the track's layout:
+`ChannelStrip::with_unpanned`, made only for tracks with such a send), not
+the main mix's panned image — balancing that image again was the defect
+behind "panning a send does nothing": a mono track panned hard right sent
+hard left reached the return as silence, and sent to the centre still
+only on the right. "As tapped" (`None`) still follows the main mix's image.
+The strip's extra output comes after outputs 0, 1 and the cue taps (2, 3);
+with cue mixes a never-muted twin (`with_cue_unpanned`) feeds the cue
+paths' copies of such sends, and a bus's cue strip has one of its own
+(`build::unpanned_ports`). Whether a send places its source is graph
+shape: `SetSendPan` stays `Impact::Params`, and the controller rebuilds
+when `None` ↔ `Some` changes the set (`build::ParamShape`, with the
+diffuse spreads and the folder buses' tracks). **Cue sends after the
+fader** place their source the same way (`build::cue_places_itself`: a
+post-fader stereo cue mix, a mono or stereo channel): they tap the
+never-muted unpanned twin (a track's strip; a bus's or return's cue
+strip, whose one unpanned output serves sends and cue mixes), so the cue
+send's pan places the source as it does before the fader — the main
+mix's pan is the main mix's. Measured (`a_post_fader_cue_send_places_its_
+source_by_its_own_pan`, DC 0.5, fader −6 dB): a mono track panned hard
+right, its cue send hard left — before L 0, R 0 (the image balanced away),
+now L 0.2506, R 0; a stereo track balanced hard right, its cue send
+centred — before L 0, R 0.25, now 0.25/0.25; a bus balanced hard right,
+its cue send hard left — before silence, now L 0.125, R 0. A mono cue
+mix or a surround channel takes the image as before. Which strips get
+the twin depends only on the cue mixes' tap and layout and the track's
+layout (all `Impact::Graph` edits); renders build no cue mixes, so no
+twin. Tests: `a_post_fader_send_with_its_own_pan_places_the_source`,
+`a_send_given_its_own_pan_while_playing_places_the_source`,
+`a_send_placing_its_source_reaches_a_returns_cue_path`,
+`a_post_fader_cue_send_places_its_source_by_its_own_pan`,
+`buses_render_ahead_with_a_cue_mix_and_the_cue_sounds_the_same` (pre- and
+post-fader), `folder_buses_and_sends_placing_their_source_do_not_allocate`,
+`cue_mixes_do_not_allocate` (a stereo post-fader cue mix too).
 
 **The click** plays in every cue mix whose click is on, at its
 `click_db` (relative to the metronome's volume) under its master level
@@ -1564,6 +1916,93 @@ pointer follows on, or fade it out and jump; while playing normally a scrub
 only locates. The published snapshot reports scrubbing apart from playing,
 so the control side treats it as stopped (no automation writing, follow
 scrolling or MIDI clock).
+
+**Changing the loop while playing.** The arranger's loop drags (an edge,
+or a new range in the loop band) are one gesture and one undo step with a
+`Command::SetLoop` per pointer move. Its impact is `Impact::Transport`
+(below `Params`): no timeline snapshot, no graph, no parameter pass — the
+session only tells the disk loader the new loop start (its pages stay
+resident) and `EngineController::send_loop` sends `SetLoopRange` /
+`SetLoopEnabled` when the range *in samples* changed (`loop_in_samples`:
+at least `MIN_LOOP_SECONDS`, recomputed with every timeline update, so a
+tempo change moves it). Before, every move rebuilt the timeline snapshot
+(and reset the launcher's pending follow actions). On the audio thread
+the command is a plain field change at a block boundary — no allocation,
+no lock, no discontinuity flag (notes keep sounding). Rendering ahead,
+it is an amend at a frame beyond the anticipators (§5, Render ahead).
+Behaviour: the loop wraps when the playhead reaches the end *in force*
+while it is before it; a playhead inside the new range plays on to its
+end, one before it plays into it, one past its end plays on (no jump
+back); an empty or reversed range is no loop (the engine's
+`LoopRange::new`), and the arranger never makes one: a dragged edge stops
+a tick from the other, a range dragged across its anchor is normalised.
+Stopped, a change applies at once. Tests: `engine/tests/ahead.rs` (above),
+session `dragging_the_loop_while_playing_rebuilds_nothing` (real time,
+dummy device: no snapshot, no graph, one undo step, the playhead never
+steps back), arranger `both_loop_edges_resize_without_toggling_…`.
+Verified with the dummy device and the offline renderer only; a real
+interface with a small buffer is still to be listened to.
+
+**Where Stop leaves the playhead, and where Play starts.** Three ways,
+persisted in the preferences (`return_to_play_start`, `stop_to_start`):
+it stays where playback stopped (the default; the edit toolbar's
+Insertion Follows Playback), it returns to where playback started
+(*Return to Start on Stop*: `EditorSettings::insertion_follows_playback`
+off), or to the start of the project (`stop_to_start`, which wins). The
+play start (`Session::play_started_at`) is where the playhead was when
+Play was pressed from stop — before any pre-roll, so the next take
+pre-rolls the same way (it used to be the pre-roll's start, which moved
+every take a pre-roll earlier) — or the Play Start Marker; loop passes do
+not move it; a selection made with Link Timeline puts the playhead at its
+start, which is where playback starts. Set from the Stop button's
+right-click menu (`recording::stop_menu`: the two returns, one at a
+time, then its MIDI learn) and the Transport menu
+(`app.return-to-play-start`, `app.stop-to-start`); the menu ticks follow
+the session wherever the change came from (`recording::follow`). The
+playhead's jump is shown at once (`show_position`) and the arranger
+scrolls it into view (jumps counter).
+
+**The Play Start Marker** (`Project::play_start: Option<PlayStart { at,
+on }>`, saved with the project, `Command::SetPlayStart` — undoable,
+coalesced, `Impact::None`) is a fixed anchor the user sets, apart from
+the dynamic play start: while `on`, Play from stop (the button, Space,
+MIDI learn, control surfaces: `Session::locate_play_start` before `play`)
+starts there whatever the playhead and the edit selection
+(`Session::play_start_position`), and so does Record from stop (its
+record start; a punch range still decides the record window, the
+pre-roll goes back from it); while playing, locates work as ever.
+Starts that put the playhead somewhere themselves play from there: a
+setlist song, an ADR cue's pre-roll (`Session::play_here` around its
+dispatch), the shuttle at normal speed, the launcher, a restarted take. Return to Start on Stop then returns to it (that is
+where playback started). A loop does not move it: playback starts at the
+marker and wraps at the loop's end once it gets there. The ruler draws it
+as a flag in the theme's playing green (hollow while off); its flag drags
+in the loop band (`Hit::PlayStart`, `Drag::PlayStart`: one gesture, on or
+off kept, snapped like the loop's edges — a loop edge under it still drags
+from the edge's side of its line; a click on it changes nothing); the
+ruler's right-click menu sets it where clicked (snapped), switches it and
+removes it; the Transport menu sets it at the playhead
+(`app.set-play-start`, `app.play-from-marker`, `app.remove-play-start`);
+dev action `play-start:<quarters|here|toggle|off>`. Section rearrangement
+(`faderframe_project::arrange`, `Arrangement::play_start`) moves it with
+the material under it: later material moving up or back takes it along, a
+moved section it is in takes it (a copied one does not: there is one), a
+cut it is in leaves it where the cut was. Tests `session/tests/stop.rs`
+(the marker, loop passes, the pre-roll), arranger
+`the_ruler_sets_switches_and_removes_the_play_start_marker`,
+`the_play_start_marker_drags_in_the_ruler_and_snaps`, arrange
+`the_play_start_marker_moves_with_the_material_under_it`.
+
+**Requested play and stop are held** (`Session::requested_playing`,
+`requested_play`): Play from stop (and the user's Stop) set the session's
+transport state at once and keep it until the engine's snapshot agrees
+(or two seconds pass, like a held locate). A second transport press before
+the engine applied the first — Record and Play together on a tape-style
+surface, Play then Stop — sees the transport as asked: Play does not
+restart the take from the pre-roll's start (it used to record the pre-roll
+too), Stop stops instead of locating to zero. Show mode: Space and the play
+button are the show's play and stop (`ShowOp::PlayStop`: a stop cues the
+song's start again); the setlist view's own Space never reached it.
 
 ## 7. MIDI and instruments
 
@@ -1745,6 +2184,39 @@ sampler and drum sampler (see *Built-in devices*).
 Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
+
+**Favorites** (issue #15) are the user's, not a project's:
+`faderframe_session::plugin_favorites` (pure; `PluginFavorites` with
+`Favorite`s keyed by `FavoriteKey` = format + the format's id — never the
+name —, remembered name/vendor, and `Category`s with stable `CategoryId`s,
+a plugin in any number of them) changed only by
+`Action::PluginFavorites(FavoriteOp)` (`Set`, `Assign`, `NewCategory`,
+`RenameCategory`, `RemoveCategory`: no command, no undo step, no dirty
+project, plugin states untouched; refused names are notices). The shell
+loads them at start-up and saves them whenever `Session::favorites_revision`
+moves (`faderframe-ui/src/favorites.rs`: `plugin-favorites.json` in the
+configuration folder — the portable `Settings` folder in portable mode —,
+written through a temporary file; an unreadable file is kept as
+`.json.unreadable`). Each format of a plugin is a favorite of its own;
+favorites whose plugin is not in the catalogue stay and show as missing
+(`missing`, with `other_formats` naming the same plugin installed in
+another format), rescans change nothing but the remembered names of
+renamed plugins (`note_names`, after each catalogue change). The plugin
+browser has a star per row and in the detail panel, category check boxes
+and "New Category…", a FAVORITES sidebar section (all favorites, each
+category — right-click renames or removes it), search over category names;
+missing favorites are listed only there, dimmed, and cannot be inserted.
+An empty mixer insert slot's menu has a Favorites submenu
+(`PluginFavorites::menu`: by name, then a submenu per category; missing
+ones disabled), and so has a container chain's "+" menu
+(`ContainerView::favorites_menu`, first, with the chain's own filter: an
+instrument only on an instrument track, no MIDI effects; a choice is
+`Action::InsertIntoChain`). Tests: the module's,
+`session/tests/plugin_favorites.rs`, the browser's `plugin_browser::tests`,
+mixer `an_empty_insert_slot_offers_the_favorites_by_category`, devices
+`a_chains_add_menu_offers_the_favorites_by_category`. Dev actions
+`favorite:<plugin id>[=<category>]`, `plugin-browser-scope:<all|favorites|
+<category or vendor>>`.
 
 **Processors survive rebuilds.** Graph rebuilds (an edit that changes
 routing, a track selected and so made live, a latency change elsewhere)
@@ -2381,6 +2853,41 @@ pagefile-backed file mapping, all named in the helper's environment).
   given up. `PluginInstance::settle` waits for answers on their way
   (tests). `the_host_does_not_wait_for_a_busy_helper`: a state taking
   400 ms to write arrives while polls return within milliseconds.
+* **Stale answers.** A pipelined answer describes the helper as it was
+  when it read the request; what FaderFrame changed after sending it the
+  answer cannot know. `RemoteInstance::changes` counts the host's changes
+  (`Changes`: editor opened/attached/floated/closed, state or program
+  loaded, activated/deactivated, parameter set — `set_at` says which and
+  when), each Poll/SaveState carries the counts it was sent with, and an
+  answer from before a change does not overwrite what that change set:
+  `editor_open` and editor requests, `program`/`pending`, latency and tail
+  (no restart for a latency of the previous activation), values set since,
+  a saved state from before a load (`take_state` asks again). Events —
+  edits made in the plugin's editor, new parameter lists, restart requests,
+  values changed only in the helper — are always taken. This was issue
+  #12 (0.22): the tick after an editor opened applied a poll answered
+  just before — "editor not open" —, the UI took that for a closed editor
+  and destroyed the X11 window the plugin's GUI sat in; Xlib plugins
+  (JUCE: TONE3000, the reporter's #TCompressor) then died of BadWindow /
+  BadDrawable in their next request, others lost their GUI. Tests:
+  `tests/pipelined_polls.rs` (each fails without the counts). An editor's
+  life from a script: `insert-plugin:<id>` (opens it), `close-insert:<n>`,
+  `show-insert:<n>`, `remove-insert:<n>`, `reload-plugins:x`.
+* **X errors are not fatal** (`xlib::tolerate_x_errors`): Xlib's default
+  error handler prints "X Error of failed request" and calls `exit(1)`,
+  and plugin toolkits leave installing one to the host (JUCE does only in
+  standalone apps). Helpers install a handler that logs (the first 20,
+  then every hundredth) and returns, before the plugin loads; FaderFrame
+  installs it for plugins hosted in process too (`plugins::install`), but
+  keeps a handler someone else installed first (GDK on an X11 display —
+  its handler ignores errors on displays it did not open). libX11 is
+  `dlopen`ed by its soname (no link-time dependency) and never closed.
+  `tests/x_errors.rs` makes a BadWindow on `X_GetProperty` in a helper and
+  in the test process (needs an X server; XWayland counts). On FaderFrame's
+  side, a closed editor's X11 window is unmapped at once and destroyed
+  `RETIRE_AFTER` (2 s) later (`plugin_window::x11::Parents::destroy`/`reap`):
+  requests the plugin made on its own connection as its GUI closed reach
+  the server before the window they live in is gone.
 * **Editors** run in the helper. Its main thread services the plugin
   GUI's descriptors and timers along with the control stream: Unix `poll`s
   them (macOS also hands AppKit its events and run loop every 10 ms while
@@ -2721,37 +3228,204 @@ plugin-host trait is platform-neutral: `can_embed(WindowApi)`,
 `AudioCallback`. Device buffers are exposed through the `DeviceBuffers` trait
 (per-channel slices, no per-callback arrays), so backends need no
 allocation in their process callbacks. Status (xruns, rate, buffer size,
-shutdown) is shared through lock-free `StreamMonitor` atomics.
+shutdown, the latencies the backend learns while running) is shared through
+lock-free `StreamMonitor` atomics.
+
+What a backend lets the user choose is `AudioBackend::capabilities()`
+(`Capabilities`: who owns the rate — `RateControl::{Server, Requested,
+Device}` —, whether a buffer size or rate applies to the running stream, how
+many output/input devices one stream takes, whether the backend keeps
+devices of different clocks in step (`clocked_by_server`), whether it
+reconnects devices that come and go by itself (`follows_devices`), free
+channel counts, a forced format). `enumerate_devices()` lists devices
+(`DeviceInfo`: id, name, channel counts *and names*, rates, buffer-size
+range, a clock id, default flags); `StreamConfig::{output_devices,
+input_devices}` name the devices to open (empty: the defaults), and a
+running stream answers `routing()` (`StreamRouting`: what each of its
+channels is connected to, devices missing now) and may take
+`request_buffer_size`/`request_sample_rate` and a `maintain()` call about
+once a second (control side only). `faderframe_audio::resolve` checks a
+`Request` (the Preferences) against a backend's devices before anything
+opens: a missing device falls back to the default (unless the backend
+follows devices itself), a rate the device does not list falls back to its
+own, a buffer size outside its range is moved inside it — each with a
+sentence for a notice.
 
 * `PipeWireBackend` (Linux) — one DSP node (`pw_filter`) with a mono float
   port per channel; inputs and outputs are processed in the same cycle on
   PipeWire's realtime data thread, so recording stays sample-aligned. A
   control thread runs a PipeWire main loop and owns every PipeWire object
-  (the stream handle only holds that thread and a channel). The node asks
-  for the requested rate and quantum (`node.rate`, `node.latency`), is
-  scheduled even when unlinked (`node.always-process`), and the callback
-  re-prepares the engine when the graph's rate or quantum changes.
-  Auto-connect links the ports to the highest-priority sink and source,
-  found through the registry. Raw `pw_filter` calls go through
-  `pipewire-sys`; the rest uses pipewire-rs.
+  (the stream handle only holds that thread and a `pw::channel` to it). The
+  node asks for the requested rate and quantum (`node.rate`,
+  `node.latency`; with `force_format` it holds the graph at them with
+  `node.force-rate`/`node.force-quantum`, node properties that end with
+  the node — nothing in PipeWire's settings is written), is scheduled even
+  when unlinked (`node.always-process`), and the callback re-prepares the
+  engine when the graph's rate, quantum or the devices' latency changes. A
+  running stream takes a buffer size or rate request through the channel
+  (`pw_filter_update_properties`) without reopening. Devices are the
+  graph's `Audio/Sink`, `Audio/Source` and `Audio/Duplex` nodes by
+  `node.name` (`graph.rs`: the registry's nodes, ports and links, the
+  `default` metadata's `default.audio.sink/source` and the `settings`
+  metadata's rate/quantum limits). Auto-connect links the node to the
+  devices asked for — several per direction, their channels one after
+  another (`graph::plan`, pure and unit-tested) — or to the server's
+  default sink and source, following the default when it changes. The
+  links are brought in line with the graph every 100 ms after a change:
+  a device that goes away keeps its channels' places (its last channel
+  count), the default stands in when none of a direction's devices is
+  there, and the links come back when it returns — an unplugged interface
+  needs no restart. Only links this node made are removed
+  (`registry.destroy_global`). The latency is what the graph reports on
+  the node's own ports: they are bound as port proxies subscribed to their
+  `SPA_PARAM_Latency` (an output port's playback side, an input port's
+  capture side, as pipewire-jack maps JACK's ranges); on this machine both
+  are one quantum, the same as the JACK backend reads through
+  pipewire-jack. Raw `pw_filter` calls go through `pipewire-sys`; the rest
+  uses pipewire-rs.
 * `JackBackend` (Linux) — JACK2 or pipewire-jack, libjack loaded at
   runtime. The server owns rate and buffer size; FaderFrame follows (the
   session rebuilds the engine on a rate change) and can request a buffer
-  size live.
+  size live. Devices are the clients owning physical ports (`plan.rs`:
+  JACK2's `system`; under pipewire-jack one client per interface), the
+  stream connects to the ones asked for (channels one after another) or
+  the first one, and `maintain()` connects them again when a device
+  returns and undoes connections of its own that are no longer wanted.
+  Latencies are the ports' `jack_port_get_latency_range` (playback for
+  outputs, capture for inputs), read in `maintain()`.
 * `CpalBackend` — the system API through cpal: WASAPI (Windows), CoreAudio
   (macOS), ALSA (Linux). Playback drives the engine; capture arrives
   through a lock-free ring (a few milliseconds of extra input latency);
-  `f32`, `i32` and `i16` devices. The streams live on a control thread, so
-  the stream handle is `Send` everywhere. With the `asio` feature
-  (Windows) the same backend drives ASIO drivers (`Api::Asio`), taking
-  capture from the driver itself. It is opt-in because it compiles
-  Steinberg's ASIO SDK, whose licence (proprietary or GPLv3) then applies
-  to the binary; the *Ports* workflow checks it with MSVC.
+  `f32`, `i32` and `i16` devices. The output device is the one asked for
+  (by cpal's device id, or name) or the default; the config opened is the
+  fewest channels that give what the session wants, else the most there
+  are (`pick_config`), so a multichannel interface whose default is stereo
+  opens its other outputs for cue mixes and hardware inserts. Capture comes
+  from the device asked for, else from the output device itself where it
+  records (one clock), else the system's default input. Latencies come
+  from cpal's callback timestamps (playback − callback beyond the buffer;
+  callback − capture plus the ring's fill for inputs). The streams live on
+  a control thread, so the stream handle is `Send` everywhere. With the
+  `asio` feature (Windows) the same backend drives ASIO drivers
+  (`Api::Asio`, `Capabilities::input_devices == 0`: capture from the
+  driver itself). It is opt-in because it compiles Steinberg's ASIO SDK,
+  whose licence (proprietary or GPLv3) then applies to the binary; the
+  *Ports* workflow checks it with MSVC. cpal exposes no ASIO control panel,
+  so Preferences offers none.
 * `DummyBackend` — timer-driven, silent; used when no audio device exists
-  and in CI.
+  and in CI. `DummyBackend::with_devices(DummyDevices)` stands in for a
+  machine's interfaces in tests (`mock_device`: rates, buffer range,
+  channels; `unplug`/`plug` — a stream on an unplugged device shuts down
+  like a pulled USB interface).
 
 *Automatic* tries PipeWire, JACK, ALSA, then the dummy device on Linux, and
 ASIO (where built in), the system API, then the dummy device elsewhere.
+
+### The audio device in the session
+
+`session::audio_device`: `AudioPreferences` (rate, buffer size, threads,
+the devices chosen per backend id — `devices: BTreeMap<String,
+DeviceChoice>` —, channel counts, `force_format`) are opened by
+`Session::start_audio_with(BackendFactory, &prefs)` (the shell's
+`BackendChoice::factory()`; `start_audio(backends, prefs)` stays for tests
+that need no recovery). `open_audio` resolves each backend's choice
+against its device list, tries in turn as resolved, at the device's own
+format (a device refusing what it listed), and on the defaults (a device
+gone between the list and the open), and reports what changed as notices
+(`AudioDeviceStatus::notes`). Channels: as chosen, else as many as the
+devices have (8 in / 2 out where unknown), never fewer than
+`Session::required_channels()` (the master's bed, tracks on interface
+outputs, hardware inserts, cue mixes, talkback; `check_channels` compares
+against these, so choosing fewer channels does not cause reopen loops).
+
+`Session::plan_audio(&prefs)` says what `apply_audio` will do: `Unchanged`,
+`Live` (a buffer size on JACK/PipeWire/the dummy device, a rate request on
+PipeWire, a rate on JACK = nothing to do; playback goes on) or `Restarted`
+(anything else; the transport stops, the playhead stays); refused while
+recording; settings that fail to open bring the previous ones back (the
+error says so). Recovery: `tick_audio_device` notices a stream that shut down
+(`AudioHealth::Reconnecting`), probes the backend on a thread of its own
+every `PROBE_EVERY` (750 ms; a system API's enumeration can be slow) and
+reopens the same devices as soon as they are back, or the defaults after
+`FALLBACK_AFTER` (2 s; `AudioHealth::Fallback`, with a notice). On the
+default it keeps probing and moves back to the chosen device when it
+returns — at once when stopped, after the stop when playing ("… is back:
+audio moves to it when playback stops"), never while recording.
+`stop_audio` ends the watching. `stream_routing()`,
+`input_channel_name(n)`/`output_channel_name(n)` give the device channel
+names (for Preferences; available to routing menus). Tests
+`session/tests/audio_device.rs` (pretend devices: channels and names, live
+buffer size vs reopening rate, unsupported rate/buffer, unplug and return,
+fallback and back after stop, missing at start-up, refused while
+recording, a failed reopen restores the previous settings, stop ends the
+watching), `faderframe-audio` `setup::tests` and
+`dummy::tests`, `faderframe-audio-pipewire` `graph::tests` and the live
+test (devices of the running server), `faderframe-audio-jack` `plan::tests`
+and its live test, `faderframe-audio-cpal`
+`the_config_opened_has_the_channels_wanted` and its live test (latency
+printed).
+
+Preferences → Audio (`faderframe-ui/src/audio_prefs.rs`) lists the
+selected audio system's devices on a thread (the running backend first for
+Automatic) and shows only what its `Capabilities` allow: output device and
+a second one ("Also play on") where the backend takes several, input
+device(s) (none for ASIO), sample rate (the device's rates for system APIs;
+the server's rate as text for JACK), buffer size (within the device's range
+for system APIs), channel counts, PipeWire's "hold the graph" option; a
+note on what the audio system decides (PipeWire's allowed rates and
+quantum limits from its `settings` metadata) and on devices of different
+clocks. Apply says beforehand whether it applies live or reopens. *Running*
+shows the stream, what was asked for against what runs, the latencies (in,
+out, heard, recording compensation), where each channel goes (device port
+names) and a device that is missing or being reconnected. Settings persist
+in `Preferences::{backend, sample_rate, buffer_size, threads,
+audio_devices, audio_input_channels, audio_output_channels,
+audio_force_format}`; a chosen device not connected now stays chosen and is
+shown as "(not connected)". `preferences-page:audio@0.5` scrolls the page
+(scripted screenshots).
+
+### Several audio interfaces
+
+* **PipeWire** (implemented): one FaderFrame node can be linked to any
+  number of devices; PipeWire runs one graph with one driver, and the
+  devices that follow it with a clock of their own (another USB interface)
+  are resampled adaptively by their ALSA nodes, so they stay in step
+  without drift. Preferences offers two devices per direction (the backend
+  takes four); their channels follow one another on FaderFrame's ports.
+  Cost: the followers' resampling (a little latency and CPU), and the
+  latency PipeWire reports is the largest over the node's ports, so
+  recording compensation uses the slower device's. Channel places come
+  from the devices present when the stream opens; a device missing then
+  gets its place once it returns and the session reopens the stream (when
+  stopped).
+* **JACK**: connections to any physical ports JACK sees. JACK2 drives one
+  device (others need `alsa_in`/`alsa_out` or `zita-a2j` bridges, which
+  resample — FaderFrame connects to their ports like any other);
+  pipewire-jack exposes every PipeWire device, kept in step by PipeWire as
+  above.
+* **System APIs (WASAPI, CoreAudio, ALSA)**: one output device; the input
+  may be another device, but then it runs on another clock and nothing
+  resamples between them: the capture ring fills or empties slowly and
+  each overflow or gap is counted as an xrun (Preferences says so). Input
+  defaults to the output device itself where it records. No aggregate
+  device is built here; macOS users can make one in Audio MIDI Setup (it
+  appears as one CoreAudio device), Windows has no system equivalent.
+  ASIO is one driver = one device.
+* **What a native multi-device design needs** (not built): a clock master
+  (one device's callback drives the engine); per follower device a stream
+  on its own thread feeding a ring; a drift estimator per follower (a DLL
+  on the ring's fill or the devices' timestamps, as PipeWire's ALSA nodes
+  do) steering an adaptive resampler (rubato's `SincFixedOut` or a polyphase
+  FIR with a slowly varying ratio, RT-safe, allocation-free after
+  creation) between the ring and the engine's buffers; latency accounting
+  per device (each follower adds the ring target and the resampler's
+  delay, so recording compensation becomes per input channel); xrun and
+  underrun handling per device (a follower's dropout must not stop the
+  master); hot-plug of followers without restarting the master; rate
+  checks (followers at another nominal rate resample by the ratio). The
+  engine already takes any channel count and a single callback; the
+  pieces missing are the follower streams, the drift-steered resampler and
+  per-channel latency in recording.
 
 ## 10. Session
 
@@ -2761,8 +3435,107 @@ changes, selection, editor focus, track creation and editor settings.
 `tick(dt)` (once per UI frame) polls transport position and meters (with
 ballistics, peak hold and clip latching on the UI side) and reacts to stream
 status (rate change, server shutdown). `render::start` runs offline bounces
-(master or stems, range, rate, channels, tail, normalise, dither) on a
-worker thread through the same engine path.
+(master, stems or one track — `RenderSource::Track`, soloed through the
+mix as its stem would be; range, rate, channels, tail, normalise, dither)
+on a worker thread through the same engine path.
+
+**Render destinations** (`render::files`). Every file a render writes
+goes to a temporary name beside its destination (`.<name>.ffrender-<pid>-<n>.<ext>`,
+claimed with `create_new` before rendering, so an unwritable folder fails
+at once) and moves into place only when the whole render — every stem —
+has been written and measured: `Staged::commit`, a rename on the same
+file system, so an existing file is replaced in one step or not at all.
+`RenderSettings::overwrite` says what may be replaced: `Never` (the
+default), `Confirmed(paths)` (what the user agreed to) or `Always` (files
+the session names itself: freezes, bounces, merges, clip effects, samples,
+the movie export's scratch WAV — no question for those). It is checked
+again right before the move: a destination it does not allow that is
+taken then (it appeared while rendering) ends the job with
+`RenderError::Exists(Staged)` — the render kept aside for the UI to ask
+and `commit` or `discard`. Moving without replacing is a hard link (fails
+atomically when the name is taken, POSIX and NTFS; without hard links,
+FAT and some shares, a check and a rename); replacing is `fs::rename`
+(POSIX rename; on Windows a replacing rename, which fails while another
+program holds the old file open — the old file stays). Cancelled and
+failed renders drop their `StagedFile`s, which remove the temporaries;
+ADM and IAMF masters go the same way. `render::destinations` lists the
+files beforehand (stems of tracks with equal names get " (2)", …), so the
+Render window asks one question (Overwrite / Cancel) for all that exist
+when Render is pressed (also after a save dialog asked: the file may have
+changed since), and asks once more for a file that appeared meanwhile.
+A folder of files (a DDP fileset, a vinyl premaster) is staged as a
+temporary folder (`StagedFile::new_dir`) and replaces its destination as a
+whole: no rename replaces a folder holding files, so the old one is
+renamed aside under a temporary name, the new one renamed in and the old
+one removed (renamed back when the new one cannot move). Staging into a
+folder first sweeps temporaries killed processes left there
+(`files::sweep_stale`): never this process's, never one touched within
+`STALE_AFTER` (1 h — a sandboxed copy in another PID namespace may still
+wait on it), of a PID that no longer runs where the system says so
+(Linux `/proc`), elsewhere once `STALE_UNKNOWN_AFTER` (a day) old.
+
+**Exports** (`session::exports`) put every other user-chosen destination
+on the same staging: the album (song files, album file and cue sheet, the
+DDP fileset, the vinyl premaster folder — `Session::album_destinations`),
+the movie export's muxed file, Make Sample → File, lead sheets, lyrics
+(`.lrc` and `.srt` together), MIDI and MIDI 2.0 files and track preset
+exports. `Session::export_to(what, dests, start)` asks first about the
+destinations there now — one `UiRequest::AskReplace(ReplaceQuestion)`
+listing all of them, answered by `Action::AnswerReplace` (the shell shows
+the Render window's Overwrite / Cancel dialog, `render_report::ask_replace`;
+folders are named "replaced as a whole") — and starts the job with what
+may be replaced; `commit_export` moves a finished job's `Staged` files and,
+for a destination that appeared meanwhile, asks again (`appeared`) while
+they wait beside it (Cancel discards them); `write_export` does both for
+small files written at once. A save dialog that already asked (GTK's file
+choosers always ask about a file that is there) is not asked again: the
+shell passes its path with `Session::agree_to_replace` around the one
+dispatch (`AppState::dispatch_chosen`, the canvas host's Save chooser,
+`dialogs::chooser_agreed`; not when it added an extension). Answers to
+questions that are gone are ignored; quitting drops waiting `Staged`
+files, which remove their temporaries. Library saves (track and plugin
+presets under names the session chose, asked about by name) and the
+session's own files (freezes, bounces, scratch renders) are not asked
+about. Tests: `session/tests/exports.rs` (MIDI asked, cancelled, replaced,
+agreed; lyrics in one question; a track preset; an album asked first with
+its DDP folder replaced whole and a killed export's temporary swept; a
+file appearing while the album is written; a sample file), the movie in
+`session/tests/video.rs`, `render::files::tests` (folders, the sweep).
+Dev action `answer-question:<overwrite|cancel>` answers the open question
+as its button would.
+
+**Render statistics** (`render::stats`, on `faderframe_analysis::levels`).
+With `RenderSettings::report` each written file is read back from disk on
+the render's worker (between writing and committing; `RenderProgress::measuring`)
+and measured in 64k-frame pieces: header facts (container, encoding, rate,
+channels, the channel mask's layout, frames, size), per channel sample
+peak, true peak (4×), RMS, samples at full scale (the format's largest
+code), samples past 0 dBFS (float), overs (runs of 3), and BS.1770 loudness
+over all channels with each speaker's weight (`WeightedLoudness`, the
+streaming form of `integrated_weighted` with the meter's gating, windows
+and range: integrated, LRA, maxima). An ADM master gets peaks but no
+loudness (only a renderer places its objects); an IAMF file is not
+decoded here, so its figures are the encoder's (`from_file` false) and it
+has no levels — each says so in `FileStats::notes`. `Rendered::stats`
+holds them (`RenderSummary` adds a render's files up), `Rendered::finished`
+only what level processing did. The Render window shows them in a report
+(`faderframe-ui/src/render_report.rs`: a section per file, warnings for
+clipping, overs and true peaks over 0 dBTP, Show in Folder via
+`gtk::FileLauncher::open_containing_folder`, falling back to opening the
+folder); cancelled and failed renders say so instead (no report). The
+album export measures its written files the same way on its worker
+(`album::measured`: each song file and the album file — render time = its
+pass-1 render plus its pass-2 levelling and writing — and each vinyl side,
+read back from the staged files before they move; `AlbumExport::report`)
+and the session asks the shell to show them (`UiRequest::RenderReport`,
+the same report window; the DDP image is verified by reading the fileset
+back, not measured). Tests: `session/tests/render_files.rs`,
+`render::files::tests`, `faderframe-analysis` `levels::tests`,
+`the_streaming_weighted_measurement_reads_as_the_meter`, the album's in
+`session/tests/exports.rs` and `album.rs` (vinyl sides). Dev actions
+`render-track:<track>` (the window for one track), `render-now:[<path>|x]`
+(press Render), `render-stop:x` (press Stop). File → Render Selected
+Track… (`app.render-selected-track`).
 
 Delivery (`session::delivery`, on `faderframe_analysis::delivery`): a
 render's `Finish` normalises the whole file to an integrated loudness
@@ -2770,8 +3543,9 @@ target and keeps the true peak under a ceiling — a lookahead limiter
 (min-hold of the needed gain over 1.5 ms, then a box filter of the same
 length, so the gain is down in time and ramps smoothly; 60 ms release;
 repeated where the reconstructed signal still overshoots), the gain refined
-until the limited result meets the target — and every written file is
-measured (`Rendered::finished`). Dither (`faderframe_audio_files::Dither`)
+until the limited result meets the target (`Rendered::finished`: the
+gain, the limiting and the audio's measurement before writing) — and every
+written file is read back and measured (`Rendered::stats`, above). Dither (`faderframe_audio_files::Dither`)
 is TPDF or TPDF with Lipshitz's 5-tap E-weighted error feedback (44.1 and
 48 kHz). `DELIVERY_PRESETS` bundle target, ceiling, format, rate and
 dither.
@@ -3004,7 +3778,9 @@ survive pulling everything to −∞ and back); mute, solo, record arm,
 polarity, monitoring, colour, output and VCA assignment are set alike
 (invalid targets, such as feedback loops, are skipped). The edit and its
 followers are one `Batch`, one undo step; selecting a member selects its
-group when the group links selection.
+group when the group links selection. A folder's Group switch is the
+edit and record group of what it holds (clips, ranges and arming, not
+faders): see "Folder groups" under folders.
 
 ### Duplicating tracks, merging clips, device names, unused media
 
@@ -3184,6 +3960,40 @@ Tests `input_quantize_puts_played_notes_on_the_grid`,
 `a_controllers_quantize_button_toggles_input_quantize`,
 `the_quantize_light_follows_input_quantize`.
 
+**Aborting a take** (`TransportAction::AbortRecording`, Ctrl+Space as in
+Ardour; `AbortAndRestartRecording`, Ctrl+Shift+Space; Transport menu
+`app.abort-recording` / `app.abort-and-restart`, rebindable in the
+shortcut editor, MIDI learn as `TransportControl::{AbortRecording,
+AbortAndRestart}`). Plain Space stays play/stop: `transport_keys` leaves
+Space with Ctrl (or Alt, Super) to the accelerators, canvases never take
+Space, and no other default shortcut uses these. `Session::abort_recording`
+takes the recording out of record mode (engine first, whatever fails —
+a device gone — the take is thrown away all the same), drops the MIDI
+take unmarked (what was played stays for Capture MIDI), stops playback and
+goes back to where the recording began (`ActiveRecording::from`; with a
+punch range to where playback started), and parks the recording in
+`discarding`: once its writer has let go, `discard_recording` deletes the
+files it planned and made (`ActiveRecording::paths`, their `.ffpk`) and
+nothing else — never a file a source of the project names. Nothing reaches
+the project or the undo history. *Restart* records again from there as
+soon as the engine reports stopped (`tick_restart_recording`; a stop is
+deferred while rendering ahead primes it, and a take started earlier
+would catch what still plays), through the usual path: the same pre-roll,
+count-in and punch range; a user transport action in between, or no stop
+within two seconds, cancels it. A launcher slot's recording is thrown
+away while playback goes on (restart: the slot records again from its
+next launch position). Not recording, Abort is Stop and Abort and Restart
+does nothing.
+A project replaced (New, Open) while recording: the shell first ends the
+take and places it so the unsaved-changes question covers it
+(`confirm_discard`, `recording_in_progress`); the session itself never
+lets a recording outlive its project (`end_recordings_for_close` in
+`replace_project` and `Drop`: its takes reach neither project, their
+files stay; they used to be placed into the next project, onto whatever
+track had the same id). Tests `session/tests/abort_recording.rs` (the
+project and the media folder as before the pass, earlier takes kept,
+restart with its pre-roll, punch, MIDI, closing while recording).
+
 **Recording over clips.** The audio thread knows what is recorded:
 `EngineContext::recording` (`record::RecordingNow`: the record window and
 the recorded tracks, set on `BeginRecord`, cleared on `EndRecord`).
@@ -3193,10 +4003,38 @@ window's edges); before and after it the track plays its clips — so what
 is heard while recording over a clip is the new take, not the old one
 under it. A count-in (`RecordingNow::silent_before`) keeps every clip
 player (audio and MIDI) silent before the window and forces the click
-there, whatever the metronome's mode. Tests `engine/tests/recording.rs`
+there, whatever the metronome's mode. A MIDI-only take sets the window too (`RecordingNow::window_only`
+on `BeginMidiRecord` when no audio recorder runs), so its count-in keeps the
+song silent as well; the count-in setting goes to every new engine
+(`recreate_engine`, `EngineController::count_in`). Tests
+`engine/tests/recording.rs`
 (`a_recorded_track_plays_its_input_not_its_clip_inside_the_window`,
-`a_count_in_plays_the_click_alone_before_the_take`), session
-`pre_and_post_roll_lengths_and_the_post_roll_stop`.
+`a_count_in_plays_the_click_alone_before_the_take`,
+`a_count_in_before_a_midi_only_take_keeps_the_song_silent`), session
+`pre_and_post_roll_lengths_and_the_post_roll_stop`,
+`the_count_in_survives_the_audio_device_reopening`.
+
+**Takes that would go wrong** (`session/tests/recording_audit.rs`):
+a frozen armed track is left out with a notice (it takes no clips; before,
+it refused the whole "Record" step and every track's take was lost); with
+several armed tracks a new track per pass puts each track's passes right
+under it; a pass reads the `latency` frames past its own capture only when
+the next pass followed at once (a wrap inside the record window) — after a
+punch-out or a locate those frames are other audio, so the pass ends with
+its own; Keep Last Pass keeps the last *complete* pass (within 1 %) when
+Stop cut the final one short; each take counts its own dropped frames
+(`record_counters` restart with `begin_recording`); Flatten Comp keeps the
+engine's 64-frame declicks (`COMP_DECLICK`) at comp edges inside the folder
+that touch no other piece; using a take with no material in a split half
+changes nothing (it silenced the half). MIDI takes
+(`MidiTake::{window, loop_end}`): a note held across a loop wrap ends at the
+wrap (not at another pass's furthest event), one still held at a punch-out
+ends there; Replace clears only inside the record window and the take's
+bar-rounded clip is cut to it. Still open: Takes mode folds an overlapped
+clip into a take as its plain source region — a `Take` has no warp,
+reversal, pitch edit, clip effects or fades, so those are not kept in the
+folder (undo brings them back); MIDI loop recording has no "new track per
+pass" and stacks passes in one clip.
 
 **Arranger.** Rows have per-track heights (stored in `WorkspaceSet`:
 default + per-track overrides, saved with the layout; drag a header's
@@ -3829,6 +4667,96 @@ devices' moves as latched automation (lanes made for controls without
 one). Slots, scenes and stops take MIDI learn
 (`MappingTarget::{LauncherSlot, LauncherScene, LauncherStop}`).
 
+### Scratch pads
+
+Scratch pads (issue #13, after Studio One's) are other arrangements of the
+project's own tracks to try an idea in without touching the song.
+
+* Model (`faderframe_project::scratch`): `Project::scratch_pads` =
+  `ScratchPads { pads, shown, song, open }`; a `ScratchPad { id, name,
+  stash }`; a `Stash` holds an arrangement by value — clips (in each
+  track's order, `StashedTrack`), each track's automation, its own
+  timeline (tempo and metre), markers, sections, key changes, chords,
+  lyrics, loop and Play Start Marker. Everything else is shared: the
+  tracks themselves (mixer, devices, routing, sends, modulators, freezes),
+  sources, video, album, setlist, the launcher; nothing is duplicated but
+  the clips a pad holds (their media are the song's).
+* The project's arrangement fields hold the arrangement **shown**;
+  `Project::show_arrangement(pad)` swaps (puts the shown one aside, takes
+  the other out of its stash; an exact inverse). So `Project::clips` never
+  holds a clip put aside, and every editor, the engine snapshot, the
+  clipboard, recording and every `Command` work on what is shown without
+  knowing about pads. A new pad starts empty in the song's tempo and metre
+  at its start, without automation lanes; material copied in brings its
+  lanes (`TimeSlice::adopt_lanes`: the same lane id in every arrangement,
+  or the lane of the same target there).
+* Commands: `ShowArrangement { pad }` (Timeline impact; an undo step of
+  its own, so every edit is undone in the arrangement it was made in —
+  switching waits for gestures and recordings to end) and `SetScratchPad`
+  (add, change, remove; the shown pad's value has no stash, the shown pad
+  is never removed; Impact::None). `RemoveTrack` takes the track's parts
+  out of every stash and `RestoreTrack` puts them back
+  (`RemovedTrack::stashed`), so stashes never name a missing track.
+  `RemoveSource` refuses sources stashed clips play,
+  `Project::used_sources` (unused media, cleanup) counts them,
+  `repair` keeps stashes consistent with the tracks and reserves their ids,
+  `compare::differences` compares the songs and names pads added, renamed,
+  changed or removed; templates drop pads.
+* Session (`session::scratch`, `Action::ScratchPad(ScratchOp)`): `New
+  { name, from }` (empty or holding a copy, shown), `CopyTo { pad, what }`
+  (after what the pad holds, from the next bar line; the shown arrangement
+  stays), `Show`, `Rename` / `PromptRename` (`UiRequest::RenameScratchPad`),
+  `Duplicate` (new ids for its clips, markers and sections), `Delete` (the
+  song is shown if the pad was), `ToSong { pad, what, place }`. Material
+  (`PadMaterial`): a section with everything in it (tempo, metre, markers,
+  the section, key, chords, lyrics, automation — `arrange::copy_span`),
+  the edit selection (its range on the selected tracks, else the selected
+  clips — whole clips without automation, as copies of clips are), given
+  clips, or all an arrangement holds (`Project::arrangement_span`, out to
+  bar lines). Clips keep their place in the bar; tracks keep their clips
+  (pads share the tracks, so nothing needs mapping). Each op is computed on
+  a copy of the project and applied as one batch of `ShowArrangement` /
+  `SetArrangement` / `SetScratchPad`, so it is one undo step.
+* Back into the song (`SongPlacement`, the song shown after, at the
+  material, which is selected): `Insert { at }` (time opens:
+  `arrange::insert_span`), `Overwrite { at }` (`arrange::overlay_span`:
+  laid over the song on its tracks, what lies under it goes, time does not
+  move) or `Replace { section, keep_length }` (`arrange::replace_span`).
+  A replacement by material of another length is ambiguous, so the caller
+  says which: the section takes the material's length (what follows moves
+  by the difference) or keeps its own (the material is cut or padded to
+  it); the menus offer both by name with the lengths in bars
+  (`Session::pad_material_length`). The replaced section is put back over
+  the new span when the material brings none.
+* Playback plays what is shown (the snapshot's clips, automation, tempo
+  and loop are the shown arrangement's). A freeze is the song's: in a pad
+  a frozen track is silent (its devices are unloaded); freezing renders
+  the song, bouncing what is shown. Renders and exports (`render_copy`:
+  master, stems, album, video, ADM, IAMF) always take the song. Each
+  arrangement keeps its playhead (`Session::pad_positions`; a pad starts
+  at bar 1; `song_position()` is the song's while a pad is shown) and the
+  arranger its scroll and zoom per arrangement (`ArrangerView::places`).
+* UI: the arranger's corner has the switcher (the arrangement's name, an
+  accent while a pad is shown, with the ruler tinted and an accent line
+  under it; click or right-click: the menu — Song and the pads to show,
+  New Scratch Pad (from the selection, from a section), the shown pad's
+  Rename / Duplicate / Delete / Bring to Song, from the song each pad's
+  entries; double-click a pad's name to rename it there; a tab list for
+  screen readers). Section and clip menus have Copy to Scratch Pad ▸ (new
+  or another pad) and, in a pad, Bring to Song ▸ (Insert / Overwrite at
+  the song's playhead bar, Replace Section ▸). Edit → Scratch Pads and the
+  command palette run `app.scratch-pad::<op>`, also the dev action
+  `scratch-pad:<new|new-from-selection|copy-section=<n>[@<pad>]|copy-selection@<pad>|show=<pad>|song|next|to-song[@<q>]|overwrite[@<q>]|replace=<n>[/keep]|rename[=<pad>=<name>]|duplicate[=<pad>]|delete[=<pad>]>`
+  (sections 0-based, pads 1-based).
+* Tests: `faderframe-project/tests/scratch_pads.rs` (swap exactness and
+  undo, commands, track removal, file form and older files, used media,
+  repair, span operations), `faderframe-session/tests/scratch_pads.rs`
+  (copy a section into a pad, edit there, the engine plays the pad's clips
+  only, insert/overwrite/replace both ways, the selection in and out,
+  clipboard across arrangements, every step undone and redone, save and
+  reopen, unused media kept, renders of the song, freezes), the arranger's
+  `scratch_tests.rs` (switcher, menus, tint, places, accessibility).
+
 ### Control surfaces
 
 `faderframe-control` holds the protocols without I/O: the session builds
@@ -4135,7 +5063,10 @@ dmabuf — linear rows padded to 256 bytes, DRM `AB24`, straight alpha —
 and GTK takes it as a `GdkDmabufTexture` (`GpuRenderer::render_to`,
 `Output::Dmabuf`); a buffer is reused only once GTK's release callback
 gave it back (`DMABUF_POOL`, eight; with all of them shown a frame is read back).
-It is used when the display imports linear `AB24` (`dmabuf_formats`);
+It is used when the display imports linear `AB24` (`dmabuf_formats`),
+never on Broadway (`takes_gpu_dmabufs`: its formats are what GTK can
+`mmap`, and the painter's device-local buffers cannot be — the dense
+views were empty there, "Failed to mmap dmabuf");
 if GTK refuses a frame, frames are read back from then on
 (`FADERFRAME_GPU_DMABUF=0` turns it off). Measured on a Radeon iGPU
 (RADV): the mastering tools at 2411×711 device pixels 4.98 → 3.80 ms per
@@ -4166,7 +5097,13 @@ are read back from then on (`FADERFRAME_GPU_SHARE=0` turns it off). Not
 measured on hardware here: Wine's vkd3d stubs `CreateSharedHandle` and
 cannot compile vello's shaders, so the exporter's test runs on the Windows
 CI runners (WARP). macOS keeps the readback. Without a GPU adapter, or
-after any error, views keep the GSK painter. `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
+after any error, views keep the GSK painter — errors no error scope
+catches included: wgpu's default for those (validation, out of memory)
+and for a device lost (a GPU reset, a driver update, resume from sleep)
+is a panic, which inside GTK's paint ends the program; the renderer keeps
+the first instead (`on_uncaptured_error`, `set_device_lost_callback`,
+`GpuRenderer::fault`) and its next frame fails with it
+(`a_device_error_fails_the_next_frame_instead_of_panicking`). `FADERFRAME_PAINT_STATS=1` logs each canvas's paint time, frame
 rate and primitives per frame. Tests: `faderframe-ui-gpu/tests/render.rs`
 (skipped without an adapter).
 
@@ -4180,6 +5117,45 @@ and geometry-size limits also bound the cache during animation or zooming.
 HiDPI and fractional scaling are handled entirely by GTK; views never assume
 96 DPI. On Wayland the app is a native Wayland client (the status bar shows
 the GDK backend).
+
+### Crash reports
+
+A crash leaves something to send (`faderframe-ui/src/crash.rs`, installed
+first in `main`; files in `<data>/Crash Reports`, the portable folder's
+`Data` too):
+
+* `crash-<start>-<pid>.log`: a **panic** on any thread (the hook, after
+  Rust's own message: thread, message, place, backtrace, the end of the
+  log — in GTK callbacks and `extern "C"` callbacks a panic ends the
+  program, on workers it may not); a **fatal signal** (Linux, macOS:
+  `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT`; written by an
+  async-signal-safe handler from what `install` prepared: version, system,
+  GTK and glibc versions, the signal, the faulting address, the thread's
+  name and id, and — where the stack it runs on has 64 KiB, the main
+  thread's 256 KiB signal stack included — the native backtrace as
+  module(+offset) for `addr2line`. Every other thread Rust starts has a
+  signal stack of a few KiB: a fault there that is not a stack overflow
+  (its address not within `OVERFLOW_REACH` of the interrupted stack
+  pointer; Linux x86_64/aarch64) is sent back once to run on the thread's
+  own stack — the handler without `SA_ONSTACK`, the instruction faults
+  again — so a worker's crash has its backtrace too (a video job's on
+  Debian 13 said only "no backtrace"; `a_crash_on_another_thread_has_its_backtrace`,
+  `a_stack_overflow_is_reported_and_ends_as_rusts`); then the previous action, Rust's stack
+  overflow report or the default, so core dumps and the system's crash
+  collection go on); an **unhandled exception** (Windows,
+  `SetUnhandledExceptionFilter`: code, address, thread, backtrace; then
+  Windows Error Reporting). Sandbox and check helpers write theirs
+  (`crash-<start>-plugin-sandbox-<pid>.log`): a plugin crashing there
+  leaves its report.
+* `session-<start>-<pid>.log`: the run's log (`tracing` writes it beside
+  stderr; Windows' GUI build has no console).
+* `running-<pid>`: while the program runs. One whose process is gone at
+  the next start is a run that did not close; the window offers its report
+  (Show Report, Open Folder), or says there is none — the system killed it
+  (out of memory, the realtime time limit's `SIGKILL`) or the machine
+  stopped — and points to its log. The newest 20 reports and 8 logs are
+  kept. Tests in `crash.rs` crash child processes (a write to a
+  `PROT_NONE` page, a panic on a thread) and read what they left.
 
 ### Piano roll
 
@@ -4258,14 +5234,23 @@ full width under the header by `faderframe-ui`, wrapped into rows by
   in their shown order, piano-roll notes on the keys between over their
   span; Ctrl-click toggles one. Ctrl+drag (Smart, Select, Grab) draws a
   rectangle selecting the clips it touches (Ctrl+Shift adds; `Marquee`,
-  outside `Drag`); a click below the last track moves the playhead like a
-  click on a lane.
+  outside `Drag`), Ctrl+Alt+drag in a body slips its contents (below); a
+  click below the last track moves the playhead like a click on a lane.
+  Selecting clips — Shift/Ctrl-click, a rectangle, a drag that moved
+  clips — drops the edit range (`clips_not_range`), as a plain click and
+  Select All did: Delete, Copy, Cut and Duplicate take a range with a
+  length first, and a range left from before used to win over the clips
+  just selected (clearing a time span on their tracks). Edits that take
+  "the selected clips" take the arrangement's (`selected_arranger_clips`:
+  never launcher clips, which the launcher puts in the same selection) —
+  split, nudge, drags, the clip menu, quantize, merge, Delete.
 
 * `EditorSettings`: edit mode (Shuffle / Slip / Spot / Grid, grid absolute
   or relative — `snap` is true exactly in Grid mode), tool (Smart, Trim,
   Time-Stretch Trim, Selector, Grabber, Separation Grabber, Scrubber,
   Pencil, Zoom), grid value (`GridDivision` down to 1/256, triplet and
-  dotted; `GridDivision::menu` is the shared menu), nudge value, Tab to
+  dotted; `GridDivision::menu` is the shared menu), Snap to Objects (see
+  "Snap to Objects"), nudge value, Tab to
   Transients, Link Timeline and Edit Selection, Insertion Follows Playback,
   Follow Playhead (scrolling while playing), transient display and
   sensitivity, warp view, counter units, the shown global lanes, and zoom
@@ -4275,12 +5260,135 @@ full width under the header by `faderframe-ui`, wrapped into rows by
 * `Selection::range` is the edit selection (a time range on the selected
   tracks). Range operations — separate, trim, clear, copy/cut/paste, repeat,
   insert silence, nudge, Tab — and clip edits are `Batch` commands, one
-  undo step each; Shuffle mode closes and opens gaps.
+  undo step each; Shuffle mode closes and opens gaps. Time added or taken
+  away on tracks (Insert Silence, Shuffle clears, Shuffle pastes) moves
+  their automation too (`clipboard::LaneWork`: one `SetAutomationLane`
+  per changed lane, the value at the edit point held over inserted time).
+  Clear, Cut and Delete of a range in the other modes take the range's
+  automation out, as Copy takes it (`LaneWork::clear_time`,
+  `curve_cleared`: the points in it go, anchors at both edges keep the
+  values outside, the line runs straight between; a lane with no point in
+  the range is left as it is); the undo step is "Cut" for a cut. A range
+  edge less than a sample inside an audio clip (grid positions are not
+  whole samples) counts as that clip's edge — Clear, Cut and Trim to
+  Selection used to split there, find nothing to split and refuse the
+  whole step.
+* The clipboard (`session::clipboard`, `Session::clipboard()`) holds
+  values, never references: `Clipboard { kind: Range | Clips, length,
+  origin, lanes, sources, rate }`. Copy (Ctrl+C, `Action::Copy`) takes the
+  edit range on the selected tracks when it has a length (the clip parts
+  in it and the tracks' automation of it), else the selected clips whole
+  (never launcher clips) — audio with take folders, warp, pitch, clip
+  effects, spectral edits, fades and gain; MIDI with notes, expression,
+  controllers and SysEx. Every source those clips need goes along by
+  value (`ClipContent::referenced_sources`): a paste registers a source
+  again after its track was removed or its import undone (no file is
+  copied; clips whose file is gone are left out with a notice). Lanes are
+  the copied tracks in folder order, each with its `gap` in arranger rows
+  (`Session::arranger_rows`) to the lane above. Paste (`Action::Paste`)
+  goes to the insertion point (`Session::insertion_point`: the playhead;
+  the edit cursor without Link Timeline), snapped to the grid in Grid
+  mode (relative grid: the copied material's offset from the grid kept),
+  on whole samples otherwise. The top lane lands on a selected track that
+  is its own track, else on the first selected track, else on its own
+  track; the others follow at their distance, each going on down to the
+  next track that takes its clips (audio → audio tracks, MIDI →
+  instrument/MIDI tracks) and left out with a notice when none does. Slip,
+  Grid and Spot replace what lies under the pasted clips (a range: under
+  the range, as before); Shuffle inserts and pushes. Pasted clips get
+  fresh ids (MIDI notes too, expression following) and are never aliases;
+  they become the selection and the insertion point moves to their end,
+  so repeated Ctrl+V lays copies end to end (Ableton Live / REAPER).
+  Delete in the arranger (the key, Edit → Delete Selection routed to it)
+  is `Action::DeleteInArranger`: the range when it has a length, else the
+  selected clips — never the piano roll's selected notes, which
+  `Action::DeleteSelection` (control surfaces' Delete) still takes before
+  clips; the clip menu's Delete removes its clips even with a range.
+  Duplicate (Ctrl+D) and Repeat (Alt+R, `Action::Repeat(n)`) place copies
+  of the range or of the selected clips right after them, end to end, and
+  select the last copy; replacement clears are computed for all copies at
+  once (`clear_spans_commands`), so repeats over a long clip work. Cut
+  removes the copied clips like Delete (or clears the range). Range-only
+  `CopyRange`/`CutRange`/`RepeatRange` stay; `PasteRange` pastes the
+  clipboard. Object copies carry no automation (as moves never did).
+* Select All (`Action::SelectAllClips`, Ctrl+A in the arranger) selects
+  every clip on the rows the arranger shows (not in closed folders, never
+  launcher clips) and their tracks, and drops the edit range; the piano
+  roll, event list and pitch editor select their own notes and rows;
+  text fields keep Ctrl+A.
+* Splitting (S, Split at Playhead; Separate with a range) keeps every
+  piece of every selected clip selected, across tracks, so repeated
+  splits of aligned drums need no reselecting; clips the cut does not
+  cross (starting or ending there, `Session::cuts_inside`) stay as they
+  are, a zero crossing that would leave the clip falls back to the
+  playhead.
+* Slip editing (`session::slip`, `Action::SlipClips { clips, by }`):
+  Ctrl+Alt+drag in a clip's body (Smart, Selector, Grabber; whole grid
+  steps in Grid mode, Shift free; a click toggles like Ctrl-click) moves
+  the audio or MIDI inside the clips — all selected when the pressed one
+  is — while place, length, fades and gain stay. Audio offsets stay
+  inside the source; pitch and spectral edits are in source frames and
+  stay with the audio; a clip with clip effects slips within its render
+  but never into the devices' latency before it; a warped clip's map
+  moves with the audio (`slip_audio`: output frame u plays what u − d
+  played; markers keep their source frames, those leaving the clip go);
+  reversed clips move their offset the other way; MIDI moves and what
+  leaves the start is cut there (as a start trim). Take folders do not
+  slip (as they do not trim). Drags are absolute within one gesture from
+  `gesture_clip`, so they are lossless and one undo step.
+* The editing context (`faderframe-ui/src/edit_keys.rs`): selection is
+  the session's, keyboard focus GTK's; the context is the editor view
+  last pressed or focused (`is_editor`: arranger, piano roll, automation,
+  album, pitch, launcher, event list, spectral, setlist). Toolbars, tool
+  selectors, transport controls and non-editor views take the focus but
+  not the context and select nothing. Edit → Cut/Copy/Paste/Duplicate/
+  Select All (`app.cut` … `app.select-all`, Ctrl+X/C/V/D/A in
+  `palette::DEFAULT_SHORTCUTS`; application accelerators run before the
+  focused widget) and Undo/Redo route by focus (`command_routes`): a text
+  field gets its own `clipboard.*`, `selection.select-all`, `text.undo`;
+  a focused editor gets the key (only it); another focused view gets it,
+  then the context; in plugin editors and dialogs nothing behind them.
+  Plain editing keys the focused widget leaves unused (Delete, S, B, Q,
+  nudges, …) go to the context from the main window and detached view
+  windows (`install_window`, also the single-key transport shortcuts
+  there now) — never while typing or with another editor focused; Tab,
+  arrows, Enter, Space, Escape and the page keys stay with focus
+  navigation (Escape also ends MIDI learn and leaves a video window's full
+  screen: the context used to swallow it, clearing notes or the range).
+  Without a shown context the arranger is it, if shown. Edit → Delete
+  Selection (`app.delete`) routes like Cut and Copy (the editors' own
+  Delete key: notes in the piano roll, rows in the event list, the range
+  or clips in the arranger; `selection.delete` in a text field). The
+  launcher and the automation view handle no keys, so they do not take
+  the context (keys pressed after clicking them reached nothing).
+  Shortcut collisions resolved: Ctrl+, is the Preferences', so the
+  nudge-trims of the end are Ctrl+Alt+, / Ctrl+Alt+. (Ctrl+. too); F10 is
+  GTK's menu bar key in the main window (Pencil is Alt+0 everywhere, F10
+  in detached windows); F11 is the Inspector's, but in a video window gone
+  full screen it toggles full screen as it did (`video::toggle_active_full_screen`);
+  Ctrl+P (Punch) is in `DEFAULT_SHORTCUTS` (it was set apart, so the
+  shortcut editor showed no default and Reset cleared it); the shortcut
+  editor's window is not an application window, so the shortcuts being
+  set no longer run while it waits for keys (Ctrl+Q quit). Ctrl+Tab stays
+  the keyboard's way into a view's controls, so Tab to Transients has no
+  extend key.
 * Multi-clip edits (`MoveClips`, `TrimClips`, `ClipGain`, `SetFade`,
   `SetClipsMuted`) act on all selected clips when the pressed clip is
   selected. Drags send absolute values inside a gesture and the session
   recomputes from `gesture_clip` — the clip as the gesture first saw it —
-  so dragging back is lossless (trimmed notes and audio return).
+  so dragging back is lossless (trimmed notes and audio return). A
+  vertical move counts the rows the arranger shows (`arranger_rows`:
+  folder order, closed folders' tracks left out; it counted the project's
+  flat list, landing clips on hidden tracks). Shuffle trims of several
+  clips on a track add up (`editing::Trimmed`, `trims_commands`: each clip
+  moves by what the trims before it added — they used to overlap), drags,
+  nudge-trims and time-stretch alike. Nudges pass over take folders for
+  trims (they refused every clip) and move a group back together, stopping
+  at zero. A start trim of a clip with clip effects stops at the render's
+  start (`rendered_offset`), never in the devices' latency before it. The
+  Separation Grabber separates on its first move (not on a mere click),
+  takes the range out of every selected track and moves those pieces
+  together, all one undo step ("Separate and Move").
 * Fades: length, `FadeShape` (Linear, Equal Power, S-Curve, Fast, Slow)
   and a drawn bend (percent; `FadeShape::gain_bent`), the same function in
   the engine and the views.
@@ -4322,6 +5430,91 @@ shows a master-only `MixerView` at the main window's right edge, between
 the toolbars and the status bar; the dock's mixer then leaves its pinned
 master out. The arranger's host lays its scrollbars over the canvas
 (`ViewHost::overlaid`) so its header column and ruler reach the edges.
+A view goes to its home area when shown, else to its kind's
+`ViewKind::default_area` (the Inspector's `left`, every other view's
+`bottom`); the `left` area beside `main` is made on first use
+(`WorkspaceLayout::ensure_left_area`, `LEFT_AREA_RATIO`), so layouts saved
+before it existed need no migration, and while empty it takes no room.
+The bottom dock hidden (F2, its tab strip's ▾ button) leaves a bar with its
+views' names and, at the right end where the ▾ was, the ▴ that shows it
+again (`dock::collapsed_bar`, issue #16).
+
+### Inspector and Channel Overview
+
+Crate `faderframe-view-inspector` (GTK-free) holds two views of the
+selected track — `chain::inspected_track`: the anchor (the track clicked
+last) while it is selected, else the first selected in `folder_order`
+(the master last); removed tracks are skipped; several selected: it shows
+one and says "1 of n selected" (edits reach every selected track through
+`group_edits`, as from the mixer).
+
+* `InspectorView` (`ViewKind::Inspector`, area `left`; the header bar's
+  "i", View → Inspector, F11, `app.view-inspector`; dev action
+  `show-inspector`) — Studio One's Inspector: the name (click: rename),
+  colour, kind, format and number; foldable sections **Routing** (input,
+  output / the instrument a MIDI track plays and its MIDI device,
+  monitoring as segments, format, pan mode, surround panner, object),
+  **Track** (record arm, MPE, group/VCA, folder, a folder's contents and
+  open state and its **Folder Bus** switch — `Field::FolderBus` =
+  `Action::SetFolderBus`, for a plain folder and a folder bus alike; a
+  folder bus is a bus, so its bus controls are the rows and strip of one:
+  what feeds it — `chain::input_label` counts tracks by
+  `Project::output_target`, so the tracks it holds count —, output,
+  format, pan mode, group/VCA, automation, its devices and a full strip —,
+  automation modes of every lane, freeze; the master: Listen
+  and Console), **Devices** (the chain, one line each) and **Channel**: the
+  console strip of the track hosted in the view — `MixerView::single_strip`
+  (`show_track`; any kind, folder strips and the master included; no
+  inserts, no cheeks, at most the mixer's widest strip) — so fader, meter,
+  pan modes, mute/solo/arm, sends, input stage, MIDI learn and their menus
+  are the mixer's own. Events reach the strip in its coordinates; its
+  requests (menus, text entry) are moved back; a press there keeps the
+  drag; the wheel moves its controls, elsewhere scrolls the Inspector.
+* `ChannelOverviewView` (`ViewKind::ChannelOverview`, the bottom dock like
+  Clip Effects; View → Channel Overview, `show-channel-overview`) — #14:
+  the signal path in one row: Input → a card per device → "+" → Channel
+  (level, pan, M S R) → Sends → Output.
+
+`chain::devices` walks a track in `Track::slots` order with depths (input
+stage, legacy instrument slot, inserts, after a container what its chains
+hold) and reads role, failure (`plugin_failed`), latency
+(`EngineController::plugin_latency`), gain reduction, sidechain, program.
+Every control is an existing action: power = `SetPluginBypass`, click =
+`OpenPluginEditor` (Ctrl: bypass, Alt: remove, as on the mixer's slots),
+× = `RemovePlugin` / `SetPreamp { model: None }` (the master's input
+stage: `SetConsole { family: None }`) / `RemoveFromChain`, drag =
+`MovePlugin` (top-level inserts only; `chain::drop_index` counts the other
+inserts before the gap; the session keeps MIDI effects before the
+instrument), "+" = `OpenPluginBrowser` (right-click: the mixer's quick
+list), right-click on a card = the mixer's insert menu
+(`MixerView::insert_menu`, `stage_menu`; the strip menus `input_menu`,
+`output_menu`, `plays_menu`, `midi_out_menu`, `send_menu`, `track_menu`
+are public for this). Rows take their values and menus from the session's
+choice lists (`input_choices`, `midi_*_choices`, `format_choices`,
+`pan_mode_choices`, `group_menu`, `folder_choices`, `listen_choices`,
+`console_choices`, `object_choice`) and `shown_*`: no second copy of a
+track's settings. Screen readers get every line (a menu's choices as
+toggles under it), the devices with their power and remove buttons, and
+the strip's own nodes under Channel.
+
+### Menu checks (toggles)
+
+`faderframe_ui::toggles` (issue #6): every on/off command is a boolean
+stateful GIO action, every one-of-several a string state with the choice
+as the item's target, so GTK's menus draw the check or radio dot (and
+expose check-box / radio menu items to screen readers). One table —
+`TOGGLES` (name, state from the session, press) and `CHOICES` (edit mode,
+edit tool) — and `toggles::follow`, run from `AppState::update_chrome`
+(after every change and ~10 times a second), keep every state, also of
+actions defined elsewhere (stop-to-start, pre-roll on a bar, count-in,
+the recording radios, master panel), in step whatever changed it: menus,
+toolbar buttons, shortcuts, surfaces, MIDI learn. The Preferences'
+Snap/Follow check boxes are bound to the same actions; the command palette
+shows a ✓ for commands that are on (`palette::checked`). Edit → Edit
+Options lists the edit flags; Transport has Metronome On and Input
+Quantize. A new toggle is a row in `TOGGLES` plus a menu item. Dev actions
+`show-menu:<Menu>[/<Submenu>]` (opens it, logs each entry's state; the
+screenshot saves `<stem>-menubar.png`), `command-palette-search:<text>`.
 
 ## 12. Metering and metrics
 
@@ -4433,7 +5626,8 @@ for its editor.
     `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
     for helper processes, Win32 pipes/events/mappings, AppKit windows), `faderframe-stretch` (the C shim of the vendored
     stretcher), `faderframe-ui` (GObject subclassing macros, dmabuf
-    textures, WGL/D3D12 texture import) and `faderframe-ui-gpu`'s `dmabuf`
+    textures, WGL/D3D12 texture import, the crash reporter's signal
+    handlers and exception filter in `crash.rs`) and `faderframe-ui-gpu`'s `dmabuf`
     and `d3d12` modules (Vulkan external memory through wgpu's hal and
     ash; shared D3D12 textures through wgpu's hal and the windows crate;
     the rest of the crate denies it).
@@ -4586,7 +5780,15 @@ reads a proxy relative to its first frame (`service::in_file`), since
 Matroska readers start a stream at its first block (a picture starting
 after 0 read back early in its proxy). MXF and DV demuxed in every package; ProRes, DNxHD and the
 other intermediates decoded through an LGPL FFmpeg the Linux tarball
-builds (`packaging/linux/lgpl_libav.sh`). Conform to a new cut from EDLs
+builds (`packaging/linux/lgpl_libav.sh`). GStreamer's MXF demuxer before
+1.28.4 crashes (a NULL read in `find_edit_entry`, on seeks and at a file's
+end, for a track whose index delta it has not matched yet; Debian 13 has
+1.26.2, which the tarball bundles): where it is such a one and gst-libav
+has `avdemux_mxf` (the tarball's FFmpeg includes the MXF demuxer),
+`streams::avoid_crashing_demuxers` ranks it below FFmpeg's at start-up
+(`faderframe_video::mxf_by_ffmpeg`). FFmpeg's has no uncompressed picture
+(a GStreamer-made UYVY MXF is refused with "no picture" — it crashed
+before); FFmpeg-made XDCAM/IMX/DNxHR and OP-Atom files import. Conform to a new cut from EDLs
 or OpenTimelineIO, or by matching the old and new picture shot by shot
 (`faderframe-conform`, `faderframe_project::conform`, `session::conform`;
 one undo step, new shots marked). ADR (`faderframe_project::adr`,
@@ -4610,7 +5812,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    always-on retrospective MIDI capture~~ — done (see *Harmony*, *MIDI
    effects*, *Piano roll* and `session::capture`).
 3. **Organisation**: ~~folder tracks~~ (done: `TrackKind::Folder`,
-   `Track::folder`, `Project::folder_order`, `session::folders`), ~~clip
+   `Track::folder`, `Project::folder_order`, `session::folders`; folder
+   buses: see *Folders and folder buses*), ~~clip
    aliases~~ (done: `Project::clip_links`, `session::aliases`), ~~project
    versions (snapshots to compare and restore)~~ (done: `session::versions`,
    `faderframe_project::compare`), ~~a command palette with a shortcut
@@ -5059,6 +6262,98 @@ Crossings (`EditFlag::SnapToZeroCrossings`) moves the cuts of Separate,
 split at the playhead and Trim to Selection, and audio trims, to the
 nearest zero crossing of the clip's audio (channels summed, within 5 ms;
 `Session::cut_at`), per clip.
+
+### Snap to Objects
+
+`EditFlag::SnapToObjects` (`EditorSettings::snap_objects`, on by default,
+remembered in `Preferences::snap_objects`; Edit → Snap to Objects, the edit
+toolbar's *Objects*, Preferences → Editing) makes drags snap to **objects**:
+clip starts and ends on the same and every other shown track (closed
+folders hide theirs; launcher clips are in no track's list), markers,
+section bounds, the loop and edit-selection bounds, the Play Start Marker
+and the playhead while stopped. `session::snapping` finds them
+(`Session::snap_to_object`, `snap_edges_to_object` → `SnapHit { at,
+object: SnapObject, track }`; `snap_edges_to_objects_and` takes an
+editor's own objects too); the arranger applies the rules (`clip_edit.rs`:
+`SNAP_PX` = `snapping::SNAP_PX`, `object_shift`, `snap_point`,
+`moved_edges`). Besides clips, ranges, markers, sections and the loop,
+these drags snap the same way: the Play Start Marker's flag, automation
+points (a point added and dragged, not a freehand stroke), tempo points
+moved sideways, chords (a new chord's end, a moved chord by either edge, a
+resized edge). Key changes stay on bar lines (a key starts a bar), so they
+take no objects. The piano roll snaps a moved or resized note's edge (a
+moved group by its leading or trailing edge or the grabbed note's) to the
+other notes' starts and ends (`SnapObject::{NoteStart, NoteEnd}`) and the
+arranger's objects, before the grid; Shift moves freely there
+(`PianoRollView::note_object_shift`, its own guide line):
+
+* **Alt bypasses all snapping**, objects and grid alike.
+* **An object within `SNAP_PX` (8 px) beats the grid**; the threshold is
+  pixels turned into time at the current zoom (`snap_reach`), so it feels
+  the same at every zoom. The nearest object wins; at equal distance the
+  first found (tracks in order, then markers, sections, loop, selection,
+  playhead).
+* **Otherwise the edit mode decides as before**: Grid snaps to the grid
+  (absolute, or relative steps), Slip and the others move freely (whole
+  samples with Snap to Samples). So in Slip only objects attract.
+* **What is edited is never a target** (`SnapSkip`): the moved or trimmed
+  clips, the dragged marker or section, the selection while it is drawn,
+  the loop while it is dragged.
+* **Which edge snaps**: a moved group by its leading or trailing edge or the
+  grabbed clip's start or end — whichever is nearest an object, all moving
+  by the same shift; a trim by the trimmed edge (audio ends then land on
+  the whole sample nearest the object); a range by its moving edge (and its
+  anchor at the press); a section body by either bound; markers, section
+  bounds and loop edges by themselves.
+* **Shuffle moves are not snapped** (clips butt where they land) and Spot
+  asks for the position.
+* The guide shows on the lanes for ruler drags too (the loop, the Play
+  Start Marker).
+
+While a drag is snapped, `ArrangerView::snap_guide` holds the `SnapHit`: a
+line across the lanes in `ArrangerTheme::snap_guide` with the object's
+name (`SnapObject::label`) on a chip; it goes with the release. Tests:
+`session/tests/snapping.rs` (`objects_within_reach_…`,
+`a_group_snaps_by_…`, `clips_in_a_closed_folder_…`), arranger
+`snap_tests.rs` (`the_play_start_marker_drags_in_the_ruler_and_snaps`,
+`automation_points_tempo_points_and_chords_snap_to_objects`), piano roll
+`notes_snap_to_other_notes_and_objects`.
+
+### The drawn grid: every zoom, one strength
+
+`faderframe_timeline::for_each_visible_line` (`visible_lines`,
+`GridDensity { min_px: 8, fine_px: 18 }`) decides what the arranger and the
+piano roll draw from the **edit grid** (`EditorSettings::grid`, so triplet
+and dotted values show as they snap), the meter map and the zoom: bars
+(every 2ⁿth when closer than `min_px`, `bar_stride`), beats where they are
+`min_px` apart, the grid's lines — exactly `snap_nearest`'s positions —
+where they are, else every 2ⁿth of them while finer than a beat, and
+`GridLineKind::Fine` lines that halve the finest cells drawn (the grid's,
+or the beats' when the grid is coarser) down to about `fine_px` once those
+cells are twice as wide. Nothing snaps to fine lines; they keep the grid
+visible to single samples (the old arranger drew a fixed 1/16 at most, so
+from about 2 000 px a quarter no line was in view, and its grid ignored the
+chosen value). Each position comes once with its strongest kind (bar >
+beat > subdivision > fine). Zoomed in the ruler labels beats, grid lines
+and fine lines too (`ruler_labels`: by level, at least 76 px apart;
+"bar.beat.tick" in 960ths, decimals below a tick). Tests
+`drawn_grid_lines_are_the_snap_positions`,
+`the_grid_shows_at_every_zoom_without_flooding` (timeline),
+`the_grid_shows_at_every_zoom_and_sits_where_clips_snap` (arranger).
+
+How strongly lines are drawn is `Theme::grid: GridLook` — a preference laid
+over every skin (`Preferences::grid_strength` 0…1, default 0.5; slider
+Preferences → Editing → Grid lines; `AppState::set_grid_strength` hands the
+theme to every canvas with `CanvasWidget::restyle`, a repaint without a new
+layout; dev action `grid-strength:<0…1>`). The skins give the colours at
+the default (`ArrangerTheme::{bar,beat,sub,fine}_line` from `GRID_ALPHAS`
+0.19/0.11/0.075/0.055 — bars, beats and subdivisions 1.9×, 2.4× and 3.4×
+the old values — the piano roll's from `PIANO_GRID_ALPHAS`, scaled by each
+skin's line strength);
+`GridLook::gain` scales opacity ⅓× … 3×. Lines are whole device pixels on
+device-pixel edges (`GridLook::line_rect`): hairlines for subdivisions and
+fine lines, a logical pixel for bars and beats (two device pixels at 2×),
+bars one device pixel wider from strength 0.8.
 
 ### Meter styles and the VU meter bridge
 

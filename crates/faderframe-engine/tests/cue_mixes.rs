@@ -660,6 +660,90 @@ fn a_bus_and_a_return_in_a_cue_mix_are_solo_safe_and_mute_safe() {
     let _ = c.vox;
 }
 
+/// The console with the drum bus a folder bus holding the kick (its
+/// default output): the folder bus has a cue path as any bus — the cue
+/// hears the kick through it, and muting the folder (which mutes what it
+/// holds) or soloing elsewhere leaves the cue mix bit for bit as it was.
+#[test]
+fn a_folder_bus_in_a_cue_mix_is_solo_safe_and_mute_safe() {
+    let c = console();
+    let mut tp = c.tp;
+    tp.project.track_mut(c.drums).unwrap().folder_bus = true;
+    let k = tp.project.track_mut(c.kick).unwrap();
+    k.output = OutputRouting::Master;
+    k.folder = Some(c.drums);
+    assert_eq!(
+        tp.project.output_target(tp.project.track(c.kick).unwrap()),
+        Some(c.drums)
+    );
+    let plain = {
+        let mut r = live(&tp, 4);
+        r.play_from(0).unwrap();
+        play(&mut r, 4, 8 * BLOCK, None)
+    };
+    let at = 6 * BLOCK;
+    assert!(
+        close(plain[2][at], console_cue_left()),
+        "{} vs {}",
+        plain[2][at],
+        console_cue_left()
+    );
+    tp.project.track_mut(c.drums).unwrap().mute = true;
+    tp.project.track_mut(c.other).unwrap().solo = true;
+    let busy = {
+        let mut r = live(&tp, 4);
+        r.play_from(0).unwrap();
+        play(&mut r, 4, 8 * BLOCK, None)
+    };
+    assert_eq!(plain[2], busy[2], "the cue mix's left output");
+    assert_eq!(plain[3], busy[3], "the cue mix's right output");
+    let centre = std::f32::consts::FRAC_1_SQRT_2;
+    assert!(close(busy[0][at], 0.5 * centre), "{}", busy[0][at]);
+}
+
+/// A post-fader send placing its source itself (its own pan) reaches a
+/// return's cue path as it reaches the return: the source placed there,
+/// before the track's own pan, never muted.
+#[test]
+fn a_send_placing_its_source_reaches_a_returns_cue_path() {
+    let mut tp = TestProject::new(SR);
+    let vox = dc_track(&mut tp, "Vox");
+    let verb = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    tp.project.track_mut(vox).unwrap().pan = 1.0;
+    let id = tp.project.ids.allocate();
+    tp.project
+        .track_mut(vox)
+        .unwrap()
+        .sends
+        .push(faderframe_project::AuxSend {
+            id,
+            target: verb,
+            level_db: 0.0,
+            tap: SendTap::PostFader,
+            enabled: true,
+            pan: Some(-1.0),
+        });
+    let cue = cue(&mut tp, 2, ChannelLayout::Stereo);
+    cue_send(&mut tp, verb, cue, 0.0, 0.0);
+    cue_send(&mut tp, vox, cue, 0.0, 0.0);
+    tp.project.track_mut(vox).unwrap().cue_sends[0].on = false;
+    let mut r = live(&tp, 4);
+    r.play_from(0).unwrap();
+    let out = play(&mut r, 4, 8 * BLOCK, None);
+    let at = 6 * BLOCK;
+    // The main mix: the vox hard right, its send hard left.
+    assert!(close(out[0][at], 0.5) && close(out[1][at], 0.5));
+    // The cue: the return alone, the vox placed hard left.
+    assert!(close(out[2][at], 0.5), "{}", out[2][at]);
+    assert!(close(out[3][at], 0.0), "{}", out[3][at]);
+    // The vox muted in the main mix: the cue does not move.
+    tp.project.track_mut(vox).unwrap().mute = true;
+    sync(&mut r, &tp, Impact::Params);
+    let out = play(&mut r, 4, 8 * BLOCK, None);
+    assert!(close(out[0][at], 0.0) && close(out[1][at], 0.0));
+    assert!(close(out[2][at], 0.5) && close(out[3][at], 0.0));
+}
+
 /// A post-fader cue mix: the bus's cue send follows the bus fader (the
 /// cue path's own, solo-safe strip), never its mute.
 #[test]
@@ -729,11 +813,24 @@ fn heard(r: &mut OfflineRenderer, blocks: usize, paced: bool) -> HashMap<i64, (f
 /// With a cue mix the buses still render ahead: the kick's chain and
 /// strip and the drum bus's chain (its cue path with them) leave the
 /// audio thread, and both the master and the cue mix sound bit for bit as
-/// without anticipation.
+/// without anticipation — pre-fader, and post-fader with the cue sends
+/// placing their sources (the bus's from its cue path's unpanned output,
+/// in the shallow tier).
 #[test]
 fn buses_render_ahead_with_a_cue_mix_and_the_cue_sounds_the_same() {
+    for tap in [SendTap::PreFader, SendTap::PostFader] {
+        renders_ahead_with_a_cue_mix(tap);
+    }
+}
+
+fn renders_ahead_with_a_cue_mix(tap: SendTap) {
     let c = console();
     let mut tp = c.tp;
+    tp.project.cue_mut(c.cue).unwrap().tap = tap;
+    // Panned away from the main mix's places.
+    tp.project.track_mut(c.drums).unwrap().pan = 0.7;
+    tp.project.track_mut(c.drums).unwrap().cue_sends[0].pan = -0.6;
+    tp.project.track_mut(c.vox).unwrap().cue_sends[0].pan = 0.4;
     // Something to render on the kick (a track is anticipated for its
     // devices); the demo's rule for the others too.
     for t in [c.kick, c.vox, c.other] {
@@ -938,4 +1035,245 @@ fn cue_lanes_drive_the_sends_and_the_cue_level() {
         out[0][3 * Q + after],
         0.5 * std::f32::consts::FRAC_1_SQRT_2
     ));
+}
+
+/// A post-fader cue send places its source by its own pan, as a send with
+/// a pan of its own does (it taps the strip's never-muted, post-fader,
+/// *unpanned* output, not the main mix's image): a mono track panned hard
+/// right in the main mix with its cue send hard left is heard hard left in
+/// the cue, at its fader's level and never muted; a stereo track balanced
+/// hard right with its cue send centred is heard centred; a bus panned
+/// hard right with its cue send hard left is heard hard left. A pre-fader
+/// cue send places its source the same way (it always did).
+#[test]
+fn a_post_fader_cue_send_places_its_source_by_its_own_pan() {
+    let mut tp = TestProject::new(SR);
+    let vox = dc_track(&mut tp, "Vox");
+    let keys = tp.track(TrackKind::Audio, "Keys", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.25, SR as usize * 2);
+    tp.clip(keys, src, MusicalTime::ZERO, i64::from(SR) * 2);
+    let pads = tp.track(TrackKind::Audio, "Pads", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.125, SR as usize * 2);
+    tp.clip(pads, src, MusicalTime::ZERO, i64::from(SR) * 2);
+    let bus = tp.track(TrackKind::Bus, "Pad Bus", ChannelLayout::Stereo);
+    tp.project.track_mut(pads).unwrap().output = OutputRouting::Track { track: bus };
+    let c = cue(&mut tp, 2, ChannelLayout::Stereo);
+    tp.project.cue_mut(c).unwrap().tap = SendTap::PostFader;
+    {
+        let t = tp.project.track_mut(vox).unwrap();
+        t.pan = 1.0;
+        t.volume_db = -6.0;
+    }
+    tp.project.track_mut(keys).unwrap().pan = 1.0;
+    tp.project.track_mut(bus).unwrap().pan = 1.0;
+    cue_send(&mut tp, vox, c, 0.0, -1.0);
+    cue_send(&mut tp, keys, c, 0.0, 0.0);
+    cue_send(&mut tp, bus, c, 0.0, -1.0);
+    // The pads reach the cue through their bus (the console rule).
+    cue_send(&mut tp, pads, c, 0.0, 0.0);
+    tp.project.track_mut(pads).unwrap().cue_sends[0].on = false;
+    let measure = |tp: &mut TestProject, solo: &[TrackId]| {
+        for t in [vox, keys, bus] {
+            if let Some(cs) = tp.project.track_mut(t).unwrap().cue_sends.first_mut() {
+                cs.on = solo.contains(&t);
+            }
+        }
+        let mut r = live(tp, 4);
+        r.play_from(0).unwrap();
+        let out = play(&mut r, 4, 8 * BLOCK, None);
+        let at = 6 * BLOCK;
+        (out[2][at], out[3][at], out[0][at], out[1][at])
+    };
+    // Measured first (printed with --nocapture), then checked.
+    let vox_alone = measure(&mut tp, &[vox]);
+    let keys_alone = measure(&mut tp, &[keys]);
+    let bus_alone = measure(&mut tp, &[bus]);
+    tp.project.track_mut(vox).unwrap().mute = true;
+    let vox_muted = measure(&mut tp, &[vox]);
+    tp.project.track_mut(vox).unwrap().mute = false;
+    tp.project.cue_mut(c).unwrap().tap = SendTap::PreFader;
+    let vox_pre = measure(&mut tp, &[vox]);
+    for (what, (l, r, ml, mr)) in [
+        ("vox, main pan +1, cue pan -1", vox_alone),
+        ("keys, main balance +1, cue pan 0", keys_alone),
+        ("bus, main balance +1, cue pan -1", bus_alone),
+        ("vox muted in the main mix", vox_muted),
+        ("vox, pre-fader cue, cue pan -1", vox_pre),
+    ] {
+        eprintln!("{what}: cue L {l:.6} R {r:.6} · main L {ml:.6} R {mr:.6}");
+    }
+    // The vox: hard left in the cue at its fader's −6 dB (a mono source
+    // hard left by the pan law is at unity on that side), hard right in
+    // the main mix.
+    let level = 0.5 * db_to_gain(-6.0);
+    let (l, r, ..) = vox_alone;
+    assert!(close(l, level) && close(r, 0.0), "cue {l} {r} vs {level}");
+    // The keys: centred (balance at the centre leaves both sides).
+    let (l, r, ..) = keys_alone;
+    assert!(close(l, 0.25) && close(r, 0.25), "cue {l} {r}");
+    // The bus: hard left.
+    let (l, r, ..) = bus_alone;
+    assert!(close(l, 0.125) && close(r, 0.0), "cue {l} {r}");
+    // Muted in the main mix: the cue does not move.
+    let (l, r, ml, mr) = vox_muted;
+    assert!(close(l, level) && close(r, 0.0), "cue {l} {r}");
+    assert!(close(ml, 0.0) && close(mr, 0.375), "main {ml} {mr}");
+    // Pre-fader: the same placement, without the fader.
+    let (l, r, ..) = vox_pre;
+    assert!(close(l, 0.5) && close(r, 0.0), "cue {l} {r}");
+}
+
+/// Cue mixes added to a playing engine, and removed again: every strip
+/// is made anew with its cue taps (outputs 2 and 3, the unpanned outputs
+/// after them) or without them — a strip carried over from the graph
+/// before would leave its cue taps unwritten (the cue mix silent) and
+/// write a send placing its source itself on the wrong output. After
+/// each rebuild the outputs are sample for sample those of an engine
+/// built that way from the start.
+#[test]
+fn cue_mixes_added_and_removed_while_playing_sound_as_built_with_them() {
+    let mut tp = TestProject::new(SR);
+    let vox = dc_track(&mut tp, "Vox");
+    let verb = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    tp.project.track_mut(vox).unwrap().pan = 1.0;
+    let id = tp.project.ids.allocate();
+    tp.project
+        .track_mut(vox)
+        .unwrap()
+        .sends
+        .push(faderframe_project::AuxSend {
+            id,
+            target: verb,
+            level_db: -6.0,
+            tap: SendTap::PostFader,
+            enabled: true,
+            pan: Some(-1.0),
+        });
+    let without = TestProject {
+        project: tp.project.clone(),
+        sources: tp.sources.clone(),
+    };
+    let cue = cue(&mut tp, 2, ChannelLayout::Stereo);
+    cue_send(&mut tp, vox, cue, 0.0, 0.0);
+    cue_send(&mut tp, verb, cue, -3.0, 0.0);
+    let with = tp;
+    for (from, to, what) in [(&without, &with, "added"), (&with, &without, "removed")] {
+        let mut fresh = live(to, 4);
+        let mut grown = live(from, 4);
+        fresh.play_from(0).unwrap();
+        grown.play_from(0).unwrap();
+        let _ = play(&mut fresh, 4, 16 * BLOCK, None);
+        let _ = play(&mut grown, 4, 16 * BLOCK, None);
+        sync(&mut grown, to, Impact::Graph);
+        let a = play(&mut fresh, 4, 16 * BLOCK, None);
+        let b = play(&mut grown, 4, 16 * BLOCK, None);
+        let wrong: Vec<String> = (0..4)
+            .filter_map(|c| {
+                let differ: Vec<usize> = (0..a[c].len()).filter(|&i| a[c][i] != b[c][i]).collect();
+                let &first = differ.first()?;
+                Some(format!(
+                    "output {c}: {} samples differ (from {first}: {} built so, {} rebuilt)",
+                    differ.len(),
+                    a[c][first],
+                    b[c][first]
+                ))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "cue mix {what}: {wrong:#?}");
+        // Something to compare: the main mix plays, and so does the cue.
+        let at = 8 * BLOCK;
+        assert!(a[0][at].abs() > 0.1 && a[1][at].abs() > 0.1);
+        if what == "added" {
+            assert!(a[2][at].abs() > 0.1 && a[3][at].abs() > 0.1, "{}", a[2][at]);
+        }
+    }
+}
+
+/// A pre-FX send added while playing to a track whose chain and strip
+/// render ahead (into a bus rendered ahead, with a cue mix): a track with
+/// a pre-FX send plays on the audio thread (`ahead_eligible`), so it
+/// comes back there, its bus with it, and the return's cue path takes the
+/// send from the track's input in the audio thread's graph — the graph
+/// builds while playing, and the main mix and the cue mix then carry the
+/// send as an engine built with it does.
+#[test]
+fn a_pre_fx_send_added_to_a_track_rendered_ahead_builds_and_plays() {
+    let c = console();
+    let mut tp = c.tp;
+    for t in [c.kick, c.vox, c.other] {
+        gain(&mut tp, t, -1.0);
+    }
+    let mut with_send = TestProject {
+        project: tp.project.clone(),
+        sources: tp.sources.clone(),
+    };
+    let id = with_send.project.ids.allocate();
+    with_send
+        .project
+        .track_mut(c.kick)
+        .unwrap()
+        .sends
+        .push(faderframe_project::AuxSend {
+            id,
+            target: c.verb,
+            level_db: -6.0,
+            tap: SendTap::PreFx,
+            enabled: true,
+            pan: None,
+        });
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let mut ahead = live(&tp, 4);
+        ahead.controller.set_render_ahead_buses(true);
+        ahead
+            .controller
+            .set_render_ahead(Some(std::time::Duration::from_millis(150)), 2);
+        sync(&mut ahead, &tp, Impact::Graph);
+        assert!(ahead.controller.ahead_strips().contains(&c.kick));
+        assert!(ahead.controller.ahead_tracks().contains(&c.drums));
+        let _ = heard(&mut ahead, 20, true);
+        ahead.controller.transport(TransportCommand::Play).unwrap();
+        let _ = heard(&mut ahead, 40, true);
+        // While playing: the send, and the graph rebuilt.
+        ahead
+            .controller
+            .sync(&with_send.project, &with_send.sources, Impact::Graph)
+            .expect("the graph builds with the pre-FX send");
+        assert!(!ahead.controller.ahead_tracks().contains(&c.kick));
+        assert!(!ahead.controller.ahead_tracks().contains(&c.drums));
+        let h = heard(&mut ahead, SR as usize / BLOCK, true);
+        let misses = ahead.controller.ahead_misses();
+        if misses > 0 && tries < 3 {
+            eprintln!("try {tries}: {misses} blocks late (a busy machine): again");
+            continue;
+        }
+        let mut fresh = live(&with_send, 4);
+        fresh.controller.transport(TransportCommand::Play).unwrap();
+        let end = h.keys().max().copied().unwrap();
+        let p = heard(&mut fresh, end as usize / BLOCK + 2, false);
+        // The last quarter second (settled after the rebuild): the same.
+        let from = end - i64::from(SR) / 4;
+        let mut both = 0;
+        for (pos, (m, cue)) in h.iter().filter(|(p, _)| **p >= from) {
+            let (m2, cue2) = p[pos];
+            assert!(
+                close(*m, m2) && close(*cue, cue2),
+                "{pos}: {m}/{cue} vs {m2}/{cue2}"
+            );
+            both += 1;
+        }
+        assert!(both >= SR as usize / 4 - BLOCK, "compared {both}");
+        // The kick's pre-FX send reaches the return's cue path: the cue
+        // is not what it is without the send.
+        let mut before = live(&tp, 4);
+        before.controller.transport(TransportCommand::Play).unwrap();
+        let q = heard(&mut before, end as usize / BLOCK + 2, false);
+        let (cue, cue_without) = (p[&end].1, q[&end].1);
+        assert!(
+            cue.abs() > 0.1 && !close(cue, cue_without),
+            "{cue} vs {cue_without}"
+        );
+        break;
+    }
 }

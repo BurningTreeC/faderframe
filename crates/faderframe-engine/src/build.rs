@@ -486,16 +486,22 @@ fn node_key(track: TrackId, role: Role, sub: u64, layouts: &[ChannelLayout]) -> 
     for l in layouts {
         // The layout itself: a strip into 5.1 is not one into six
         // discrete channels.
-        eat(match l {
-            ChannelLayout::Surround(f) => {
-                0x1_0000
-                    + faderframe_core::SurroundFormat::ALL
-                        .iter()
-                        .position(|x| x == f)
-                        .unwrap_or(0) as u64
+        match l {
+            // A layout of the user's: its width and which one (interned:
+            // one address per layout for the life of the process, and keys
+            // are only compared within it). Never a built-in's key — a node
+            // adopted across layouts keeps buffers of the other's width.
+            ChannelLayout::Surround(faderframe_core::SurroundFormat::Custom(c)) => {
+                eat(0x2_0000 + c.speakers.len() as u64);
+                eat(std::ptr::from_ref(*c) as usize as u64);
             }
-            other => other.channel_count() as u64,
-        });
+            ChannelLayout::Surround(f) => eat(0x1_0000
+                + faderframe_core::SurroundFormat::ALL
+                    .iter()
+                    .position(|x| x == f)
+                    .unwrap_or(0) as u64),
+            other => eat(other.channel_count() as u64),
+        }
     }
     NodeKey(h)
 }
@@ -1661,7 +1667,10 @@ pub fn build_graph(
         // The node's graph is `g`'s.
         let reachable = |n: &TrackNodes| n.input.filter(|_| n.input_ahead == ahead_strip);
         match t.output {
-            OutputRouting::Master if has_objects && !ahead_strip && project.is_object(t) => {
+            // An object (into the master: by default or by name).
+            OutputRouting::Master | OutputRouting::Track { .. }
+                if has_objects && !ahead_strip && project.is_object(t) =>
+            {
                 object_outs.push(out);
             }
             OutputRouting::Master | OutputRouting::Track { .. } => {
@@ -1751,6 +1760,17 @@ pub fn build_graph(
             let (tap_node, tap_port, tap_layout) = match send.tap {
                 SendTap::PreFx => (tn.preamp.or(tn.input).unwrap_or(strip), 0, t.layout),
                 SendTap::PreFader => (strip, 1, t.chain_layout()),
+                // Its own pan places the source (not the main mix's image).
+                SendTap::PostFader if places_itself(t, send, target) => {
+                    let kind = StripKind::Main {
+                        quiet: false,
+                        cue_taps: cue_taps(t),
+                    };
+                    match unpanned_ports(project, t, kind).0 {
+                        Some(port) => (strip, port, t.chain_layout()),
+                        None => (strip, 0, destination_layout(project, t)),
+                    }
+                }
                 SendTap::PostFader => (strip, 0, destination_layout(project, t)),
             };
             let level = slots.send(send.id)?;
@@ -1949,7 +1969,15 @@ pub fn build_graph(
                             cue_tap(project, &nodes, &cue_paths, &strip_latency, src, false)
                         }
                         SendTap::PostFader => {
-                            cue_tap(project, &nodes, &cue_paths, &strip_latency, src, true)
+                            cue_tap(project, &nodes, &cue_paths, &strip_latency, src, true).map(
+                                |tap| {
+                                    if places_itself(src, send, t) {
+                                        unpanned_tap(project, tap, src)
+                                    } else {
+                                        tap
+                                    }
+                                },
+                            )
                         }
                     };
                     if let Some(tap) = tap {
@@ -2094,6 +2122,13 @@ pub fn build_graph(
             }
             let Some(tap) = cue_tap(project, &nodes, &cue_paths, &strip_latency, t, post) else {
                 continue;
+            };
+            // After the fader its own pan places the source, as before it
+            // (not the main mix's image, which it would only balance).
+            let tap = if cue_places_itself(t, cue) {
+                unpanned_tap(project, tap, t)
+            } else {
+                tap
             };
             let s = slots.cue_send(t.id, cue.id)?;
             let spec = NodeSpec::new(format!("{} → {}", t.name, cue.name))
@@ -2517,6 +2552,100 @@ fn is_diffuse(project: &Project, t: &Track) -> bool {
     project.surround_panned(t).is_some() && project.effective_surround(t).diffuse
 }
 
+/// What a parameter edit can change of the graph's shape (a change
+/// rebuilds it): the diffuse spreads (their decorrelation filters), where
+/// folder buses take their tracks' default outputs (moving a track into or
+/// out of one, see `Project::output_target`), and the post-fader sends
+/// that place their source themselves ([`places_itself`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamShape {
+    pub diffuse: Vec<TrackId>,
+    pub folder_routes: Vec<(TrackId, TrackId)>,
+    pub placing_sends: Vec<faderframe_core::SendId>,
+}
+
+pub fn param_shape(project: &Project) -> ParamShape {
+    let folder_routes = if project.tracks.iter().any(Track::is_folder_bus) {
+        project
+            .tracks
+            .iter()
+            .filter(|t| t.output == OutputRouting::Master)
+            .filter_map(|t| project.folder_bus_of(t).map(|f| (t.id, f.id)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let placing_sends = project
+        .tracks
+        .iter()
+        .flat_map(|t| {
+            t.sends
+                .iter()
+                .filter(|s| {
+                    project
+                        .track(s.target)
+                        .is_some_and(|target| places_itself(t, s, target))
+                })
+                .map(|s| s.id)
+        })
+        .collect();
+    ParamShape {
+        diffuse: diffuse_tracks(project),
+        folder_routes,
+        placing_sends,
+    }
+}
+
+/// A post-fader send with a pan of its own places the track's source
+/// itself (a mono source by the pan law, a stereo one balanced) into a
+/// stereo destination, from the strip's post-fader *unpanned* output —
+/// the track's own pan (or dual pan) is the main mix's, not the send's.
+/// Without one ("as tapped") it follows the main mix's image.
+fn places_itself(t: &Track, send: &faderframe_project::AuxSend, target: &Track) -> bool {
+    send.enabled
+        && send.tap == SendTap::PostFader
+        && send.pan.is_some()
+        && target.layout == ChannelLayout::Stereo
+        && matches!(
+            t.chain_layout(),
+            ChannelLayout::Mono | ChannelLayout::Stereo
+        )
+}
+
+/// A cue send placing its source itself: into a stereo cue mix after the
+/// fader, from the strip's never-muted post-fader *unpanned* output, so
+/// its pan places a mono or stereo source (the pan law, a balance) as it
+/// does before the fader — not balancing the main mix's panned image.
+/// (A mono cue mix, or a surround channel, takes the image as it is.)
+fn cue_places_itself(t: &Track, cue: &faderframe_project::CueMix) -> bool {
+    cue.post_fader()
+        && cue.layout == ChannelLayout::Stereo
+        && faderframe_project::cue::feeds_cues(t.kind)
+        && matches!(
+            t.chain_layout(),
+            ChannelLayout::Mono | ChannelLayout::Stereo
+        )
+}
+
+/// Does a cue mix take `t` from its never-muted post-fader unpanned
+/// output ([`cue_places_itself`])?
+fn cue_unpanned(project: &Project, t: &Track) -> bool {
+    project
+        .cue_mixes
+        .iter()
+        .any(|cue| cue_places_itself(t, cue))
+}
+
+/// Does `t`'s strip have the post-fader unpanned output (a send of it
+/// [`places_itself`])?
+fn has_unpanned(project: &Project, t: &Track) -> bool {
+    t.sends.iter().any(|s| {
+        project
+            .track(s.target)
+            .is_some_and(|target| places_itself(t, s, target))
+    })
+}
+
 /// Which strip [`add_strip`] builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StripKind {
@@ -2586,6 +2715,19 @@ fn add_strip(
     let metered_elsewhere =
         t.kind == TrackKind::Master && project.objects().next().is_some() && !quiet;
     let diffuse = is_diffuse(project, t);
+    // A send placing the source itself: the post-fader unpanned output;
+    // with the cue taps, its never-muted twin for the cue paths' copies of
+    // those sends and for cue sends after the fader (the cue path of a bus
+    // is never muted: its one unpanned output serves both).
+    let (unpanned_port, cue_unpanned_port) = unpanned_ports(project, t, kind);
+    // What the processor is made with is in its key: a rebuild must not
+    // hand a strip made without the cue taps (cue mixes added while
+    // playing) to a node with them — its cue outputs would stay unwritten
+    // and its unpanned output land on the wrong port — nor the reverse.
+    // Not whether it is `quiet`: that only says which graph it renders in
+    // (ahead or live; adoption stays within a graph), and summing points
+    // add their sources in key order, so a strip rendered ahead must keep
+    // the key it has live or the sums round differently.
     let mut spec = NodeSpec::new(if cue {
         format!("{} · Cue Strip", t.name)
     } else {
@@ -2594,7 +2736,12 @@ fn add_strip(
     .key(node_key(
         t.id,
         if cue { Role::CueStrip } else { Role::Strip },
-        u64::from(object) | (u64::from(metered_elsewhere) << 1) | (u64::from(diffuse) << 2),
+        u64::from(object)
+            | (u64::from(metered_elsewhere) << 1)
+            | (u64::from(diffuse) << 2)
+            | (u64::from(unpanned_port.is_some()) << 3)
+            | (u64::from(cue_unpanned_port.is_some()) << 4)
+            | (u64::from(cue_taps) << 5),
         &[layout, dest],
     ))
     .audio_in(layout)
@@ -2604,6 +2751,10 @@ fn add_strip(
         spec = spec.audio_out(layout).audio_out(dest);
     }
     if cue {
+        spec = spec.audio_out(layout);
+    }
+    // (After the others, in port order.)
+    for _ in unpanned_port.iter().chain(&cue_unpanned_port) {
         spec = spec.audio_out(layout);
     }
     if let Some(g) = group {
@@ -2626,9 +2777,34 @@ fn add_strip(
     if cue {
         strip = strip.solo_safe();
     }
+    if let Some(port) = unpanned_port {
+        strip = strip.with_unpanned(usize::from(port));
+    }
+    if let Some(port) = cue_unpanned_port {
+        strip = strip.with_cue_unpanned(usize::from(port));
+    }
     let strip = b.add_node(spec, Box::new(if quiet { strip.quiet() } else { strip }));
     b.connect_audio(from, 0, strip, 0)?;
     Ok(strip)
+}
+
+/// A strip's post-fader unpanned output (for its sends placing the
+/// source themselves) and its never-muted twin (with the cue taps: for the
+/// cue paths' copies of those sends and for cue sends after the fader),
+/// each when something takes it, after the strip's other outputs: a
+/// track's after outputs 0 and 1 and its cue taps (2, 3); a bus's cue
+/// path's after its 0–2 (that strip is never muted: no twin, its one
+/// unpanned output serves the sends and the cue mixes).
+fn unpanned_ports(project: &Project, t: &Track, kind: StripKind) -> (Option<u16>, Option<u16>) {
+    let sends = has_unpanned(project, t);
+    match kind {
+        StripKind::Main { cue_taps: true, .. } => {
+            let twin = sends || cue_unpanned(project, t);
+            (sends.then_some(4), twin.then_some(4 + u16::from(sends)))
+        }
+        StripKind::Main { .. } => (sends.then_some(2), None),
+        StripKind::Cue => ((sends || cue_unpanned(project, t)).then_some(3), None),
+    }
 }
 
 /// The talkback microphone's node key channel (no track of its own).
@@ -2699,6 +2875,36 @@ fn cue_tap<'a>(
             in_bb: n.strip_ahead,
             latency: strip_latency.get(&t.id).copied().unwrap_or(0),
         })
+    }
+}
+
+/// `tap` (a post-fader cue tap of `t`) moved to its strip's never-muted
+/// post-fader *unpanned* output: what a send placing the source itself
+/// ([`places_itself`]) takes on a cue path, and a cue send after the fader
+/// ([`cue_places_itself`]) — a bus's cue path's strip (never muted), a
+/// track's twin of the main mix's unpanned output. (As it was when the
+/// strip has none.)
+fn unpanned_tap<'a>(project: &Project, tap: CueTap<'a>, t: &Track) -> CueTap<'a> {
+    let port = if has_cue_path(t) {
+        unpanned_ports(project, t, StripKind::Cue).0
+    } else {
+        unpanned_ports(
+            project,
+            t,
+            StripKind::Main {
+                quiet: false,
+                cue_taps: true,
+            },
+        )
+        .1
+    };
+    match port {
+        Some(port) => CueTap {
+            port,
+            layout: t.chain_layout(),
+            ..tap
+        },
+        None => tap,
     }
 }
 
@@ -3183,4 +3389,58 @@ fn build_ahead_chain(
         prev = node;
     }
     Ok((input, prev, latency))
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use faderframe_core::SurroundFormat;
+    use faderframe_core::surround::{LayoutDef, SpeakerDef};
+
+    fn custom(name: &str, speakers: usize) -> SurroundFormat {
+        LayoutDef {
+            name: name.into(),
+            speakers: (0..speakers)
+                .map(|i| SpeakerDef {
+                    label: format!("S{i}"),
+                    azimuth: 170.0 - 340.0 * i as f32 / speakers as f32,
+                    elevation: 0.0,
+                    lfe: false,
+                })
+                .collect(),
+        }
+        .intern()
+        .unwrap()
+    }
+
+    /// Nodes keep their processors across rebuilds while their key holds
+    /// (`adopt_state_from`), buffers sized for the layout included: the
+    /// user's speaker layouts must key apart from each other and from the
+    /// built-in formats (all once keyed as LCR — a master moved between
+    /// them kept the listening node of the other width, and its crossfade
+    /// read past its buffer on the audio thread).
+    #[test]
+    fn speaker_layouts_of_the_users_key_their_nodes_apart() {
+        let key = |f: SurroundFormat| {
+            node_key(
+                TrackId(1),
+                Role::DeviceOut,
+                0,
+                &[ChannelLayout::Surround(f)],
+            )
+        };
+        let hexagon = custom("Key Test Hexagon", 6);
+        let octagon = custom("Key Test Octagon", 8);
+        assert_ne!(key(hexagon), key(octagon));
+        assert_ne!(key(hexagon), key(SurroundFormat::Lcr));
+        assert_ne!(key(octagon), key(SurroundFormat::Lcr));
+        for f in SurroundFormat::ALL {
+            assert_ne!(key(hexagon), key(f), "{}", f.name());
+        }
+        assert_eq!(
+            key(hexagon),
+            key(custom("Key Test Hexagon", 6)),
+            "the same layout"
+        );
+    }
 }

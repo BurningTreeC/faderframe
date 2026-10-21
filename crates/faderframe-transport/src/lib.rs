@@ -113,6 +113,18 @@ impl TransportState {
         self.loop_enabled && self.loop_range.is_some()
     }
 
+    /// Whether looping is switched on (whether or not there is a range).
+    pub fn loop_enabled(&self) -> bool {
+        self.loop_enabled
+    }
+
+    /// Set the loop range and switch (as [`TransportCommand::SetLoopRange`]
+    /// and [`TransportCommand::SetLoopEnabled`]): never a discontinuity.
+    pub fn set_loop(&mut self, range: Option<LoopRange>, enabled: bool) {
+        self.loop_range = range.filter(|r| !r.is_empty());
+        self.loop_enabled = enabled;
+    }
+
     /// How often playback has jumped (stop, locate, scrub): loop wraps are
     /// not jumps. Wraps around.
     pub fn jumps(&self) -> u32 {

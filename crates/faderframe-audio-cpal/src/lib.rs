@@ -11,6 +11,14 @@
 //! samples. The streams live on a control thread that owns them, so the
 //! returned stream is `Send` on every platform.
 //!
+//! Capture comes from the device asked for, else from the output device
+//! itself where it records (one clock), else from the system's default
+//! input. Two devices run on two clocks and nothing here resamples between
+//! them: the ring then slowly fills or empties, and each overflow or gap
+//! is counted as an xrun (an aggregate device made by the system — macOS
+//! Audio MIDI Setup — or one interface for both directions avoids it).
+//! Latencies come from cpal's callback timestamps.
+//!
 //! No cpal type escapes this crate: the engine only sees
 //! [`faderframe_audio::DeviceBuffers`].
 
@@ -19,10 +27,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, SupportedBufferSize};
 use faderframe_audio::{
-    AudioBackend, AudioCallback, AudioError, AudioStream, DeviceBuffers, DeviceInfo,
-    MAX_BUFFER_SIZE, STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor, StreamStatus,
+    AudioBackend, AudioCallback, AudioError, AudioStream, Capabilities, DeviceBuffers, DeviceInfo,
+    MAX_BUFFER_SIZE, RateControl, STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor,
+    StreamRouting, StreamStatus,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -166,6 +176,48 @@ fn rates(ranges: &[cpal::SupportedStreamConfigRange]) -> Vec<u32> {
         .collect()
 }
 
+/// The buffer sizes a set of config ranges agree on, if they say.
+fn buffer_range(ranges: &[cpal::SupportedStreamConfigRange]) -> Option<(u32, u32)> {
+    ranges
+        .iter()
+        .filter_map(|c| match c.buffer_size() {
+            SupportedBufferSize::Range { min, max } => Some((*min, *max)),
+            SupportedBufferSize::Unknown => None,
+        })
+        .reduce(|(a, b), (lo, hi)| (a.min(lo), b.max(hi)))
+}
+
+/// The config range to open: at `rate`, the fewest channels that give
+/// `wanted` (else the most there are), `f32` before `i32` before `i16`.
+fn pick_config(
+    ranges: &[cpal::SupportedStreamConfigRange],
+    rate: u32,
+    wanted: u16,
+) -> Option<&cpal::SupportedStreamConfigRange> {
+    let format_rank = |f: SampleFormat| match f {
+        SampleFormat::F32 => 0,
+        SampleFormat::I32 => 1,
+        SampleFormat::I16 => 2,
+        _ => 3,
+    };
+    ranges
+        .iter()
+        .filter(|c| {
+            format_rank(c.sample_format()) < 3
+                && (c.min_sample_rate()..=c.max_sample_rate()).contains(&rate)
+        })
+        .min_by_key(|c| {
+            let ch = c.channels();
+            // Enough channels first (the fewest of those), else the most.
+            let fit = if ch >= wanted {
+                (0, ch - wanted)
+            } else {
+                (1, wanted - ch)
+            };
+            (fit, format_rank(c.sample_format()))
+        })
+}
+
 impl AudioBackend for CpalBackend {
     fn id(&self) -> &'static str {
         match self.api {
@@ -179,6 +231,21 @@ impl AudioBackend for CpalBackend {
         self.api.name()
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            rate: RateControl::Device,
+            live_buffer_size: false,
+            live_sample_rate: false,
+            output_devices: 1,
+            // An ASIO driver records from itself.
+            input_devices: usize::from(!self.api.duplex()),
+            clocked_by_server: false,
+            follows_devices: false,
+            free_channel_counts: false,
+            force_format: false,
+        }
+    }
+
     fn is_available(&self) -> bool {
         self.api
             .host()
@@ -187,26 +254,40 @@ impl AudioBackend for CpalBackend {
 
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
         let host = self.api.host()?;
-        let default = host.default_output_device().map(|d| device_id(&d));
+        let default_out = host.default_output_device().map(|d| device_id(&d));
+        let default_in = host.default_input_device().map(|d| device_id(&d));
         let devices = host
-            .output_devices()
+            .devices()
             .map_err(|e| AudioError::BackendUnavailable(e.to_string()))?;
         Ok(devices
-            .map(|d| {
+            .filter_map(|d| {
                 let outs: Vec<_> = d.supported_output_configs().into_iter().flatten().collect();
                 let ins: Vec<_> = d.supported_input_configs().into_iter().flatten().collect();
-                let out_cfg = d.default_output_config().ok();
+                if outs.is_empty() && ins.is_empty() {
+                    return None;
+                }
+                let current = d
+                    .default_output_config()
+                    .or_else(|_| d.default_input_config())
+                    .ok();
                 let id = device_id(&d);
-                DeviceInfo {
-                    is_default: default.as_deref() == Some(id.as_str()),
-                    id,
+                let either = if outs.is_empty() { &ins } else { &outs };
+                Some(DeviceInfo {
+                    is_default: default_out.as_deref() == Some(id.as_str())
+                        || default_in.as_deref() == Some(id.as_str()),
                     name: device_name(&d),
                     input_channels: ins.iter().map(|c| c.channels()).max().unwrap_or(0),
                     output_channels: outs.iter().map(|c| c.channels()).max().unwrap_or(0),
-                    sample_rates: rates(&outs),
-                    current_sample_rate: out_cfg.as_ref().map(|c| c.sample_rate()),
+                    sample_rates: rates(either),
+                    current_sample_rate: current.as_ref().map(|c| c.sample_rate()),
                     current_buffer_size: None,
-                }
+                    buffer_sizes: buffer_range(either),
+                    // Each device its own clock, as far as anyone here can
+                    // tell.
+                    clock: Some(id.clone()),
+                    id,
+                    ..DeviceInfo::default()
+                })
             })
             .collect())
     }
@@ -222,8 +303,8 @@ impl AudioBackend for CpalBackend {
         let thread = std::thread::Builder::new()
             .name("audio-control".into())
             .spawn(move || match open(api, &config, callback) {
-                Ok((streams, info, monitor, workgroup)) => {
-                    let _ = ready_tx.send(Ok((info, monitor, workgroup)));
+                Ok((streams, info, monitor, workgroup, routing)) => {
+                    let _ = ready_tx.send(Ok((info, monitor, workgroup, routing)));
                     // Keep the streams until asked to stop.
                     let _ = stop_rx.recv();
                     drop(streams);
@@ -233,14 +314,15 @@ impl AudioBackend for CpalBackend {
                 }
             })
             .map_err(stream_err)?;
-        let (info, monitor, workgroup) = match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                let _ = thread.join();
-                return Err(e);
-            }
-            Err(_) => return Err(AudioError::Stream("the device did not open in time".into())),
-        };
+        let (info, monitor, workgroup, routing) =
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    let _ = thread.join();
+                    return Err(e);
+                }
+                Err(_) => return Err(AudioError::Stream("the device did not open in time".into())),
+            };
         tracing::info!("{} stream open: {info}", self.api.name());
         Ok(Box::new(CpalStream {
             thread: Some(thread),
@@ -248,18 +330,29 @@ impl AudioBackend for CpalBackend {
             info,
             monitor,
             workgroup,
+            routing,
         }))
     }
 }
 
 /// What `open` returns: the streams to keep, their description, the
-/// stream monitor and the device's audio workgroup.
+/// stream monitor, the device's audio workgroup and the devices used.
 type Opened = (
     Vec<cpal::Stream>,
     StreamInfo,
     Arc<StreamMonitor>,
     Option<faderframe_realtime::Workgroup>,
+    StreamRouting,
 );
+
+/// A device by id (or name) among `devices`.
+fn find(mut devices: impl Iterator<Item = cpal::Device>, wanted: &str) -> Option<cpal::Device> {
+    let all: Vec<cpal::Device> = devices.by_ref().collect();
+    all.iter()
+        .find(|d| device_id(d) == wanted)
+        .or_else(|| all.iter().find(|d| device_name(d) == wanted))
+        .cloned()
+}
 
 /// Open playback (and capture) on the calling thread.
 fn open(
@@ -268,11 +361,8 @@ fn open(
     callback: Box<dyn AudioCallback>,
 ) -> Result<Opened, AudioError> {
     let host = api.host()?;
-    let device = match &config.device {
-        Some(id) => host
-            .output_devices()
-            .map_err(stream_err)?
-            .find(|d| device_id(d) == *id || device_name(d) == *id)
+    let device = match config.output_devices.first() {
+        Some(id) => find(host.output_devices().map_err(stream_err)?, id)
             .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?,
         None => host
             .default_output_device()
@@ -284,23 +374,14 @@ fn open(
         .supported_output_configs()
         .map_err(stream_err)?
         .collect();
-    // Prefer f32 at the wanted rate, with the device's channel count.
-    let pick = |fmt: SampleFormat| {
-        ranges.iter().find(|c| {
-            c.sample_format() == fmt
-                && c.channels() == default.channels()
-                && (c.min_sample_rate()..=c.max_sample_rate()).contains(&wanted_rate)
-        })
-    };
-    let range = [SampleFormat::F32, SampleFormat::I32, SampleFormat::I16]
-        .into_iter()
-        .find_map(pick)
-        .ok_or_else(|| {
-            AudioError::UnsupportedConfig(format!(
-                "{} cannot run at {wanted_rate} Hz in a supported sample format",
-                device_name(&device)
-            ))
-        })?;
+    // As many channels as the stream wants where the device has them.
+    let wanted_outputs = config.output_channels.max(default.channels());
+    let range = pick_config(&ranges, wanted_rate, wanted_outputs).ok_or_else(|| {
+        AudioError::UnsupportedConfig(format!(
+            "{} cannot run at {wanted_rate} Hz in a supported sample format",
+            device_name(&device)
+        ))
+    })?;
     let format = range.sample_format();
     let channels = range.channels();
     let buffer_size = match (config.buffer_size, range.buffer_size()) {
@@ -322,47 +403,92 @@ fn open(
     };
     let monitor = StreamMonitor::new(wanted_rate, nominal);
 
-    // Capture: the default input device (or the duplex device itself) at
-    // the same rate, if any.
+    // Capture: the device asked for; else the output device itself where
+    // it records (one clock, no drift); else the system's default input
+    // (a clock of its own: see `Rt::run`). An ASIO driver is one duplex
+    // device.
     let mut streams = Vec::new();
     let mut input_channels = 0u16;
     let mut input_rx = None;
     let input = if api.duplex() {
         Some(device.clone())
+    } else if let Some(id) = config.input_devices.first() {
+        Some(
+            find(host.input_devices().map_err(stream_err)?, id)
+                .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?,
+        )
+    } else if device.supports_input() {
+        Some(device.clone())
     } else {
         host.default_input_device()
     };
+    let hw_input_latency = Arc::new(AtomicU32::new(0));
+    let mut input_name = None;
     if config.input_channels > 0
         && let Some(input) = input
         && let Ok(in_default) = input.default_input_config()
     {
+        let in_ranges: Vec<_> = input
+            .supported_input_configs()
+            .into_iter()
+            .flatten()
+            .collect();
+        let (in_channels, in_format) =
+            match pick_config(&in_ranges, wanted_rate, config.input_channels) {
+                Some(c) => (c.channels(), c.sample_format()),
+                None => (in_default.channels(), in_default.sample_format()),
+            };
         let in_config = cpal::StreamConfig {
-            channels: in_default.channels(),
+            channels: in_channels,
             sample_rate: wanted_rate,
             buffer_size: cpal::BufferSize::Default,
         };
         let cap = (wanted_rate as f32 * INPUT_RING_SECONDS) as usize * in_config.channels as usize;
         let (tx, rx) = rtrb::RingBuffer::new(cap.max(1024));
-        let m = Arc::clone(&monitor);
-        match build_input(&input, &in_config, in_default.sample_format(), tx, m) {
+        let feed = Feed {
+            tx,
+            monitor: Arc::clone(&monitor),
+            latency: Arc::clone(&hw_input_latency),
+            channels: usize::from(in_channels.max(1)),
+            rate: wanted_rate,
+            promoted: false,
+        };
+        match build_input(&input, &in_config, in_format, feed) {
             Ok(s) => {
                 input_channels = in_config.channels;
                 input_rx = Some(rx);
+                input_name = Some(device_name(&input));
                 streams.push(s);
             }
             Err(e) => tracing::warn!("{}: no capture ({e})", api.name()),
         }
     }
 
+    let output_name = device_name(&device);
     let info = StreamInfo {
         backend: if api.duplex() { "asio" } else { "system" },
-        device: device_name(&device),
+        device: match &input_name {
+            Some(i) if *i != output_name => format!("{output_name} + {i}"),
+            _ => output_name.clone(),
+        },
         sample_rate: wanted_rate,
         buffer_size: nominal,
         input_channels,
         output_channels: channels,
         input_latency: 0,
         output_latency: 0,
+    };
+    let routing = StreamRouting {
+        outputs: (1..=channels)
+            .map(|c| Some(format!("{output_name} · {c}")))
+            .collect(),
+        inputs: (1..=input_channels)
+            .map(|c| input_name.as_ref().map(|n| format!("{n} · {c}")))
+            .collect(),
+        missing: Vec::new(),
+        devices: std::iter::once(output_name.clone())
+            .chain(input_name.clone().filter(|i| *i != output_name))
+            .collect(),
     };
     let mut callback = callback;
     callback.prepare(&info);
@@ -376,6 +502,8 @@ fn open(
         frame: vec![0.0; input_channels as usize],
         promoted: false,
         nominal: Nominal::new(nominal),
+        hw_input_latency,
+        captured: false,
     };
     let output = match format {
         SampleFormat::F32 => build_output::<f32>(&device, &out_config, rt),
@@ -397,7 +525,7 @@ fn open(
     if workgroup.is_some() {
         tracing::debug!("the DSP workers join the device's audio workgroup");
     }
-    Ok((streams, info, monitor, workgroup))
+    Ok((streams, info, monitor, workgroup, routing))
 }
 
 fn on_error(monitor: &StreamMonitor, e: cpal::Error) {
@@ -408,59 +536,72 @@ fn on_error(monitor: &StreamMonitor, e: cpal::Error) {
     }
 }
 
+/// Frames in a duration at a rate.
+fn frames_in(d: Duration, rate: u32) -> u32 {
+    (d.as_secs_f64() * f64::from(rate))
+        .round()
+        .min(f64::from(u32::MAX - 1)) as u32
+}
+
+/// The capture callback's side of the input ring.
+struct Feed {
+    tx: rtrb::Producer<f32>,
+    monitor: Arc<StreamMonitor>,
+    /// Capture to callback, beyond the callback's own frames (frames).
+    latency: Arc<AtomicU32>,
+    channels: usize,
+    rate: u32,
+    promoted: bool,
+}
+
+impl Feed {
+    fn push<T: Copy>(&mut self, data: &[T], info: &cpal::InputCallbackInfo, f: impl Fn(T) -> f32) {
+        // The capture thread is on the audio path too.
+        if !self.promoted {
+            self.promoted = true;
+            faderframe_realtime::priority::make_audio_thread_realtime();
+        }
+        let ts = info.timestamp();
+        let own = (data.len() / self.channels) as u32;
+        let since = frames_in(ts.callback.duration_since(ts.capture), self.rate);
+        self.latency
+            .store(since.saturating_sub(own), Ordering::Relaxed);
+        let mut full = false;
+        for v in data {
+            full |= self.tx.push(f(*v)).is_err();
+        }
+        if full {
+            // The playback side fell behind (another clock running slower,
+            // or a stall): captured audio was lost.
+            self.monitor.record_xrun();
+        }
+    }
+}
+
 fn build_input(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     format: SampleFormat,
-    mut tx: rtrb::Producer<f32>,
-    monitor: Arc<StreamMonitor>,
+    mut feed: Feed,
 ) -> Result<cpal::Stream, AudioError> {
-    let m = Arc::clone(&monitor);
+    let m = Arc::clone(&feed.monitor);
     let err = move |e| on_error(&m, e);
-    let mut promoted = false;
     let stream = match format {
         SampleFormat::F32 => device.build_input_stream::<f32, _, _>(
             *config,
-            move |data, _| {
-                // The capture thread is on the audio path too.
-                if !promoted {
-                    promoted = true;
-                    faderframe_realtime::priority::make_audio_thread_realtime();
-                }
-                for v in data {
-                    let _ = tx.push(*v);
-                }
-            },
+            move |data, info| feed.push(data, info, |v| v),
             err,
             None,
         ),
         SampleFormat::I32 => device.build_input_stream::<i32, _, _>(
             *config,
-            move |data, _| {
-                // The capture thread is on the audio path too.
-                if !promoted {
-                    promoted = true;
-                    faderframe_realtime::priority::make_audio_thread_realtime();
-                }
-                for v in data {
-                    let _ = tx.push(f32::from_sample(*v));
-                }
-            },
+            move |data, info| feed.push(data, info, f32::from_sample),
             err,
             None,
         ),
         _ => device.build_input_stream::<i16, _, _>(
             *config,
-            move |data, _| {
-                // The capture thread is on the audio path too.
-                if !promoted {
-                    promoted = true;
-                    faderframe_realtime::priority::make_audio_thread_realtime();
-                }
-                for v in data {
-                    let _ = tx.push(f32::from_sample(*v));
-                }
-            },
+            move |data, info| feed.push(data, info, f32::from_sample),
             err,
             None,
         ),
@@ -483,6 +624,10 @@ struct Rt {
     promoted: bool,
     /// The block size reported (`info.buffer_size` follows it).
     nominal: Nominal,
+    /// The capture side's latency beyond its callbacks (frames).
+    hw_input_latency: Arc<AtomicU32>,
+    /// Captured frames have arrived (a dry ring after that is a dropout).
+    captured: bool,
 }
 
 struct Io<'a> {
@@ -514,6 +659,28 @@ impl DeviceBuffers for Io<'_> {
 }
 
 impl Rt {
+    /// Latencies from this callback's timestamps: until the first frame
+    /// written is heard, beyond the callback's own frames; and captured
+    /// audio's way here, through the ring (realtime safe: atomics).
+    fn measure(&mut self, info: &cpal::OutputCallbackInfo, frames: usize) {
+        let ts = info.timestamp();
+        let rate = self.info.sample_rate;
+        let ahead = frames_in(ts.playback.duration_since(ts.callback), rate);
+        let output = ahead.saturating_sub(frames as u32);
+        self.monitor.set_output_latency(output);
+        if let Some(rx) = &self.input_rx {
+            let waiting = (rx.slots() / self.frame.len().max(1)) as u32;
+            self.monitor
+                .set_input_latency(self.hw_input_latency.load(Ordering::Relaxed) + waiting);
+        }
+        // The engine hears of a change of more than 2 ms (the timestamps
+        // jitter by less than that from callback to callback).
+        if output.abs_diff(self.info.output_latency) > rate / 500 {
+            self.info.output_latency = output;
+            self.callback.prepare(&self.info);
+        }
+    }
+
     /// One chunk of at most `MAX_BUFFER_SIZE` frames into `out`
     /// (interleaved).
     fn run<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T]) {
@@ -533,6 +700,7 @@ impl Rt {
         }
         // Captured frames, or silence when the ring runs dry.
         let in_ch = self.inputs.len();
+        let mut dry = false;
         for i in 0..n {
             let got = match &mut self.input_rx {
                 Some(rx) if rx.slots() >= in_ch => {
@@ -541,11 +709,21 @@ impl Rt {
                     }
                     true
                 }
-                _ => false,
+                Some(_) => {
+                    dry = true;
+                    false
+                }
+                None => false,
             };
+            self.captured |= got;
             for (c, buf) in self.inputs.iter_mut().enumerate() {
                 buf[i] = if got { self.frame[c] } else { 0.0 };
             }
+        }
+        if dry && self.captured {
+            // Capture fell behind (another clock running faster here):
+            // the input had a gap.
+            self.monitor.record_xrun();
         }
         let mut io = Io {
             frames: n,
@@ -575,7 +753,8 @@ where
     device
         .build_output_stream::<T, _, _>(
             *config,
-            move |data: &mut [T], _| {
+            move |data: &mut [T], info| {
+                rt.measure(info, data.len() / ch);
                 for chunk in data.chunks_mut(MAX_BUFFER_SIZE as usize * ch) {
                     rt.run(chunk);
                 }
@@ -592,6 +771,7 @@ struct CpalStream {
     info: StreamInfo,
     monitor: Arc<StreamMonitor>,
     workgroup: Option<faderframe_realtime::Workgroup>,
+    routing: StreamRouting,
 }
 
 impl AudioStream for CpalStream {
@@ -599,11 +779,18 @@ impl AudioStream for CpalStream {
         let status = self.monitor.status();
         let mut info = self.info.clone();
         info.buffer_size = status.buffer_size;
+        // As measured from the callbacks' timestamps.
+        info.input_latency = status.input_latency.unwrap_or(0);
+        info.output_latency = status.output_latency.unwrap_or(0);
         info
     }
 
     fn status(&self) -> StreamStatus {
         self.monitor.status()
+    }
+
+    fn routing(&self) -> StreamRouting {
+        self.routing.clone()
     }
 
     fn io_workgroup(&self) -> Option<faderframe_realtime::Workgroup> {
@@ -623,6 +810,40 @@ impl Drop for CpalStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multichannel interface whose default is stereo opens with as many
+    /// channels as the session wants (cue mixes, hardware inserts), the
+    /// fewest that give them, in f32 where it can.
+    #[test]
+    fn the_config_opened_has_the_channels_wanted() {
+        let range = |ch, fmt| {
+            cpal::SupportedStreamConfigRange::new(
+                ch,
+                44_100,
+                96_000,
+                SupportedBufferSize::Range { min: 32, max: 4096 },
+                fmt,
+            )
+        };
+        let ranges = [
+            range(2, SampleFormat::I32),
+            range(2, SampleFormat::F32),
+            range(8, SampleFormat::I32),
+            range(18, SampleFormat::F32),
+        ];
+        let pick = |rate, wanted| {
+            pick_config(&ranges, rate, wanted).map(|c| (c.channels(), c.sample_format()))
+        };
+        assert_eq!(pick(48_000, 2), Some((2, SampleFormat::F32)));
+        assert_eq!(pick(48_000, 6), Some((8, SampleFormat::I32)));
+        assert_eq!(
+            pick(48_000, 32),
+            Some((18, SampleFormat::F32)),
+            "the most there are"
+        );
+        assert_eq!(pick(192_000, 2), None, "not at that rate");
+        assert_eq!(buffer_range(&ranges), Some((32, 4096)));
+    }
 
     /// Callbacks varying in size give one nominal size, not one per
     /// callback: larger at once, smaller after a few seconds of smaller

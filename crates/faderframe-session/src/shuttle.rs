@@ -9,7 +9,7 @@
 //! window's picture are the shuttle's position. Stopping the shuttle leaves
 //! the playhead where it got to.
 
-use crate::{Action, Result, Session, TransportAction};
+use crate::{Result, Session, TransportAction};
 use faderframe_transport::TransportCommand;
 use std::time::{Duration, Instant};
 
@@ -114,7 +114,8 @@ impl Session {
             if !self.transport.playing {
                 self.engine.transport(TransportCommand::Locate(here))?;
                 self.show_position(here);
-                self.dispatch(Action::Transport(TransportAction::Play))?;
+                // From here, not from the Play Start Marker.
+                self.play()?;
             }
             self.revision += 1;
             return Ok(());

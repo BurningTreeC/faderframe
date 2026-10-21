@@ -143,6 +143,10 @@ define_id!(
     /// A cue mix (a performer's headphone mix on its own outputs).
     CueId, "cuemix#"
 );
+define_id!(
+    /// A scratch pad: another arrangement of the project's tracks.
+    ScratchPadId, "pad#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

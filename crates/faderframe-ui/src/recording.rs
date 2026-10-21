@@ -154,22 +154,8 @@ pub fn install_actions(app: &Rc<AppState>) {
             }
         })
         .build();
-    let weak = Rc::downgrade(app);
-    let punch = gio::ActionEntry::builder("punch")
-        .activate(move |_, _, _| {
-            if let Some(app) = weak.upgrade() {
-                app.dispatch(Action::Transport(TransportAction::TogglePunch));
-            }
-        })
-        .build();
-    let weak = Rc::downgrade(app);
-    let toggle_metronome = gio::ActionEntry::builder("toggle-metronome")
-        .activate(move |_, _, _| {
-            if let Some(app) = weak.upgrade() {
-                toggle_metronome(&app);
-            }
-        })
-        .build();
+    // `punch` and `toggle-metronome` are toggles with their state
+    // (`crate::toggles`).
     let weak = Rc::downgrade(app);
     let metronome_settings = gio::ActionEntry::builder("metronome-settings")
         .activate(move |_, _, _| {
@@ -178,28 +164,110 @@ pub fn install_actions(app: &Rc<AppState>) {
             }
         })
         .build();
+    // Where Stop leaves the playhead and where Play starts: their ticks
+    // and the preferences follow the session ([`follow`]), whatever
+    // changed them.
+    let (stop_to_start, return_to_play_start, play_from_marker) = {
+        let s = app.session.borrow();
+        (
+            s.editor.stop_to_start,
+            !s.editor.insertion_follows_playback,
+            s.project().play_start.is_some_and(|m| m.on),
+        )
+    };
     let weak = Rc::downgrade(app);
     let stop_to_start = gio::ActionEntry::builder("stop-to-start")
-        .state(app.session.borrow().editor.stop_to_start.to_variant())
-        .activate(move |_, action, _| {
+        .state(stop_to_start.to_variant())
+        .activate(move |_, _, _| {
             let Some(app) = weak.upgrade() else { return };
-            let on = !app.session.borrow().editor.stop_to_start;
-            app.dispatch(Action::SetEditFlag(
-                faderframe_session::EditFlag::StopToStart,
-                on,
-            ));
-            action.set_state(&on.to_variant());
-            let mut p = Preferences::load();
-            p.stop_to_start = on;
-            if let Err(e) = p.save() {
-                tracing::warn!("cannot save preferences: {e}");
+            let action = stop_option(&app.session.borrow(), StopOption::ProjectStart);
+            app.dispatch(action);
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let return_to_play_start = gio::ActionEntry::builder("return-to-play-start")
+        .state(return_to_play_start.to_variant())
+        .activate(move |_, _, _| {
+            let Some(app) = weak.upgrade() else { return };
+            let action = stop_option(&app.session.borrow(), StopOption::PlayStart);
+            app.dispatch(action);
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let play_from_marker = gio::ActionEntry::builder("play-from-marker")
+        .state(play_from_marker.to_variant())
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Transport(TransportAction::TogglePlayStart));
+            }
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let set_play_start = gio::ActionEntry::builder("set-play-start")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                let at = app.session.borrow().playhead();
+                app.dispatch(Action::Transport(TransportAction::SetPlayStart(Some(at))));
+            }
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let remove_play_start = gio::ActionEntry::builder("remove-play-start")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Transport(TransportAction::SetPlayStart(None)));
+            }
+        })
+        .build();
+    // Development aid: `play-start:<quarters|here|toggle|off>`.
+    let weak = Rc::downgrade(app);
+    let play_start = gio::ActionEntry::builder("play-start")
+        .parameter_type(Some(&String::static_variant_type()))
+        .activate(move |_, _, param| {
+            let (Some(app), Some(arg)) = (weak.upgrade(), param.and_then(|p| p.get::<String>()))
+            else {
+                return;
+            };
+            let action = match arg.as_str() {
+                "off" => TransportAction::SetPlayStart(None),
+                "toggle" => TransportAction::TogglePlayStart,
+                "here" => TransportAction::SetPlayStart(Some(app.session.borrow().playhead())),
+                q => match q.parse::<f64>() {
+                    Ok(q) => TransportAction::SetPlayStart(Some(
+                        faderframe_timeline::MusicalTime::from_quarters(q),
+                    )),
+                    Err(_) => return,
+                },
+            };
+            app.dispatch(Action::Transport(action));
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let abort = gio::ActionEntry::builder("abort-recording")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Transport(TransportAction::AbortRecording));
+            }
+        })
+        .build();
+    let weak = Rc::downgrade(app);
+    let abort_and_restart = gio::ActionEntry::builder("abort-and-restart")
+        .activate(move |_, _, _| {
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(Action::Transport(TransportAction::AbortAndRestartRecording));
             }
         })
         .build();
     app.app.add_action_entries([
         metronome_settings,
         stop_to_start,
-        toggle_metronome,
+        return_to_play_start,
+        play_from_marker,
+        set_play_start,
+        remove_play_start,
+        play_start,
+        abort,
+        abort_and_restart,
         radio(app, "record-mode", r.mode.id(), |r, id| {
             r.mode = RecordMode::from_id(id).unwrap_or(r.mode);
         }),
@@ -219,10 +287,110 @@ pub fn install_actions(app: &Rc<AppState>) {
             r.preroll_on_bar = !r.preroll_on_bar;
         }),
         toggle(app, "count-in", r.count_in, |r| r.count_in = !r.count_in),
-        punch,
         punch_from_loop,
     ]);
-    app.app.set_accels_for_action("app.punch", &["<Control>p"]);
+    // Ctrl+P: `palette::DEFAULT_SHORTCUTS` (rebindable).
+}
+
+/// Where Stop leaves the playhead, besides where it stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopOption {
+    /// Back where playback started (Return to Start on Stop).
+    PlayStart,
+    /// At the start of the project.
+    ProjectStart,
+}
+
+/// The session's flags for switching `option` (one at a time: switching
+/// one on switches the other off).
+fn stop_option(s: &faderframe_session::Session, option: StopOption) -> Action {
+    use faderframe_session::EditFlag as F;
+    let e = &s.editor;
+    let returns = !e.insertion_follows_playback && !e.stop_to_start;
+    match option {
+        StopOption::PlayStart => Action::Several(vec![
+            Action::SetEditFlag(F::InsertionFollowsPlayback, returns),
+            Action::SetEditFlag(F::StopToStart, false),
+        ]),
+        StopOption::ProjectStart if e.stop_to_start => Action::SetEditFlag(F::StopToStart, false),
+        StopOption::ProjectStart => Action::Several(vec![
+            Action::SetEditFlag(F::StopToStart, true),
+            Action::SetEditFlag(F::InsertionFollowsPlayback, true),
+        ]),
+    }
+}
+
+/// The Stop button's right-click choices (before its MIDI learn).
+pub fn stop_menu(s: &faderframe_session::Session) -> Vec<(String, Action)> {
+    let e = &s.editor;
+    let mark = |on: bool, label: &str| {
+        if on {
+            format!("✓ {label}")
+        } else {
+            format!("   {label}")
+        }
+    };
+    vec![
+        (
+            mark(
+                !e.insertion_follows_playback && !e.stop_to_start,
+                "Return to Start on Stop",
+            ),
+            stop_option(s, StopOption::PlayStart),
+        ),
+        (
+            mark(e.stop_to_start, "Return to Project Start on Stop"),
+            stop_option(s, StopOption::ProjectStart),
+        ),
+    ]
+}
+
+/// The stop options' and the Play Start Marker's menu ticks as the session
+/// has them (changed from the Stop button's menu, the edit toolbar, the
+/// ruler, MIDI learn, undo); the stop options saved when they changed.
+pub fn follow(app: &Rc<AppState>) {
+    let (returns, to_start, marker) = {
+        let s = app.session.borrow();
+        (
+            !s.editor.insertion_follows_playback,
+            s.editor.stop_to_start,
+            s.project().play_start,
+        )
+    };
+    let mut changed = false;
+    for (name, on, saved) in [
+        ("return-to-play-start", returns && !to_start, true),
+        ("stop-to-start", to_start, true),
+        ("play-from-marker", marker.is_some_and(|m| m.on), false),
+    ] {
+        let Some(a) = app
+            .app
+            .lookup_action(name)
+            .and_downcast::<gio::SimpleAction>()
+        else {
+            continue;
+        };
+        if a.state().and_then(|v| v.get::<bool>()) != Some(on) {
+            a.set_state(&on.to_variant());
+            changed |= saved;
+        }
+    }
+    if let Some(a) = app
+        .app
+        .lookup_action("remove-play-start")
+        .and_downcast::<gio::SimpleAction>()
+        && a.is_enabled() != marker.is_some()
+    {
+        a.set_enabled(marker.is_some());
+    }
+    if changed {
+        let mut p = Preferences::load();
+        p.return_to_play_start = returns;
+        p.stop_to_start = to_start;
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    }
 }
 
 fn radio_menu(action: &str, items: impl IntoIterator<Item = (String, String)>) -> gio::Menu {
@@ -413,4 +581,51 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     }
     offset.connect_value_changed(move |_| update());
     g.upcast()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use faderframe_session::Session;
+
+    fn labels(s: &Session) -> Vec<String> {
+        stop_menu(s).into_iter().map(|(l, _)| l).collect()
+    }
+
+    /// The Stop button's menu: Return to Start on Stop and Return to
+    /// Project Start on Stop, ticked as the session has them, one at a time.
+    #[test]
+    fn the_stop_menu_switches_one_return_at_a_time() {
+        let mut s = Session::new(
+            faderframe_project::Project::new("Stop", 48_000),
+            None,
+            faderframe_engine::EngineConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            labels(&s),
+            [
+                "   Return to Start on Stop",
+                "   Return to Project Start on Stop"
+            ]
+        );
+        let pick = |s: &mut Session, i: usize| {
+            let action = stop_menu(s).swap_remove(i).1;
+            s.dispatch(action).unwrap();
+        };
+        pick(&mut s, 0);
+        assert!(!s.editor.insertion_follows_playback && !s.editor.stop_to_start);
+        assert!(labels(&s)[0].starts_with('✓'));
+        // The other one: this one goes off.
+        pick(&mut s, 1);
+        assert!(s.editor.stop_to_start && s.editor.insertion_follows_playback);
+        assert!(labels(&s)[0].starts_with(' ') && labels(&s)[1].starts_with('✓'));
+        // And back.
+        pick(&mut s, 0);
+        assert!(!s.editor.insertion_follows_playback && !s.editor.stop_to_start);
+        pick(&mut s, 0);
+        assert!(s.editor.insertion_follows_playback && !s.editor.stop_to_start);
+        assert!(labels(&s).iter().all(|l| l.starts_with(' ')));
+    }
 }

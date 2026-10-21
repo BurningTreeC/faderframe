@@ -74,6 +74,7 @@ faderframe-view-launcher = { path = "crates/faderframe-view-launcher" }
 faderframe-view-modulators = { path = "crates/faderframe-view-modulators" }
 faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }
 faderframe-view-clipfx = { path = "crates/faderframe-view-clipfx" }
+faderframe-view-inspector = { path = "crates/faderframe-view-inspector" }
 faderframe-transcribe = { path = "crates/faderframe-transcribe" }
 faderframe-speech = { path = "crates/faderframe-speech" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }

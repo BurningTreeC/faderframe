@@ -224,7 +224,8 @@ impl Session {
             ShowOp::Cue(i) if i < n => self.cue_song(i)?,
             ShowOp::Go(i) if i < n => {
                 self.cue_song(i)?;
-                self.transport_action(TransportAction::Play)?;
+                // The song from its start (not the Play Start Marker).
+                self.play()?;
                 self.show.playing_song = Some(i);
             }
             ShowOp::Next | ShowOp::Previous if n > 0 => {
@@ -254,7 +255,7 @@ impl Session {
                     if at < song.start || at >= song.end {
                         self.cue_song(i)?;
                     }
-                    self.transport_action(TransportAction::Play)?;
+                    self.play()?;
                     self.show.playing_song = Some(i);
                 }
             }

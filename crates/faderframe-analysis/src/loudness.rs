@@ -227,6 +227,151 @@ pub fn speaker_weight(azimuth: f64, elevation: f64) -> f64 {
     }
 }
 
+/// Gated integrated loudness (LUFS) of 400 ms gating blocks' mean
+/// squares (BS.1770: the absolute gate, then 10 LU under their mean).
+fn gated_integrated(gating: &[f64]) -> f64 {
+    let above: Vec<f64> = gating
+        .iter()
+        .copied()
+        .filter(|&e| loudness(e) > ABSOLUTE_GATE)
+        .collect();
+    if above.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    let gate = loudness(above.iter().sum::<f64>() / above.len() as f64) + RELATIVE_GATE;
+    let kept: Vec<f64> = above.into_iter().filter(|&e| loudness(e) > gate).collect();
+    if kept.is_empty() {
+        return f64::NEG_INFINITY;
+    }
+    loudness(kept.iter().sum::<f64>() / kept.len() as f64)
+}
+
+/// Loudness range (LU, EBU Tech 3342) of short-term values (LUFS): the
+/// spread of the gated ones between their 10th and 95th percentiles.
+fn loudness_range(short_terms: &[f64]) -> f64 {
+    let above: Vec<f64> = short_terms
+        .iter()
+        .copied()
+        .filter(|&l| l > ABSOLUTE_GATE)
+        .collect();
+    if above.len() < 2 {
+        return 0.0;
+    }
+    let mean = above.iter().map(|&l| mean_square(l)).sum::<f64>() / above.len() as f64;
+    let gate = loudness(mean) + LRA_GATE;
+    let mut kept: Vec<f64> = above.into_iter().filter(|&l| l > gate).collect();
+    if kept.len() < 2 {
+        return 0.0;
+    }
+    kept.sort_by(f64::total_cmp);
+    let at = |p: f64| kept[((kept.len() - 1) as f64 * p).round() as usize];
+    at(0.95) - at(0.10)
+}
+
+/// BS.1770 loudness of any number of channels, each with its weight (as
+/// [`integrated_weighted`]), fed piece by piece — a whole file read back
+/// in chunks: integrated loudness, loudness range and the highest
+/// momentary and short-term loudness, gated and windowed as the stereo
+/// [`LoudnessMeter`] measures them (two channels weighing 1.0 read the
+/// same).
+#[derive(Clone, Debug)]
+pub struct WeightedLoudness {
+    filters: Vec<KWeighting>,
+    weights: Vec<f64>,
+    /// Frames per 100 ms block.
+    block: usize,
+    fill: usize,
+    energy: f64,
+    /// The last 30 block energies (3 s), newest last.
+    blocks: std::collections::VecDeque<f64>,
+    gating: Vec<f64>,
+    short_terms: Vec<f64>,
+    max_momentary: f64,
+    max_short_term: f64,
+}
+
+impl WeightedLoudness {
+    /// `weights[c]`: channel `c`'s weight (1.0 front and heights, 1.41 the
+    /// surrounds, 0 the LFE — [`speaker_weight`]).
+    pub fn new(sample_rate: u32, weights: &[f64]) -> Self {
+        let rate = sample_rate.max(8000) as f64;
+        Self {
+            filters: vec![KWeighting::new(rate); weights.len()],
+            weights: weights.to_vec(),
+            block: (rate / 10.0).round() as usize,
+            fill: 0,
+            energy: 0.0,
+            blocks: std::collections::VecDeque::with_capacity(31),
+            gating: Vec::new(),
+            short_terms: Vec::new(),
+            max_momentary: f64::NEG_INFINITY,
+            max_short_term: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Feed planar audio (`audio[c]`, equal lengths; channels beyond the
+    /// weights are not measured).
+    pub fn add(&mut self, audio: &[&[f32]]) {
+        let frames = audio.iter().map(|c| c.len()).min().unwrap_or(0);
+        for f in 0..frames {
+            let mut e = 0.0;
+            for ((k, &w), ch) in self.filters.iter_mut().zip(&self.weights).zip(audio) {
+                if w != 0.0 {
+                    let y = k.run(ch[f]);
+                    e += w * y * y;
+                }
+            }
+            self.energy += e;
+            self.fill += 1;
+            if self.fill == self.block {
+                self.end_block();
+            }
+        }
+    }
+
+    fn end_block(&mut self) {
+        let ms = self.energy / self.block as f64;
+        self.energy = 0.0;
+        self.fill = 0;
+        if self.blocks.len() == 30 {
+            self.blocks.pop_front();
+        }
+        self.blocks.push_back(ms);
+        let window = |n: usize| self.blocks.iter().rev().take(n).sum::<f64>() / n as f64;
+        if self.blocks.len() >= 4 {
+            let momentary = window(4);
+            self.gating.push(momentary);
+            self.max_momentary = self.max_momentary.max(loudness(momentary));
+        }
+        if self.blocks.len() >= 30 {
+            let st = loudness(window(30));
+            self.short_terms.push(st);
+            self.max_short_term = self.max_short_term.max(st);
+        }
+    }
+
+    /// Gated integrated loudness (LUFS; `-inf` for silence or under
+    /// 400 ms).
+    pub fn integrated(&self) -> f64 {
+        gated_integrated(&self.gating)
+    }
+
+    /// Loudness range (LU; 0 under 3 s).
+    pub fn range(&self) -> f64 {
+        loudness_range(&self.short_terms)
+    }
+
+    /// Highest momentary loudness (LUFS).
+    pub fn max_momentary(&self) -> f64 {
+        self.max_momentary
+    }
+
+    /// Highest short-term loudness (LUFS; `-inf` under 3 s).
+    pub fn max_short_term(&self) -> f64 {
+        self.max_short_term
+    }
+}
+
 /// EBU R128 loudness of a stereo signal.
 #[derive(Clone, Debug)]
 pub struct LoudnessMeter {
@@ -370,44 +515,13 @@ impl LoudnessMeter {
 
     /// Gated integrated loudness (LUFS).
     pub fn integrated(&self) -> f64 {
-        let above: Vec<f64> = self
-            .gating
-            .iter()
-            .copied()
-            .filter(|&e| loudness(e) > ABSOLUTE_GATE)
-            .collect();
-        if above.is_empty() {
-            return f64::NEG_INFINITY;
-        }
-        let gate = loudness(above.iter().sum::<f64>() / above.len() as f64) + RELATIVE_GATE;
-        let kept: Vec<f64> = above.into_iter().filter(|&e| loudness(e) > gate).collect();
-        if kept.is_empty() {
-            return f64::NEG_INFINITY;
-        }
-        loudness(kept.iter().sum::<f64>() / kept.len() as f64)
+        gated_integrated(&self.gating)
     }
 
     /// Loudness range (LU): the spread of gated short-term values between
     /// their 10th and 95th percentiles.
     pub fn range(&self) -> f64 {
-        let above: Vec<f64> = self
-            .short_terms
-            .iter()
-            .copied()
-            .filter(|&l| l > ABSOLUTE_GATE)
-            .collect();
-        if above.len() < 2 {
-            return 0.0;
-        }
-        let mean = above.iter().map(|&l| mean_square(l)).sum::<f64>() / above.len() as f64;
-        let gate = loudness(mean) + LRA_GATE;
-        let mut kept: Vec<f64> = above.into_iter().filter(|&l| l > gate).collect();
-        if kept.len() < 2 {
-            return 0.0;
-        }
-        kept.sort_by(f64::total_cmp);
-        let at = |p: f64| kept[((kept.len() - 1) as f64 * p).round() as usize];
-        at(0.95) - at(0.10)
+        loudness_range(&self.short_terms)
     }
 
     /// Short-term loudness every 100 ms, oldest first.
@@ -513,5 +627,50 @@ mod weighted_tests {
         assert_eq!(speaker_weight(110.0, 0.0), std::f64::consts::SQRT_2);
         assert_eq!(speaker_weight(30.0, 0.0), 1.0);
         assert_eq!(speaker_weight(90.0, 45.0), 1.0);
+    }
+
+    /// Fed in uneven pieces, the streaming measurement reads what the
+    /// stereo meter and the whole-file measurement read: integrated
+    /// loudness, range and maxima.
+    #[test]
+    fn the_streaming_weighted_measurement_reads_as_the_meter() {
+        let rate = 48_000u32;
+        let tone = |amp: f32, secs: usize| -> Vec<f32> {
+            (0..rate as usize * secs)
+                .map(|i| amp * (i as f32 * 997.0 * std::f32::consts::TAU / rate as f32).sin())
+                .collect()
+        };
+        let (a, b) = (tone(0.1, 20), tone(0.0316, 20));
+        let mut meter = LoudnessMeter::new(rate);
+        let mut streamed = WeightedLoudness::new(rate, &[1.0, 1.0]);
+        for part in [&a, &b] {
+            meter.process(part, part, true);
+            for chunk in part.chunks(7_777) {
+                streamed.add(&[chunk, chunk]);
+            }
+        }
+        let read = meter.read();
+        assert!((streamed.integrated() - read.integrated).abs() < 1e-9);
+        assert!((streamed.range() - read.range).abs() < 1e-9);
+        assert!(
+            (streamed.range() - 10.0).abs() < 0.2,
+            "{}",
+            streamed.range()
+        );
+        assert!((streamed.max_short_term() - read.max_short_term).abs() < 1e-9);
+        assert!((streamed.max_momentary() - read.max_momentary).abs() < 1e-9);
+        let (whole, _) = integrated_weighted(&[&a, &a], &[1.0, 1.0], rate);
+        let mut only_a = WeightedLoudness::new(rate, &[1.0, 1.0]);
+        only_a.add(&[&a, &a]);
+        assert!((only_a.integrated() - whole).abs() < 1e-9);
+        // A surround channel weighs 1.41 (+1.5 dB), the LFE nothing.
+        let mut side = WeightedLoudness::new(rate, &[std::f64::consts::SQRT_2, 0.0]);
+        side.add(&[&a, &a]);
+        let mut front = WeightedLoudness::new(rate, &[1.0]);
+        front.add(&[&a]);
+        assert!((side.integrated() - front.integrated() - 1.505).abs() < 0.01);
+        let silent = WeightedLoudness::new(rate, &[1.0, 1.0]);
+        assert_eq!(silent.integrated(), f64::NEG_INFINITY);
+        assert_eq!(silent.range(), 0.0);
     }
 }

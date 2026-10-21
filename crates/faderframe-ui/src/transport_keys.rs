@@ -37,7 +37,7 @@ fn install_window(app: &Rc<AppState>, window: &gtk::Window) {
 
 /// Entries focus their inner GtkText, while other editable widgets can
 /// delegate to a child. Check the focus ancestry, not just GtkEntry itself.
-fn editing_text(mut focus: Option<gtk::Widget>) -> bool {
+pub(crate) fn editing_text(mut focus: Option<gtk::Widget>) -> bool {
     while let Some(widget) = focus {
         if widget
             .downcast_ref::<gtk::Editable>()

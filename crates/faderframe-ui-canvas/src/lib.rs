@@ -38,9 +38,9 @@ pub use paint::{External, Image, Paint, Path, PathCmd, Pixels};
 pub use painter::{DrawOp, Painter, RecordingPainter, kept};
 pub use text::{Align, FontFamily, FontWeight, TextStyle};
 pub use theme::{
-    Accent, ArrangerTheme, ConsoleLook, ConsoleTheme, DeviceTheme, FaderStyle, KnobStyle, LedStyle,
-    MeterKind, MeterStyle, PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography,
-    UiPalette,
+    Accent, ArrangerTheme, ConsoleLook, ConsoleTheme, DeviceTheme, FaderStyle, GRID_ALPHAS,
+    GridEmphasis, GridLook, KnobStyle, LedStyle, MeterKind, MeterStyle, PIANO_GRID_ALPHAS,
+    PerformanceTheme, PianoRollTheme, Theme, ToolsTheme, Typography, UiPalette,
 };
 pub use view::{
     CanvasView, EventCx, FileChoice, FilesCommit, HostRequest, MenuItem, ScrollAxis, ScrollInfo,

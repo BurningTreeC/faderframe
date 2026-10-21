@@ -235,8 +235,26 @@ impl Session {
         })
     }
 
-    /// Write a MIDI clip as a MIDI 2.0 clip file.
-    pub fn export_midi2_clip(&self, path: &Path, clip: ClipId) -> Result<()> {
+    /// Write a MIDI clip as a MIDI 2.0 clip file (an existing file asked
+    /// about first; staged and moved into place, see [`crate::exports`]).
+    pub fn export_midi2_clip(&mut self, path: &Path, clip: ClipId) -> Result<()> {
+        let bytes = self.midi2_clip_bytes(clip)?;
+        crate::exports::make_parent(path)?;
+        let shown = path.to_path_buf();
+        self.write_export(
+            "MIDI 2.0 clip",
+            vec![(path.to_path_buf(), bytes)],
+            move |s, _| {
+                s.notify(
+                    crate::NoticeLevel::Info,
+                    format!("exported the MIDI 2.0 clip to {}", shown.display()),
+                );
+            },
+        )
+    }
+
+    /// A MIDI clip as a MIDI 2.0 clip file's bytes.
+    fn midi2_clip_bytes(&self, clip: ClipId) -> Result<Vec<u8>> {
         let p = &self.project;
         let c = p.clip(clip).ok_or_else(|| err("no such clip"))?;
         let m = c
@@ -420,7 +438,7 @@ impl Session {
             events: events.into_iter().map(|(t, _, p)| (t, p)).collect(),
             length: tick(m.length),
         };
-        std::fs::write(path, file.write()).map_err(|e| err(format!("{}: {e}", path.display())))
+        Ok(file.write())
     }
 
     /// Import a MIDI 2.0 clip file at `at` (see the module docs); with

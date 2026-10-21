@@ -91,6 +91,11 @@ fn a_714_mix_becomes_an_iamf_master() {
             .unwrap();
         let rendered = job.join().unwrap();
         assert_eq!(rendered[0].path, out);
+        // No decoder here: the file's facts, no levels claimed.
+        let st = rendered[0].stats.clone().unwrap().unwrap();
+        assert!(!st.from_file && st.levels.is_none() && !st.notes.is_empty());
+        assert_eq!(st.bytes, std::fs::metadata(&out).unwrap().len());
+        assert_eq!(st.channels, 12);
         if name.ends_with(".iamf") {
             let seq = read::parse(&std::fs::read(&out).unwrap()).unwrap();
             assert_eq!(seq.layout, 7, "7.1.4");

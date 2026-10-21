@@ -9,8 +9,10 @@ use faderframe_core::gain::format_db;
 use std::collections::BTreeSet;
 
 /// What `now` has that differs from `then`, one line each (empty: the
-/// same).
+/// same). The songs are compared, whichever scratch pad either shows; the
+/// pads by name.
 pub fn differences(then: &Project, now: &Project) -> Vec<String> {
+    let (then, now) = (&*then.song(), &*now.song());
     let mut out = Vec::new();
     let name = |p: &Project, id| {
         p.track(id)
@@ -153,6 +155,22 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
     }
     if then.timecode != now.timecode {
         out.push("Timecode changed".into());
+    }
+    let (a, b) = (&then.scratch_pads, &now.scratch_pads);
+    for p in &b.pads {
+        match a.pad(p.id) {
+            None => out.push(format!("Scratch pad ‘{}’ added", p.name)),
+            Some(old) if old.name != p.name => {
+                out.push(format!("Scratch pad ‘{}’ renamed ‘{}’", old.name, p.name))
+            }
+            Some(old) if old.stash != p.stash => {
+                out.push(format!("Scratch pad ‘{}’ changed", p.name));
+            }
+            Some(_) => {}
+        }
+    }
+    for p in a.pads.iter().filter(|p| b.pad(p.id).is_none()) {
+        out.push(format!("Scratch pad ‘{}’ removed", p.name));
     }
     out
 }

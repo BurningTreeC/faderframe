@@ -9,19 +9,29 @@
 //! whatever the server runs at; a buffer-size change can be *requested*
 //! (`jack_set_buffer_size`), which affects the whole JACK graph.
 //!
+//! Devices are the clients that own physical ports (JACK2's `system`; under
+//! pipewire-jack one per interface). With auto-connect the stream's ports
+//! are connected to the devices asked for (their channels one after
+//! another) or the first one, and [`AudioStream::maintain`] connects them
+//! again when a device comes back.
+//!
 //! No JACK type escapes this crate: the engine only sees
 //! [`faderframe_audio::DeviceBuffers`].
 
 #![cfg(target_os = "linux")]
 
+mod plan;
+
 use faderframe_audio::{
-    AudioBackend, AudioCallback, AudioError, AudioStream, DeviceBuffers, DeviceInfo, StreamConfig,
-    StreamInfo, StreamMonitor, StreamStatus, validate_format,
+    AudioBackend, AudioCallback, AudioError, AudioStream, Capabilities, DeviceBuffers, DeviceInfo,
+    RateControl, StreamConfig, StreamInfo, StreamMonitor, StreamRouting, StreamStatus,
+    validate_format,
 };
 use jack::{
     AsyncClient, AudioIn, AudioOut, Client, ClientOptions, ClientStatus, Control, Frames,
     LatencyType, NotificationHandler, Port, PortFlags, ProcessHandler, ProcessScope,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 const AUDIO_TYPE: &str = "32 bit float mono audio";
@@ -42,6 +52,16 @@ fn physical_ports(client: &Client, flags: PortFlags) -> Vec<String> {
     client.ports(None, Some(AUDIO_TYPE), flags | PortFlags::IS_PHYSICAL)
 }
 
+/// The devices: physical *output* ports are capture sources, *input*
+/// ports are playback sinks (JACK's port direction is from the graph's
+/// view).
+fn devices_of(client: &Client) -> Vec<plan::Group> {
+    plan::groups(
+        &physical_ports(client, PortFlags::IS_OUTPUT),
+        &physical_ports(client, PortFlags::IS_INPUT),
+    )
+}
+
 impl AudioBackend for JackBackend {
     fn id(&self) -> &'static str {
         "jack"
@@ -51,26 +71,49 @@ impl AudioBackend for JackBackend {
         "JACK (JACK2 / PipeWire)"
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            rate: RateControl::Server,
+            live_buffer_size: true,
+            live_sample_rate: false,
+            output_devices: 4,
+            input_devices: 4,
+            // One server clock (JACK2 drives one device; pipewire-jack's
+            // devices are kept in step by PipeWire).
+            clocked_by_server: true,
+            follows_devices: true,
+            free_channel_counts: true,
+            force_format: false,
+        }
+    }
+
     fn is_available(&self) -> bool {
         open_client("faderframe-probe").is_ok()
     }
 
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
         let client = open_client("faderframe-probe")?;
-        // Physical *output* ports are capture sources, *input* ports are
-        // playback sinks (JACK's port direction is from the graph's view).
-        let capture = physical_ports(&client, PortFlags::IS_OUTPUT).len() as u16;
-        let playback = physical_ports(&client, PortFlags::IS_INPUT).len() as u16;
-        Ok(vec![DeviceInfo {
-            id: "jack".into(),
-            name: "JACK server".into(),
-            input_channels: capture,
-            output_channels: playback,
-            sample_rates: Vec::new(),
-            current_sample_rate: Some(client.sample_rate()),
-            current_buffer_size: Some(client.buffer_size()),
-            is_default: true,
-        }])
+        let groups = devices_of(&client);
+        let first_capture = groups.iter().position(|g| !g.capture.is_empty());
+        let first_playback = groups.iter().position(|g| !g.playback.is_empty());
+        Ok(groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| DeviceInfo {
+                id: g.client.clone(),
+                name: g.client.clone(),
+                input_channels: g.capture.len() as u16,
+                output_channels: g.playback.len() as u16,
+                input_names: g.capture.iter().map(|p| plan::short(p).into()).collect(),
+                output_names: g.playback.iter().map(|p| plan::short(p).into()).collect(),
+                sample_rates: Vec::new(),
+                current_sample_rate: Some(client.sample_rate()),
+                current_buffer_size: Some(client.buffer_size()),
+                buffer_sizes: None,
+                clock: Some("jack".into()),
+                is_default: Some(i) == first_capture || Some(i) == first_playback,
+            })
+            .collect())
     }
 
     fn open_stream(
@@ -151,28 +194,24 @@ impl AudioBackend for JackBackend {
             .map_err(|e| AudioError::Stream(format!("activate JACK client: {e}")))?;
         monitor.set_running(true);
 
-        if config.auto_connect {
-            let c = active.as_client();
-            for (ours, theirs) in out_names.iter().zip(physical_ports(c, PortFlags::IS_INPUT)) {
-                if let Err(e) = c.connect_ports_by_name(ours, &theirs) {
-                    tracing::warn!("cannot connect {ours} → {theirs}: {e}");
-                }
-            }
-            for (theirs, ours) in physical_ports(c, PortFlags::IS_OUTPUT)
-                .into_iter()
-                .zip(in_names.iter())
-            {
-                if let Err(e) = c.connect_ports_by_name(&theirs, ours) {
-                    tracing::warn!("cannot connect {theirs} → {ours}: {e}");
-                }
-            }
-        }
-        tracing::info!("JACK stream open: {info}");
-        Ok(Box::new(JackStream {
+        let mut stream = JackStream {
             client: active,
             info,
             monitor,
-        }))
+            in_names,
+            out_names,
+            wanted_in: config.input_devices.clone(),
+            wanted_out: config.output_devices.clone(),
+            auto_connect: config.auto_connect,
+            made: HashSet::new(),
+            known: HashMap::new(),
+            missing: Vec::new(),
+            latencies: (0, 0),
+            devices: None,
+        };
+        stream.maintain();
+        tracing::info!("JACK stream open: {}", stream.info);
+        Ok(Box::new(stream))
     }
 }
 
@@ -260,6 +299,109 @@ struct JackStream {
     client: AsyncClient<JackNotifications, JackProcess>,
     info: StreamInfo,
     monitor: Arc<StreamMonitor>,
+    /// The stream's own ports (full names).
+    in_names: Vec<String>,
+    out_names: Vec<String>,
+    /// Devices (clients) asked for.
+    wanted_in: Vec<String>,
+    wanted_out: Vec<String>,
+    auto_connect: bool,
+    /// Connections this stream made: (source, destination).
+    made: HashSet<(String, String)>,
+    /// Channel counts of devices seen (by client and direction: playback
+    /// true), so a missing one keeps its place.
+    known: HashMap<(String, bool), usize>,
+    /// Devices asked for that are not there.
+    missing: Vec<String>,
+    /// As the server reported them at the last `maintain` (latencies in
+    /// and out; the devices connected): `info` is asked often.
+    latencies: (u32, u32),
+    devices: Option<String>,
+}
+
+impl JackStream {
+    /// The largest latency JACK reports between our ports of one
+    /// direction and the devices.
+    fn latency(&self, output: bool) -> u32 {
+        let c = self.client.as_client();
+        let (names, mode) = if output {
+            (&self.out_names, LatencyType::Playback)
+        } else {
+            (&self.in_names, LatencyType::Capture)
+        };
+        names
+            .iter()
+            .filter_map(|n| c.port_by_name(n))
+            .map(|p| p.get_latency_range(mode).1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Connect the wanted devices' ports (again), and undo connections of
+    /// ours that are not wanted any more (a stand-in device's, once the
+    /// wanted one is back).
+    fn connect(&mut self) {
+        if !self.auto_connect {
+            return;
+        }
+        let c = self.client.as_client();
+        let groups = devices_of(c);
+        for g in &groups {
+            for (len, playback) in [(g.playback.len(), true), (g.capture.len(), false)] {
+                if len > 0 {
+                    self.known.insert((g.client.clone(), playback), len);
+                }
+            }
+        }
+        let known = |playback: bool| -> HashMap<String, usize> {
+            self.known
+                .iter()
+                .filter(|((_, p), _)| *p == playback)
+                .map(|((c, _), n)| (c.clone(), *n))
+                .collect()
+        };
+        let outs = plan::assign(
+            &groups,
+            &self.wanted_out,
+            true,
+            self.out_names.len(),
+            &known(true),
+        );
+        let ins = plan::assign(
+            &groups,
+            &self.wanted_in,
+            false,
+            self.in_names.len(),
+            &known(false),
+        );
+        let mut wanted: HashSet<(String, String)> = HashSet::new();
+        for (ours, theirs) in self.out_names.iter().zip(&outs.ports) {
+            if let Some(t) = theirs {
+                wanted.insert((ours.clone(), t.clone()));
+            }
+        }
+        for (ours, theirs) in self.in_names.iter().zip(&ins.ports) {
+            if let Some(t) = theirs {
+                wanted.insert((t.clone(), ours.clone()));
+            }
+        }
+        for (src, dst) in self.made.difference(&wanted) {
+            let _ = c.disconnect_ports_by_name(src, dst);
+        }
+        for (src, dst) in &wanted {
+            let connected = c
+                .port_by_name(src)
+                .is_some_and(|p| p.is_connected_to(dst).unwrap_or(false));
+            if !connected && let Err(e) = c.connect_ports_by_name(src, dst) {
+                tracing::warn!("cannot connect {src} → {dst}: {e}");
+            }
+        }
+        self.made = wanted;
+        let mut missing = outs.missing;
+        missing.extend(ins.missing);
+        missing.dedup();
+        self.missing = missing;
+    }
 }
 
 impl AudioStream for JackStream {
@@ -268,7 +410,47 @@ impl AudioStream for JackStream {
         let mut info = self.info.clone();
         info.sample_rate = status.sample_rate;
         info.buffer_size = status.buffer_size;
+        // As the server reported it lately (connections change it).
+        (info.input_latency, info.output_latency) = self.latencies;
+        if let Some(d) = &self.devices {
+            info.device = d.clone();
+        }
         info
+    }
+
+    fn routing(&self) -> StreamRouting {
+        let c = self.client.as_client();
+        let mut r = StreamRouting {
+            missing: self.missing.clone(),
+            ..StreamRouting::default()
+        };
+        for (names, list) in [
+            (&self.in_names, &mut r.inputs),
+            (&self.out_names, &mut r.outputs),
+        ] {
+            for n in names {
+                let peer = c
+                    .port_by_name(n)
+                    .and_then(|p| p.get_connections().into_iter().next());
+                list.push(peer.map(|peer| {
+                    let client = peer.split_once(':').map_or(peer.as_str(), |(c, _)| c);
+                    if !r.devices.iter().any(|d| d == client) {
+                        r.devices.push(client.to_string());
+                    }
+                    format!("{client} · {}", plan::short(&peer))
+                }));
+            }
+        }
+        r
+    }
+
+    /// Connect the wanted devices (again) and note the latencies and
+    /// devices `info` reports. Never from a JACK callback.
+    fn maintain(&mut self) {
+        self.connect();
+        self.latencies = (self.latency(false), self.latency(true));
+        let devices = self.routing().devices;
+        self.devices = (!devices.is_empty()).then(|| devices.join(" + "));
     }
 
     fn status(&self) -> StreamStatus {

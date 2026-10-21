@@ -139,7 +139,14 @@ fn a_714_mix_becomes_an_atmos_master() {
             ..RenderSettings::defaults_for(s.project(), out.clone())
         })
         .unwrap();
-    job.join().unwrap();
+    let rendered = job.join().unwrap();
+    // Read back: every channel's peaks, no loudness (a renderer places
+    // the objects).
+    let st = rendered[0].stats.clone().unwrap().unwrap();
+    assert_eq!((st.container.as_str(), st.channels), ("BWF (ADM)", 15));
+    let levels = st.levels.as_ref().unwrap();
+    assert_eq!(levels.channels.len(), 15);
+    assert!(levels.loudness.is_none() && !st.notes.is_empty());
     let axml = faderframe_audio_files::wavstream::read_chunk(&out, b"axml")
         .unwrap()
         .unwrap();

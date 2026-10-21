@@ -354,7 +354,7 @@ impl ArrangerView {
     }
 
     pub(crate) fn chord_drag(
-        &self,
+        &mut self,
         drag: &mut GlobalDrag,
         pos: Point,
         mods: Modifiers,
@@ -374,7 +374,9 @@ impl ArrangerView {
                 *to = Self::key_position(model, t_at);
                 cx.set_cursor(Cursor::Grabbing);
             }
-            GlobalDrag::NewChord { to, .. } => *to = self.snap(t_at, model, mods),
+            GlobalDrag::NewChord { to, .. } => {
+                *to = self.snap_point(t_at, model, mods, &Default::default());
+            }
             GlobalDrag::Chord {
                 index,
                 part,
@@ -391,27 +393,30 @@ impl ArrangerView {
                 let Some(c) = model.project().chords.get(*index) else {
                     return;
                 };
+                let (c_start, c_end) = (c.start, c.end);
+                let skip = faderframe_session::SnapSkip::default();
                 match part {
                     SectionPart::Body => {
-                        let len = c.end - c.start;
-                        let s = self.snap(
-                            (c.start + (self.time_at(pos.x) - *grab)).max(MusicalTime::ZERO),
-                            model,
-                            mods,
-                        );
+                        let len = c_end - c_start;
+                        let raw = (c_start + (self.time_at(pos.x) - *grab)).max(MusicalTime::ZERO);
+                        // Either edge onto an object near it, else the grid.
+                        let s = match self.object_shift(&[raw, raw + len], model, mods, &skip) {
+                            Some(shift) => (raw + shift).max(MusicalTime::ZERO),
+                            None => self.snap(raw, model, mods),
+                        };
                         (*start, *end) = (s, s + len);
                         cx.set_cursor(Cursor::Grabbing);
                     }
                     SectionPart::Start => {
                         *start = self
-                            .snap(t_at, model, mods)
-                            .min(c.end - MusicalTime::from_ticks(1));
+                            .snap_point(t_at, model, mods, &skip)
+                            .min(c_end - MusicalTime::from_ticks(1));
                         cx.set_cursor(Cursor::ResizeHorizontal);
                     }
                     SectionPart::End => {
                         *end = self
-                            .snap(t_at, model, mods)
-                            .max(c.start + MusicalTime::from_ticks(1));
+                            .snap_point(t_at, model, mods, &skip)
+                            .max(c_start + MusicalTime::from_ticks(1));
                         cx.set_cursor(Cursor::ResizeHorizontal);
                     }
                 }

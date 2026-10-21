@@ -2,8 +2,10 @@
 //! cutting a span out (later material moves up), and opening a span
 //! (later material moves back) to insert a copy. Clips are split at the
 //! span's edges, automation keeps its values on both sides of a cut,
-//! tempo and time-signature changes, markers, sections and the loop and
-//! punch ranges move along. Section moves, copies and deletes
+//! tempo and time-signature changes, markers, sections, the loop and
+//! punch ranges and the Play Start Marker move along (a cut it is in
+//! leaves it where the cut was; a moved span takes it along, a copy
+//! does not: there is one). Section moves, copies and deletes
 //! ([`move_section`], [`copy_section`], [`delete_section`]) are built from
 //! these.
 //!
@@ -14,13 +16,14 @@
 //! [`Command::SetArrangement`]: crate::Command::SetArrangement
 
 use crate::{ChordEvent, Clip, ClipContent, KeyChange, Marker, MusicalRange, Project, Section};
-use faderframe_automation::{AutomationPoint, AutomationSet};
+use faderframe_automation::{AutomationCurve, AutomationLane, AutomationPoint, AutomationSet};
 use faderframe_core::{AutomationLaneId, ClipId, IdAllocator, SectionId, TrackId};
 use faderframe_timeline::{
     MeterChange, MusicalTime, TempoCurve, TempoMap, TempoPoint, TimeSignature, TimeSignatureMap,
     Timeline,
 };
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 /// The parts of a project that time edits change.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +40,7 @@ pub struct Arrangement {
     pub loop_range: Option<MusicalRange>,
     pub loop_enabled: bool,
     pub punch_range: Option<MusicalRange>,
+    pub play_start: Option<crate::PlayStart>,
     pub ids: IdAllocator,
 }
 
@@ -58,6 +62,7 @@ impl Arrangement {
             loop_range: p.loop_range,
             loop_enabled: p.loop_enabled,
             punch_range: p.punch_range,
+            play_start: p.play_start,
             ids: p.ids.clone(),
         }
     }
@@ -86,6 +91,7 @@ impl Arrangement {
             loop_range: std::mem::replace(&mut p.loop_range, self.loop_range),
             loop_enabled: std::mem::replace(&mut p.loop_enabled, self.loop_enabled),
             punch_range: std::mem::replace(&mut p.punch_range, self.punch_range),
+            play_start: std::mem::replace(&mut p.play_start, self.play_start),
             ids: std::mem::replace(&mut p.ids, self.ids),
         }
     }
@@ -101,6 +107,9 @@ pub struct TimeSlice {
     clips: Vec<Clip>,
     /// Points of each lane, with the lane's values at both edges.
     automation: Vec<(TrackId, AutomationLaneId, Vec<AutomationPoint>)>,
+    /// The lanes of `automation`, without points (what another arrangement
+    /// needs to take them, see [`TimeSlice::adopt_lanes`]).
+    lanes: Vec<(TrackId, AutomationLane)>,
     /// The tempo from the start on (first point at 0).
     tempo: Vec<TempoPoint>,
     /// Signatures by bar from the start (first at 0).
@@ -113,6 +122,8 @@ pub struct TimeSlice {
     chords: Vec<ChordEvent>,
     /// Lyric lines starting in the span.
     lyrics: Vec<crate::lyrics::LyricLine>,
+    /// The Play Start Marker's place in the span, when it is in it.
+    play_start: Option<MusicalTime>,
 }
 
 const TICK: MusicalTime = MusicalTime(1);
@@ -209,9 +220,11 @@ fn sync_track_clips(p: &mut Project) {
 pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
     let tl = &p.timeline;
     let len = b - a;
+    let in_slots = p.launcher_clips();
     let clips = p
         .clips
         .values()
+        .filter(|c| !in_slots.contains(&c.id))
         .filter(|c| c.start + SLACK < b && c.end(tl, p.sample_rate) > a + SLACK)
         .filter_map(|c| c.slice(a, b, c.id, tl, p.sample_rate))
         .map(|mut c| {
@@ -220,12 +233,20 @@ pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
         })
         .collect();
     let mut automation = Vec::new();
+    let mut lanes = Vec::new();
     for t in &p.tracks {
         for lane in &t.automation.lanes {
             let curve = &lane.curve;
             if curve.is_empty() {
                 continue;
             }
+            lanes.push((
+                t.id,
+                AutomationLane {
+                    curve: AutomationCurve::default(),
+                    ..lane.clone()
+                },
+            ));
             let mut pts: Vec<AutomationPoint> = Vec::new();
             if let Some(v) = curve.value_at(a)
                 && !curve.points().iter().any(|q| q.time == a)
@@ -302,6 +323,7 @@ pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
         bars: bars.map(|(ba, bb)| bb - ba),
         clips,
         automation,
+        lanes,
         tempo,
         meter,
         markers: p
@@ -350,6 +372,10 @@ pub fn copy_span(p: &Project, a: MusicalTime, b: MusicalTime) -> TimeSlice {
                 text: l.text.clone(),
             })
             .collect(),
+        play_start: p
+            .play_start
+            .filter(|m| m.at >= a && m.at < b)
+            .map(|m| m.at - a),
     }
 }
 
@@ -587,6 +613,15 @@ pub fn remove_span(p: &mut Project, a: MusicalTime, b: MusicalTime) {
         .punch_range
         .and_then(|r| range_after_cut(r.start, r.end, a, b))
         .map(|(start, end)| MusicalRange { start, end });
+    // The Play Start Marker stays: later on it moves up, inside the cut
+    // it goes to where the cut was.
+    if let Some(m) = &mut p.play_start {
+        if m.at >= b {
+            m.at -= len;
+        } else if m.at >= a {
+            m.at = a;
+        }
+    }
     sync_track_clips(p);
 }
 
@@ -622,31 +657,7 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
             }
         }
     }
-    for c in &slice.clips {
-        let id: ClipId = p.ids.allocate();
-        let fits = p.tracks.iter().any(|t| {
-            t.id == c.track
-                && match c.content {
-                    ClipContent::Audio(_) | ClipContent::Takes(_) => {
-                        t.kind == crate::TrackKind::Audio
-                    }
-                    ClipContent::Midi(_) => matches!(
-                        t.kind,
-                        crate::TrackKind::Instrument | crate::TrackKind::Midi
-                    ),
-                }
-        });
-        if fits {
-            p.clips.insert(
-                id,
-                Clip {
-                    id,
-                    start: at + c.start,
-                    ..c.clone()
-                },
-            );
-        }
-    }
+    place_clips(p, at, slice);
     // Automation.
     for t in &mut p.tracks {
         for lane in &mut t.automation.lanes {
@@ -861,6 +872,14 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
     };
     p.loop_range = p.loop_range.map(shift);
     p.punch_range = p.punch_range.map(shift);
+    // The Play Start Marker moves along; a moved span brings its own.
+    if let Some(m) = &mut p.play_start {
+        match slice.play_start.filter(|_| keep_ids) {
+            Some(rel) => m.at = at + rel,
+            None if m.at >= at => m.at += len,
+            None => {}
+        }
+    }
     sync_track_clips(p);
 }
 
@@ -904,6 +923,248 @@ pub fn delete_section(p: &mut Project, id: SectionId) -> bool {
     };
     remove_span(p, s.start, s.end);
     true
+}
+
+/// Does `track` take `clip` (audio on audio tracks, MIDI on instrument and
+/// MIDI tracks)?
+fn takes_clip(p: &Project, clip: &Clip) -> bool {
+    p.tracks.iter().any(|t| {
+        t.id == clip.track
+            && match clip.content {
+                ClipContent::Audio(_) | ClipContent::Takes(_) => t.kind == crate::TrackKind::Audio,
+                ClipContent::Midi(_) => matches!(
+                    t.kind,
+                    crate::TrackKind::Instrument | crate::TrackKind::Midi
+                ),
+            }
+    })
+}
+
+/// Put copies of the slice's clips (new ids) on their tracks from `at`.
+fn place_clips(p: &mut Project, at: MusicalTime, slice: &TimeSlice) {
+    for c in &slice.clips {
+        if !takes_clip(p, c) {
+            continue;
+        }
+        let id: ClipId = p.ids.allocate();
+        p.clips.insert(
+            id,
+            Clip {
+                id,
+                start: at + c.start,
+                ..c.clone()
+            },
+        );
+    }
+}
+
+/// The bar lines at or before `start` and at or after `end` (an end a
+/// hair past a bar line, as audio clips' ends are, counts as on it), at
+/// least a bar apart.
+pub fn bar_lines(
+    meter: &TimeSignatureMap,
+    start: MusicalTime,
+    end: MusicalTime,
+) -> (MusicalTime, MusicalTime) {
+    let a = meter.bar_start(meter.bar_at(start));
+    let last = meter.bar_at(end);
+    let mut b = if meter.bar_start(last) + SLACK >= end {
+        meter.bar_start(last)
+    } else {
+        meter.bar_start(last + 1)
+    };
+    if b <= a {
+        b = meter.bar_start(meter.bar_at(a) + 1);
+    }
+    (a, b)
+}
+
+impl TimeSlice {
+    pub fn clip_count(&self) -> usize {
+        self.clips.len()
+    }
+
+    /// The tracks its clips are on.
+    pub fn clip_tracks(&self) -> BTreeSet<TrackId> {
+        self.clips.iter().map(|c| c.track).collect()
+    }
+
+    /// Nothing to place: no clips, automation, markers, sections, keys,
+    /// chords or lyrics.
+    pub fn is_empty(&self) -> bool {
+        self.clips.is_empty()
+            && self.automation.is_empty()
+            && self.markers.is_empty()
+            && self.sections.is_empty()
+            && self.keys.is_empty()
+            && self.chords.is_empty()
+            && self.lyrics.is_empty()
+    }
+
+    /// Keep the material of `tracks` only (`None`: every track's); with
+    /// `clips`, only the clips copied from those, whole clips without
+    /// automation (as copies of clips carry none).
+    pub fn retain(&mut self, tracks: Option<&BTreeSet<TrackId>>, clips: Option<&BTreeSet<ClipId>>) {
+        let on = |t: &TrackId| tracks.is_none_or(|k| k.contains(t));
+        self.clips
+            .retain(|c| on(&c.track) && clips.is_none_or(|k| k.contains(&c.id)));
+        if clips.is_some() {
+            self.automation.clear();
+        }
+        self.automation.retain(|(t, _, _)| on(t));
+        let kept: BTreeSet<(TrackId, AutomationLaneId)> =
+            self.automation.iter().map(|(t, l, _)| (*t, *l)).collect();
+        self.lanes.retain(|(t, l)| kept.contains(&(*t, l.id)));
+    }
+
+    /// Only the material on the tracks: the timeline's parts (tempo and
+    /// metre changes, markers, sections, keys, chords, lyrics) go — where
+    /// it is placed keeps its own.
+    pub fn without_globals(&mut self) {
+        self.tempo.clear();
+        self.meter.clear();
+        self.markers.clear();
+        self.sections.clear();
+        self.keys.clear();
+        self.chords.clear();
+        self.lyrics.clear();
+    }
+
+    /// Everything `lead` later in a slice `length` long (at least `lead`
+    /// and what it holds; `bars`: how many whole bars that is where it was
+    /// copied from). The timeline's parts go unless `lead` is zero.
+    pub fn delay(&mut self, lead: MusicalTime, length: MusicalTime, bars: Option<i32>) {
+        if lead > MusicalTime::ZERO {
+            self.without_globals();
+            for c in &mut self.clips {
+                c.start += lead;
+            }
+            for (_, _, pts) in &mut self.automation {
+                for q in pts.iter_mut() {
+                    q.time += lead;
+                }
+            }
+        }
+        self.length = length;
+        self.bars = bars;
+    }
+
+    /// Let `p` take this slice's automation: a lane of the same target
+    /// under another id takes the points, lanes it lacks are added (without
+    /// points).
+    pub fn adopt_lanes(&mut self, p: &mut Project) {
+        let mut renamed: Vec<(TrackId, AutomationLaneId, AutomationLaneId)> = Vec::new();
+        for (track, lane) in &self.lanes {
+            let Some(t) = p.tracks.iter_mut().find(|t| t.id == *track) else {
+                continue;
+            };
+            if t.automation.lanes.iter().any(|l| l.id == lane.id) {
+                continue;
+            }
+            match t.automation.lanes.iter().find(|l| l.target == lane.target) {
+                Some(same) => renamed.push((*track, lane.id, same.id)),
+                None => t.automation.lanes.push(lane.clone()),
+            }
+        }
+        for (track, from, to) in renamed {
+            for a in &mut self.automation {
+                if a.0 == track && a.1 == from {
+                    a.1 = to;
+                }
+            }
+            for l in &mut self.lanes {
+                if l.0 == track && l.1.id == from {
+                    l.1.id = to;
+                }
+            }
+        }
+    }
+}
+
+/// Lay the slice over the arrangement from `at` without moving time: on
+/// each track it has clips for, what lies under `[at, at + length)` goes
+/// (clips across an edge are cut there) and its clips come in; its
+/// automation replaces the lanes' over the span. Tempo, metre, markers and
+/// sections stay as they are.
+pub fn overlay_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice) {
+    let len = slice.length;
+    if len <= MusicalTime::ZERO {
+        return;
+    }
+    let end_at = at + len;
+    let rate = p.sample_rate;
+    let tracks = slice.clip_tracks();
+    let in_slots = p.launcher_clips();
+    let under: Vec<Clip> = p
+        .clips
+        .values()
+        .filter(|c| !in_slots.contains(&c.id) && tracks.contains(&c.track))
+        .cloned()
+        .collect();
+    for c in under {
+        let end = c.end(&p.timeline, rate);
+        if end <= at + SLACK || c.start + SLACK >= end_at {
+            continue;
+        }
+        p.clips.remove(&c.id);
+        if c.start + SLACK < at
+            && let Some(left) = c.slice(c.start, at, c.id, &p.timeline, rate)
+        {
+            p.clips.insert(left.id, left);
+        }
+        if end > end_at + SLACK {
+            let id: ClipId = p.ids.allocate();
+            if let Some(right) = c.slice(end_at, end, id, &p.timeline, rate) {
+                p.clips.insert(id, right);
+            }
+        }
+    }
+    place_clips(p, at, slice);
+    for t in &mut p.tracks {
+        for lane in &mut t.automation.lanes {
+            let Some((_, _, pts)) = slice
+                .automation
+                .iter()
+                .find(|(tr, id, _)| *tr == t.id && *id == lane.id)
+            else {
+                continue;
+            };
+            let shifted: Vec<AutomationPoint> = pts
+                .iter()
+                .map(|q| AutomationPoint {
+                    time: at + q.time,
+                    ..*q
+                })
+                .collect();
+            lane.curve.replace_range(at, end_at, &shifted);
+        }
+    }
+    sync_track_clips(p);
+}
+
+/// Replace `[a, b)` with the slice: what is there goes, the slice comes in
+/// and what follows moves by the difference in length. When the slice
+/// brings no section, `section` (the one replaced) is put over it again.
+pub fn replace_span(
+    p: &mut Project,
+    a: MusicalTime,
+    b: MusicalTime,
+    slice: &TimeSlice,
+    section: Option<Section>,
+) {
+    remove_span(p, a, b);
+    insert_span(p, a, slice, false);
+    if slice.sections.is_empty()
+        && let Some(s) = section
+    {
+        p.sections.retain(|x| x.id != s.id);
+        p.sections.push(Section {
+            start: a,
+            end: a + slice.length,
+            ..s
+        });
+        p.sections.sort_by_key(|s| s.start);
+    }
 }
 
 #[cfg(test)]
@@ -1166,6 +1427,56 @@ mod tests {
             "the loop still covers the song"
         );
         assert_eq!(p.timeline.tempo.points().len(), 1, "no repeated tempo");
+    }
+
+    #[test]
+    fn the_play_start_marker_moves_with_the_material_under_it() {
+        let (p, _, ids) = song();
+        let marker = |at: MusicalTime, on: bool| Some(crate::PlayStart { at, on });
+        let half = MusicalTime::from_quarters(2.0);
+        // In C (bar 2½): moving C to the front takes it along, off or on.
+        let mut q = p.clone();
+        q.play_start = marker(bars(2) + half, false);
+        assert!(move_section(&mut q, ids[2], MusicalTime::ZERO));
+        assert_eq!(order(&q), "CABD");
+        assert_eq!(q.play_start, marker(half, false));
+        // Moving A after D: C (and the marker) move up a bar.
+        let mut q = p.clone();
+        q.play_start = marker(bars(2) + half, true);
+        assert!(move_section(&mut q, ids[0], bars(4)));
+        assert_eq!(order(&q), "BCDA");
+        assert_eq!(q.play_start, marker(bars(1) + half, true));
+        // Copying B to the front: what follows moves later; no second
+        // marker comes with the copy.
+        let mut q = p.clone();
+        q.play_start = marker(bars(1), true);
+        assert!(copy_section(&mut q, ids[1], MusicalTime::ZERO).is_some());
+        assert_eq!(order(&q), "BABCD");
+        assert_eq!(q.play_start, marker(bars(2), true));
+        // Deleting C with the marker in it: it stays where C was (D's
+        // start now); deleting B before it moves it up.
+        let mut q = p.clone();
+        q.play_start = marker(bars(2) + half, true);
+        assert!(delete_section(&mut q, ids[2]));
+        assert_eq!(q.play_start, marker(bars(2), true));
+        let mut q = p.clone();
+        q.play_start = marker(bars(2) + half, true);
+        assert!(delete_section(&mut q, ids[1]));
+        assert_eq!(q.play_start, marker(bars(1) + half, true));
+        // Before the moved material: it stays.
+        let mut q = p.clone();
+        q.play_start = marker(half, true);
+        assert!(move_section(&mut q, ids[3], bars(1)));
+        assert_eq!(q.play_start, marker(half, true));
+        // An arrangement swaps it back (undo).
+        let mut q = p.clone();
+        q.play_start = marker(bars(2) + half, true);
+        let mut moved = q.clone();
+        move_section(&mut moved, ids[2], MusicalTime::ZERO);
+        let undo = Arrangement::of(&moved).swap_into(&mut q);
+        assert_eq!(q.play_start, marker(half, true));
+        undo.swap_into(&mut q);
+        assert_eq!(q.play_start, marker(bars(2) + half, true));
     }
 
     #[test]

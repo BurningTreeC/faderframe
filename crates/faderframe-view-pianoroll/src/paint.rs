@@ -8,9 +8,12 @@ use crate::{
 use faderframe_project::midi_ops::Scale;
 use faderframe_project::{Clip, MidiClip, MidiController, MidiNote};
 use faderframe_session::Session;
-use faderframe_timeline::{GridDivision, GridLineKind, MusicalTime, for_each_grid_line};
+use faderframe_timeline::{
+    GridDensity, GridDivision, GridLineKind, MusicalTime, for_each_grid_line, for_each_visible_line,
+};
 use faderframe_ui_canvas::{
-    Align, Color, FontFamily, Paint, Painter, Path, Point, Rect, Size, TextStyle, Theme,
+    Align, Color, FontFamily, GridEmphasis, Paint, Painter, Path, Point, Rect, Size, TextStyle,
+    Theme,
 };
 
 impl PianoRollView {
@@ -210,27 +213,6 @@ impl PianoRollView {
     }
 
     /// Grid lines dense enough to read, never closer than ~7 px.
-    fn grid_division(&self, model: &Session) -> GridDivision {
-        let chosen = model.editor.grid;
-        let step_px = |d: GridDivision| {
-            d.step(faderframe_timeline::TimeSignature::FOUR_FOUR)
-                .quarters() as f32
-                * self.ppq
-        };
-        if step_px(chosen) >= 7.0 {
-            return chosen;
-        }
-        [
-            GridDivision::Note(16),
-            GridDivision::Note(8),
-            GridDivision::Beat,
-            GridDivision::Bar,
-        ]
-        .into_iter()
-        .find(|d| step_px(*d) >= 7.0)
-        .unwrap_or(GridDivision::Bar)
-    }
-
     fn paint_grid(&self, p: &mut dyn Painter, g: Rect, clip: &Clip, m: &MidiClip, model: &Session) {
         let pr = &self.theme.piano;
         let top = (((g.y - self.grid_top() + self.scroll_y) / self.row_h)
@@ -317,15 +299,28 @@ impl PianoRollView {
         let meter = &project.timeline.meter;
         let start = clip.start + self.time_at(g.x).max(MusicalTime::ZERO);
         let end = clip.start + self.time_at(g.right());
-        for_each_grid_line(start, end, self.grid_division(model), meter, |t, kind| {
-            let x = self.x_of(t - clip.start);
-            let c = match kind {
-                GridLineKind::Bar => pr.bar_line,
-                GridLineKind::Beat => pr.beat_line,
-                GridLineKind::Subdivision => pr.sub_line,
-            };
-            p.vline(x, g.y, g.bottom(), c);
-        });
+        // The edit grid (where notes snap), bars and beats; thinned zoomed
+        // out, finer lines zoomed in (the arranger's rules and strength).
+        let look = self.theme.grid;
+        let scale = p.scale_factor();
+        for_each_visible_line(
+            start,
+            end,
+            model.editor.grid,
+            meter,
+            f64::from(self.ppq),
+            GridDensity::default(),
+            |t, kind| {
+                let (c, e) = match kind {
+                    GridLineKind::Bar => (pr.bar_line, GridEmphasis::Bar),
+                    GridLineKind::Beat => (pr.beat_line, GridEmphasis::Beat),
+                    GridLineKind::Subdivision => (pr.sub_line, GridEmphasis::Subdivision),
+                    GridLineKind::Fine => (pr.fine_line, GridEmphasis::Fine),
+                };
+                let x = self.x_of(t - clip.start);
+                p.fill(look.line_rect(x, g.y, g.bottom(), e, scale), look.color(c));
+            },
+        );
         // Past the clip end.
         let x_end = self.x_of(m.length);
         if x_end < g.right() {
@@ -553,6 +548,21 @@ impl PianoRollView {
                 Rect::new(x - 0.75, g.y, 1.5, g.h),
                 self.theme.arranger.playhead,
             );
+        }
+        // The object a move or resize snapped to, named.
+        if let Some(hit) = self.snap_guide {
+            let a = &self.theme.arranger;
+            let x = self.x_of(hit.at - clip.start);
+            let scale = p.scale_factor().max(1.0);
+            let w = scale.round().max(1.0) / scale;
+            let left = (x * scale).floor() / scale;
+            p.fill(Rect::new(left, g.y, w, g.h), a.snap_guide);
+            let style = TextStyle::new(self.theme.fonts.tiny, a.snap_guide).bold();
+            let label = hit.object.label();
+            let tw = p.text_width(label, &style) + 10.0;
+            let tag = Rect::new(left + 4.0, g.y + 3.0, tw, 15.0);
+            p.fill_rounded(tag, 3.0, &Paint::Solid(a.ruler_bg.with_alpha(0.92)));
+            p.text(label, tag.inset_xy(5.0, 0.0), &style);
         }
     }
 
