@@ -120,11 +120,34 @@ impl BackendChoice {
         let loopback = std::env::var("FADERFRAME_DUMMY_LOOPBACK")
             .ok()
             .and_then(|v| v.parse::<u32>().ok());
+        // FADERFRAME_DUMMY_DEVICES=<name>=<inputs>x<outputs>[;…]: the dummy
+        // offers these pretend interfaces instead of its one silent device
+        // (the Audio preferences without hardware, scripted screenshots).
+        let devices = std::env::var("FADERFRAME_DUMMY_DEVICES").ok().map(|v| {
+            faderframe_audio::dummy::DummyDevices::new(
+                v.split(';')
+                    .filter_map(|d| {
+                        let (name, io) = d.split_once('=')?;
+                        let (inputs, outputs) = io.split_once('x')?;
+                        Some(faderframe_audio::dummy::mock_device(
+                            name.trim(),
+                            inputs.trim().parse().ok()?,
+                            outputs.trim().parse().ok()?,
+                            &[48_000, 44_100, 88_200, 96_000],
+                            Some((16, 4096)),
+                        ))
+                    })
+                    .collect(),
+            )
+        });
         let dummy = move || {
-            Box::new(match (tone, loopback) {
-                (Some(hz), _) => faderframe_audio::dummy::DummyBackend::with_input_pluck(hz),
-                (None, Some(d)) => faderframe_audio::dummy::DummyBackend::with_loopback(d),
-                (None, None) => faderframe_audio::dummy::DummyBackend::default(),
+            Box::new(match (tone, loopback, &devices) {
+                (Some(hz), _, _) => faderframe_audio::dummy::DummyBackend::with_input_pluck(hz),
+                (None, Some(d), _) => faderframe_audio::dummy::DummyBackend::with_loopback(d),
+                (None, None, Some(devices)) => {
+                    faderframe_audio::dummy::DummyBackend::with_devices(devices.clone())
+                }
+                (None, None, None) => faderframe_audio::dummy::DummyBackend::default(),
             }) as Box<dyn AudioBackend>
         };
         #[cfg(target_os = "linux")]

@@ -2800,7 +2800,7 @@ covered by `the_stock_devices_do_not_allocate`.
   `.ffpreset` under the presets folder, or a track preset in the
   library, compared as canonical paths); the menus list only those. The
   shell confirms first (`PromptDeletePreset`).
-  Built-in factory presets live in `plugin_host::presets`: 276 across
+  Built-in factory presets live in `plugin_host::presets`: 470 across
   the EQ, Program EQ, compressor, 76, limiter, gate, de-esser, channel
   strip, saturator, utility, delay, reverb, modulation (its tremolos in a
   "Tremolo" submenu), the four MIDI effects and Synth (its first fifteen
