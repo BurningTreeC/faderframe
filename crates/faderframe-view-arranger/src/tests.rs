@@ -293,7 +293,7 @@ fn take_lanes_open_and_comp_by_click_and_swipe() {
     assert!(p.texts().iter().any(|t| t.contains("Take 1")));
     assert!(p.balanced_clips());
 
-    // Clicking lane 1 uses take 1 everywhere.
+    // Clicking lane 1 uses take 1 in the one comp section: everywhere.
     let base_h = view.row_h();
     let lane_y = |k: usize| row.y + base_h + LANE_H * (k as f32 + 0.5);
     let x0 = view.x_of(start + MusicalTime::from_quarters_i(1));
@@ -335,6 +335,34 @@ fn take_lanes_open_and_comp_by_click_and_swipe() {
         1,
         "undo restores the comp before the swipe"
     );
+
+    // With a comp made, a click changes only the section under it
+    // (issue #20: one click replaced the whole comp).
+    s.dispatch(Action::Redo).unwrap();
+    let comped = s.project().clip(clip).unwrap().as_takes().unwrap().clone();
+    let x_mid = view.x_of(start + MusicalTime::from_quarters_i(2));
+    let mut actions = run(&mut view, down(Point::new(x_mid, lane_y(1))), size, &s).0;
+    actions.extend(run(&mut view, up(Point::new(x_mid, lane_y(1))), size, &s).0);
+    assert_eq!(actions.len(), 1, "one edit: {actions:?}");
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    let f = s.project().clip(clip).unwrap().as_takes().unwrap().clone();
+    let swapped: Vec<_> = f
+        .pieces()
+        .iter()
+        .map(|p| (p.start, p.end, p.take))
+        .collect();
+    let expected: Vec<_> = comped
+        .pieces()
+        .iter()
+        .map(|p| (p.start, p.end, if p.take == 2 { 1 } else { p.take }))
+        .collect();
+    assert_eq!(swapped, expected, "take 2 in the middle section only");
+    // A click on the take already playing there edits nothing.
+    let mut actions = run(&mut view, down(Point::new(x_mid, lane_y(1))), size, &s).0;
+    actions.extend(run(&mut view, up(Point::new(x_mid, lane_y(1))), size, &s).0);
+    assert!(actions.is_empty(), "{actions:?}");
 
     // Right-click on a lane offers take commands.
     let ev = ViewEvent::PointerDown {

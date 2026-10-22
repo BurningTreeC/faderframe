@@ -217,6 +217,24 @@ impl TakeFolder {
         self.set_comp(a, b, Some(take));
     }
 
+    /// Play `take` in the comp segment at `pos` (a click on its lane): the
+    /// section between the comp boundaries around `pos` changes, the rest
+    /// of the comp stays. A take with no material in that section changes
+    /// nothing.
+    pub fn use_take_at(&mut self, pos: i64, take: usize) {
+        let Some(t) = self.takes.get(take) else {
+            return;
+        };
+        let pos = pos.clamp(0, (self.length - 1).max(0));
+        let Some((a, b, _)) = self.segments().find(|&(a, b, _)| pos >= a && pos < b) else {
+            return;
+        };
+        if t.start.max(a) >= t.end.min(b) {
+            return;
+        }
+        self.set_comp(a, b, Some(take));
+    }
+
     /// Remove a take; comp segments that used it go silent.
     pub fn remove_take(&mut self, take: usize) {
         if take >= self.takes.len() {
@@ -428,6 +446,58 @@ mod tests {
         used.use_take(1);
         assert_eq!(used, left);
         assert_eq!(used.take_at(100), Some(0), "still plays");
+    }
+
+    /// A click on a lane swaps the section under the pointer, never the
+    /// whole comp (issue #20).
+    #[test]
+    fn a_click_uses_the_take_in_one_section() {
+        let mut f = folder(3, 1000);
+        f.use_take(0);
+        f.set_comp(200, 400, Some(1));
+        f.set_comp(600, 800, Some(2));
+        f.use_take_at(300, 2);
+        assert_eq!(
+            f.segments().collect::<Vec<_>>(),
+            vec![
+                (0, 200, Some(0)),
+                (200, 400, Some(2)),
+                (400, 600, Some(0)),
+                (600, 800, Some(2)),
+                (800, 1000, Some(0))
+            ]
+        );
+        // The take already playing there: nothing changes.
+        let before = f.clone();
+        f.use_take_at(250, 2);
+        assert_eq!(f, before);
+        // A neighbour's take merges the sections.
+        f.use_take_at(500, 2);
+        assert_eq!(
+            f.segments().collect::<Vec<_>>(),
+            vec![(0, 200, Some(0)), (200, 800, Some(2)), (800, 1000, Some(0))]
+        );
+        // The folder's end belongs to the last section.
+        f.use_take_at(1000, 1);
+        assert_eq!(f.take_at(900), Some(1));
+        assert_eq!(f.take_at(100), Some(0));
+        // Nothing comped yet: the one section is the whole folder.
+        let mut g = folder(2, 1000);
+        g.use_take_at(10, 1);
+        assert_eq!(g.segments().collect::<Vec<_>>(), vec![(0, 1000, Some(1))]);
+    }
+
+    #[test]
+    fn a_click_where_the_take_has_no_material_changes_nothing() {
+        let mut f = folder(2, 1000);
+        f.takes[1].start = 600;
+        f.use_take(0);
+        f.set_comp(200, 500, None);
+        let before = f.clone();
+        f.use_take_at(300, 1);
+        assert_eq!(f, before, "take 2 starts at 600");
+        f.use_take_at(300, 7);
+        assert_eq!(f, before, "no such take");
     }
 
     #[test]

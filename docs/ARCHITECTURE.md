@@ -4148,8 +4148,10 @@ pass" and stacks passes in one clip.
 default + per-track overrides, saved with the layout; drag a header's
 bottom edge, Alt+wheel for all, View → Track Height). Open take folders
 (`Session::takes_open`, editor state like the selection) add a lane per
-take below the track; clicking a lane uses that take, dragging comps the
-swiped range (snapped), right-click offers Use/Delete Take and Flatten.
+take below the track; clicking a lane puts that take into the comp section
+under the pointer (between the comp boundaries around it — never the whole
+comp), dragging comps the swiped range (snapped), right-click offers
+Use (the whole take)/Delete Take and Flatten.
 While recording, armed tracks show a growing red region; the punch range is
 drawn in the ruler.
 

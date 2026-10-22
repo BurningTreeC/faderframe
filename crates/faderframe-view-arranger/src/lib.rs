@@ -304,6 +304,8 @@ struct Marquee {
 struct CompDrag {
     clip: ClipId,
     take: usize,
+    /// The folder frame pressed (a click swaps the section there).
+    at: i64,
     anchor: i64,
     origin: Point,
     moved: bool,
@@ -3759,6 +3761,7 @@ impl ArrangerView {
                 self.comp = Some(CompDrag {
                     clip,
                     take,
+                    at: frame,
                     anchor,
                     origin: pos,
                     moved: false,
@@ -4207,14 +4210,17 @@ impl ArrangerView {
             if comp.moved {
                 cx.emit(Action::EndGesture);
             } else if let Some(c) = model.project().clip(comp.clip) {
-                // A click uses the whole take.
+                // A click puts the take into the comp section under the
+                // pointer only; the whole take is "Use" in the lane's menu.
                 let mut f = comp.base;
-                f.use_take(comp.take);
-                cx.emit(Action::Edit(Command::SetClipContent {
-                    clip: comp.clip,
-                    start: c.start,
-                    content: Box::new(ClipContent::Takes(f)),
-                }));
+                f.use_take_at(comp.at, comp.take);
+                if c.as_takes() != Some(&f) {
+                    cx.emit(Action::Edit(Command::SetClipContent {
+                        clip: comp.clip,
+                        start: c.start,
+                        content: Box::new(ClipContent::Takes(f)),
+                    }));
+                }
             }
             cx.set_cursor(Cursor::Default);
             return;
@@ -5070,7 +5076,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             Hit::TakeLane { clip, take, .. } => {
                 let f = model.project().clip(clip)?.as_takes()?;
                 Some(format!(
-                    "{}\nClick: use this take · Drag: comp this section · Right-click: more",
+                    "{}\nClick: this take in the comp section here · Drag: comp the swiped range · Right-click: use the whole take, more",
                     f.takes.get(take)?.name
                 ))
             }
