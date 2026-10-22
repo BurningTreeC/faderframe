@@ -2,10 +2,11 @@
 //!
 //! Native editors (CLAP, VST3, LV2) embed into a window of the platform's
 //! own window system — an X11 window on Linux (through XWayland: `x11.rs`),
-//! inside a GTK window with the editor header where GDK's X11 display can
-//! be opened (`frame.rs`), a Win32 window on Windows (`win32.rs`), an
-//! `NSWindow`'s content view on macOS (`cocoa.rs`). Each backend offers the
-//! same `Parents` API; everything else here is shared. Plugins that cannot
+//! a Win32 window on Windows (`win32.rs`), an `NSWindow`'s content view on
+//! macOS (`cocoa.rs`) —, laid over the room under the editor header of a
+//! GTK window (`frame.rs`) or, where that cannot be made, a plain
+//! top-level window. Each backend offers the same `Parents` API;
+//! everything else here is shared. Plugins that cannot
 //! embed but can open their own window do that (floating). Everything else
 //! — built-ins, plugins without a GUI, no X server — gets the generic
 //! parameter window, which also exists for every plugin on request.
@@ -18,75 +19,11 @@
 
 #[cfg(target_os = "macos")]
 mod cocoa;
-#[cfg(all(unix, not(target_os = "macos")))]
 mod frame;
 #[cfg(windows)]
 mod win32;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11;
-
-/// Editors under the header exist on X11 so far; on Windows and macOS
-/// native editors keep the platform's plain windows.
-#[cfg(any(windows, target_os = "macos"))]
-mod frame {
-    use super::Parents;
-    use crate::state::AppState;
-    use std::rc::Rc;
-
-    pub enum Frame {}
-
-    impl Frame {
-        pub fn build(
-            _app: &Rc<AppState>,
-            _x: &Parents,
-            _title: &str,
-            _header: &gtk::HeaderBar,
-            _size: (u32, u32),
-            _resizable: bool,
-        ) -> Option<Frame> {
-            None
-        }
-        pub fn window(&self) -> &gtk::Window {
-            match *self {}
-        }
-        pub fn top(&self) -> u64 {
-            match *self {}
-        }
-        pub fn child(&self) -> u64 {
-            match *self {}
-        }
-        pub fn outer_size(&self, _size: (u32, u32)) -> (u32, u32) {
-            match *self {}
-        }
-        pub fn move_when_shown(&self, _pos: (i32, i32)) {
-            match *self {}
-        }
-        pub fn settled(&self) -> bool {
-            match *self {}
-        }
-        pub fn scale(&self) -> u32 {
-            match *self {}
-        }
-        pub fn size(&self, _x: &Parents) -> Option<(u32, u32)> {
-            match *self {}
-        }
-        pub fn follow(&self, _x: &Parents) -> Option<(u32, u32)> {
-            match *self {}
-        }
-        pub fn request_size(&self, _size: (u32, u32)) {
-            match *self {}
-        }
-        pub fn show(&self) {
-            match *self {}
-        }
-        pub fn hide(&self) {
-            match *self {}
-        }
-        pub fn close(&self, _x: Option<&Parents>) {
-            match *self {}
-        }
-    }
-}
 
 #[cfg(target_os = "macos")]
 use cocoa::Parents;
@@ -148,11 +85,8 @@ pub fn screenshot(path: &std::path::Path) {
             .filter_map(|n| match n.host {
                 Host::Parent(win) => Some((win, n.size)),
                 // The whole window, header and all.
-                Host::Framed(top) => e
-                    .frames
-                    .borrow()
-                    .get(&n.plugin)
-                    .and_then(|f| with_parents(|x| f.size(x)).flatten())
+                Host::Framed(top) => with_parents(|x| x.size(top))
+                    .flatten()
                     .map(|size| (top, size)),
                 Host::Floating => None,
             })
@@ -180,8 +114,8 @@ pub fn screenshot(path: &std::path::Path) {
 enum Host {
     /// A window of ours (the backend's id).
     Parent(u64),
-    /// A GTK window with the editor header (`frame.rs`; the id is its X11
-    /// window).
+    /// A GTK window with the editor header (`frame.rs`; the id is its
+    /// native window).
     Framed(u64),
     /// The plugin's own top-level window.
     Floating,
@@ -1194,32 +1128,34 @@ fn follow_frame(
             }
         });
     };
-    let room = EDITORS.with(|e| {
+    let followed = EDITORS.with(|e| {
         let frames = e.frames.borrow();
         let f = frames.get(&plugin)?;
-        if let Some(size) = requests.resize {
-            tracing::debug!("plugin editor {plugin}: the plugin asks for {size:?}");
-            f.request_size(size);
-            set_size(size);
-        }
-        if requests.hide {
-            f.hide();
-        }
-        if requests.show {
-            f.show();
-        }
-        with_parents(|x| f.follow(x)).flatten()
+        with_parents(|x| {
+            if let Some(size) = requests.resize {
+                tracing::debug!("plugin editor {plugin}: the plugin asks for {size:?}");
+                f.request_size(x, size);
+                set_size(size);
+            }
+            if requests.hide {
+                f.hide(x);
+            }
+            if requests.show {
+                f.show();
+            }
+            f.follow(x).map(|room| (room, f.scale(x)))
+        })
+        .flatten()
     });
-    let Some(room) = room.filter(|_| resizable) else {
+    let Some((room, scale)) = followed.filter(|_| resizable) else {
         return;
     };
-    let Some((size, scale)) = EDITORS.with(|e| {
-        let scale = e.frames.borrow().get(&plugin)?.scale();
+    let Some(size) = EDITORS.with(|e| {
         e.native
             .borrow()
             .iter()
             .find(|n| n.plugin == plugin)
-            .map(|n| (n.size, scale))
+            .map(|n| n.size)
     }) else {
         return;
     };

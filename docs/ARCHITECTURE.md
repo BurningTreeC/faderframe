@@ -3006,12 +3006,12 @@ pagefile-backed file mapping, all named in the helper's environment).
 * **Editors.** CLAP GUIs embed into a host window of the platform's own
   window system (`gui` API `x11`, `win32` or `cocoa`; see *Editor windows*
   below). On Windows the editor's scale is set from the display's DPI. On
-  Linux FaderFrame is a Wayland client, so the parent is an X11 window
-  (XWayland) of a separate connection (`x11rb`): inside a GTK window on
-  GDK's X11 display that carries the same header as the built-ins' editors
-  (Bypass, Presets, Outputs, Parameters — see *Editor windows*), or, where
-  that display cannot be opened, a plain top-level window created at the
-  editor's size, with fixed-size hints for non-resizable editors (window
+  every platform the parent sits under a GTK window's header like the
+  built-ins' editors (Bypass, Presets, Outputs, Parameters — see *Editor
+  windows*). On Linux FaderFrame is a Wayland client, so the parent is an
+  X11 window (XWayland) of a separate connection (`x11rb`): inside a GTK
+  window on GDK's X11 display, or, where that display cannot be opened, a
+  plain top-level window created at the editor's size, with fixed-size hints for non-resizable editors (window
   managers float them), `WM_DELETE_WINDOW` closing the editor, configure
   events resizing resizable ones and `request_resize` resizing the parent. Plugins that
   cannot embed but can float open their own window. Editors open centred
@@ -3283,32 +3283,52 @@ converted between GDK's top-left and Cocoa's bottom-left origin). The
 plugin-host trait is platform-neutral: `can_embed(WindowApi)`,
 `open_embedded(api, scale)`, `attach(ParentWindow)`.
 
-On X11 native editors get the header too (`frame.rs`). GTK on Wayland
-cannot hold another program's window, but GTK can open GDK's X11 display
-beside the Wayland one (`gdk_x11_display_open` and
-`gdk_x11_surface_get_xid`, looked up in the running GTK, so a GTK without
-X11 still runs): the editor window is a GTK window there (not one of the
-application's — its `app` actions are inserted — styled through
-`style::add_display`, which also copies the desktop's decoration layout,
-font and icon theme), the header its title bar, a `DrawingArea` the room
-under it. Inside its X11 window `x11.rs` creates the window the plugin
-embeds into (`create_child`: the screen's default depth, visual and
-colormap — GTK's windows are often 32-bit ARGB, which plugins drawing with
-the default visual cannot use), and the UI tick keeps it over the room
-(`Frame::follow`: the room's place from `compute_point` + the surface
-transform × the surface scale). Plugin resize requests set the room's
-content size (fixed-size editors) or the window's default size
+Native editors get the header too (`frame.rs`): the editor window is a
+GTK window with the header as its title bar and a `DrawingArea` room
+under it; the plugin embeds into a native window of the backend's laid
+over the room, which the UI tick keeps there (`Frame::follow`: the room's
+place from `compute_point` + the surface transform, in backend pixels —
+physical on X11 and Windows (× `Surface::scale`), points on macOS — what
+plugins size their editors in). Backends add `frame_display`,
+`frame_handle`, `frame_scale`, `create_child`, `place_child`,
+`hide_child`, `release_child`, `release_top`, `move_to`, `set_dialog`,
+`size`:
+
+* X11: GTK on Wayland cannot hold another program's window, but GTK can
+  open GDK's X11 display beside the Wayland one (`gdk_x11_display_open`
+  and `gdk_x11_surface_get_xid`, looked up in the running GTK, so a GTK
+  without X11 still runs). The frame is not one of the application's
+  windows there (its `app` actions are inserted) and is styled through
+  `style::add_display`, which also copies the desktop's decoration
+  layout, font and icon theme. The embedding window is an X11 child of
+  the frame's with the screen's default depth, visual and colormap (GTK's
+  windows are often 32-bit ARGB, which plugins drawing with the default
+  visual cannot use). The frame is marked a dialog (window managers float
+  it). On close the embedding window is reparented to the root and
+  retired like the plain windows (`release_child`, with a round trip so
+  the server has done that before GTK destroys its window).
+* Windows: a `WS_CHILD` window of GTK's (from `Win32Surface::handle`,
+  which gets `WS_CLIPCHILDREN`); GTK's DirectComposition target is made
+  with `topmost = FALSE`, so its content stays behind child windows.
+* macOS: GDK turns every mouse event in its own windows into a GDK
+  event (GTK reports them all handled), so a view inside one would never
+  get any; the embedding window is a borderless `RoomWindow` (an
+  `NSWindow` subclass that can become key, for the plugin's text fields)
+  attached as a child window above GTK's (`gdk_macos_surface_get_native_window`,
+  GTK 4.8, retained in `Parents::tops`), placed in screen coordinates
+  every tick (macOS moves child windows with their parent, but a resize
+  from the top or left moves the room too), detached while the frame is
+  hidden. Events of windows not GDK's go to Cocoa.
+
+On Windows and macOS the frame is an application window, transient for
+the main window, like the device editors. Plugin resize requests set the
+room's content size (fixed-size editors) or the window's default size
 (resizable); a resizable editor takes the room's new size unless it is
 within one GTK pixel of the size it has or asked for (never answer a
-plugin's own resize with another). The window is marked a dialog (window
-managers float it) and moved to its stored place once shown (GTK cannot
-place windows; a configure request on the X11 connection does). On close
-the plugin closes its GUI first, the embedding window is reparented to the
-root and retired like the plain windows (`release_child`, with a round
-trip so the server has done that before GTK destroys its window), then the
-GTK window goes. `FADERFRAME_EDITOR_HEADER=0` keeps the plain windows.
-Windows and macOS keep plain windows for now (`frame` is an empty stub
-there).
+plugin's own resize with another). Frames are moved to their stored place
+once shown (GTK cannot place windows; the backends can). The plugin
+closes its GUI before its window and the frame go.
+`FADERFRAME_EDITOR_HEADER=0` keeps the plain windows.
 
 ## 9. Audio backends
 

@@ -1,10 +1,15 @@
-//! Editor parent windows on Windows: plain top-level Win32 windows the
-//! plugins create their child windows in. GTK's main loop dispatches every
+//! Editor parent windows on Windows: Win32 windows the plugins create
+//! their child windows in — children of a GTK window with the editor
+//! header (`frame.rs`; GTK's DirectComposition content stays behind child
+//! windows), or plain top-level windows. GTK's main loop dispatches every
 //! message of the UI thread, these windows' included; the window procedure
 //! only records close requests and resizes for the next UI tick.
 
+use super::frame::Room;
 use super::{ParentEvent, Rect};
 use faderframe_plugin_host::{ParentWindow, WindowApi};
+use gtk::gdk;
+use gtk::prelude::*;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -17,10 +22,11 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    GetWindowRect, IDC_ARROW, IsIconic, LoadCursorW, RegisterClassExW, SIZE_MINIMIZED, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow, WM_CLOSE, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CLIPCHILDREN,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
+    GWL_STYLE, GetWindowLongPtrW, GetWindowRect, IDC_ARROW, IsIconic, LoadCursorW,
+    RegisterClassExW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WM_CLOSE, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
 };
 
 thread_local! {
@@ -160,6 +166,128 @@ impl Parents {
             ));
         }
         Ok(id(hwnd))
+    }
+
+    /// Editor frames are ordinary GTK windows here.
+    pub fn frame_display(&self) -> Option<gdk::Display> {
+        gdk::Display::default()
+    }
+
+    /// The window of a GTK surface.
+    pub fn frame_handle(&self, surface: &gdk::Surface) -> Option<u64> {
+        let hwnd = surface
+            .downcast_ref::<gdk4_win32::Win32Surface>()?
+            .handle()
+            .0;
+        (!hwnd.is_null()).then_some(hwnd as usize as u64)
+    }
+
+    /// Physical pixels per GTK pixel.
+    pub fn frame_scale(&self, surface: &gdk::Surface) -> f64 {
+        surface.scale()
+    }
+
+    /// Nothing to let go of: GTK owns its window.
+    pub fn release_top(&self, _top: u64) {}
+
+    /// A child window of `top` (an editor's GTK frame) for the editor to
+    /// embed into; hidden until placed.
+    pub fn create_child(&self, top: u64, size: (u32, u32)) -> Result<u64, String> {
+        // SAFETY: `top` is GTK's live window; adding a style bit keeps its
+        // drawing off the child (DirectComposition does that anyway).
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd(top), GWL_STYLE);
+            SetWindowLongPtrW(hwnd(top), GWL_STYLE, style | WS_CLIPCHILDREN as isize);
+        }
+        // SAFETY: registered class, valid strings, a live parent.
+        let child = unsafe {
+            CreateWindowExW(
+                0,
+                self.class.as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                0,
+                0,
+                size.0.min(16_000) as i32,
+                size.1.min(16_000) as i32,
+                hwnd(top),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null::<c_void>(),
+            )
+        };
+        if child.is_null() {
+            return Err(format!(
+                "cannot create the editor window: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(id(child))
+    }
+
+    /// Keep a child window over `room` (client pixels of its parent) and
+    /// shown; only `changed` rooms need telling.
+    pub fn place_child(&self, _top: u64, child: u64, (x, y, w, h): Room, changed: bool) {
+        if !changed {
+            return;
+        }
+        // SAFETY: `child` is a window of ours.
+        unsafe {
+            SetWindowPos(
+                hwnd(child),
+                std::ptr::null_mut(),
+                x,
+                y,
+                w.min(16_000) as i32,
+                h.min(16_000) as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+    }
+
+    /// Children hide with their parent.
+    pub fn hide_child(&self, _top: u64, _child: u64) {}
+
+    /// Close a child window before its parent goes (the editor closed
+    /// first).
+    pub fn release_child(&self, _top: u64, child: u64) {
+        self.destroy(child);
+    }
+
+    /// Move a top-level window (GTK has no way to).
+    pub fn move_to(&self, win: u64, pos: (i32, i32)) {
+        // SAFETY: `win` is a live top-level window.
+        unsafe {
+            SetWindowPos(
+                hwnd(win),
+                std::ptr::null_mut(),
+                pos.0,
+                pos.1,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Window types are an X11 matter.
+    pub fn set_dialog(&self, _win: u64) {}
+
+    /// A window's size.
+    pub fn size(&self, win: u64) -> Option<(u32, u32)> {
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: `win` is a live window; `r` is written.
+        (unsafe { GetWindowRect(hwnd(win), &mut r) } != 0).then(|| {
+            (
+                (r.right - r.left).max(0) as u32,
+                (r.bottom - r.top).max(0) as u32,
+            )
+        })
     }
 
     pub fn parent(&self, win: u64) -> ParentWindow {

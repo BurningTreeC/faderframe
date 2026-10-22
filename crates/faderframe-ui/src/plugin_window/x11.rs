@@ -4,9 +4,15 @@
 //! display (`frame.rs`, the editor header above), or plain top-level
 //! windows where that display is not available.
 
+use super::frame::Room;
 use super::{ParentEvent, Rect};
 use faderframe_plugin_host::{ParentWindow, WindowApi};
 use gtk::glib;
+use gtk::glib::translate::{FromGlibPtrNone, ToGlibPtr};
+use gtk::{gdk, prelude::*};
+use std::cell::OnceCell;
+use std::ffi::{c_char, c_ulong};
+use std::sync::OnceLock;
 use x11rb::connection::Connection;
 use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
 use x11rb::protocol::Event;
@@ -52,6 +58,46 @@ const RETIRE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn x_err(e: impl std::fmt::Display) -> String {
     format!("X11: {e}")
+}
+
+/// GDK's X11 functions, looked up in the running GTK (a GTK built without
+/// X11 still runs; editors then get plain windows).
+type DisplayOpen = unsafe extern "C" fn(*const c_char) -> *mut gdk::ffi::GdkDisplay;
+type SurfaceXid = unsafe extern "C" fn(*mut gdk::ffi::GdkSurface) -> c_ulong;
+
+struct GdkX11 {
+    open: DisplayOpen,
+    xid: SurfaceXid,
+}
+
+fn gdk_x11() -> Option<&'static GdkX11> {
+    static API: OnceLock<Option<GdkX11>> = OnceLock::new();
+    API.get_or_init(|| {
+        let lib = libloading::os::unix::Library::this();
+        // SAFETY: GTK's own X11 functions with their signatures in
+        // gdk/x11/gdkx11display.h and gdkx11surface.h; the library is the
+        // GTK already loaded into the process, which stays loaded.
+        let api = unsafe {
+            lib.get::<DisplayOpen>(b"gdk_x11_display_open\0")
+                .ok()
+                .map(|s| *s)
+                .zip(
+                    lib.get::<SurfaceXid>(b"gdk_x11_surface_get_xid\0")
+                        .ok()
+                        .map(|s| *s),
+                )
+                .map(|(open, xid)| GdkX11 { open, xid })
+        };
+        std::mem::forget(lib);
+        api
+    })
+    .as_ref()
+}
+
+thread_local! {
+    /// GDK's X11 display, opened for the first framed editor (`None`: not
+    /// available).
+    static GDK_DISPLAY: OnceCell<Option<gdk::Display>> = const { OnceCell::new() };
 }
 
 impl Parents {
@@ -188,16 +234,61 @@ impl Parents {
         Ok(u64::from(win))
     }
 
-    /// A window inside `parent` (the X11 window of an editor's GTK frame,
+    /// The display editor frames open on: GDK's X11 display (FaderFrame's
+    /// own is Wayland's).
+    pub fn frame_display(&self) -> Option<gdk::Display> {
+        GDK_DISPLAY.with(|d| {
+            d.get_or_init(|| {
+                let api = gdk_x11()?;
+                // SAFETY: NULL names $DISPLAY; the call returns a display
+                // or NULL.
+                let ptr = unsafe { (api.open)(std::ptr::null()) };
+                if ptr.is_null() {
+                    tracing::warn!(
+                        "GTK cannot open the X11 display: plugin editors without header"
+                    );
+                    return None;
+                }
+                // SAFETY: a live display; the reference taken here is kept
+                // for the program's life (whoever else owns it).
+                Some(unsafe { gdk::Display::from_glib_none(ptr) })
+            })
+            .clone()
+        })
+    }
+
+    /// The X11 window of a surface on GDK's X11 display.
+    pub fn frame_handle(&self, surface: &gdk::Surface) -> Option<u64> {
+        let api = gdk_x11()?;
+        let x11 = glib::Type::from_name("GdkX11Surface")?;
+        if !surface.type_().is_a(x11) {
+            return None;
+        }
+        // SAFETY: an X11 surface (checked above), borrowed for the call.
+        let id = unsafe { (api.xid)(surface.to_glib_none().0) };
+        // `c_ulong` is 32 bits wide on some targets.
+        #[allow(clippy::unnecessary_cast)]
+        (id != 0).then_some(id as u64)
+    }
+
+    /// X11 pixels per GTK pixel.
+    pub fn frame_scale(&self, surface: &gdk::Surface) -> f64 {
+        surface.scale()
+    }
+
+    /// Nothing to let go of: X11 windows are ids.
+    pub fn release_top(&self, _top: u64) {}
+
+    /// A window inside `top` (the X11 window of an editor's GTK frame,
     /// another client's) for the editor to embed into; unmapped until
-    /// [`place_child`](Self::place_child).
-    pub fn create_child(&self, parent: u64, size: (u32, u32)) -> Result<u64, String> {
+    /// placed.
+    pub fn create_child(&self, top: u64, size: (u32, u32)) -> Result<u64, String> {
         let win = self.conn.generate_id().map_err(x_err)?;
         self.conn
             .create_window(
                 self.depth,
                 win,
-                id(parent),
+                id(top),
                 0,
                 0,
                 size.0.clamp(1, 16_000) as u16,
@@ -215,9 +306,13 @@ impl Parents {
         Ok(u64::from(win))
     }
 
-    /// Move and size a child window (in its parent's pixels) and show it.
-    pub fn place_child(&self, win: u64, (x, y, w, h): (i32, i32, u32, u32)) {
-        let win = id(win);
+    /// Keep a child window over `room` (pixels of its parent) and shown;
+    /// only `changed` rooms need telling (children move with the parent).
+    pub fn place_child(&self, _top: u64, child: u64, (x, y, w, h): Room, changed: bool) {
+        if !changed {
+            return;
+        }
+        let win = id(child);
         let _ = self.conn.configure_window(
             win,
             &xproto::ConfigureWindowAux::new()
@@ -230,19 +325,22 @@ impl Parents {
         let _ = self.conn.flush();
     }
 
+    /// Children hide with their parent.
+    pub fn hide_child(&self, _top: u64, _child: u64) {}
+
     /// Close a child window before its parent goes: hidden and moved out
     /// to the root (destroying the parent would destroy it with the
     /// plugin's windows inside, see [`RETIRE_AFTER`]), destroyed later.
     /// Returns once the server has done that.
-    pub fn release_child(&self, win: u64) {
-        let _ = self.conn.unmap_window(id(win));
-        let _ = self.conn.reparent_window(id(win), self.root, 0, 0);
+    pub fn release_child(&self, _top: u64, child: u64) {
+        let _ = self.conn.unmap_window(id(child));
+        let _ = self.conn.reparent_window(id(child), self.root, 0, 0);
         if let Ok(c) = self.conn.get_input_focus() {
             let _ = c.reply();
         }
         self.retired
             .borrow_mut()
-            .push((id(win), std::time::Instant::now()));
+            .push((id(child), std::time::Instant::now()));
     }
 
     /// Ask the window manager to move a top-level window (GTK has no way

@@ -369,9 +369,8 @@ pub fn install(theme: &Theme) {
 }
 
 /// Style windows on `display` (not the default one) like the others, now
-/// and after every theme change. (Only plugin editor frames on X11 open on
-/// another display so far.)
-#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+/// and after every theme change (plugin editor frames on X11 open on
+/// GDK's X11 display).
 pub fn add_display(display: &gdk::Display, theme: &Theme) {
     if OTHER_DISPLAYS.with(|d| d.borrow().contains(display)) {
         return;
