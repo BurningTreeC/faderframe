@@ -8,6 +8,9 @@ use std::cell::RefCell;
 
 thread_local! {
     static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// Displays besides the default one that windows open on (the X11
+    /// display of framed plugin editors): styled like it.
+    static OTHER_DISPLAYS: RefCell<Vec<gdk::Display>> = const { RefCell::new(Vec::new()) };
 }
 
 const CSS: &str = r#"
@@ -310,24 +313,33 @@ pub fn css(theme: &Theme) -> String {
     out
 }
 
+/// GTK's own widgets (buttons, entries, dialogs) follow the skin, not the
+/// desktop's GTK theme: a light skin on a dark desktop otherwise gets dark
+/// buttons.
+fn apply_settings(settings: &gtk::Settings, theme: &Theme) {
+    settings.set_gtk_theme_name(Some("Adwaita"));
+    settings.set_gtk_application_prefer_dark_theme(theme.dark);
+    // GTK ≥ 4.20 chooses the variant from its colour scheme.
+    let nick = if theme.dark { "dark" } else { "light" };
+    if let Some(pspec) = settings.find_property("gtk-interface-color-scheme")
+        && let Some(class) = glib::EnumClass::with_type(pspec.value_type())
+        && let Some(value) = class.to_value_by_nick(nick)
+    {
+        settings.set_property_from_value("gtk-interface-color-scheme", &value);
+    }
+}
+
 /// Apply `theme` to GTK: its light/dark variant and FaderFrame's CSS
 /// (replacing the previous theme's).
 pub fn install(theme: &Theme) {
     if let Some(settings) = gtk::Settings::default() {
-        // GTK's own widgets (buttons, entries, dialogs) follow the skin, not
-        // the desktop's GTK theme: a light skin on a dark desktop otherwise
-        // gets dark buttons.
-        settings.set_gtk_theme_name(Some("Adwaita"));
-        settings.set_gtk_application_prefer_dark_theme(theme.dark);
-        // GTK ≥ 4.20 chooses the variant from its colour scheme.
-        let nick = if theme.dark { "dark" } else { "light" };
-        if let Some(pspec) = settings.find_property("gtk-interface-color-scheme")
-            && let Some(class) = glib::EnumClass::with_type(pspec.value_type())
-            && let Some(value) = class.to_value_by_nick(nick)
-        {
-            settings.set_property_from_value("gtk-interface-color-scheme", &value);
-        }
+        apply_settings(&settings, theme);
     }
+    OTHER_DISPLAYS.with(|d| {
+        for display in d.borrow().iter() {
+            apply_settings(&gtk::Settings::for_display(display), theme);
+        }
+    });
     let Some(display) = gdk::Display::default() else {
         glib::g_warning!("faderframe", "no display available");
         return;
@@ -341,9 +353,51 @@ pub fn install(theme: &Theme) {
                 &provider,
                 gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
+            OTHER_DISPLAYS.with(|d| {
+                for other in d.borrow().iter() {
+                    gtk::style_context_add_provider_for_display(
+                        other,
+                        &provider,
+                        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                    );
+                }
+            });
             provider
         });
         provider.load_from_string(&css(theme));
+    });
+}
+
+/// Style windows on `display` (not the default one) like the others, now
+/// and after every theme change. (Only plugin editor frames on X11 open on
+/// another display so far.)
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+pub fn add_display(display: &gdk::Display, theme: &Theme) {
+    if OTHER_DISPLAYS.with(|d| d.borrow().contains(display)) {
+        return;
+    }
+    OTHER_DISPLAYS.with(|d| d.borrow_mut().push(display.clone()));
+    let settings = gtk::Settings::for_display(display);
+    // The desktop's choices reach the default display only (portal or
+    // XSETTINGS): the same title bar buttons and fonts here.
+    if let Some(default) = gtk::Settings::default() {
+        for name in [
+            "gtk-decoration-layout",
+            "gtk-font-name",
+            "gtk-icon-theme-name",
+        ] {
+            settings.set_property_from_value(name, &default.property_value(name));
+        }
+    }
+    apply_settings(&settings, theme);
+    PROVIDER.with(|p| {
+        if let Some(provider) = p.borrow().as_ref() {
+            gtk::style_context_add_provider_for_display(
+                display,
+                provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
     });
 }
 

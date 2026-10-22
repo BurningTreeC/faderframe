@@ -1,14 +1,14 @@
 //! Plugin editor windows.
 //!
-//! Native editors (CLAP, VST3) embed into a plain top-level window of the
-//! platform's own window system — an X11 window on Linux (through XWayland:
-//! `x11.rs`), a Win32 window on Windows (`win32.rs`), an `NSWindow`'s
-//! content view on macOS (`cocoa.rs`). Each backend offers the same
-//! `Parents` API;
-//! everything else here is shared. Plugins that cannot embed but can open
-//! their own window do that (floating). Everything else — built-ins,
-//! plugins without a GUI, no X server — gets the generic parameter window,
-//! which also exists for every plugin on request.
+//! Native editors (CLAP, VST3, LV2) embed into a window of the platform's
+//! own window system — an X11 window on Linux (through XWayland: `x11.rs`),
+//! inside a GTK window with the editor header where GDK's X11 display can
+//! be opened (`frame.rs`), a Win32 window on Windows (`win32.rs`), an
+//! `NSWindow`'s content view on macOS (`cocoa.rs`). Each backend offers the
+//! same `Parents` API; everything else here is shared. Plugins that cannot
+//! embed but can open their own window do that (floating). Everything else
+//! — built-ins, plugins without a GUI, no X server — gets the generic
+//! parameter window, which also exists for every plugin on request.
 //!
 //! Plugin GUIs run on the host's main loop: on Linux through the CLAP
 //! posix-fd and timer extensions (registered descriptors become glib fd
@@ -18,10 +18,75 @@
 
 #[cfg(target_os = "macos")]
 mod cocoa;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod frame;
 #[cfg(windows)]
 mod win32;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod x11;
+
+/// Editors under the header exist on X11 so far; on Windows and macOS
+/// native editors keep the platform's plain windows.
+#[cfg(any(windows, target_os = "macos"))]
+mod frame {
+    use super::Parents;
+    use crate::state::AppState;
+    use std::rc::Rc;
+
+    pub enum Frame {}
+
+    impl Frame {
+        pub fn build(
+            _app: &Rc<AppState>,
+            _x: &Parents,
+            _title: &str,
+            _header: &gtk::HeaderBar,
+            _size: (u32, u32),
+            _resizable: bool,
+        ) -> Option<Frame> {
+            None
+        }
+        pub fn window(&self) -> &gtk::Window {
+            match *self {}
+        }
+        pub fn top(&self) -> u64 {
+            match *self {}
+        }
+        pub fn child(&self) -> u64 {
+            match *self {}
+        }
+        pub fn outer_size(&self, _size: (u32, u32)) -> (u32, u32) {
+            match *self {}
+        }
+        pub fn move_when_shown(&self, _pos: (i32, i32)) {
+            match *self {}
+        }
+        pub fn settled(&self) -> bool {
+            match *self {}
+        }
+        pub fn scale(&self) -> u32 {
+            match *self {}
+        }
+        pub fn size(&self, _x: &Parents) -> Option<(u32, u32)> {
+            match *self {}
+        }
+        pub fn follow(&self, _x: &Parents) -> Option<(u32, u32)> {
+            match *self {}
+        }
+        pub fn request_size(&self, _size: (u32, u32)) {
+            match *self {}
+        }
+        pub fn show(&self) {
+            match *self {}
+        }
+        pub fn hide(&self) {
+            match *self {}
+        }
+        pub fn close(&self, _x: Option<&Parents>) {
+            match *self {}
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 use cocoa::Parents;
@@ -52,6 +117,8 @@ struct Editors {
     /// remembered (and reported once).
     parents: RefCell<Option<Result<Parents, String>>>,
     native: RefCell<Vec<NativeEditor>>,
+    /// The GTK windows of editors under the header ([`Host::Framed`]).
+    frames: RefCell<HashMap<PluginInstanceId, frame::Frame>>,
     generic: RefCell<HashMap<PluginInstanceId, gtk::Window>>,
     /// Built-in devices' own editors (canvas views), and the order they
     /// opened in (the last is where `device-click` clicks).
@@ -80,6 +147,13 @@ pub fn screenshot(path: &std::path::Path) {
             .iter()
             .filter_map(|n| match n.host {
                 Host::Parent(win) => Some((win, n.size)),
+                // The whole window, header and all.
+                Host::Framed(top) => e
+                    .frames
+                    .borrow()
+                    .get(&n.plugin)
+                    .and_then(|f| with_parents(|x| f.size(x)).flatten())
+                    .map(|size| (top, size)),
                 Host::Floating => None,
             })
             .collect()
@@ -106,6 +180,9 @@ pub fn screenshot(path: &std::path::Path) {
 enum Host {
     /// A window of ours (the backend's id).
     Parent(u64),
+    /// A GTK window with the editor header (`frame.rs`; the id is its X11
+    /// window).
+    Framed(u64),
     /// The plugin's own top-level window.
     Floating,
 }
@@ -210,9 +287,34 @@ fn with_parents<R>(f: impl FnOnce(&Parents) -> R) -> Option<R> {
     })
 }
 
-fn drop_host(host: Host) {
-    if let Host::Parent(win) = host {
-        with_parents(|x| x.destroy(win));
+/// Whether an editor's window is where it belongs yet (a frame is moved
+/// there once shown; until then its position means nothing).
+fn settled(plugin: PluginInstanceId, host: Host) -> bool {
+    match host {
+        Host::Framed(_) => EDITORS.with(|e| {
+            e.frames
+                .borrow()
+                .get(&plugin)
+                .is_some_and(frame::Frame::settled)
+        }),
+        _ => true,
+    }
+}
+
+fn drop_host(plugin: PluginInstanceId, host: Host) {
+    match host {
+        Host::Parent(win) => {
+            with_parents(|x| x.destroy(win));
+        }
+        Host::Framed(_) => {
+            if let Some(frame) = EDITORS.with(|e| e.frames.borrow_mut().remove(&plugin)) {
+                let closed = with_parents(|x| frame.close(Some(x)));
+                if closed.is_none() {
+                    frame.close(None);
+                }
+            }
+        }
+        Host::Floating => {}
     }
 }
 
@@ -261,7 +363,82 @@ pub fn close(app: &Rc<AppState>, plugin: PluginInstanceId) {
     }
 }
 
-/// The Bypass toggle of an editor window's header.
+/// What an editor window's header shows.
+struct Heading {
+    /// The track the plugin's commands name.
+    track: TrackId,
+    bypassed: bool,
+    /// The device's name …
+    name: String,
+    /// … and the line under it: the vendor (when asked for) and the track.
+    sub: String,
+}
+
+fn heading(app: &AppState, plugin: PluginInstanceId, with_vendor: bool) -> Option<Heading> {
+    let (_, title) = title_of(app, plugin)?;
+    let s = app.session.try_borrow().ok()?;
+    let (track, slot) = s.plugin_owner(plugin)?;
+    let name = s
+        .device_name(plugin)
+        .unwrap_or_else(|| slot.plugin.name.clone());
+    let place = title.rsplit(" — ").next().unwrap_or_default().to_string();
+    let vendor = if with_vendor {
+        s.available_plugins()
+            .into_iter()
+            .find(|p| p.plugin.id == slot.plugin.id && p.plugin.format == slot.plugin.format)
+            .map(|p| p.vendor)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Some(Heading {
+        track,
+        bypassed: slot.bypass,
+        name,
+        sub: if vendor.is_empty() {
+            place
+        } else {
+            format!("{vendor} · {place}")
+        },
+    })
+}
+
+/// An editor window's header: the device's name over its place, Bypass,
+/// Presets and (multi-output plugins) Outputs; callers add their button at
+/// the end.
+fn editor_header(app: &Rc<AppState>, plugin: PluginInstanceId, h: &Heading) -> gtk::HeaderBar {
+    let header = gtk::HeaderBar::new();
+    let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let name_label = gtk::Label::new(Some(&h.name));
+    name_label.add_css_class("title");
+    let sub = gtk::Label::new(Some(&h.sub));
+    sub.add_css_class("subtitle");
+    heading.append(&name_label);
+    heading.append(&sub);
+    header.set_title_widget(Some(&heading));
+    header.pack_start(&bypass_button(app, plugin, h.track, h.bypassed));
+    header.pack_start(&presets_button(app, plugin));
+    if let Some(outputs) = outputs_button(app, plugin) {
+        header.pack_start(&outputs);
+    }
+    header
+}
+
+/// The header's button to the generic editor.
+fn parameters_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::Button {
+    let params = gtk::Button::with_label("Parameters");
+    params.set_tooltip_text(Some("Every parameter in a list"));
+    let weak = Rc::downgrade(app);
+    params.connect_clicked(move |_| {
+        if let Some(a) = weak.upgrade() {
+            open_generic(&a, plugin);
+        }
+    });
+    params
+}
+
+/// The Bypass toggle of an editor window's header. It follows bypass
+/// changes made elsewhere (mixer, undo, MIDI, automation).
 fn bypass_button(
     app: &Rc<AppState>,
     plugin: PluginInstanceId,
@@ -279,8 +456,13 @@ fn bypass_button(
             target: faderframe_automation::AutomationTarget::PluginBypass(plugin),
         },
     );
+    let following = Rc::new(Cell::new(false));
     let weak = Rc::downgrade(app);
+    let quiet = Rc::clone(&following);
     bypass.connect_toggled(move |b| {
+        if quiet.get() {
+            return;
+        }
         if let Some(a) = weak.upgrade() {
             a.dispatch(Action::Edit(Command::SetPluginBypass {
                 track,
@@ -288,6 +470,26 @@ fn bypass_button(
                 bypass: b.is_active(),
             }));
         }
+    });
+    let button = bypass.downgrade();
+    let weak = Rc::downgrade(app);
+    glib::timeout_add_local(Duration::from_millis(200), move || {
+        let (Some(b), Some(a)) = (button.upgrade(), weak.upgrade()) else {
+            return glib::ControlFlow::Break;
+        };
+        let now = a
+            .session
+            .try_borrow()
+            .ok()
+            .and_then(|s| s.plugin_owner(plugin).map(|(_, slot)| slot.bypass));
+        if let Some(now) = now
+            && now != b.is_active()
+        {
+            following.set(true);
+            b.set_active(now);
+            following.set(false);
+        }
+        glib::ControlFlow::Continue
     });
     bypass
 }
@@ -550,31 +752,17 @@ fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     if let Some(main) = app.window.borrow().as_ref() {
         window.set_transient_for(Some(main));
     }
-    let header = gtk::HeaderBar::new();
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let name_label = gtk::Label::new(Some(&name));
-    name_label.add_css_class("title");
-    let sub = gtk::Label::new(Some(title.rsplit(" — ").next().unwrap_or_default()));
-    sub.add_css_class("subtitle");
-    heading.append(&name_label);
-    heading.append(&sub);
-    header.set_title_widget(Some(&heading));
-    header.pack_start(&bypass_button(app, plugin, track, bypassed));
-    header.pack_start(&presets_button(app, plugin));
-    if let Some(outputs) = outputs_button(app, plugin) {
-        header.pack_start(&outputs);
-    }
-    let params = gtk::Button::with_label("Parameters");
-    params.set_tooltip_text(Some("Every parameter in a list"));
-    {
-        let weak = Rc::downgrade(app);
-        params.connect_clicked(move |_| {
-            if let Some(a) = weak.upgrade() {
-                open_generic(&a, plugin);
-            }
-        });
-    }
-    header.pack_end(&params);
+    let header = editor_header(
+        app,
+        plugin,
+        &Heading {
+            track,
+            bypassed,
+            sub: title.rsplit(" — ").next().unwrap_or_default().to_string(),
+            name,
+        },
+    );
+    header.pack_end(&parameters_button(app, plugin));
     window.set_titlebar(Some(&header));
     let canvas = crate::canvas::CanvasWidget::new(app, view);
     app.register_canvas(&canvas);
@@ -614,6 +802,11 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             Host::Parent(win) => {
                 with_parents(|x| x.raise(win));
             }
+            Host::Framed(_) => EDITORS.with(|e| {
+                if let Some(f) = e.frames.borrow().get(&plugin) {
+                    f.show();
+                }
+            }),
             Host::Floating => {
                 if let Ok(mut s) = app.session.try_borrow_mut()
                     && let Some(ed) = s.plugin_editor(plugin)
@@ -636,8 +829,8 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             r
         });
     });
-    let mut failure = None;
-    let opened = {
+    let api = WindowApi::NATIVE;
+    let (embed, float) = {
         let Ok(mut s) = app.session.try_borrow_mut() else {
             return false;
         };
@@ -645,70 +838,32 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
             tracing::debug!("{title}: no editor of its own");
             return false;
         };
-        let mut opened = None;
-        let api = WindowApi::NATIVE;
-        let (embed, float) = (ed.can_embed(api), ed.can_float(api));
-        tracing::debug!("{title}: editor embeds ({api:?}): {embed}, floats: {float}");
-        if embed {
-            let embedded = EDITORS.with(|e| {
-                let parents = e.parents.borrow();
-                let Some(Ok(x)) = parents.as_ref() else {
-                    return None;
-                };
-                let size = match ed.open_embedded(api, x.scale()) {
-                    Ok(size) => size,
-                    Err(err) => {
-                        failure = Some(err.to_string());
-                        return None;
-                    }
-                };
-                let resizable = ed.can_resize();
-                let pos = placement(app, plugin, size);
-                let win = match x.create_window(&title, size, resizable, pos) {
-                    Ok(win) => win,
-                    Err(err) => {
-                        ed.close();
-                        failure = Some(err);
-                        return None;
-                    }
-                };
-                match ed.attach(x.parent(win)) {
-                    Ok(()) => {
-                        x.map_at(win, pos);
-                        tracing::debug!("plugin editor {plugin}: {size:?} placed at {pos:?}");
-                        Some(NativeEditor {
-                            plugin,
-                            host: Host::Parent(win),
-                            size,
-                            resizable,
-                            pos: Some(pos),
-                        })
-                    }
-                    Err(err) => {
-                        x.destroy(win);
-                        failure = Some(err.to_string());
-                        None
-                    }
-                }
-            });
-            opened = embedded;
-        }
-        if opened.is_none() && float {
-            match ed.open_floating(api, &title) {
-                Ok(()) => {
-                    opened = Some(NativeEditor {
-                        plugin,
-                        host: Host::Floating,
-                        size: (0, 0),
-                        resizable: false,
-                        pos: None,
-                    });
-                }
-                Err(err) => failure = Some(err.to_string()),
-            }
-        }
-        opened
+        (ed.can_embed(api), ed.can_float(api))
     };
+    tracing::debug!("{title}: editor embeds ({api:?}): {embed}, floats: {float}");
+    let mut failure = None;
+    let mut opened = None;
+    if embed {
+        opened = embed_native(app, plugin, &title, &mut failure);
+    }
+    if opened.is_none()
+        && float
+        && let Ok(mut s) = app.session.try_borrow_mut()
+        && let Some(ed) = s.plugin_editor(plugin)
+    {
+        match ed.open_floating(api, &title) {
+            Ok(()) => {
+                opened = Some(NativeEditor {
+                    plugin,
+                    host: Host::Floating,
+                    size: (0, 0),
+                    resizable: false,
+                    pos: None,
+                });
+            }
+            Err(err) => failure = Some(err.to_string()),
+        }
+    }
     if let Some(err) = &failure {
         tracing::warn!("{title}: the plugin's editor failed: {err}");
     }
@@ -722,11 +877,115 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     }
     match opened {
         Some(n) => {
+            let framed = matches!(n.host, Host::Framed(_));
             EDITORS.with(|e| e.native.borrow_mut().push(n));
+            if framed {
+                EDITORS.with(|e| {
+                    if let Some(f) = e.frames.borrow().get(&plugin) {
+                        f.show();
+                    }
+                });
+            }
             true
         }
         None => false,
     }
+}
+
+/// Open `plugin`'s GUI embedded: under the editor header where there is
+/// one (`frame.rs`), else in a plain window of the platform's.
+fn embed_native(
+    app: &Rc<AppState>,
+    plugin: PluginInstanceId,
+    title: &str,
+    failure: &mut Option<String>,
+) -> Option<NativeEditor> {
+    let api = WindowApi::NATIVE;
+    // Made before the plugin's editor is borrowed: the header reads the
+    // session.
+    let header = heading(app, plugin, true).map(|h| {
+        let header = editor_header(app, plugin, &h);
+        header.pack_end(&parameters_button(app, plugin));
+        header
+    });
+    let Ok(mut s) = app.session.try_borrow_mut() else {
+        return None;
+    };
+    let ed = s.plugin_editor(plugin)?;
+    EDITORS.with(|e| {
+        let parents = e.parents.borrow();
+        let Some(Ok(x)) = parents.as_ref() else {
+            return None;
+        };
+        let size = match ed.open_embedded(api, x.scale()) {
+            Ok(size) => size,
+            Err(err) => {
+                *failure = Some(err.to_string());
+                return None;
+            }
+        };
+        let resizable = ed.can_resize();
+        if let Some(frame) = header
+            .as_ref()
+            .and_then(|h| frame::Frame::build(app, x, title, h, size, resizable))
+        {
+            if let Err(err) = ed.attach(x.parent(frame.child())) {
+                frame.close(Some(x));
+                *failure = Some(err.to_string());
+                return None;
+            }
+            let pos = placement(app, plugin, frame.outer_size(size));
+            frame.move_when_shown(pos);
+            let weak = Rc::downgrade(app);
+            // The host closes the editor first, then the window.
+            frame.window().connect_close_request(move |_| {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(a) = weak.upgrade() {
+                        close_native(&a, plugin);
+                    }
+                });
+                glib::Propagation::Stop
+            });
+            tracing::debug!("plugin editor {plugin}: {size:?} under the header, at {pos:?}");
+            let top = frame.top();
+            e.frames.borrow_mut().insert(plugin, frame);
+            return Some(NativeEditor {
+                plugin,
+                host: Host::Framed(top),
+                size,
+                resizable,
+                pos: Some(pos),
+            });
+        }
+        let pos = placement(app, plugin, size);
+        let win = match x.create_window(title, size, resizable, pos) {
+            Ok(win) => win,
+            Err(err) => {
+                ed.close();
+                *failure = Some(err);
+                return None;
+            }
+        };
+        match ed.attach(x.parent(win)) {
+            Ok(()) => {
+                x.map_at(win, pos);
+                tracing::debug!("plugin editor {plugin}: {size:?} placed at {pos:?}");
+                Some(NativeEditor {
+                    plugin,
+                    host: Host::Parent(win),
+                    size,
+                    resizable,
+                    pos: Some(pos),
+                })
+            }
+            Err(err) => {
+                x.destroy(win);
+                *failure = Some(err.to_string());
+                None
+            }
+        }
+    })
 }
 
 fn close_native(app: &Rc<AppState>, plugin: PluginInstanceId) {
@@ -736,7 +995,8 @@ fn close_native(app: &Rc<AppState>, plugin: PluginInstanceId) {
         Some(native.remove(i).host)
     });
     let Some(host) = host else { return };
-    if let Host::Parent(win) = host
+    if let Host::Parent(win) | Host::Framed(win) = host
+        && settled(plugin, host)
         && let Some(Some(pos)) = with_parents(|x| x.position(win))
     {
         store_position(app, plugin, pos);
@@ -746,7 +1006,7 @@ fn close_native(app: &Rc<AppState>, plugin: PluginInstanceId) {
     {
         ed.close();
     }
-    drop_host(host);
+    drop_host(plugin, host);
 }
 
 /// The parent windows' events: close buttons and resizes.
@@ -843,13 +1103,17 @@ pub fn tick(app: &Rc<AppState>) {
             _ => {
                 drop(s);
                 EDITORS.with(|e| e.native.borrow_mut().retain(|n| n.plugin != plugin));
-                drop_host(host);
+                drop_host(plugin, host);
                 continue;
             }
         };
         drop(s);
         if requests.closed {
             close_native(app, plugin);
+            continue;
+        }
+        if let Host::Framed(_) = host {
+            follow_frame(app, plugin, resizable, requests);
             continue;
         }
         if let Host::Parent(win) = host {
@@ -910,6 +1174,70 @@ pub fn tick(app: &Rc<AppState>) {
     }
 }
 
+/// A framed editor's tick: the plugin's requests, its window kept over the
+/// room under the header (a resizable editor takes the room's size).
+fn follow_frame(
+    app: &Rc<AppState>,
+    plugin: PluginInstanceId,
+    resizable: bool,
+    requests: faderframe_plugin_host::EditorRequests,
+) {
+    let set_size = |size| {
+        EDITORS.with(|e| {
+            if let Some(n) = e
+                .native
+                .borrow_mut()
+                .iter_mut()
+                .find(|n| n.plugin == plugin)
+            {
+                n.size = size;
+            }
+        });
+    };
+    let room = EDITORS.with(|e| {
+        let frames = e.frames.borrow();
+        let f = frames.get(&plugin)?;
+        if let Some(size) = requests.resize {
+            tracing::debug!("plugin editor {plugin}: the plugin asks for {size:?}");
+            f.request_size(size);
+            set_size(size);
+        }
+        if requests.hide {
+            f.hide();
+        }
+        if requests.show {
+            f.show();
+        }
+        with_parents(|x| f.follow(x)).flatten()
+    });
+    let Some(room) = room.filter(|_| resizable) else {
+        return;
+    };
+    let Some((size, scale)) = EDITORS.with(|e| {
+        let scale = e.frames.borrow().get(&plugin)?.scale();
+        e.native
+            .borrow()
+            .iter()
+            .find(|n| n.plugin == plugin)
+            .map(|n| (n.size, scale))
+    }) else {
+        return;
+    };
+    // The room is a whole number of GTK pixels: within one of the size
+    // the plugin has (or asked for), it is that size — never answer a
+    // plugin's own resize with another.
+    if room.0.abs_diff(size.0) < scale && room.1.abs_diff(size.1) < scale {
+        return;
+    }
+    let applied = app
+        .session
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut s| s.plugin_editor(plugin)?.set_size(room.0, room.1));
+    tracing::debug!("plugin editor {plugin}: room {room:?}, the plugin took {applied:?}");
+    set_size(applied.unwrap_or(room));
+}
+
 fn track_positions(app: &Rc<AppState>) {
     type Open = (PluginInstanceId, u64, Option<(i32, i32)>);
     let open: Vec<Open> = EDITORS.with(|e| {
@@ -917,8 +1245,10 @@ fn track_positions(app: &Rc<AppState>) {
             .borrow()
             .iter()
             .filter_map(|n| match n.host {
-                Host::Parent(win) => Some((n.plugin, win, n.pos)),
-                Host::Floating => None,
+                Host::Parent(win) | Host::Framed(win) if settled(n.plugin, n.host) => {
+                    Some((n.plugin, win, n.pos))
+                }
+                _ => None,
             })
             .collect()
     });
@@ -1195,26 +1525,10 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
     let Some((track, title)) = title_of(app, plugin) else {
         return;
     };
-    let (params, vendor, bypassed, name) = {
-        let mut s = app.session.borrow_mut();
-        let params: Vec<PluginParameterView> = s.plugin_parameter_views(plugin);
-        let info = s.plugin_owner(plugin).map(|(_, slot)| {
-            let vendor = s
-                .available_plugins()
-                .into_iter()
-                .find(|p| p.plugin.id == slot.plugin.id && p.plugin.format == slot.plugin.format)
-                .map(|p| p.vendor)
-                .unwrap_or_default();
-            let name = s
-                .device_name(plugin)
-                .unwrap_or_else(|| slot.plugin.name.clone());
-            (vendor, slot.bypass, name)
-        });
-        let Some((vendor, bypassed, name)) = info else {
-            return;
-        };
-        (params, vendor, bypassed, name)
+    let Some(heading) = heading(app, plugin, true) else {
+        return;
     };
+    let params: Vec<PluginParameterView> = app.session.borrow_mut().plugin_parameter_views(plugin);
 
     let window = gtk::Window::builder()
         .application(&app.app)
@@ -1227,31 +1541,7 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
         window.set_transient_for(Some(main));
     }
 
-    let header = gtk::HeaderBar::new();
-    let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let name_label = gtk::Label::new(Some(&name));
-    name_label.add_css_class("title");
-    let sub = gtk::Label::new(Some(&title_of(app, plugin).map_or_else(
-        String::new,
-        |(_, t)| {
-            let track_name = t.rsplit(" — ").next().unwrap_or_default().to_string();
-            if vendor.is_empty() {
-                track_name
-            } else {
-                format!("{vendor} · {track_name}")
-            }
-        },
-    )));
-    sub.add_css_class("subtitle");
-    heading.append(&name_label);
-    heading.append(&sub);
-    header.set_title_widget(Some(&heading));
-
-    header.pack_start(&bypass_button(app, plugin, track, bypassed));
-    header.pack_start(&presets_button(app, plugin));
-    if let Some(outputs) = outputs_button(app, plugin) {
-        header.pack_start(&outputs);
-    }
+    let header = editor_header(app, plugin, &heading);
     if has_native(app, plugin) {
         let native = gtk::Button::with_label("Plugin GUI");
         native.set_tooltip_text(Some("Open the plugin's own editor"));

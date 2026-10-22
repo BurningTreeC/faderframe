@@ -3006,11 +3006,14 @@ pagefile-backed file mapping, all named in the helper's environment).
 * **Editors.** CLAP GUIs embed into a host window of the platform's own
   window system (`gui` API `x11`, `win32` or `cocoa`; see *Editor windows*
   below). On Windows the editor's scale is set from the display's DPI. On
-  Linux FaderFrame is a Wayland client, so the parent is a top-level window
-  on a separate X11 connection (`x11rb`, XWayland): created at the editor's size, with
-  fixed-size hints for non-resizable editors (window managers float them),
-  `WM_DELETE_WINDOW` closing the editor, configure events resizing
-  resizable ones and `request_resize` resizing the parent. Plugins that
+  Linux FaderFrame is a Wayland client, so the parent is an X11 window
+  (XWayland) of a separate connection (`x11rb`): inside a GTK window on
+  GDK's X11 display that carries the same header as the built-ins' editors
+  (Bypass, Presets, Outputs, Parameters — see *Editor windows*), or, where
+  that display cannot be opened, a plain top-level window created at the
+  editor's size, with fixed-size hints for non-resizable editors (window
+  managers float them), `WM_DELETE_WINDOW` closing the editor, configure
+  events resizing resizable ones and `request_resize` resizing the parent. Plugins that
   cannot embed but can float open their own window. Editors open centred
   on the monitor showing FaderFrame — in X11 coordinates from RandR,
   matched by connector name, because XWayland's layout can differ from the
@@ -3266,9 +3269,11 @@ headers). The plugin is driven directly, without lilv.
 
 `faderframe-ui/src/plugin_window/` keeps the shared logic (opening,
 placement, positions saved per instance, resize requests, closing, fd and
-timer sources, the generic window) apart from three backends with the same
-`Parents` API: `x11.rs` (XWayland top-level windows, RandR monitor
-geometry, the screenshot capture), `win32.rs` (plain top-level Win32
+timer sources, the generic window, the editor header shared by every
+editor window: name over vendor · track, Bypass following changes made
+elsewhere, Presets, Outputs, Parameters) apart from three backends with the
+same `Parents` API: `x11.rs` (XWayland windows, RandR monitor geometry, the
+screenshot capture), `win32.rs` (plain top-level Win32
 windows with `WS_CLIPCHILDREN`; GTK's main loop dispatches their messages,
 the window procedure records close requests and resizes for the next UI
 tick; positions in physical pixels from the monitors' work areas) and
@@ -3277,6 +3282,33 @@ content-size changes are noticed by polling on the UI tick; positions are
 converted between GDK's top-left and Cocoa's bottom-left origin). The
 plugin-host trait is platform-neutral: `can_embed(WindowApi)`,
 `open_embedded(api, scale)`, `attach(ParentWindow)`.
+
+On X11 native editors get the header too (`frame.rs`). GTK on Wayland
+cannot hold another program's window, but GTK can open GDK's X11 display
+beside the Wayland one (`gdk_x11_display_open` and
+`gdk_x11_surface_get_xid`, looked up in the running GTK, so a GTK without
+X11 still runs): the editor window is a GTK window there (not one of the
+application's — its `app` actions are inserted — styled through
+`style::add_display`, which also copies the desktop's decoration layout,
+font and icon theme), the header its title bar, a `DrawingArea` the room
+under it. Inside its X11 window `x11.rs` creates the window the plugin
+embeds into (`create_child`: the screen's default depth, visual and
+colormap — GTK's windows are often 32-bit ARGB, which plugins drawing with
+the default visual cannot use), and the UI tick keeps it over the room
+(`Frame::follow`: the room's place from `compute_point` + the surface
+transform × the surface scale). Plugin resize requests set the room's
+content size (fixed-size editors) or the window's default size
+(resizable); a resizable editor takes the room's new size unless it is
+within one GTK pixel of the size it has or asked for (never answer a
+plugin's own resize with another). The window is marked a dialog (window
+managers float it) and moved to its stored place once shown (GTK cannot
+place windows; a configure request on the X11 connection does). On close
+the plugin closes its GUI first, the embedding window is reparented to the
+root and retired like the plain windows (`release_child`, with a round
+trip so the server has done that before GTK destroys its window), then the
+GTK window goes. `FADERFRAME_EDITOR_HEADER=0` keeps the plain windows.
+Windows and macOS keep plain windows for now (`frame` is an empty stub
+there).
 
 ## 9. Audio backends
 

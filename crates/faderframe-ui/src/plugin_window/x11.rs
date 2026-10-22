@@ -1,6 +1,8 @@
 //! Editor parent windows on X11 (Linux/BSD). FaderFrame is a Wayland
-//! client, so these come from a separate X11 connection (XWayland): plain
-//! top-level windows the plugins put their GUIs into.
+//! client, so these come from a separate X11 connection (XWayland): windows
+//! the plugins put their GUIs into — inside a GTK window on GDK's X11
+//! display (`frame.rs`, the editor header above), or plain top-level
+//! windows where that display is not available.
 
 use super::{ParentEvent, Rect};
 use faderframe_plugin_host::{ParentWindow, WindowApi};
@@ -25,6 +27,13 @@ struct Atoms {
 pub struct Parents {
     conn: RustConnection,
     root: xproto::Window,
+    /// The screen's default depth, visual and colormap: the windows
+    /// editors embed into have them whatever their parent's (GTK's frames
+    /// are often 32-bit ARGB, which plugins drawing with the default
+    /// visual cannot use).
+    depth: u8,
+    visual: xproto::Visualid,
+    colormap: xproto::Colormap,
     black: u32,
     atoms: Atoms,
     /// Windows closed (unmapped) and when: destroyed once
@@ -48,9 +57,15 @@ fn x_err(e: impl std::fmt::Display) -> String {
 impl Parents {
     pub fn connect() -> Result<Self, String> {
         let (conn, screen) = x11rb::connect(None).map_err(x_err)?;
-        let (root, black) = {
+        let (root, depth, visual, colormap, black) = {
             let s = &conn.setup().roots[screen];
-            (s.root, s.black_pixel)
+            (
+                s.root,
+                s.root_depth,
+                s.root_visual,
+                s.default_colormap,
+                s.black_pixel,
+            )
         };
         let atom = |name: &[u8]| -> Result<xproto::Atom, String> {
             Ok(conn
@@ -72,6 +87,9 @@ impl Parents {
         Ok(Self {
             conn,
             root,
+            depth,
+            visual,
+            colormap,
             black,
             atoms,
             retired: std::cell::RefCell::new(Vec::new()),
@@ -168,6 +186,92 @@ impl Parents {
         self.size_hints(win, size, resizable, Some(pos));
         self.conn.flush().map_err(x_err)?;
         Ok(u64::from(win))
+    }
+
+    /// A window inside `parent` (the X11 window of an editor's GTK frame,
+    /// another client's) for the editor to embed into; unmapped until
+    /// [`place_child`](Self::place_child).
+    pub fn create_child(&self, parent: u64, size: (u32, u32)) -> Result<u64, String> {
+        let win = self.conn.generate_id().map_err(x_err)?;
+        self.conn
+            .create_window(
+                self.depth,
+                win,
+                id(parent),
+                0,
+                0,
+                size.0.clamp(1, 16_000) as u16,
+                size.1.clamp(1, 16_000) as u16,
+                0,
+                xproto::WindowClass::INPUT_OUTPUT,
+                self.visual,
+                &xproto::CreateWindowAux::new()
+                    .background_pixel(self.black)
+                    .border_pixel(self.black)
+                    .colormap(self.colormap),
+            )
+            .map_err(x_err)?;
+        self.conn.flush().map_err(x_err)?;
+        Ok(u64::from(win))
+    }
+
+    /// Move and size a child window (in its parent's pixels) and show it.
+    pub fn place_child(&self, win: u64, (x, y, w, h): (i32, i32, u32, u32)) {
+        let win = id(win);
+        let _ = self.conn.configure_window(
+            win,
+            &xproto::ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(w.clamp(1, 16_000))
+                .height(h.clamp(1, 16_000)),
+        );
+        let _ = self.conn.map_window(win);
+        let _ = self.conn.flush();
+    }
+
+    /// Close a child window before its parent goes: hidden and moved out
+    /// to the root (destroying the parent would destroy it with the
+    /// plugin's windows inside, see [`RETIRE_AFTER`]), destroyed later.
+    /// Returns once the server has done that.
+    pub fn release_child(&self, win: u64) {
+        let _ = self.conn.unmap_window(id(win));
+        let _ = self.conn.reparent_window(id(win), self.root, 0, 0);
+        if let Ok(c) = self.conn.get_input_focus() {
+            let _ = c.reply();
+        }
+        self.retired
+            .borrow_mut()
+            .push((id(win), std::time::Instant::now()));
+    }
+
+    /// Ask the window manager to move a top-level window (GTK has no way
+    /// to; a configure request is honoured by most).
+    pub fn move_to(&self, win: u64, pos: (i32, i32)) {
+        let _ = self.conn.configure_window(
+            id(win),
+            &xproto::ConfigureWindowAux::new().x(pos.0).y(pos.1),
+        );
+        let _ = self.conn.flush();
+    }
+
+    /// Mark a top-level window as a dialog (window managers float it).
+    pub fn set_dialog(&self, win: u64) {
+        let a = &self.atoms;
+        let _ = self.conn.change_property32(
+            xproto::PropMode::REPLACE,
+            id(win),
+            a.net_wm_window_type,
+            xproto::AtomEnum::ATOM,
+            &[a.net_wm_window_type_dialog],
+        );
+        let _ = self.conn.flush();
+    }
+
+    /// A window's size.
+    pub fn size(&self, win: u64) -> Option<(u32, u32)> {
+        let g = self.conn.get_geometry(id(win)).ok()?.reply().ok()?;
+        Some((u32::from(g.width), u32::from(g.height)))
     }
 
     /// The handle editors embed into.
