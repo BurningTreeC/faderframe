@@ -1044,15 +1044,22 @@ impl CanvasWidget {
                 if std::mem::take(&mut w.imp().access.borrow_mut().keyboard) {
                     w.queue_draw();
                 }
-                w.deliver(ViewEvent::PointerDown {
+                let taken = w.deliver(ViewEvent::PointerDown {
                     pos: Point::new(x as f32, y as f32),
                     button: button(b),
                     modifiers: modifiers(g.current_event_state()),
                     clicks: n.max(1) as u32,
                 });
+                // A press the view took goes no further: in a header bar
+                // the window handle would also take it — two quick taps
+                // maximise the window, a right-click opens the window
+                // menu, a drag moves the window.
+                if taken {
+                    g.set_state(gtk::EventSequenceState::Claimed);
+                }
             }
         ));
-        self.add_controller(click);
+        self.add_controller(click.clone());
 
         let drag = gtk::GestureDrag::new();
         drag.set_button(0);
@@ -1101,7 +1108,9 @@ impl CanvasWidget {
                 });
             }
         ));
-        self.add_controller(drag);
+        self.add_controller(drag.clone());
+        // One group: a claimed press would deny the drag otherwise.
+        drag.group_with(&click);
 
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion(glib::clone!(
