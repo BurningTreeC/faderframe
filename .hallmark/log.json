@@ -1,0 +1,31 @@
+[
+ {
+  "shape": "Conversational FAQ (answers show screens)",
+  "theme": "Kiln (deal 1/3, accent from the brand amber)",
+  "axes": "dark/high-contrast-serif/warm",
+  "hero": "Counter (swapped from Corridor)",
+  "nav": "floating pill",
+  "footer": "mast",
+  "imagery": "screenshots 8 (the app own captures, docs/screenshots)",
+  "photos": [],
+  "entry": "the download beside the captured console, a release well over its corner",
+  "fingerprint": "Hanging|Single column|Hairline|Solid|Tightly cropped to the grid|None",
+  "sections": [
+   "Counter hero",
+   "Table: the six builds",
+   "Showcase: the strips close up, four numbered notes",
+   "Switcher: five workspaces",
+   "Table: the release log",
+   "Band: the download beside the demo in nine skins",
+   "Mast footer"
+  ],
+  "signature": "the console mixer captured from the app, on the first screen and cropped large below",
+  "waived": [],
+  "job": "try",
+  "draw": "369b6f",
+  "brand": "FaderFrame (spec 2026-10-24)",
+  "prompt": "GitHub Pages site for FaderFrame that showcases it and offers the latest version for download",
+  "date": "2026-10-24",
+  "mode": "build"
+ }
+]

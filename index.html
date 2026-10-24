@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>FaderFrame, a multitrack DAW for Linux, macOS and Windows</title>
+<meta name="description" content="FaderFrame records, edits, mixes and masters. A DAW written in Rust, native on Wayland, free under the MIT licence.">
+<meta name="theme-color" content="#0b0605">
+<link rel="icon" href="assets/img/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="assets/img/icon-180.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="FaderFrame: first take to vinyl master">
+<meta property="og:description" content="A free multitrack DAW in Rust: Linux first, macOS and Windows too.">
+<meta property="og:image" content="https://burningtreec.github.io/faderframe/assets/img/og.jpg">
+<meta property="og:url" content="https://burningtreec.github.io/faderframe/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preload" href="assets/fonts/boska-500.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/css/site.css">
+<script>document.documentElement.classList.add('js');</script>
+<script src="assets/js/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav class="pill" aria-label="Primary">
+  <a class="wordmark" href="#top" aria-label="FaderFrame, back to the top">
+    <img src="assets/img/icon.svg" alt="" width="28" height="28">
+    <span>FaderFrame</span>
+  </a>
+  <ul class="pill__links">
+    <li><a href="#builds">Builds</a></li>
+    <li><a href="#mixer">Mixer</a></li>
+    <li><a href="#workspaces">Workspaces</a></li>
+    <li><a href="https://github.com/BurningTreeC/faderframe">GitHub</a></li>
+  </ul>
+  <a class="pill__action" href="#builds">Download</a>
+</nav>
+
+<main id="main">
+
+<header class="hero" id="top">
+  <div class="container hero__grid">
+  <div class="hero__text">
+    <h1>First take to vinyl master.</h1>
+    <p class="lead">A free DAW in Rust: Linux first, macOS and Windows too.</p>
+    <div class="hero__get" data-get>
+      <a class="btn btn--primary" data-os="linux" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/faderframe-0.30.0-linux-x86_64.tar.xz">Download for Linux</a>
+      <a class="btn btn--ghost" data-os="mac" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-macos-arm64.dmg">macOS</a>
+      <a class="btn btn--ghost" data-os="windows" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-windows-x64-setup.exe">Windows</a>
+    </div>
+    <p class="hero__meta" data-get-meta>Portable tarball for x86_64, <span data-size="linux-tar">35.1&nbsp;MB</span>.</p>
+  </div>
+  <div class="hero__visual">
+    <figure class="hero__shot shot" data-slot="hero" data-kind="product" data-alt="FaderFrame's console mixer: whole channel strips, preamp at the top, faders and meters below">
+      <img src="assets/img/console-1340.webp"
+           srcset="assets/img/console-760.webp 760w, assets/img/console-1340.webp 1340w"
+           sizes="(min-width: 60rem) 52vw, 92vw" width="1340" height="962" fetchpriority="high"
+           alt="FaderFrame's console mixer, seven channel strips side by side: Drums, Bass with an American 312 preamp, Pluck, Pad, Lead Synth, Drum Bus and Echo, each with its inserts, sends, pan, fader and meter.">
+    </figure>
+    <dl class="reading">
+      <dt>Latest release</dt>
+      <dd class="figure" data-version>0.30.0</dd>
+      <dd>Released <time data-released datetime="2026-10-22">22 October 2026</time></dd>
+    </dl>
+  </div>
+  </div>
+</header>
+
+<section class="section builds" id="builds" aria-labelledby="builds-title">
+  <div class="container">
+    <div class="head">
+      <h2 id="builds-title">Which of six builds is yours?</h2>
+      <p class="lead">Builds of <span data-version>0.30.0</span>, released <time data-released datetime="2026-10-22">22 October 2026</time>.</p>
+    </div>
+    <table class="builds__table">
+      <thead>
+        <tr><th scope="col">System</th><th scope="col">Build</th><th scope="col">Good to know</th><th scope="col" class="num">Size</th><th scope="col"><span class="visually-hidden">Download</span></th></tr>
+      </thead>
+      <tbody data-platform="linux">
+        <tr>
+          <th scope="rowgroup" rowspan="2">Linux</th>
+          <td class="b">Portable tarball</td>
+          <td class="n">Debian 13 or newer (glibc 2.41)</td>
+          <td class="num s" data-size="linux-tar">35.1&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="linux-tar" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/faderframe-0.30.0-linux-x86_64.tar.xz">Download<span class="visually-hidden"> the Linux portable tarball</span></a></td>
+        </tr>
+        <tr>
+          <td class="b">Flatpak</td>
+          <td class="n">Older distributions</td>
+          <td class="num s" data-size="linux-flatpak">16.2&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="linux-flatpak" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-linux-x86_64.flatpak">Download<span class="visually-hidden"> the Linux Flatpak</span></a></td>
+        </tr>
+      </tbody>
+      <tbody data-platform="mac">
+        <tr>
+          <th scope="rowgroup" rowspan="2">macOS<span class="th-note">Not notarised: allow it once in Privacy &amp; Security</span></th>
+          <td class="b">Apple silicon</td>
+          <td class="n"></td>
+          <td class="num s" data-size="mac-arm">42.3&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="mac-arm" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-macos-arm64.dmg">Download<span class="visually-hidden"> for Macs with Apple silicon</span></a></td>
+        </tr>
+        <tr>
+          <td class="b">Intel</td>
+          <td class="n"></td>
+          <td class="num s" data-size="mac-intel">46.1&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="mac-intel" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-macos-x86_64.dmg">Download<span class="visually-hidden"> for Intel Macs</span></a></td>
+        </tr>
+      </tbody>
+      <tbody data-platform="windows">
+        <tr>
+          <th scope="rowgroup" rowspan="2">Windows</th>
+          <td class="b">Installer</td>
+          <td class="n">SmartScreen: More info, then Run anyway</td>
+          <td class="num s" data-size="win-setup">54.9&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="win-setup" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-windows-x64-setup.exe">Download<span class="visually-hidden"> the Windows installer</span></a></td>
+        </tr>
+        <tr>
+          <td class="b">Portable zip</td>
+          <td class="n">Runs from a USB stick</td>
+          <td class="num s" data-size="win-zip">80.1&nbsp;MB</td>
+          <td class="g"><a class="get" data-build="win-zip" href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/FaderFrame-0.30.0-windows-x64-portable.zip">Download<span class="visually-hidden"> the portable Windows zip</span></a></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="section mixer" id="mixer" aria-labelledby="mixer-title">
+  <div class="container">
+    <div class="head">
+      <h2 id="mixer-title">An American 312 on the bass?</h2>
+      <p class="lead">Each strip runs top to bottom like a console channel.</p>
+    </div>
+    <figure class="strips">
+      <div class="strips__frame">
+        <div class="shot" data-slot="strips" data-kind="product" data-alt="The top of the first six mixer strips: preamp, inserts, sends, pan and gain">
+          <picture>
+            <source media="(max-width: 39.99rem)" srcset="assets/img/strips-phone-576.webp" width="576" height="460">
+            <img src="assets/img/strips-1152.webp" loading="lazy" width="1152" height="460"
+                 alt="Six channel strips close up: Drums, Bass with an American 312 preamp, Pluck, Pad, Lead Synth and Drum Bus, showing their preamps, inserts, sends, pan and gain.">
+          </picture>
+        </div>
+        <span class="pin" style="--x: 17.2%; --xs: 34.4%; --y: 9.8%" aria-hidden="true">1</span>
+        <span class="pin" style="--x: 17.2%; --xs: 34.4%; --y: 35.2%" aria-hidden="true">2</span>
+        <span class="pin" style="--x: 33.7%; --xs: 67.4%; --y: 59.8%" aria-hidden="true">3</span>
+        <span class="pin pin--wide" style="--x: 84.6%; --y: 22.8%" aria-hidden="true">4</span>
+      </div>
+      <figcaption>
+        <ol class="notes">
+          <li>A preamp solved from its circuit; its Gain is the real gain.</li>
+          <li>Inserts: stock devices, or CLAP, VST3, LV2 and Audio Units plugins.</li>
+          <li>Sends to the Echo and Space returns, before or after the fader.</li>
+          <li>A parallel container squashing a copy of the drum bus.</li>
+        </ol>
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="section work" id="workspaces" aria-labelledby="work-title">
+  <div class="container">
+    <div class="work__head">
+      <h2 id="work-title">Can it tune a vocal too?</h2>
+      <div class="seg" role="tablist" aria-label="Workspaces" data-tabs>
+        <button type="button" role="tab" id="tab-tune" aria-controls="panel-tune" aria-selected="true">Tune</button>
+        <button type="button" role="tab" id="tab-arrange" aria-controls="panel-arrange" aria-selected="false" tabindex="-1">Arrange</button>
+        <button type="button" role="tab" id="tab-compose" aria-controls="panel-compose" aria-selected="false" tabindex="-1">Compose</button>
+        <button type="button" role="tab" id="tab-devices" aria-controls="panel-devices" aria-selected="false" tabindex="-1">Devices</button>
+        <button type="button" role="tab" id="tab-master" aria-controls="panel-master" aria-selected="false" tabindex="-1">Master</button>
+      </div>
+    </div>
+    <div class="work__panel" role="tabpanel" id="panel-tune" aria-labelledby="tab-tune">
+      <div class="shot" data-slot="tune" data-kind="product" data-alt="The pitch editor with a sung phrase and the Lyrics lane">
+        <img src="assets/img/vocals-1280.webp" srcset="assets/img/vocals-1280.webp 1280w, assets/img/vocals-2400.webp 2400w" sizes="(min-width: 90rem) 1312px, 92vw" loading="lazy" width="2400" height="1304" alt="The pitch editor with a sung phrase corrected to the key, and a transcribed speech clip in the Lyrics lane above the tracks.">
+      </div>
+      <p class="work__line">Sung notes snapped to the key, their sung pitch faint behind.</p>
+    </div>
+    <div class="work__panel" role="tabpanel" id="panel-arrange" aria-labelledby="tab-arrange" hidden>
+      <div class="shot" data-slot="arrange" data-kind="product" data-alt="The Editing workspace with the global lanes, a folder and the Modulators panel">
+        <img src="assets/img/editing-1280.webp" srcset="assets/img/editing-1280.webp 1280w, assets/img/editing-2400.webp 2400w" sizes="(min-width: 90rem) 1312px, 92vw" loading="lazy" width="2400" height="1304" alt="The Editing workspace: markers, sections, key and chord lanes above the tracks, arpeggios in a folder, and two modulators in the bottom dock.">
+      </div>
+      <p class="work__line">Markers, sections, the key and the chords sit above the tracks.</p>
+    </div>
+    <div class="work__panel" role="tabpanel" id="panel-compose" aria-labelledby="tab-compose" hidden>
+      <div class="shot" data-slot="compose" data-kind="product" data-alt="The piano roll editing the lead synth's melody">
+        <img src="assets/img/piano-roll-1280.webp" srcset="assets/img/piano-roll-1280.webp 1280w, assets/img/piano-roll-2400.webp 2400w" sizes="(min-width: 90rem) 1312px, 92vw" loading="lazy" width="2400" height="1304" alt="The piano roll editing a synth melody under the key and chord tracks, with the notes of A minor highlighted.">
+      </div>
+      <p class="work__line">The piano roll under the chord track, the scale lit.</p>
+    </div>
+    <div class="work__panel" role="tabpanel" id="panel-devices" aria-labelledby="tab-devices" hidden>
+      <div class="shot shot--devices" data-slot="devices" data-kind="product" data-alt="Device editors: the EQ, the Synth, the Program EQ and a container">
+        <img src="assets/img/devices-1280.webp" srcset="assets/img/devices-1280.webp 1280w, assets/img/devices-2400.webp 2400w" sizes="(min-width: 90rem) 1312px, 92vw" loading="lazy" width="2400" height="1446" alt="Four device editors: the EQ with dynamic and spectral bands, the Synth, the Program EQ and the Parallel Squash container.">
+      </div>
+      <p class="work__line">An EQ with dynamic and spectral bands, a synth, a Program EQ.</p>
+    </div>
+    <div class="work__panel" role="tabpanel" id="panel-master" aria-labelledby="tab-master" hidden>
+      <div class="shot" data-slot="master" data-kind="product" data-alt="The Mastering workspace with loudness, level, phase and spectrum meters">
+        <img src="assets/img/mastering-1280.webp" srcset="assets/img/mastering-1280.webp 1280w, assets/img/mastering-2400.webp 2400w" sizes="(min-width: 90rem) 1312px, 92vw" loading="lazy" width="2400" height="1304" alt="The Mastering workspace with EBU R128 loudness, level, phase and spectrum meters in the Tools view.">
+      </div>
+      <p class="work__line">EBU R128 loudness, phase and spectrum, measured as you hear them.</p>
+    </div>
+  </div>
+</section>
+
+<section class="section log" aria-labelledby="log-title">
+  <div class="container">
+    <div class="head head--split">
+      <h2 id="log-title">Is it finished?</h2>
+      <p class="lead">Not yet. Most of a working DAW is there.</p>
+    </div>
+    <table class="log__table" data-log>
+      <thead>
+        <tr><th scope="col">Version</th><th scope="col">Released</th><th scope="col">What changed</th></tr>
+      </thead>
+      <tbody>
+        <tr data-tag="v0.30.0"><th scope="row" class="figure">0.30.0</th><td><time datetime="2026-10-22">22 Oct 2026</time></td><td>Comping changes only the section you click</td></tr>
+        <tr data-tag="v0.29.0"><th scope="row" class="figure">0.29.0</th><td><time datetime="2026-10-22">22 Oct 2026</time></td><td>Plugin editor header on Windows and macOS</td></tr>
+        <tr data-tag="v0.28.0"><th scope="row" class="figure">0.28.0</th><td><time datetime="2026-10-22">22 Oct 2026</time></td><td>Plugin GUIs under the editor header on Linux</td></tr>
+        <tr data-tag="v0.27.0"><th scope="row" class="figure">0.27.0</th><td><time datetime="2026-10-21">21 Oct 2026</time></td><td>Clip drags no longer exhaust file handles</td></tr>
+        <tr data-tag="v0.26.0"><th scope="row" class="figure">0.26.0</th><td><time datetime="2026-10-21">21 Oct 2026</time></td><td>Ripple editing per track, selection or project</td></tr>
+      </tbody>
+    </table>
+    <p class="log__more"><a class="link" href="https://github.com/BurningTreeC/faderframe/releases">Every release on GitHub</a></p>
+  </div>
+</section>
+
+<section class="band start" aria-labelledby="start-title">
+  <div class="container start__grid">
+    <div class="start__text">
+      <h2 id="start-title">What opens on first start?</h2>
+      <p class="lead">The demo: eight bars in A minor, every sound generated.</p>
+      <div class="start__get">
+        <a class="btn btn--ghost" data-close-get href="https://github.com/BurningTreeC/faderframe/releases/download/v0.30.0/faderframe-0.30.0-linux-x86_64.tar.xz">Download for Linux</a>
+        <a class="link" href="#builds">Other builds</a>
+      </div>
+    </div>
+    <figure class="start__shot">
+      <div class="shot" data-slot="skins" data-kind="product" data-alt="The demo session in all nine skins">
+        <img src="assets/img/themes-1280.webp" srcset="assets/img/themes-1280.webp 1280w, assets/img/themes-2400.webp 2400w" sizes="(min-width: 60rem) 52vw, 92vw" loading="lazy" width="2400" height="1429" alt="The same demo session in nine skins: Studio, Vintage Console, Daylight, Midnight, Frost, Fjord, Neon, High Contrast and Lumen.">
+      </div>
+      <figcaption>The demo in all nine skins, switched live from the View menu.</figcaption>
+    </figure>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="container">
+    <p class="foot__mast"><img src="assets/img/icon.svg" alt="" width="64" height="64"><span>FaderFrame</span></p>
+    <p class="foot__line">A DAW made on Linux, with love.</p>
+    <ul class="foot__links">
+      <li><a href="https://github.com/BurningTreeC/faderframe">Source on GitHub</a></li>
+      <li><a href="https://github.com/BurningTreeC/faderframe/releases">Releases</a></li>
+      <li><a href="https://github.com/BurningTreeC/faderframe/issues">Issues</a></li>
+      <li><a href="https://github.com/BurningTreeC/faderframe/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+      <li><a href="https://github.com/BurningTreeC/faderframe/blob/main/LICENSE">MIT licence</a></li>
+    </ul>
+    <p class="foot__legal">© 2026 BurningTreeC and the FaderFrame contributors. Set in Boska by the Indian Type Foundry and Geist by Vercel.</p>
+  </div>
+</footer>
+
+
+<script>window.hallmarkSlots = (m) => { for (const [k, v] of Object.entries(m)) { const s = document.querySelector(`[data-slot="${k}"]`); if (!s) continue; const im = new Image(); im.src = typeof v === 'string' ? v : v.src; im.alt = (typeof v === 'object' && v.alt) || s.dataset.alt || ''; s.querySelectorAll(':scope > img').forEach((o) => o.remove()); s.prepend(im); } };
+document.querySelectorAll('[data-slot] img').forEach((i) => { if (i.complete && !i.naturalWidth) i.remove(); else i.addEventListener('error', () => i.remove(), { once: true }); });</script>
+</body>
+</html>
