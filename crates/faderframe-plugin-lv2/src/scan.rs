@@ -83,6 +83,16 @@ impl Ui {
     pub fn is_x11(&self) -> bool {
         self.class == format!("{UI}X11UI")
     }
+
+    /// Shows a window of its own (kxstudio's external UI, or the older
+    /// one it replaced).
+    pub fn is_external(&self) -> bool {
+        is_external_class(&self.class)
+    }
+}
+
+fn is_external_class(class: &str) -> bool {
+    class == crate::sys::uri::EXTERNAL_UI_WIDGET || class == crate::sys::uri::EXTERNAL_UI_OLD_WIDGET
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -396,6 +406,8 @@ pub fn bundle_graph(bundle: &Path) -> Result<Graph, String> {
                 format!("{UI}GtkUI"),
                 format!("{UI}Gtk3UI"),
                 format!("{UI}Qt5UI"),
+                crate::sys::uri::EXTERNAL_UI_WIDGET.to_string(),
+                crate::sys::uri::EXTERNAL_UI_OLD_WIDGET.to_string(),
             ]
             .iter()
             .flat_map(|c| g.of_type(c))
@@ -530,7 +542,8 @@ pub struct Cache {
     bundles: BTreeMap<PathBuf, CacheEntry>,
 }
 
-const CACHE_VERSION: u32 = 1;
+/// 2: UIs whose binary is an `lv2:binary`, external UIs.
+const CACHE_VERSION: u32 = 2;
 
 impl Cache {
     pub fn load(path: &Path) -> Cache {
@@ -725,10 +738,12 @@ fn describe_plugin(g: &Graph, p: &Node, uri: &str, bundle: &Path) -> Result<Lv2P
             let class = g
                 .objects(u, RDF_TYPE)
                 .filter_map(Node::iri)
-                .find(|c| c.starts_with(UI))?
+                .find(|c| c.starts_with(UI) || is_external_class(c))?
                 .to_string();
+            // `lv2:binary` since UI 2.x (JUCE writes it), `ui:binary` before.
             let binary = g
-                .object(u, &format!("{UI}binary"))
+                .object(u, &lv2("binary"))
+                .or_else(|| g.object(u, &format!("{UI}binary")))
                 .and_then(Node::iri)
                 .and_then(ttl::url_path)?;
             Some(Ui {

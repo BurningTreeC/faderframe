@@ -543,7 +543,10 @@ impl Helper {
                 ed.close();
                 Response::Done
             }
-            EditorCall::Raise => Response::Done,
+            EditorCall::Raise => {
+                ed.raise();
+                Response::Done
+            }
             EditorCall::CanResize => Response::Flag(ed.can_resize()),
             EditorCall::SetSize { width, height } => Response::Size(ed.set_size(width, height)),
         };

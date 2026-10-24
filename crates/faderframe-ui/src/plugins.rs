@@ -16,6 +16,21 @@ fn cache_path(name: &str) -> PathBuf {
     crate::paths::cache_dir().join(name)
 }
 
+/// Plugin GUIs made with FLTK (Yoshimi's, for one) open windows of their
+/// own. On Wayland FLTK decorates them through libdecor, whose GTK 3
+/// plugin cannot work in a process that has GTK 4 (its calls bind to GTK
+/// 4's functions; the plugin's process hangs). FaderFrame shows plugin GUIs
+/// through X11 anyway: FLTK uses XWayland too, here and in the helpers
+/// (they inherit it). Call it first in `main`, before any thread exists.
+pub fn prepare_plugin_toolkits() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_some() {
+        // SAFETY: no other thread exists yet (the caller's promise), so
+        // nothing reads the environment meanwhile.
+        unsafe { std::env::set_var("FLTK_BACKEND", "x11") };
+    }
+}
+
 const CLAP_CACHE: &str = "clap-scan.json";
 const VST3_CACHE: &str = "vst3-scan.json";
 #[cfg(target_os = "linux")]

@@ -130,6 +130,8 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
 }
 
 fn main() -> ExitCode {
+    // Before any thread: it sets the environment.
+    faderframe_ui::plugins::prepare_plugin_toolkits();
     // A realtime time limit inherited (a sandbox helper's from FaderFrame)
     // or set by the desktop: a thread running realtime past it must lose
     // its priority, never get the process killed.

@@ -1,7 +1,10 @@
 //! Plugin UIs: X11 UIs (`ui:X11UI`) embedded into the host's parent
-//! window. They talk to the plugin only through ports (control values and
-//! atom messages), so they keep working when the plugin is instantiated
-//! again; their idle callback runs on the host's timer.
+//! window, else external UIs (kxstudio's `external-ui#Widget`) in windows
+//! of their own. They talk to the plugin through ports (control values and
+//! atom messages) and may reach the instance itself (`instance-access`,
+//! `data-access`): when the plugin is instantiated again, the UI is made
+//! again on the new instance. Idle (or an external UI's `run`) runs on the
+//! host's timer.
 
 use crate::core::Shared;
 use crate::instance::Lv2Instance;
@@ -25,16 +28,47 @@ const SUPPORTED: &[&str] = &[
     sys::uri::UI_NO_USER_RESIZE,
     sys::uri::OPTIONS,
     sys::uri::LOG,
+    sys::uri::INSTANCE_ACCESS,
+    sys::uri::DATA_ACCESS,
+    sys::uri::EXTERNAL_UI_HOST,
+    sys::uri::EXTERNAL_UI_OLD_HOST,
 ];
 
+fn usable(ui: &Ui) -> bool {
+    ui.required_features
+        .iter()
+        .all(|f| SUPPORTED.contains(&f.as_str()))
+}
+
 /// The UI to embed: an X11 UI whose required features the host has.
+pub fn embeddable(model: &Lv2Plugin) -> Option<&Ui> {
+    model.uis.iter().find(|u| u.is_x11() && usable(u))
+}
+
+/// The UI that shows a window of its own: an external UI.
+pub fn floating(model: &Lv2Plugin) -> Option<&Ui> {
+    model.uis.iter().find(|u| u.is_external() && usable(u))
+}
+
+/// The UI the plugin has, embedded preferred.
 pub fn find(model: &Lv2Plugin) -> Option<&Ui> {
-    model.uis.iter().find(|u| {
-        u.is_x11()
-            && u.required_features
-                .iter()
-                .all(|f| SUPPORTED.contains(&f.as_str()))
-    })
+    embeddable(model).or_else(|| floating(model))
+}
+
+/// Where an editor shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Place {
+    /// In the host's X11 window.
+    Embedded(u64),
+    /// In its own window, titled so.
+    Floating(String),
+}
+
+/// The plugin instance a UI may reach (`instance-access`, `data-access`).
+#[derive(Clone, Copy)]
+pub struct PluginAccess {
+    pub handle: sys::LV2_Handle,
+    pub extension_data: Option<unsafe extern "C" fn(uri: *const c_char) -> *const c_void>,
 }
 
 /// What a UI did, for the instance to apply.
@@ -51,6 +85,8 @@ pub struct Controller {
     events: RefCell<Vec<UiEvent>>,
     requests: Cell<EditorRequests>,
     symbols: Vec<CString>,
+    /// An external UI's window was closed by the user.
+    closed: Cell<bool>,
 }
 
 unsafe extern "C" fn write(
@@ -114,6 +150,12 @@ unsafe extern "C" fn port_index(handle: *mut c_void, symbol: *const c_char) -> u
         .map_or(sys::LV2UI_INVALID_PORT_INDEX, |i| i as u32)
 }
 
+unsafe extern "C" fn ui_closed(controller: *mut c_void) {
+    // SAFETY: our controller.
+    let c = unsafe { &*controller.cast::<Controller>() };
+    c.closed.set(true);
+}
+
 fn data<T>(r: &T) -> *mut c_void {
     (r as *const T).cast_mut().cast()
 }
@@ -125,6 +167,9 @@ struct Features {
     _resize: Box<sys::LV2UI_Resize>,
     _touch: Box<sys::LV2UI_Touch>,
     _port_map: Box<sys::LV2UI_Port_Map>,
+    _data_access: Box<sys::LV2_Extension_Data_Feature>,
+    _external: Box<sys::LV2_External_UI_Host>,
+    _title: CString,
     _values: Box<[f32; 2]>,
     _options: Box<[sys::LV2_Options_Option]>,
     _uris: Vec<CString>,
@@ -133,7 +178,13 @@ struct Features {
 }
 
 impl Features {
-    fn new(controller: *mut c_void, parent: u64, rate: f64, scale: f64) -> Features {
+    fn new(
+        controller: *mut c_void,
+        place: &Place,
+        plugin: PluginAccess,
+        rate: f64,
+        scale: f64,
+    ) -> Features {
         let u = Urids::get();
         let map = Box::new(crate::urid::map_feature());
         let unmap = Box::new(crate::urid::unmap_feature());
@@ -148,6 +199,17 @@ impl Features {
         let port_map = Box::new(sys::LV2UI_Port_Map {
             handle: controller,
             port_index: Some(port_index),
+        });
+        let data_access = Box::new(sys::LV2_Extension_Data_Feature {
+            data_access: plugin.extension_data,
+        });
+        let title = match place {
+            Place::Floating(t) => CString::new(t.replace('\0', "")).unwrap_or_default(),
+            Place::Embedded(_) => CString::default(),
+        };
+        let external = Box::new(sys::LV2_External_UI_Host {
+            ui_closed: Some(ui_closed),
+            plugin_human_id: title.as_ptr(),
         });
         let values = Box::new([rate as f32, scale as f32]);
         let opt = |key: u32, value: *const f32| sys::LV2_Options_Option {
@@ -171,16 +233,26 @@ impl Features {
             },
         ]
         .into_boxed_slice();
-        let list_data: Vec<(&str, *mut c_void)> = vec![
+        let mut list_data: Vec<(&str, *mut c_void)> = vec![
             (sys::uri::URID_MAP, data(&*map)),
             (sys::uri::URID_UNMAP, data(&*unmap)),
-            (sys::uri::UI_PARENT, parent as usize as *mut c_void),
             (sys::uri::UI_RESIZE, data(&*resize_f)),
             (sys::uri::UI_TOUCH, data(&*touch_f)),
             (sys::uri::UI_PORT_MAP, data(&*port_map)),
             (sys::uri::UI_IDLE, std::ptr::null_mut()),
             (sys::uri::OPTIONS, options.as_ptr().cast_mut().cast()),
+            (sys::uri::INSTANCE_ACCESS, plugin.handle),
+            (sys::uri::DATA_ACCESS, data(&*data_access)),
         ];
+        match place {
+            Place::Embedded(parent) => {
+                list_data.push((sys::uri::UI_PARENT, *parent as usize as *mut c_void));
+            }
+            Place::Floating(_) => {
+                list_data.push((sys::uri::EXTERNAL_UI_HOST, data(&*external)));
+                list_data.push((sys::uri::EXTERNAL_UI_OLD_HOST, data(&*external)));
+            }
+        }
         let uris: Vec<CString> = list_data
             .iter()
             .map(|(u, _)| CString::new(*u).unwrap_or_default())
@@ -202,6 +274,9 @@ impl Features {
             _resize: resize_f,
             _touch: touch_f,
             _port_map: port_map,
+            _data_access: data_access,
+            _external: external,
+            _title: title,
             _values: values,
             _options: options,
             _uris: uris,
@@ -212,9 +287,12 @@ impl Features {
 }
 
 pub struct Editor {
+    pub place: Place,
     desc: *const LV2UI_Descriptor,
     handle: LV2UI_Handle,
     widget: sys::LV2UI_Widget,
+    /// An external UI's widget (null: embedded).
+    external: *mut sys::LV2_External_UI_Widget,
     idle: *const sys::LV2UI_Idle_Interface,
     ui_resize: *const sys::LV2UI_Resize,
     /// Must outlive the UI.
@@ -228,24 +306,36 @@ pub struct Editor {
     closed: bool,
     message: Vec<u8>,
     atom: Vec<u64>,
-    _library: libloading::Library,
+    /// `None`: an entry point linked into this program.
+    _library: Option<libloading::Library>,
 }
 
 impl Editor {
     pub fn open(
         model: &Lv2Plugin,
         ui: &Ui,
-        parent: u64,
+        place: Place,
+        plugin: PluginAccess,
+        linked: Option<sys::LV2UI_Descriptor_Function>,
         rate: f64,
         scale: f64,
     ) -> Result<Editor, String> {
-        // SAFETY: loading the UI's library runs its initialisers (the
-        // user opened the editor).
-        let library = unsafe { libloading::Library::new(&ui.binary) }
-            .map_err(|e| format!("{}: {e}", ui.binary.display()))?;
-        // SAFETY: the LV2 UI entry point.
-        let entry: libloading::Symbol<'_, sys::LV2UI_Descriptor_Function> =
-            unsafe { library.get(b"lv2ui_descriptor\0") }.map_err(|e| e.to_string())?;
+        let (entry, library) = match linked {
+            Some(entry) => (entry, None),
+            None => {
+                // SAFETY: loading the UI's library runs its initialisers
+                // (the user opened the editor).
+                let library = unsafe { libloading::Library::new(&ui.binary) }
+                    .map_err(|e| format!("{}: {e}", ui.binary.display()))?;
+                // SAFETY: the LV2 UI entry point, valid while the library
+                // is loaded (kept in the editor).
+                let entry = *unsafe {
+                    library.get::<sys::LV2UI_Descriptor_Function>(b"lv2ui_descriptor\0")
+                }
+                .map_err(|e| e.to_string())?;
+                (entry, Some(library))
+            }
+        };
         let mut desc = std::ptr::null();
         for i in 0..1024 {
             // SAFETY: indices from 0 until it gives null.
@@ -270,11 +360,12 @@ impl Editor {
                 .iter()
                 .map(|p| CString::new(p.symbol.clone()).unwrap_or_default())
                 .collect(),
+            closed: Cell::new(false),
         });
         let cptr = (&*controller as *const Controller)
             .cast_mut()
             .cast::<c_void>();
-        let features = Box::new(Features::new(cptr, parent, rate, scale));
+        let features = Box::new(Features::new(cptr, &place, plugin, rate, scale));
         let plugin_uri = CString::new(model.uri.clone()).map_err(|e| e.to_string())?;
         let mut bundle = ui.bundle.to_string_lossy().into_owned();
         if !bundle.ends_with('/') {
@@ -314,10 +405,18 @@ impl Editor {
         };
         let idle = ext(sys::uri::UI_IDLE).cast::<sys::LV2UI_Idle_Interface>();
         let ui_resize = ext(sys::uri::UI_RESIZE).cast::<sys::LV2UI_Resize>();
+        let floating = matches!(place, Place::Floating(_));
+        let external = if floating {
+            widget.cast::<sys::LV2_External_UI_Widget>()
+        } else {
+            std::ptr::null_mut()
+        };
         let mut e = Editor {
+            place,
             desc,
             handle,
             widget,
+            external,
             idle,
             ui_resize,
             _features: features,
@@ -330,12 +429,35 @@ impl Editor {
             atom: vec![0; 1024],
             _library: library,
         };
-        if !e.sized
+        if floating {
+            if e.external.is_null() {
+                return Err(format!("{}: the UI gave no window", model.name));
+            }
+            // Its own window: nothing to size.
+            e.sized = true;
+            e.show();
+        } else if !e.sized
             && let Some(size) = window_size(e.widget as usize as u32)
         {
             e.request_size(size);
         }
         Ok(e)
+    }
+
+    /// Show an external UI's window (again).
+    pub fn show(&mut self) {
+        if !self.external.is_null() && !self.closed {
+            // SAFETY: the external UI's widget, alive until cleanup.
+            unsafe {
+                if let Some(f) = (*self.external).show {
+                    f(self.external);
+                }
+            }
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 
     fn request_size(&mut self, size: (u32, u32)) {
@@ -402,15 +524,28 @@ impl Editor {
             let size = (8 + body.len()) as u32;
             self.port_event(port, size, transfer, self.atom.as_ptr().cast());
         }
-        if !self.idle.is_null() {
+        if self.closed {
+            return;
+        }
+        if !self.external.is_null() {
+            // SAFETY: the external UI's widget, alive until cleanup.
+            unsafe {
+                if let Some(f) = (*self.external).run {
+                    f(self.external);
+                }
+            }
+        } else if !self.idle.is_null() {
             // SAFETY: the UI's idle interface.
             let r = unsafe { (*self.idle).idle.map_or(0, |f| f(self.handle)) };
             if r != 0 {
-                self.closed = true;
-                let mut q = self.controller.requests.get();
-                q.closed = true;
-                self.controller.requests.set(q);
+                self.controller.closed.set(true);
             }
+        }
+        if self.controller.closed.get() {
+            self.closed = true;
+            let mut q = self.controller.requests.get();
+            q.closed = true;
+            self.controller.requests.set(q);
         }
         if !self.sized && self.size_tries < 10 {
             self.size_tries += 1;
@@ -461,8 +596,15 @@ fn window_size(window: u32) -> Option<(u32, u32)> {
 
 impl Drop for Editor {
     fn drop(&mut self) {
-        // SAFETY: the UI is not used after this.
+        // SAFETY: the external UI's widget, then the UI's cleanup; the UI
+        // is not used after this.
         unsafe {
+            if !self.external.is_null()
+                && !self.closed
+                && let Some(f) = (*self.external).hide
+            {
+                f(self.external);
+            }
             if let Some(f) = (*self.desc).cleanup {
                 f(self.handle);
             }
@@ -472,15 +614,15 @@ impl Drop for Editor {
 
 impl PluginEditor for Lv2Instance {
     fn can_embed(&mut self, api: WindowApi) -> bool {
-        api == WindowApi::X11 && find(&self.model).is_some()
+        api == WindowApi::X11 && embeddable(&self.model).is_some()
     }
 
     fn can_float(&mut self, _api: WindowApi) -> bool {
-        false
+        floating(&self.model).is_some()
     }
 
     fn open_embedded(&mut self, api: WindowApi, scale: f64) -> Result<(u32, u32), PluginError> {
-        if api != WindowApi::X11 || find(&self.model).is_none() {
+        if api != WindowApi::X11 || embeddable(&self.model).is_none() {
             return Err(PluginError::Failed("no X11 editor".into()));
         }
         self.ui_scale = scale;
@@ -489,31 +631,27 @@ impl PluginEditor for Lv2Instance {
     }
 
     fn attach(&mut self, parent: ParentWindow) -> Result<(), PluginError> {
-        let ui = find(&self.model).ok_or_else(|| PluginError::Failed("no X11 editor".into()))?;
-        let rate = self.rate;
-        let ed = Editor::open(&self.model, ui, parent.handle, rate, self.ui_scale)
-            .map_err(PluginError::Failed)?;
-        self.editor = Some(ed);
-        self.shared
-            .ui_open
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.idle_ui();
-        Ok(())
+        self.open_editor(Place::Embedded(parent.handle))
+            .map_err(PluginError::Failed)
     }
 
-    fn open_floating(&mut self, _api: WindowApi, _title: &str) -> Result<(), PluginError> {
-        Err(PluginError::Failed("LV2 editors embed".into()))
+    fn open_floating(&mut self, _api: WindowApi, title: &str) -> Result<(), PluginError> {
+        self.open_editor(Place::Floating(title.to_string()))
+            .map_err(PluginError::Failed)
+    }
+
+    fn raise(&mut self) {
+        if let Some(ed) = self.editor.as_mut() {
+            ed.show();
+        }
     }
 
     fn close(&mut self) {
-        self.shared
-            .ui_open
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.editor = None;
+        self.close_editor();
     }
 
     fn is_open(&self) -> bool {
-        self.editor.as_ref().is_some_and(|e| !e.closed)
+        self.editor.as_ref().is_some_and(|e| !e.is_closed())
     }
 
     fn can_resize(&mut self) -> bool {

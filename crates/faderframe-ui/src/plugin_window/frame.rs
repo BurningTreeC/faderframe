@@ -40,6 +40,9 @@ pub struct Frame {
     placed: Cell<Option<Room>>,
     /// Where the window goes once shown.
     pending_move: Cell<Option<(i32, i32)>>,
+    /// A size the plugin asked for before the window's first configure,
+    /// asked again once it has one.
+    pending_size: Cell<Option<(u32, u32)>>,
 }
 
 impl Frame {
@@ -119,6 +122,7 @@ impl Frame {
             header: (f64::from(header_h) * scale).round() as u32,
             placed: Cell::new(None),
             pending_move: Cell::new(None),
+            pending_size: Cell::new(None),
         })
     }
 
@@ -186,6 +190,10 @@ impl Frame {
     /// header. Returns the room's size (backend pixels) when it changed.
     pub fn follow(&self, x: &Parents) -> Option<(u32, u32)> {
         let room = self.room(x)?;
+        if let Some(size) = self.pending_size.take() {
+            self.request_size(x, size);
+            self.window.queue_resize();
+        }
         if let Some(pos) = self.pending_move.take() {
             x.move_to(self.top, pos);
         }
@@ -197,6 +205,13 @@ impl Frame {
 
     /// The plugin asked for another size (backend pixels).
     pub fn request_size(&self, x: &Parents, size: (u32, u32)) {
+        // Shown but not yet configured (an editor asking while it starts,
+        // as LV2 UIs do): GDK resizes no X11 window while its first
+        // configure is pending, and the window would keep the size it was
+        // mapped with.
+        if self.window.width() <= 0 {
+            self.pending_size.set(Some(size));
+        }
         let scale = self.window.surface().map_or(1.0, |s| x.frame_scale(&s));
         let (w, h) = logical(size, scale);
         if self.resizable {

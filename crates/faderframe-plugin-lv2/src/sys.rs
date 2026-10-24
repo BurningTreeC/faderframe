@@ -250,6 +250,29 @@ pub struct LV2UI_Touch {
 /// `LV2UI_INVALID_PORT_INDEX`.
 pub const LV2UI_INVALID_PORT_INDEX: u32 = u32::MAX;
 
+/// `LV2_Extension_Data_Feature` (data-access): the plugin's
+/// `extension_data`.
+#[repr(C)]
+pub struct LV2_Extension_Data_Feature {
+    pub data_access: Option<unsafe extern "C" fn(uri: *const c_char) -> *const c_void>,
+}
+
+/// An external UI's widget (kxstudio's external-ui extension): it shows
+/// its own window and runs its events in `run`.
+#[repr(C)]
+pub struct LV2_External_UI_Widget {
+    pub run: Option<unsafe extern "C" fn(*mut LV2_External_UI_Widget)>,
+    pub show: Option<unsafe extern "C" fn(*mut LV2_External_UI_Widget)>,
+    pub hide: Option<unsafe extern "C" fn(*mut LV2_External_UI_Widget)>,
+}
+
+/// The host side of an external UI: told when the user closed its window.
+#[repr(C)]
+pub struct LV2_External_UI_Host {
+    pub ui_closed: Option<unsafe extern "C" fn(controller: LV2UI_Controller)>,
+    pub plugin_human_id: *const c_char,
+}
+
 /// URIs the host uses.
 pub mod uri {
     pub const LV2: &str = "http://lv2plug.in/ns/lv2core#";
@@ -310,4 +333,11 @@ pub mod uri {
     pub const UI_SCALE: &str = "http://lv2plug.in/ns/extensions/ui#scaleFactor";
     pub const UI_X11: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
     pub const INSTANCE_ACCESS: &str = "http://lv2plug.in/ns/ext/instance-access";
+    pub const DATA_ACCESS: &str = "http://lv2plug.in/ns/ext/data-access";
+    /// External UIs: the class and host feature, kxstudio's and the older
+    /// ones they replaced.
+    pub const EXTERNAL_UI_WIDGET: &str = "http://kxstudio.sf.net/ns/lv2ext/external-ui#Widget";
+    pub const EXTERNAL_UI_HOST: &str = "http://kxstudio.sf.net/ns/lv2ext/external-ui#Host";
+    pub const EXTERNAL_UI_OLD_WIDGET: &str = "http://lv2plug.in/ns/extensions/ui#external";
+    pub const EXTERNAL_UI_OLD_HOST: &str = "http://nedko.arnaudov.name/lv2/external_ui/";
 }

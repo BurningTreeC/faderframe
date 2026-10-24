@@ -45,12 +45,17 @@ pub struct Lv2Instance {
     /// may run alongside the audio thread.
     handle: sys::LV2_Handle,
     state_iface: *const sys::LV2_State_Interface,
+    /// The descriptor's `extension_data`, for the UI's data-access.
+    extension_data:
+        Option<unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void>,
     max_frames: usize,
     /// Rate and block size of the last activation.
     active: Option<(f64, u32)>,
     latency: u32,
     activations: u64,
     pub(crate) editor: Option<crate::ui::Editor>,
+    /// The UIs' entry point when it is linked into this program.
+    ui_entry: Option<sys::LV2UI_Descriptor_Function>,
     pub(crate) ui_scale: f64,
     pub(crate) rate: f64,
     pub(crate) edits: Vec<EditorEdit>,
@@ -111,6 +116,7 @@ impl Lv2Instance {
             state_iface: core
                 .extension(sys::uri::STATE_INTERFACE)
                 .cast::<sys::LV2_State_Interface>(),
+            extension_data: core.extension_data(),
             cell: Arc::new(TryCell::new(core)),
             links,
             binary,
@@ -121,6 +127,7 @@ impl Lv2Instance {
             latency: 0,
             activations: 0,
             editor: None,
+            ui_entry: None,
             ui_scale: 1.0,
             edits: Vec::new(),
             program: None,
@@ -129,6 +136,13 @@ impl Lv2Instance {
         };
         s.load_default_state();
         Ok(s)
+    }
+
+    /// The plugin's UIs come from an entry point linked into this program
+    /// (`model` describes them as their bundle would).
+    pub fn with_ui_entry(mut self, entry: sys::LV2UI_Descriptor_Function) -> Self {
+        self.ui_entry = Some(entry);
+        self
     }
 
     /// The bundle's metadata (presets, default state).
@@ -209,6 +223,9 @@ impl Lv2Instance {
     /// Make the plugin again for `rate` and blocks of `frames`.
     fn reinstantiate(&mut self, rate: f64, frames: usize) -> Result<(), PluginError> {
         let saved = self.current_state();
+        // The UI may hold the old instance (instance-access): it goes
+        // before it and is made again on the new one.
+        let place = self.editor.take().map(|e| e.place.clone());
         if let Some(mut old) = self.cell.lock_blocking(10_000) {
             old.live = false;
         }
@@ -224,13 +241,52 @@ impl Lv2Instance {
         self.state_iface = core
             .extension(sys::uri::STATE_INTERFACE)
             .cast::<sys::LV2_State_Interface>();
+        self.extension_data = core.extension_data();
         self.cell = Arc::new(TryCell::new(core));
         self.links = links;
         self.rate = rate;
         self.max_frames = frames;
         self.active = None;
-        self.restore(&saved.properties).map_err(failed)?;
+        let restored = self.restore(&saved.properties);
+        if let Some(place) = place
+            && let Err(e) = self.open_editor(place)
+        {
+            tracing::warn!("{}: the editor did not open again: {e}", self.model.name);
+        }
+        restored.map_err(failed)
+    }
+
+    /// Make the UI that shows at `place`, on the current instance.
+    pub(crate) fn open_editor(&mut self, place: crate::ui::Place) -> Result<(), String> {
+        self.close_editor();
+        let model = Arc::clone(&self.model);
+        let ui = match place {
+            crate::ui::Place::Embedded(_) => crate::ui::embeddable(&model),
+            crate::ui::Place::Floating(_) => crate::ui::floating(&model),
+        }
+        .ok_or("no editor that shows so")?;
+        let plugin = crate::ui::PluginAccess {
+            handle: self.handle,
+            extension_data: self.extension_data,
+        };
+        let ed = crate::ui::Editor::open(
+            &model,
+            ui,
+            place,
+            plugin,
+            self.ui_entry,
+            self.rate,
+            self.ui_scale,
+        )?;
+        self.editor = Some(ed);
+        self.shared.ui_open.store(true, Ordering::Relaxed);
+        self.idle_ui();
         Ok(())
+    }
+
+    pub(crate) fn close_editor(&mut self) {
+        self.shared.ui_open.store(false, Ordering::Relaxed);
+        self.editor = None;
     }
 
     /// The UI's writes and the plugin's messages for it.
@@ -279,6 +335,15 @@ impl Lv2Instance {
             ed.idle(&self.model, &self.shared, &mut self.links.from_plugin);
         }
         self.pump_ui();
+        // Closed by the user (or its idle): cleaned up now, outside its
+        // own callbacks.
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(crate::ui::Editor::is_closed)
+        {
+            self.close_editor();
+        }
     }
 }
 

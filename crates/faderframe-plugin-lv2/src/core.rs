@@ -458,6 +458,14 @@ impl Core {
     }
 
     /// The plugin's extension data for `uri`.
+    /// The plugin's `extension_data` (for a UI's data-access).
+    pub fn extension_data(
+        &self,
+    ) -> Option<unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void> {
+        // SAFETY: reading the descriptor's function table.
+        unsafe { (*self.desc).extension_data }
+    }
+
     pub fn extension(&self, uri: &str) -> *const std::ffi::c_void {
         let Ok(name) = CString::new(uri) else {
             return std::ptr::null();

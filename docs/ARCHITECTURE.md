@@ -3201,7 +3201,10 @@ headers). The plugin is driven directly, without lilv.
 * **Metadata.** It is Turtle (`ttl.rs`: `oxttl` into one graph per bundle,
   relative IRIs resolved per file).
   * `scan` reads a bundle's `manifest.ttl` and the files it points to:
-    plugins, UIs, presets.
+    plugins, UIs, presets. A UI's binary is its `lv2:binary` (UI 2.x;
+    JUCE writes it) or the older `ui:binary`; UI classes are the `ui:`
+    ones and kxstudio's external UI (`external-ui#Widget`, or the older
+    `ui#external`).
   * Nothing is loaded, so scanning needs no helper process. A cache of
     descriptions (`scan::Cache`, `lv2-scan.json`) is refreshed by `stat`
     unless a bundle's Turtle files changed.
@@ -3250,15 +3253,37 @@ headers). The plugin is driven directly, without lilv.
   * Output control ports (meters, latency) are published as atomics.
   * No allocation on the audio thread (`tests/host.rs`, which drives a
     plugin written in the test itself).
-* **Editors** (`ui.rs`): X11 UIs only, embedded with `ui:parent`.
+* **Editors** (`ui.rs`): X11 UIs embedded with `ui:parent`
+  (`ui::embeddable`), else external UIs in windows of their own
+  (`ui::floating`, `can_float`/`open_floating`: the widget's `show`, its
+  `run` on the host timer, `hide` before cleanup; the user closing it
+  calls the host feature's `ui_closed`; `plugin_human_id` = the editor
+  title).
   * Supported UI features: `ui:resize` (requests), `ui:touch` (gestures),
-    `ui:portMap`, the idle interface on a 30 ms host timer, and options
-    (rate, scale).
+    `ui:portMap`, the idle interface on a 30 ms host timer, options
+    (rate, scale), `instance-access` (the plugin's handle — JUCE's and
+    Yoshimi's UIs need it), `data-access` (the descriptor's
+    `extension_data`) and the external UI host (kxstudio's and the older
+    URI).
   * The size comes from `ui:resize`, else from the UI window's X11
-    geometry.
-  * UIs reach the plugin only through ports: control writes become
-    `EditorEdit`s, and atom messages travel through rings both ways. No
-    instance-access is given, so UIs survive re-instantiation.
+    geometry; the frame is made at 480 × 320 and follows the UI's first
+    request (`Frame::request_size` before its first configure).
+  * Control writes become `EditorEdit`s and atom messages travel through
+    rings both ways. A UI may hold the instance, so re-instantiation
+    (another rate or block size) cleans the UI up before the old instance
+    goes and makes it again on the new one, where it was (`ui::Place`:
+    the same parent window, or floating with its title).
+  * A closed UI (idle answered non-zero, or `ui_closed`) is cleaned up
+    after its callback returned (`Lv2Instance::idle_ui`).
+  * FLTK UIs (Yoshimi) on Wayland would decorate through libdecor's GTK 3
+    plugin, which cannot work in a process with GTK 4 (its calls bind to
+    GTK 4's; the process hangs): `faderframe_ui::plugins::prepare_plugin_toolkits`,
+    first in `main`, sets `FLTK_BACKEND=x11` while `DISPLAY` is set
+    (helpers inherit it).
+  * Tests: `tests/ui.rs` (UIs linked into the test through
+    `Lv2Instance::with_ui_entry`: both binaries scanned, instance and
+    data access, made again after a rate change, an external UI's
+    show/run/close).
 * The sandbox carries LV2 like the other formats (`Format::Lv2`). Tests:
   `tests/host.rs` (CI) and the opt-in `tests/bundles.rs`
   (`FADERFRAME_TEST_LV2_PATH`: the LV2 book's examples and DPF's). The
@@ -3323,7 +3348,10 @@ plugins size their editors in). Backends add `frame_display`,
 On Windows and macOS the frame is an application window, transient for
 the main window, like the device editors. Plugin resize requests set the
 room's content size (fixed-size editors) or the window's default size
-(resizable); a resizable editor takes the room's new size unless it is
+(resizable); a request made before the frame's first configure (an editor
+asking while it starts) is asked again once the window has its size,
+with a queued resize (`Frame::pending_size`: GDK resizes no X11 window
+while its first configure is pending); a resizable editor takes the room's new size unless it is
 within one GTK pixel of the size it has or asked for (never answer a
 plugin's own resize with another). Frames are moved to their stored place
 once shown (GTK cannot place windows; the backends can). The plugin
