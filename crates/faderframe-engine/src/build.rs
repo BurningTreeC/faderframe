@@ -736,6 +736,8 @@ impl PluginCx<'_> {
                     bypass,
                     p.failed,
                     channels,
+                    p.missed,
+                    spec.event_inputs > 0,
                 );
                 (
                     b.add_node(

@@ -20,6 +20,10 @@
 //!   audio thread (a byte through a pipe; Windows: an event) and waits for
 //!   its answer, then reads the outputs. Everything the helper writes is validated
 //!   (counts, event kinds, finite samples) — the host never trusts it.
+//! * **Late blocks**: one not answered within the callback's budget plays
+//!   silence (counted); the blocks after it, while the helper is still
+//!   busy with it, are not sent and report [`ProcessStatus::Missed`] (the
+//!   engine keeps their note-offs for the next block that is).
 //! * **Failure**: a helper that dies is noticed at once (its pipe closes;
 //!   Windows: its process handle is signalled); one that does not answer within [`BLOCK_TIMEOUT`] is given up. Either way
 //!   the processor reports [`ProcessStatus::Error`] (the engine bypasses
@@ -38,6 +42,7 @@
 //! [`PluginInstance`]: faderframe_plugin_host::PluginInstance
 //! [`PluginProcessor`]: faderframe_plugin_host::PluginProcessor
 //! [`ProcessStatus::Error`]: faderframe_plugin_host::ProcessStatus::Error
+//! [`ProcessStatus::Missed`]: faderframe_plugin_host::ProcessStatus::Missed
 
 pub mod wire;
 

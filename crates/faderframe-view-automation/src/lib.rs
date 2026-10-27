@@ -546,20 +546,23 @@ impl AutomationView {
             .track(track)
             .map(|t| t.automation.lanes.iter().map(|l| l.target).collect())
             .unwrap_or_default();
-        let mut items: Vec<MenuItem<Action>> = model
-            .automatable_parameters(track)
-            .into_iter()
-            .filter(|p| !existing.contains(&p.target))
-            .map(|p| {
-                MenuItem::new(
-                    p.name.clone(),
-                    Action::ShowAutomation {
-                        track,
-                        target: p.target,
-                    },
-                )
-            })
-            .collect();
+        // The track's own, then each device's in a submenu.
+        let mut items = faderframe_ui_canvas::menu::grouped(
+            model
+                .automatable_parameters(track)
+                .into_iter()
+                .filter(|p| !existing.contains(&p.target))
+                .map(|p| {
+                    let item = MenuItem::new(
+                        p.menu_label(),
+                        Action::ShowAutomation {
+                            track,
+                            target: p.target,
+                        },
+                    );
+                    (p.menu, item)
+                }),
+        );
         if items.is_empty() {
             items.push(MenuItem::disabled("Every parameter has a lane"));
         }

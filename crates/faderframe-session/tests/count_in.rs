@@ -1,10 +1,11 @@
 #![allow(clippy::unwrap_used)]
-//! A pre-roll that cannot reach back far enough (recording from the start,
-//! or closer to it than the pre-roll): what it cannot play before the
-//! project's start is counted in before playback — the transport stands at
-//! the start while the click counts, then plays from there, and the take
-//! holds what was played from that moment. With the dummy device in real
-//! time (120 BPM 4/4: a beat is 24 000 frames, a bar 96 000 — two seconds).
+//! Counting in before playback: the transport stands while the click
+//! counts, then plays from there, and the take holds what was played from
+//! that moment. A count-in of its own length comes before the pre-roll;
+//! what a pre-roll cannot play before the project's start is counted in
+//! too (recording from the start, or closer to it than the pre-roll).
+//! With the dummy device in real time (120 BPM 4/4: a beat is 24 000
+//! frames, a bar 96 000 — two seconds).
 
 use faderframe_audio::dummy::DummyBackend;
 use faderframe_core::TrackId;
@@ -46,11 +47,17 @@ fn session() -> (Session, TrackId) {
     (s, t)
 }
 
-fn preroll(s: &mut Session, roll: Roll, on_bar: bool, count_in: bool) {
+fn preroll(s: &mut Session, roll: Roll, on_bar: bool) {
     let mut r = s.record;
     r.preroll = roll;
     r.preroll_on_bar = on_bar;
-    r.count_in = count_in;
+    s.dispatch(Action::SetRecordSettings(r)).unwrap();
+}
+
+fn count_in(s: &mut Session, length: Option<Roll>) {
+    let mut r = s.record;
+    r.count_in = length.is_some();
+    r.count_in_length = length.unwrap_or(r.count_in_length);
     s.dispatch(Action::SetRecordSettings(r)).unwrap();
 }
 
@@ -154,7 +161,7 @@ fn the_pre_roll_before_the_start_is_a_count_in() {
 #[test]
 fn recording_from_the_start_counts_a_bar_in_then_plays_and_records_from_it() {
     let (mut s, t) = session();
-    preroll(&mut s, Roll::bars(1.0), true, false);
+    preroll(&mut s, Roll::bars(1.0), true);
     transport(&mut s, TransportAction::ToggleRecord);
     assert!(s.transport().playing, "started at once");
     let w = watch(&mut s, |s, w| {
@@ -208,46 +215,123 @@ fn recording_from_the_start_counts_a_bar_in_then_plays_and_records_from_it() {
 
 /// From beat 3 of bar 1 with a one-bar pre-roll (not on a bar): two beats
 /// are counted in, two play from the start before the take — and Stop
-/// returns to beat 3. A count-in setting keeps those two beats silent but
-/// counts and records the same way.
+/// returns to beat 3.
 #[test]
 fn a_pre_roll_reaching_past_the_start_counts_in_the_rest() {
-    for count_in in [false, true] {
-        let (mut s, t) = session();
-        preroll(&mut s, Roll::bars(1.0), false, count_in);
-        transport(
-            &mut s,
-            TransportAction::Locate(MusicalTime::from_quarters_i(2)),
-        );
-        tick_for(&mut s, Duration::from_millis(50));
-        transport(&mut s, TransportAction::ToggleRecord);
-        let w = watch(&mut s, |s, w| {
-            w.playing_from.is_some() && s.processing_position() >= 3 * BEAT
-        });
-        let c = counted(&w);
-        assert!(
-            (Duration::from_millis(900)..Duration::from_millis(1_300)).contains(&c),
-            "two beats counted in: {c:?}"
-        );
-        assert!(w.counting_positions.iter().all(|p| *p == 0), "{w:?}");
-        assert!(
-            w.shown.iter().all(|p| (-2 * BEAT..0).contains(p)),
-            "{:?}",
-            w.shown
-        );
-        assert_eq!(s.engine().count_in(), count_in);
-        transport(&mut s, TransportAction::Stop);
-        s.wait_for_recordings();
-        let c = takes(&s, t);
-        assert_eq!(c.len(), 1, "{c:?}");
-        assert_eq!(
-            c[0].start,
-            MusicalTime::from_quarters_i(2),
-            "the take at beat 3"
-        );
-        tick_for(&mut s, Duration::from_millis(100));
-        assert_eq!(s.processing_position(), 2 * BEAT, "back at beat 3");
-    }
+    let (mut s, t) = session();
+    preroll(&mut s, Roll::bars(1.0), false);
+    transport(
+        &mut s,
+        TransportAction::Locate(MusicalTime::from_quarters_i(2)),
+    );
+    tick_for(&mut s, Duration::from_millis(50));
+    transport(&mut s, TransportAction::ToggleRecord);
+    let w = watch(&mut s, |s, w| {
+        w.playing_from.is_some() && s.processing_position() >= 3 * BEAT
+    });
+    let c = counted(&w);
+    assert!(
+        (Duration::from_millis(900)..Duration::from_millis(1_300)).contains(&c),
+        "two beats counted in: {c:?}"
+    );
+    assert!(w.counting_positions.iter().all(|p| *p == 0), "{w:?}");
+    assert!(
+        w.shown.iter().all(|p| (-2 * BEAT..0).contains(p)),
+        "{:?}",
+        w.shown
+    );
+    transport(&mut s, TransportAction::Stop);
+    s.wait_for_recordings();
+    let c = takes(&s, t);
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(
+        c[0].start,
+        MusicalTime::from_quarters_i(2),
+        "the take at beat 3"
+    );
+    tick_for(&mut s, Duration::from_millis(100));
+    assert_eq!(s.processing_position(), 2 * BEAT, "back at beat 3");
+}
+
+/// The reported wish (#23): a count-in without a pre-roll. Recording from
+/// bar 3 with a one-bar count-in stands at bar 3 for a bar while the click
+/// counts (shown as bar 2), then plays and records from there.
+#[test]
+fn a_count_in_counts_its_bars_then_records_from_the_playhead() {
+    let (mut s, t) = session();
+    count_in(&mut s, Some(Roll::bars(1.0)));
+    transport(
+        &mut s,
+        TransportAction::Locate(MusicalTime::from_quarters_i(8)),
+    );
+    tick_for(&mut s, Duration::from_millis(50));
+    transport(&mut s, TransportAction::ToggleRecord);
+    let w = watch(&mut s, |s, w| {
+        w.playing_from.is_some() && s.processing_position() >= 2 * BAR + BEAT
+    });
+    let c = counted(&w);
+    assert!(
+        (Duration::from_millis(1_850)..Duration::from_millis(2_300)).contains(&c),
+        "a bar counted in: {c:?}"
+    );
+    assert!(w.counting_positions.iter().all(|p| *p == 2 * BAR), "{w:?}");
+    assert!(
+        w.shown.iter().all(|p| (BAR..2 * BAR).contains(p)),
+        "shown in bar 2: {:?}",
+        w.shown
+    );
+    transport(&mut s, TransportAction::Stop);
+    s.wait_for_recordings();
+    let c = takes(&s, t);
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(
+        c[0].start,
+        MusicalTime::from_quarters_i(8),
+        "the take at bar 3"
+    );
+    tick_for(&mut s, Duration::from_millis(100));
+    assert_eq!(s.processing_position(), 2 * BAR, "back at bar 3");
+}
+
+/// A count-in comes before the pre-roll: it stands at the pre-roll's
+/// start while it counts. From the project's start, the pre-roll that
+/// cannot play there is counted in as well (both, back to back).
+#[test]
+fn a_count_in_comes_before_the_pre_roll() {
+    let (mut s, _) = session();
+    count_in(&mut s, Some(Roll::beats(2.0)));
+    preroll(&mut s, Roll::bars(1.0), true);
+    // From bar 3: two beats standing at bar 2, then bar 2 plays.
+    transport(
+        &mut s,
+        TransportAction::Locate(MusicalTime::from_quarters_i(8)),
+    );
+    tick_for(&mut s, Duration::from_millis(50));
+    transport(&mut s, TransportAction::ToggleRecord);
+    let w = watch(&mut s, |s, w| {
+        w.playing_from.is_some() && s.processing_position() >= BAR + BEAT
+    });
+    let c = counted(&w);
+    assert!(
+        (Duration::from_millis(900)..Duration::from_millis(1_300)).contains(&c),
+        "two beats counted in: {c:?}"
+    );
+    assert!(w.counting_positions.iter().all(|p| *p == BAR), "{w:?}");
+    transport(&mut s, TransportAction::AbortRecording);
+    s.wait_for_discarded_recordings();
+    tick_for(&mut s, Duration::from_millis(100));
+    // From the start: the bar of pre-roll and the two beats before it.
+    transport(&mut s, TransportAction::Locate(MusicalTime::ZERO));
+    tick_for(&mut s, Duration::from_millis(50));
+    transport(&mut s, TransportAction::ToggleRecord);
+    let w = watch(&mut s, |_, w| !w.counting_positions.is_empty());
+    let first = s.engine().transport_snapshot().counting_in as i64;
+    assert!(
+        (BAR + 2 * BEAT - 4_800..=BAR + 2 * BEAT).contains(&first),
+        "a bar and two beats to count: {first} ({w:?})"
+    );
+    transport(&mut s, TransportAction::AbortRecording);
+    s.wait_for_discarded_recordings();
 }
 
 /// Stop while counting in: nothing plays later, nothing is recorded, no
@@ -256,7 +340,7 @@ fn a_pre_roll_reaching_past_the_start_counts_in_the_rest() {
 #[test]
 fn stop_and_abort_cancel_a_count_in_and_a_restart_counts_in_again() {
     let (mut s, t) = session();
-    preroll(&mut s, Roll::bars(1.0), true, false);
+    preroll(&mut s, Roll::bars(1.0), true);
     for how in [
         TransportAction::Stop,
         TransportAction::AbortRecording,

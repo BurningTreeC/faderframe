@@ -600,45 +600,46 @@ impl ArrangerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    /// Every automatable parameter of the track, checked when shown.
-    pub(crate) fn parameter_menu(
-        model: &Session,
-        track: TrackId,
-        at: Point,
-    ) -> HostRequest<Action> {
+    /// Every automatable parameter of the track, checked when shown: the
+    /// track's own, then each device's in a submenu.
+    pub fn parameter_menu(model: &Session, track: TrackId, at: Point) -> HostRequest<Action> {
         let shown: Vec<_> = model
             .shown_lanes(track)
             .iter()
             .map(|l| (l.target, l.id))
             .collect();
-        let items = model
-            .automatable_parameters(track)
-            .into_iter()
-            .map(|param| {
-                let lane = shown
-                    .iter()
-                    .find(|(t, _)| *t == param.target)
-                    .map(|(_, id)| *id);
-                let has_points = model
-                    .project()
-                    .track(track)
-                    .and_then(|t| t.automation.lane(param.target))
-                    .is_some_and(|l| !l.curve.is_empty());
-                let label = if has_points {
-                    format!("{} ●", param.name)
-                } else {
-                    param.name.clone()
-                };
-                let action = match lane {
-                    Some(id) => Action::HideAutomationLane(id),
-                    None => Action::ShowAutomation {
-                        track,
-                        target: param.target,
-                    },
-                };
-                MenuItem::new(label, action).checked(lane.is_some())
-            })
-            .collect();
+        let items = faderframe_ui_canvas::menu::grouped(
+            model
+                .automatable_parameters(track)
+                .into_iter()
+                .map(|param| {
+                    let lane = shown
+                        .iter()
+                        .find(|(t, _)| *t == param.target)
+                        .map(|(_, id)| *id);
+                    let has_points = model
+                        .project()
+                        .track(track)
+                        .and_then(|t| t.automation.lane(param.target))
+                        .is_some_and(|l| !l.curve.is_empty());
+                    let label = if has_points {
+                        format!("{} ●", param.menu_label())
+                    } else {
+                        param.menu_label().to_string()
+                    };
+                    let action = match lane {
+                        Some(id) => Action::HideAutomationLane(id),
+                        None => Action::ShowAutomation {
+                            track,
+                            target: param.target,
+                        },
+                    };
+                    (
+                        param.menu,
+                        MenuItem::new(label, action).checked(lane.is_some()),
+                    )
+                }),
+        );
         HostRequest::ContextMenu { at, items }
     }
 

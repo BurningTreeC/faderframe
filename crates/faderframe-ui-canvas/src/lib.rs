@@ -22,6 +22,7 @@ pub mod controls;
 mod event;
 pub mod flow;
 mod geometry;
+pub mod menu;
 mod paint;
 mod painter;
 mod text;

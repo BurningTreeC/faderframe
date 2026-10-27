@@ -648,6 +648,23 @@ impl Active {
                     key,
                     velocity,
                 } if velocity > 0 => {
+                    // One note per key and channel: one still sounding there
+                    // (two sources, a graph handing the plugin on) ends
+                    // first — a plugin matching note-offs by note id would
+                    // otherwise keep it for ever.
+                    let old = self.note_ids.end(channel, key);
+                    if old != NoteIds::NONE {
+                        self.in_events
+                            .push(note_event(t, kNoteOffEvent as u16, |e| {
+                                e.__field0.noteOff = NoteOffEvent {
+                                    channel: channel as i16,
+                                    pitch: key as i16,
+                                    velocity: 0.0,
+                                    noteId: old,
+                                    tuning: 0.0,
+                                }
+                            }));
+                    }
                     let id = self.note_ids.start(channel, key);
                     self.in_events.push(note_event(t, kNoteOnEvent as u16, |e| {
                         e.__field0.noteOn = NoteOnEvent {
@@ -954,7 +971,7 @@ impl PluginProcessor for Vst3Processor {
     fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
         let Some(mut guard) = self.cell.try_lock() else {
             silence(io);
-            return ProcessStatus::Continue;
+            return ProcessStatus::Missed;
         };
         match guard.as_mut() {
             Some(active) => active.process(ctx, io),

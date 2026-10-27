@@ -27,22 +27,29 @@ contents=$app/Contents
 res=$contents/Resources
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Frameworks" "$res/share/glib-2.0/schemas" "$res/share/icons"
-# The program and its launcher (the bundle's executable). Distinct names
-# beyond case: macOS file systems usually ignore case.
-cp "$bin" "$contents/MacOS/faderframe-bin"
-install -m755 packaging/macos/launcher.sh "$contents/MacOS/FaderFrame"
+# The program is the bundle's executable (a launcher script would make
+# Apple silicon take the app for an Intel one); it finds the bundle's data
+# itself (faderframe_ui::app_bundle).
+cp "$bin" "$contents/MacOS/FaderFrame"
 sed "s/@VERSION@/$version/g" packaging/macos/Info.plist >"$contents/Info.plist"
 python3 packaging/icons.py icns packaging/icons/io.github.BurningTreeC.FaderFrame.svg "$res/FaderFrame.icns"
 cp LICENSE THIRD_PARTY_LICENSES.md AOM-PATENT-LICENSE.txt "$res/"
 
-# GTK's settings schemas and icon themes.
+# GTK's settings schemas and icon themes. Homebrew links them into its
+# prefix (relative links into its Cellar): copied as files, never as
+# links, which break on a Mac without Homebrew (and GTK then lacks its
+# fallback icon).
 cp "$brew"/share/glib-2.0/schemas/org.gtk.gtk4.*.gschema.xml "$res/share/glib-2.0/schemas/"
 glib-compile-schemas "$res/share/glib-2.0/schemas"
 for theme in hicolor Adwaita; do
     if [ -d "$brew/share/icons/$theme" ]; then
-        cp -R "$brew/share/icons/$theme" "$res/share/icons/"
+        cp -RL "$brew/share/icons/$theme" "$res/share/icons/"
     fi
 done
+if [ ! -f "$res/share/icons/hicolor/index.theme" ]; then
+    echo "the hicolor icon theme is missing (brew install hicolor-icon-theme)" >&2
+    exit 1
+fi
 
 # Image loaders (SVG icons), from Homebrew's shared loader directory (it
 # links every formula's loaders); the cache gets the bundle's path at
@@ -60,7 +67,7 @@ fi
 
 # GStreamer's plugins video uses (demuxers and muxers, JPEG, conversion,
 # Opus, the H.264/H.265 parsers, VideoToolbox decoding) and its plugin
-# scanner; the launcher points GStreamer at them.
+# scanner; the program points GStreamer at them (faderframe_ui::app_bundle).
 gst_src=$brew/lib/gstreamer-1.0
 gst_dir=$res/lib/gstreamer-1.0
 mkdir -p "$gst_dir"
@@ -83,13 +90,21 @@ gst_parts=("$gst_dir"/*.dylib)
 # Every non-system library the binary, the loaders and GStreamer's plugins
 # use.
 python3 packaging/macos/bundle_dylibs.py "$contents/Frameworks" \
-    "$contents/MacOS/faderframe-bin" "$loader_dir"/loaders/*.so "${gst_parts[@]}"
+    "$contents/MacOS/FaderFrame" "$loader_dir"/loaders/*.so "${gst_parts[@]}"
+
+# Nothing in the bundle may point outside it.
+links=$(find "$res" -type l)
+if [ -n "$links" ]; then
+    echo "links left in the bundle's resources:" >&2
+    echo "$links" >&2
+    exit 1
+fi
 
 # Ad-hoc signatures (install_name_tool invalidated the original ones).
 find "$contents/Frameworks" "$loader_dir/loaders" "$gst_dir" -type f \( -name '*.dylib' -o -name '*.so' \) \
     -exec codesign --force --sign - {} \;
 [ -f "$contents/MacOS/gst-plugin-scanner" ] && codesign --force --sign - "$contents/MacOS/gst-plugin-scanner"
-codesign --force --sign - "$contents/MacOS/faderframe-bin"
+codesign --force --sign - "$contents/MacOS/FaderFrame"
 codesign --force --sign - "$app"
 
 dmg=$dist/FaderFrame-$version-macos-$arch.dmg

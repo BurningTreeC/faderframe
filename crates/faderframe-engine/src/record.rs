@@ -67,14 +67,10 @@ pub const RECORDING_TRACKS: usize = 128;
 /// window and the tracks whose input is captured. Their clips are silent
 /// inside the window and their input is heard there (tape style), so
 /// recording over a clip does not play the clip under the new take.
-///
-/// With a count-in, nothing of the arrangement plays before the window
-/// (the pre-roll is the click alone).
 #[derive(Clone, Copy, Debug)]
 pub struct RecordingNow {
     window: Option<(i64, i64)>,
     tracks: [Option<TrackId>; RECORDING_TRACKS],
-    pub(crate) count_in: bool,
 }
 
 impl Default for RecordingNow {
@@ -82,28 +78,11 @@ impl Default for RecordingNow {
         Self {
             window: None,
             tracks: [None; RECORDING_TRACKS],
-            count_in: false,
         }
     }
 }
 
 impl RecordingNow {
-    /// A record window and no audio tracks (a MIDI-only take: its count-in
-    /// silences the arrangement before the window all the same).
-    pub(crate) fn window_only(from: i64, to: i64, count_in: bool) -> Self {
-        Self {
-            window: Some((from, to)),
-            tracks: [None; RECORDING_TRACKS],
-            count_in,
-        }
-    }
-
-    /// Counting in: the arrangement is silent before this position.
-    pub fn silent_before(&self, recording: bool) -> Option<i64> {
-        let (from, _) = self.window?;
-        (self.count_in && recording).then_some(from)
-    }
-
     /// Records `track`?
     pub fn records(&self, track: TrackId) -> bool {
         self.window.is_some() && self.tracks.iter().map_while(|t| *t).any(|t| t == track)

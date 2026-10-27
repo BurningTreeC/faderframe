@@ -32,6 +32,18 @@ pub struct ModTargetChoice {
     pub takes_notes: bool,
     /// The parameter takes modulation per note (each voice its own).
     pub per_note: bool,
+    /// The submenus menus list it in: none for the track's own, else the
+    /// device and the plugin's own groups.
+    pub menu: Vec<String>,
+    /// Its label there when not `name`.
+    pub short: Option<String>,
+}
+
+impl ModTargetChoice {
+    /// Its label in its submenu.
+    pub fn menu_label(&self) -> &str {
+        self.short.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// A modulator mapping (see the module docs).
@@ -223,6 +235,8 @@ impl Session {
                 name: "Volume".into(),
                 takes_notes: false,
                 per_note: false,
+                menu: Vec::new(),
+                short: None,
             },
             ModTargetChoice {
                 target: ModTarget::Pan,
@@ -230,6 +244,8 @@ impl Session {
                 name: "Pan".into(),
                 takes_notes: false,
                 per_note: false,
+                menu: Vec::new(),
+                short: None,
             },
         ];
         for slot in t.slots() {
@@ -237,18 +253,22 @@ impl Session {
                 continue;
             };
             let takes_notes = self.engine.plugin_takes_notes(slot.id);
+            let device = t.name_of(slot);
             for p in infos {
                 if self.engine.plugin_modulatable(slot.id, p.id) {
+                    let (menu, short) = self.device_menu(&device, slot.id, p);
                     out.push(ModTargetChoice {
                         target: ModTarget::Plugin {
                             plugin: slot.id,
                             parameter: p.id,
                         },
-                        group: t.name_of(slot),
+                        group: device.clone(),
                         name: p.name.clone(),
                         takes_notes,
                         per_note: takes_notes
                             && self.engine.plugin_modulatable_per_note(slot.id, p.id),
+                        menu,
+                        short: Some(short),
                     });
                 }
             }

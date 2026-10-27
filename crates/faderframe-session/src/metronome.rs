@@ -235,9 +235,20 @@ impl Session {
         }
     }
 
+    /// Whether the click stops when a count-in has counted in (only while
+    /// counting in is on: a pre-roll's count-in before the project's start
+    /// keeps the metronome's mode otherwise).
+    pub(crate) fn apply_count_in_click(&self) {
+        let r = &self.record;
+        self.engine
+            .metronome()
+            .set_count_in_only(r.count_in && r.count_in_click_only);
+    }
+
     /// A new engine: the metronome as it was.
     pub(crate) fn reapply_metronome(&mut self) {
         self.engine.metronome().set_mode(self.record.metronome);
+        self.apply_count_in_click();
         self.apply_metronome_levels();
         // Its sounds at its rate, made in the next tick.
         self.metronome_rate = 0;

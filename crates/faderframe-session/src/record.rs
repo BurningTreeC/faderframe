@@ -133,8 +133,14 @@ pub struct RecordSettings {
     pub preroll: Roll,
     /// The pre-roll starts on a bar line (back from where it would).
     pub preroll_on_bar: bool,
-    /// The pre-roll plays the click alone (the arrangement waits).
+    /// Recording from stop counts in first: the transport stands while
+    /// the click alone counts `count_in_length` on the tempo and metre
+    /// there, then playback starts (at the pre-roll's start, if any).
     pub count_in: bool,
+    pub count_in_length: Roll,
+    /// The metronome clicks only while counting in: the take records
+    /// without it, whatever the metronome's mode.
+    pub count_in_click_only: bool,
     /// Played after a punch-out, then playback stops (punch range only).
     pub postroll: Roll,
     pub metronome: MetronomeMode,
@@ -160,6 +166,8 @@ impl Default for RecordSettings {
             preroll: Roll::OFF,
             preroll_on_bar: true,
             count_in: false,
+            count_in_length: Roll::bars(1.0),
+            count_in_click_only: true,
             postroll: Roll::OFF,
             metronome: MetronomeMode::Recording,
             latency_offset: 0,
@@ -814,13 +822,22 @@ impl Session {
             } else {
                 (self.record.preroll, self.record.preroll_on_bar)
             };
+            let mut plays_from = self.transport.position;
             if !roll.is_off() {
                 // What the pre-roll cannot play before the project's start
                 // is counted in before playback starts there.
                 let (start, frames) = self.pre_roll(from, roll, on_bar);
                 self.engine.transport(TransportCommand::Locate(start))?;
                 self.show_position(start);
+                plays_from = start;
                 count_in = frames;
+            }
+            // The count-in comes before all of it (the launcher's slots
+            // count in by their own setting, above).
+            if self.record.count_in && !slot {
+                let counted_from = plays_from - count_in as i64;
+                let back = self.rolled_back(counted_from, self.record.count_in_length);
+                count_in += (counted_from - back).max(0).unsigned_abs();
             }
             // Post-roll: on after the punch-out, then stop.
             if let Some((_, end)) = punch
@@ -1090,6 +1107,27 @@ impl Session {
         if roll.is_off() {
             return (from, 0);
         }
+        let start = self.rolled_back(from, roll);
+        let p = &self.project;
+        let meter = &p.timeline.meter;
+        let start = if on_bar {
+            let t = self.engine.samples_to_musical(p, start);
+            self.engine
+                .musical_to_samples(p, meter.bar_start(meter.bar_at(t)))
+        } else {
+            start
+        }
+        .min(from);
+        if start < 0 {
+            (0, start.unsigned_abs())
+        } else {
+            (start, 0)
+        }
+    }
+
+    /// `roll` before `from` (engine samples; negative before the project's
+    /// start, where its first tempo and metre carry back).
+    fn rolled_back(&self, from: i64, roll: Roll) -> i64 {
         let p = &self.project;
         let meter = &p.timeline.meter;
         let at = self.engine.samples_to_musical(p, from);
@@ -1112,22 +1150,9 @@ impl Session {
             }
             RollUnit::Seconds => None,
         };
-        let start = match back {
+        match back {
             Some(t) => self.engine.musical_to_samples(p, t),
             None => from - (roll.amount * f64::from(self.engine.sample_rate())).round() as i64,
-        };
-        let start = if on_bar {
-            let t = self.engine.samples_to_musical(p, start);
-            self.engine
-                .musical_to_samples(p, meter.bar_start(meter.bar_at(t)))
-        } else {
-            start
-        }
-        .min(from);
-        if start < 0 {
-            (0, start.unsigned_abs())
-        } else {
-            (start, 0)
         }
     }
 

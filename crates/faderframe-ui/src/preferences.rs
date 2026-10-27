@@ -157,6 +157,27 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          every changing curve on the CPU. Without a usable GPU they stay as they are.",
     ));
     row(&g, 7, "Drawing", &gpu);
+    let renderers: Vec<&str> = crate::drawing::RENDERERS.iter().map(|r| r.1).collect();
+    let renderer = gtk::DropDown::from_strings(&renderers);
+    renderer.set_selected(
+        crate::drawing::RENDERERS
+            .iter()
+            .position(|r| r.0 == prefs.renderer)
+            .unwrap_or(0) as u32,
+    );
+    renderer.set_tooltip_text(Some(
+        "What GTK draws the windows with, from the next start. Software needs no graphics \
+         driver: use it when the driver crashes or draws wrongly.",
+    ));
+    row(&g, 8, "Renderer", &renderer);
+    renderer.connect_selected_notify(|d| {
+        let r = crate::drawing::RENDERERS[(d.selected() as usize).min(3)];
+        let mut p = Preferences::load();
+        p.renderer = r.0.into();
+        if let Err(e) = p.save() {
+            tracing::warn!("cannot save preferences: {e}");
+        }
+    });
     {
         let weak = Rc::downgrade(app);
         gpu.connect_toggled(move |b| {
@@ -233,7 +254,7 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          its versions uses (deleted recordings and imports, replaced renders). The undo \
          history ends when the project closes, so nothing else needs them.",
     ));
-    row(&g, 8, "Unused media on closing", &unused);
+    row(&g, 9, "Unused media on closing", &unused);
     unused.connect_selected_notify(|d| {
         let mut p = Preferences::load();
         p.unused_media = UNUSED[(d.selected() as usize).min(UNUSED.len() - 1)]

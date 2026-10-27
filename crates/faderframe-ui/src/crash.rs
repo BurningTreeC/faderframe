@@ -191,7 +191,7 @@ fn prune(dir: &Path, prefix: &str, keep: usize) {
 }
 
 #[cfg(unix)]
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -201,7 +201,7 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -220,7 +220,7 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn alive(_pid: u32) -> bool {
+pub(crate) fn alive(_pid: u32) -> bool {
     false
 }
 
@@ -935,6 +935,14 @@ pub fn offer_previous_run(window: &gtk::Window) {
              or the computer stopped. Crash reports are kept in\n{}",
             dir.display()
         ),
+    };
+    let detail = if crate::drawing::switched_to_software() {
+        format!(
+            "{detail}\n\nIt crashed inside the graphics driver, so FaderFrame now draws its \
+             windows in software (Preferences → General → Renderer)."
+        )
+    } else {
+        detail
     };
     tracing::warn!(
         "the run started {} UTC did not close: report {}, log {}",

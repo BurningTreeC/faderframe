@@ -16,7 +16,7 @@ use faderframe_core::ClipId;
 use faderframe_project::pitch::{Edge, PitchEdit, PitchNote};
 use faderframe_project::{AudioClip, Clip};
 use faderframe_session::pitch::PitchOp;
-use faderframe_session::{Action, Session};
+use faderframe_session::{Action, Session, TransportAction};
 use faderframe_ui_canvas::{
     CanvasView, Color, Cursor, EventCx, HostRequest, Key, MenuItem, Modifiers, Paint, Painter,
     Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
@@ -77,6 +77,8 @@ enum Drag {
     Band { from: Point, to: Point, add: bool },
     /// Changing a toolbar value (pitch amount or straightening).
     Value { item: Item, from: f32, start: f32 },
+    /// Moving the playhead along the ruler.
+    Locate,
 }
 
 pub struct PitchView {
@@ -151,6 +153,19 @@ fn shown(model: &Session) -> Option<Shown<'_>> {
         rate,
         start: p.timeline.to_samples(clip.start, rate),
     })
+}
+
+/// Move the playhead to `seconds` into the clip shown (if any).
+fn locate(seconds: f64, model: &Session, cx: &mut EventCx<'_, Action>) -> bool {
+    let Some(s) = shown(model) else {
+        return false;
+    };
+    let at = s.start + (seconds * s.rate).round() as i64;
+    let tl = &model.project().timeline;
+    cx.emit(Action::Transport(TransportAction::Locate(
+        tl.to_musical(at.max(0), s.rate),
+    )));
+    true
 }
 
 /// A note's name (MIDI 60 = C4).
@@ -1081,6 +1096,15 @@ impl PitchView {
             return true;
         }
         let g = self.grid(size);
+        // The ruler: the playhead goes where it is clicked (and follows a
+        // drag).
+        if pos.y < g.y && pos.x >= g.x {
+            if !locate(self.ruler_seconds(pos.x, size), model, cx) {
+                return false;
+            }
+            self.drag = Some(Drag::Locate);
+            return true;
+        }
         if !g.contains(pos) {
             return false;
         }
@@ -1160,6 +1184,12 @@ impl PitchView {
         true
     }
 
+    /// The ruler's time at `x`: seconds into the clip, inside the view.
+    fn ruler_seconds(&self, x: f32, size: Size) -> f64 {
+        let g = self.grid(size);
+        self.seconds_at(x.clamp(g.x, g.right()), g)
+    }
+
     fn pointer_move(
         &mut self,
         pos: Point,
@@ -1170,6 +1200,7 @@ impl PitchView {
     ) -> bool {
         let row_h = self.row_h;
         let seconds = self.seconds_at(pos.x, self.grid(size));
+        let ruler = self.ruler_seconds(pos.x, size);
         match &mut self.drag {
             Some(Drag::Edge {
                 edge,
@@ -1238,6 +1269,7 @@ impl PitchView {
                 cx.redraw();
                 true
             }
+            Some(Drag::Locate) => locate(ruler, model, cx),
             Some(Drag::Value { item, from, start }) => {
                 let v = (*start + (pos.x - *from) / 200.0).clamp(0.0, 1.0);
                 let v = (v * 100.0).round() / 100.0;
@@ -1284,6 +1316,7 @@ impl PitchView {
                 cx.redraw();
                 true
             }
+            Some(Drag::Locate) => true,
             None => false,
         }
     }
@@ -1528,6 +1561,10 @@ impl CanvasView<Session, Action> for PitchView {
                 .into(),
             );
         }
+        if pos.y < TOOLBAR_H + RULER_H && pos.x >= self.keys_w() {
+            shown(model)?;
+            return Some("Click or drag to move the playhead".into());
+        }
         if self.edge_at(pos, size, model).is_some() {
             let melodic = shown(model)
                 .and_then(|s| s.edit().map(|e| e.polyphonic.is_none()))
@@ -1673,6 +1710,62 @@ mod tests {
             modifiers: Modifiers::NONE,
             clicks,
         }
+    }
+
+    /// A click on the ruler puts the playhead there, and it follows a drag
+    /// along it (the clip's place on the timeline counted in).
+    #[test]
+    fn the_ruler_moves_the_playhead() {
+        let (mut s, clip) = session();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let g = view.grid(size);
+        let rate = s.project().sample_rate as f64;
+        let start = s
+            .project()
+            .timeline
+            .to_samples(s.project().clip(clip).unwrap().start, rate);
+        // The view's scale as painted (it does not scroll here).
+        let (px_per_sec, scroll_x) = (view.px_per_sec, view.scroll_x);
+        let heard_at = |s: &Session, x: f32| {
+            let seconds = f64::from((x - g.x + scroll_x) / px_per_sec);
+            (
+                start + (seconds * rate).round() as i64,
+                s.transport().position,
+            )
+        };
+        let y = TOOLBAR_H + RULER_H / 2.0;
+        let x = g.x + 150.0;
+        send(&mut view, down(Point::new(x, y), 1), size, &mut s);
+        let (want, got) = heard_at(&s, x);
+        assert!((want - got).abs() <= 1, "clicked: {got}, wanted {want}");
+        let x = g.x + 400.0;
+        send(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(x, y + 80.0),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &mut s,
+        );
+        let (want, got) = heard_at(&s, x);
+        assert!((want - got).abs() <= 1, "dragged: {got}, wanted {want}");
+        send(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: Point::new(x, y),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &mut s,
+        );
+        assert!(view.drag.is_none());
+        assert!(shifts(&s, clip).iter().all(|v| *v == 0.0), "no note moved");
     }
 
     #[test]

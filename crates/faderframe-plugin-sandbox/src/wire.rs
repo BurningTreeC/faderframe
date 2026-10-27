@@ -145,6 +145,9 @@ pub struct Param {
     pub modulatable: bool,
     #[serde(default)]
     pub per_note: bool,
+    /// The plugin's group of it ("Scene A/Osc 1"; empty: none).
+    #[serde(default)]
+    pub group: String,
 }
 
 const UNITS: [ParameterUnit; 6] = [
@@ -169,16 +172,19 @@ impl From<&ParameterInfo> for Param {
             stepped: p.stepped,
             modulatable: false,
             per_note: false,
+            group: String::new(),
         }
     }
 }
 
 impl Param {
-    /// The parameter with what the instance says of its modulation.
+    /// The parameter with what the instance says of its modulation and
+    /// group.
     pub fn of(p: &ParameterInfo, inst: &dyn faderframe_plugin_host::PluginInstance) -> Self {
         Self {
             modulatable: inst.modulatable(p.id),
             per_note: inst.modulatable_per_note(p.id),
+            group: inst.parameter_group(p.id).unwrap_or_default(),
             ..Self::from(p)
         }
     }

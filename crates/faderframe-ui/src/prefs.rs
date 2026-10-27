@@ -67,8 +67,14 @@ pub struct Preferences {
     pub preroll: String,
     /// The pre-roll starts on a bar line.
     pub preroll_on_bar: bool,
-    /// The pre-roll plays the click alone.
+    /// Recording counts in first (until 0.31: the pre-roll played the
+    /// click alone).
     pub count_in: bool,
+    /// The count-in's length (`Roll::id`); empty: preferences from before
+    /// 0.32.
+    pub count_in_length: String,
+    /// The metronome clicks only while counting in.
+    pub count_in_click_only: bool,
     /// Played after a punch-out (`Roll::id`).
     pub postroll: String,
     /// How the metronome sounds (Preferences → Metronome).
@@ -115,6 +121,8 @@ pub struct Preferences {
     pub render_ahead_buses: bool,
     /// Draw dense views (analysers, meters, curves) on the GPU.
     pub gpu_painter: bool,
+    /// GTK's renderer (`drawing::RENDERERS`; empty: GTK's choice).
+    pub renderer: String,
     /// The GPU painter was set in Preferences (until then it is on, the
     /// default, whatever an older file says).
     pub gpu_painter_chosen: bool,
@@ -185,6 +193,8 @@ impl Default for Preferences {
             unused_media: "ask".into(),
             preroll_on_bar: true,
             count_in: false,
+            count_in_length: String::new(),
+            count_in_click_only: true,
             postroll: String::new(),
             metronome_sound: Default::default(),
             talkback: Default::default(),
@@ -207,6 +217,7 @@ impl Default for Preferences {
             render_ahead_ms: 200,
             render_ahead_buses: true,
             gpu_painter: true,
+            renderer: String::new(),
             gpu_painter_chosen: false,
             headphones: None,
             headphone_head: None,
@@ -287,15 +298,28 @@ impl Preferences {
     /// Recording settings from these preferences.
     pub fn record_settings(&self) -> RecordSettings {
         let d = RecordSettings::default();
+        let preroll = faderframe_session::Roll::from_id(&self.preroll).unwrap_or(
+            faderframe_session::Roll::bars(f64::from(self.preroll_bars.min(8))),
+        );
+        // Before 0.32 the count-in was a pre-roll of the click alone: now
+        // a count-in as long, without the pre-roll.
+        let (preroll, count_in_length) =
+            match faderframe_session::Roll::from_id(&self.count_in_length) {
+                Some(length) => (preroll, length),
+                None if self.count_in && !preroll.is_off() => {
+                    (faderframe_session::Roll::OFF, preroll)
+                }
+                None => (preroll, d.count_in_length),
+            };
         RecordSettings {
             mode: RecordMode::from_id(&self.record_mode).unwrap_or(d.mode),
             loop_mode: LoopRecordMode::from_id(&self.loop_record_mode).unwrap_or(d.loop_mode),
             metronome: MetronomeMode::from_id(&self.metronome).unwrap_or(d.metronome),
-            preroll: faderframe_session::Roll::from_id(&self.preroll).unwrap_or(
-                faderframe_session::Roll::bars(f64::from(self.preroll_bars.min(8))),
-            ),
+            preroll,
             preroll_on_bar: self.preroll_on_bar,
             count_in: self.count_in,
+            count_in_length,
+            count_in_click_only: self.count_in_click_only,
             input_quantize: self.input_quantize,
             input_grid: self.input_grid,
             postroll: faderframe_session::Roll::from_id(&self.postroll).unwrap_or(d.postroll),
@@ -311,6 +335,8 @@ impl Preferences {
         self.preroll = r.preroll.id();
         self.preroll_on_bar = r.preroll_on_bar;
         self.count_in = r.count_in;
+        self.count_in_length = r.count_in_length.id();
+        self.count_in_click_only = r.count_in_click_only;
         self.input_quantize = r.input_quantize;
         self.input_grid = r.input_grid;
         self.postroll = r.postroll.id();
@@ -384,6 +410,37 @@ mod tests {
         let restored: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         assert_eq!(restored, prefs);
+    }
+
+    /// A count-in from before 0.32 (a pre-roll of the click alone) becomes
+    /// a count-in as long, without the pre-roll; new settings round-trip.
+    #[test]
+    fn older_count_ins_become_count_ins_of_their_own() {
+        use faderframe_session::Roll;
+        let old: Preferences =
+            serde_json::from_str(r#"{"preroll":"2bars","count_in":true}"#).unwrap();
+        let r = old.record_settings();
+        assert!(r.count_in && r.count_in_click_only);
+        assert_eq!((r.preroll, r.count_in_length), (Roll::OFF, Roll::bars(2.0)));
+        let plain: Preferences = serde_json::from_str(r#"{"preroll":"1bars"}"#).unwrap();
+        let r = plain.record_settings();
+        assert!(!r.count_in);
+        assert_eq!(
+            (r.preroll, r.count_in_length),
+            (Roll::bars(1.0), Roll::bars(1.0))
+        );
+        // Saved again: as they are now.
+        let mut prefs = old;
+        let chosen = faderframe_session::RecordSettings {
+            preroll: Roll::bars(1.0),
+            count_in_length: Roll::beats(2.0),
+            count_in_click_only: false,
+            ..r
+        };
+        prefs.set_record_settings(&chosen);
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored.record_settings(), chosen);
     }
 
     #[test]

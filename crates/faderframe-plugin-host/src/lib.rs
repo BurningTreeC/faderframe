@@ -145,6 +145,12 @@ pub enum ProcessStatus {
     Sleep,
     /// The plugin failed; the host bypasses it and reports on the control side.
     Error,
+    /// The block never reached the plugin (another graph's turn with a
+    /// shared processor, a helper process still busy with an earlier
+    /// block): the output is silent and the events were not taken — the
+    /// host keeps what they end (note-offs, pedals let go) for its next
+    /// block, or the plugin would hold those notes for ever.
+    Missed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -459,6 +465,13 @@ pub trait PluginInstance {
     /// CLAP's polyphonic modulation).
     fn modulatable_per_note(&self, _id: ParameterId) -> bool {
         false
+    }
+    /// The plugin's own group of the parameter, outermost first and parts
+    /// separated by '/' ("Scene A/Osc 1": CLAP's module path, VST3's units,
+    /// a built-in's band or pad); `None` outside any. Its name may start
+    /// with the group or its last part.
+    fn parameter_group(&self, _id: ParameterId) -> Option<String> {
+        None
     }
     /// Set a parameter from the UI; reaches the processor without blocking.
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError>;

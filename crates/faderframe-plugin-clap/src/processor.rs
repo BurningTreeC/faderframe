@@ -7,7 +7,9 @@
 //! copies its input into preallocated port buffers and calls `process`.
 //! Nothing here allocates: buffers and event storage are sized at
 //! activation. If the cell is busy (the control thread is reconfiguring
-//! the plugin) or empty (deactivated), the block is silent.
+//! the plugin, another graph has its turn) or empty (deactivated), the
+//! block is silent; a busy one's events never reached the plugin
+//! (`Missed`: the engine keeps their note-offs for its next block).
 
 use crate::host::FfHost;
 use clack_host::events::event_types::{
@@ -212,7 +214,7 @@ impl PluginProcessor for ClapProcessor {
         let _audio = crate::host::AudioThreadScope::enter();
         let Some(mut guard) = self.cell.try_lock() else {
             silence(io);
-            return FfStatus::Continue;
+            return FfStatus::Missed;
         };
         let st = &mut *guard;
         let n = io.frames.min(st.max_frames);
@@ -309,20 +311,39 @@ impl PluginProcessor for ClapProcessor {
             room -= 1;
         }
         if let Some(midi) = io.events_in.first() {
-            for ev in midi.iter().take(room) {
+            for ev in midi.iter() {
+                if room == 0 {
+                    break;
+                }
+                room -= 1;
                 let t = ev.sample_offset.min(last);
                 match ev.event {
                     MidiEvent::NoteOn {
                         channel,
                         key,
                         velocity,
-                    } => {
+                    } if velocity > 0 => {
+                        // One note per key and channel: one still sounding
+                        // there (two sources, a graph handing the plugin on)
+                        // ends first — a plugin matching note-offs by note
+                        // id would otherwise keep it for ever.
+                        let old = st.note_ids.end(channel, key);
+                        if old != NoteIds::NONE && room > 0 {
+                            room -= 1;
+                            let pckn = Pckn::new(0u16, channel as u16, key as u16, note_match(old));
+                            st.events_in.push(&NoteOffEvent::new(t, pckn, 0.0));
+                        }
                         let id = note_match(st.note_ids.start(channel, key));
                         let pckn = Pckn::new(0u16, channel as u16, key as u16, id);
                         st.events_in
                             .push(&NoteOnEvent::new(t, pckn, velocity as f64 / 127.0));
                     }
-                    MidiEvent::NoteOff {
+                    MidiEvent::NoteOn {
+                        channel,
+                        key,
+                        velocity,
+                    }
+                    | MidiEvent::NoteOff {
                         channel,
                         key,
                         velocity,

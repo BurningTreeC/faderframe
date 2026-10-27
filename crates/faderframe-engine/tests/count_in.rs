@@ -14,7 +14,7 @@ use faderframe_engine::offline::OfflineRenderer;
 use faderframe_engine::{ClickKind, ClickSound, ClickSounds, EngineConfig, MetronomeMode};
 use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
 use faderframe_timeline::MusicalTime;
-use faderframe_transport::TransportCommand;
+use faderframe_transport::{LoopRange, TransportCommand};
 
 const SR: u32 = 48_000;
 /// Not a divisor of a beat: the count-in ends inside a callback.
@@ -201,4 +201,55 @@ fn stop_cancels_a_count_in_and_play_keeps_it() {
     let t = r.controller.transport_snapshot();
     assert!(!t.started() && t.position == 0);
     assert!(out.iter().all(|v| *v == 0.0), "silence after the stop");
+}
+
+/// Click only during the count-in: the metronome counts in, then keeps
+/// quiet through the take — through a loop wrap and after the stop too
+/// (the clicks still heard then are the take's) — whatever its mode; the
+/// next start without a count-in clicks again.
+#[test]
+fn the_click_can_keep_quiet_after_counting_in() {
+    for latency in [0usize, 6_400] {
+        let l = latency;
+        let mut r = renderer(latency as u32);
+        let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+        r.controller.metronome().set_mode(MetronomeMode::Always);
+        r.controller.metronome().set_count_in_only(true);
+        r.controller
+            .transport(TransportCommand::SetLoopRange(LoopRange::new(
+                0, BAR as i64,
+            )))
+            .unwrap();
+        r.controller
+            .transport(TransportCommand::SetLoopEnabled(true))
+            .unwrap();
+        r.controller
+            .transport(TransportCommand::PlayAfterCountIn(BAR as u64))
+            .unwrap();
+        let blocks = (2 * BAR + BAR / 2 + latency) / BLOCK;
+        let out = play(&mut r, &mut bufs, blocks);
+        assert!(r.controller.transport_snapshot().playing);
+        let accent = click(ClickKind::Accent);
+        assert!(clicks_at(&out, l, 0.0, &accent), "latency {l}: counted in");
+        // The song alone from bar 1 on, through the loop's wrap.
+        assert!(
+            out[l + BAR..].iter().all(|v| (*v - DC).abs() < 1e-6),
+            "latency {l}: no click after the count-in"
+        );
+        // Stopped: what is still on its way is the take's, no click.
+        r.controller.transport(TransportCommand::Stop).unwrap();
+        let tail = play(&mut r, &mut bufs, (BEAT + latency) / BLOCK);
+        assert!(
+            tail.iter().all(|v| *v == 0.0 || (*v - DC).abs() < 1e-6),
+            "latency {l}: no click after the stop"
+        );
+        // Played without a count-in: the metronome's mode again.
+        r.controller.transport(TransportCommand::Locate(0)).unwrap();
+        r.controller.transport(TransportCommand::Play).unwrap();
+        let out = play(&mut r, &mut bufs, (BEAT + latency) / BLOCK + 1);
+        assert!(
+            clicks_at(&out, l, DC, &accent),
+            "latency {l}: clicks again on bar 1"
+        );
+    }
 }

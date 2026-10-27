@@ -1310,6 +1310,16 @@ impl EditorSettings {
 /// Folder next to the project file that imported and recorded media go to.
 pub const MEDIA_FOLDER: &str = "Audio";
 
+/// A new project's name (until it is saved: then its file's).
+pub const UNTITLED: &str = "Untitled";
+
+/// The name a project file gives its project: its name without the
+/// extension.
+fn file_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy().trim().to_string();
+    (!stem.is_empty()).then_some(stem)
+}
+
 /// Audio device settings (Preferences → Audio): `None`/empty means the
 /// backend's default. See [`audio_device`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2415,8 +2425,6 @@ impl Session {
         self.apply_talkback()?;
         self.apply_low_latency_limit();
         self.reapply_metronome();
-        // The record settings' count-in lives in the engine too.
-        self.engine.set_count_in(self.record.count_in)?;
         // A new meter bank: quasi-peak metering applied again.
         self.ppm_meters.clear();
         self.engine.set_midi_input(self.midi.renew_queue())?;
@@ -2956,7 +2964,7 @@ impl Session {
             self.automation_play_stopped();
             // The post-roll after a punch-out ran out: the take ends too.
             if std::mem::take(&mut self.postroll_armed) {
-                let done = self.stop_recording().and_then(|_| self.after_stop());
+                let done = self.stop_recording().and_then(|_| self.after_stop(None));
                 if let Err(e) = done {
                     self.notify(NoticeLevel::Error, e.to_string());
                 }
@@ -3480,7 +3488,7 @@ impl Session {
         let project = if demo {
             faderframe_project::demo::demo_project(rate)
         } else {
-            let mut p = Project::new("Untitled", rate);
+            let mut p = Project::new(UNTITLED, rate);
             let id: TrackId = p.ids.allocate();
             let mut t = Track::new(id, TrackKind::Audio, "Audio 1", TrackColor::palette(0));
             t.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
@@ -3522,6 +3530,13 @@ impl Session {
         for v in project.video.sources.values_mut() {
             v.path = media::resolve(&v.path, dir.as_deref());
         }
+        // Saved by earlier versions, which never named projects after
+        // their files.
+        if project.name == UNTITLED
+            && let Some(name) = file_name(&path)
+        {
+            project.name = name;
+        }
         let mut adopted = Vec::new();
         for t in &mut project.tracks {
             adopted.extend(self.adopt_instrument(t));
@@ -3552,6 +3567,14 @@ impl Session {
             self.consolidate_media(&project_media);
         }
         self.capture_plugin_states();
+        // The project is named after its file (the window's title shows
+        // it), unless it was given a name of its own.
+        if let Some(name) = file_name(&path)
+            && self.named_after_its_file()
+        {
+            self.project.name = name;
+            self.revision += 1;
+        }
         let mut stored = self.project.clone();
         for s in stored.sources.values_mut() {
             if let SourceSpec::File { path: p, .. } = &mut s.spec {
@@ -3618,6 +3641,19 @@ impl Session {
             self.notify(NoticeLevel::Error, e.to_string());
         }
         let _ = std::fs::remove_dir_all(&self.media_dir);
+    }
+
+    /// Whether the project's name is one it got rather than one given:
+    /// the default, the demo's, or its file's.
+    fn named_after_its_file(&self) -> bool {
+        let name = self.project.name.as_str();
+        name == UNTITLED
+            || name == faderframe_project::demo::DEMO_NAME
+            || self
+                .path
+                .as_deref()
+                .and_then(file_name)
+                .is_some_and(|stem| stem == name)
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -4350,7 +4386,7 @@ impl Session {
             Action::SetRecordSettings(r) => {
                 self.record = r;
                 self.engine.metronome().set_mode(r.metronome);
-                self.engine.set_count_in(r.count_in)?;
+                self.apply_count_in_click();
                 self.revision += 1;
             }
             Action::FlattenTakes(clip) => self.flatten_takes(clip)?,
@@ -4840,11 +4876,7 @@ impl Session {
             TransportAction::Stop => {
                 self.disarm_postroll()?;
                 if self.transport.playing {
-                    self.engine.transport(TransportCommand::Stop)?;
-                    self.requested_playing(false);
-                    self.stop_recording()?;
-                    self.automation_stop_sent();
-                    self.after_stop()?;
+                    self.stop_here()?;
                 } else if self.recording.is_some() {
                     self.stop_recording()?;
                 } else {
@@ -4863,12 +4895,7 @@ impl Session {
             }
             TransportAction::TogglePlay => {
                 if self.transport.playing {
-                    self.disarm_postroll()?;
-                    self.engine.transport(TransportCommand::Stop)?;
-                    self.requested_playing(false);
-                    self.stop_recording()?;
-                    self.automation_stop_sent();
-                    self.after_stop()?;
+                    self.stop_here()?;
                 } else {
                     self.locate_play_start()?;
                     self.play()?;
@@ -6309,22 +6336,38 @@ impl Session {
     /// Where the playhead goes when playback stops: the start of the
     /// project ([`EditFlag::StopToStart`]), where playback started, or it
     /// stays ([`EditFlag::InsertionFollowsPlayback`]).
-    fn after_stop(&mut self) -> Result<()> {
+    /// The user's Stop (the button, Space): playback stops where it is
+    /// heard, unless Stop returns elsewhere. The engine has processed the
+    /// output latency (the graph's and the device's) beyond that, and
+    /// stops there.
+    fn stop_here(&mut self) -> Result<()> {
+        // Without a stream nothing is processed ahead of what is heard.
+        let heard = self.audio.is_some().then(|| self.transport().position);
+        self.disarm_postroll()?;
+        self.engine.transport(TransportCommand::Stop)?;
+        self.requested_playing(false);
+        self.stop_recording()?;
+        self.automation_stop_sent();
+        self.after_stop(heard)
+    }
+
+    /// Where the playhead goes after a stop: the start of the project, back
+    /// where playback started, or (`heard`: stopped by the user) where it
+    /// was heard.
+    fn after_stop(&mut self, heard: Option<i64>) -> Result<()> {
         if self.editor.stop_to_start {
             self.play_started_at = None;
             self.engine.transport(TransportCommand::Locate(0))?;
             self.show_position(0);
             return Ok(());
         }
-        self.return_to_play_start()
-    }
-
-    fn return_to_play_start(&mut self) -> Result<()> {
-        if let Some(pos) = self.play_started_at.take()
-            && !self.editor.insertion_follows_playback
-        {
-            self.engine.transport(TransportCommand::Locate(pos))?;
-            self.show_position(pos);
+        let at = match self.play_started_at.take() {
+            Some(start) if !self.editor.insertion_follows_playback => Some(start),
+            _ => heard,
+        };
+        if let Some(at) = at {
+            self.engine.transport(TransportCommand::Locate(at))?;
+            self.show_position(at);
         }
         Ok(())
     }
@@ -6560,6 +6603,42 @@ mod tests {
             !t.workspace().active_layout().floating.is_empty(),
             "detached mixer restored"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A project is named after its file when saved (the window's title
+    /// says so) — a new one, the demo, one named after its earlier file —
+    /// but a name given in Preferences stays; a file saved by an earlier
+    /// version as "Untitled" opens with its file's name.
+    #[test]
+    fn saving_names_the_project_after_its_file() {
+        let dir = std::env::temp_dir().join(format!("ff-session-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Session::new(Project::new(UNTITLED, 48_000), None, config()).unwrap();
+        assert!(s.title().starts_with("Untitled"));
+        s.save_as(&dir.join("My Song")).unwrap();
+        assert_eq!(s.project().name, "My Song");
+        assert_eq!(s.title(), "My Song — FaderFrame", "saved: not dirty");
+        // Saved again under another name: that name.
+        s.save_as(&dir.join("My Song v2.ffproj")).unwrap();
+        assert_eq!(s.project().name, "My Song v2");
+        // A name of its own stays.
+        s.dispatch(Action::Edit(Command::RenameProject {
+            name: "Opener".into(),
+        }))
+        .unwrap();
+        s.save().unwrap();
+        s.save_as(&dir.join("take three")).unwrap();
+        assert_eq!(s.project().name, "Opener");
+        let mut d = Session::demo(config()).unwrap();
+        d.save_as(&dir.join("from the demo")).unwrap();
+        assert_eq!(d.project().name, "from the demo");
+        // Written by an earlier version: "Untitled" in the file.
+        let old = dir.join("older.ffproj");
+        file::save(&old, &Project::new(UNTITLED, 48_000), None).unwrap();
+        let mut t = Session::new(Project::new("x", 48_000), None, config()).unwrap();
+        t.open(&old).unwrap();
+        assert_eq!(t.project().name, "older");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

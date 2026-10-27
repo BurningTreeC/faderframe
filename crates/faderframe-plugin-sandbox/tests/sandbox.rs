@@ -52,6 +52,7 @@ impl PluginFactory for Broken {
             broken_descriptor("test.hang"),
             broken_descriptor("test.sysex"),
             broken_descriptor("test.slow"),
+            broken_descriptor("test.lagging"),
         ]
     }
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
@@ -96,6 +97,9 @@ impl PluginInstance for BrokenInstance {
         if self.0.id == "test.sysex" {
             return Ok(Box::new(SysexSum));
         }
+        if self.0.id == "test.lagging" {
+            return Ok(Box::new(Lagging(true)));
+        }
         Ok(Box::new(BrokenProcessor(self.0.id == "test.crash")))
     }
 }
@@ -110,6 +114,23 @@ impl PluginProcessor for BrokenProcessor {
         loop {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+    fn reset(&mut self) {}
+}
+
+/// Takes its first block slowly (an editor opening in the helper, the
+/// machine busy), the rest at once.
+struct Lagging(bool);
+
+impl PluginProcessor for Lagging {
+    fn process(&mut self, _ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
+        if std::mem::take(&mut self.0) {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        for out in io.audio_out.iter_mut() {
+            out.clear();
+        }
+        ProcessStatus::Continue
     }
     fn reset(&mut self) {}
 }
@@ -570,6 +591,20 @@ fn units_and_categories_cross_unchanged() {
     }
 }
 
+#[test]
+fn parameter_groups_cross_unchanged() {
+    let a = local(builtin::DRUMS);
+    let b = remote(PluginFormat::Builtin, builtin::DRUMS);
+    let groups = |i: &dyn PluginInstance| -> Vec<Option<String>> {
+        i.parameters()
+            .iter()
+            .map(|p| i.parameter_group(p.id))
+            .collect()
+    };
+    assert_eq!(groups(a.as_ref()), groups(b.as_ref()));
+    assert!(groups(b.as_ref()).contains(&Some("Pad 16".into())));
+}
+
 /// `cargo test --release -p faderframe-plugin-sandbox --test sandbox
 /// round_trip -- --ignored --nocapture`: what a block through a helper
 /// costs on top of processing it in process.
@@ -712,4 +747,48 @@ fn the_host_does_not_wait_for_a_busy_helper() {
     assert!(inst.request_state());
     inst.poll();
     assert_eq!(inst.save_state().unwrap(), vec![7; 1000]);
+}
+
+/// A helper late with a block: that block's events reached it (its answer
+/// is given up on, silence), but the blocks after it, while it is still
+/// busy, are never sent — they say so, and the engine keeps what their
+/// events end (note-offs) for the next block that is.
+#[test]
+fn blocks_a_late_helper_never_gets_say_they_missed_it() {
+    let mut inst = remote(PluginFormat::Vst3, "test.lagging");
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let note = |on: bool| {
+        [TimedMidiEvent::new(
+            0,
+            if on {
+                MidiEvent::NoteOn {
+                    channel: 0,
+                    key: 60,
+                    velocity: 100,
+                }
+            } else {
+                MidiEvent::NoteOff {
+                    channel: 0,
+                    key: 60,
+                    velocity: 0,
+                }
+            },
+        )]
+    };
+    // Sent, its answer late.
+    assert_eq!(
+        run(p.as_mut(), 1, &note(true), &[]).1,
+        ProcessStatus::Continue
+    );
+    // Still busy with it: not sent.
+    assert_eq!(
+        run(p.as_mut(), 1, &note(false), &[]).1,
+        ProcessStatus::Missed
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        run(p.as_mut(), 1, &note(false), &[]).1,
+        ProcessStatus::Continue
+    );
+    assert!(p.take_underruns() >= 2, "both silent blocks are counted");
 }

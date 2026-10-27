@@ -328,6 +328,11 @@ pub(crate) const TOGGLES: &[Toggle] = &[
         press: None,
     },
     Toggle {
+        name: "count-in-click-only",
+        on: |s| s.record.count_in_click_only,
+        press: None,
+    },
+    Toggle {
         name: "master-panel",
         on: |s| s.master_panel(),
         press: None,
@@ -477,6 +482,7 @@ pub(crate) fn sync(map: &impl IsA<gio::ActionMap>, s: &Session) {
         ("metronome", r.metronome.id().to_string()),
         ("preroll", r.preroll.id()),
         ("postroll", r.postroll.id()),
+        ("count-in-length", r.count_in_length.id()),
     ] {
         set(name, id.to_variant());
     }

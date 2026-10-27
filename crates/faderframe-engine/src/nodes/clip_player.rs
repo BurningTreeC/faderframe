@@ -514,12 +514,6 @@ impl Processor<EngineContext> for AudioClipPlayer {
                     let Some(lane) = timeline.lane(self.track) else {
                         continue;
                     };
-                    // Counting in: nothing before the take starts.
-                    let from = match cx.data.recording.silent_before(t.recording) {
-                        Some(start) if start >= to => continue,
-                        Some(start) => from.max(start),
-                        None => from,
-                    };
                     let n = (to - from) as usize;
                     // Recording this track: inside the record window the
                     // take replaces what is there, so that stays silent.

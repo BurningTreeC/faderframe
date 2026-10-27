@@ -6,7 +6,7 @@ use faderframe_engine::EngineConfig;
 use faderframe_plugin_host::devices::synth::id as synth;
 use faderframe_project::modulation::ModTarget;
 use faderframe_session::SelectMode;
-use faderframe_ui_canvas::{Modifiers, RecordingPainter};
+use faderframe_ui_canvas::{Modifiers, RecordingPainter, menu};
 
 const SIZE: Size = Size::new(900.0, 300.0);
 
@@ -118,18 +118,18 @@ fn a_card_adds_maps_routes_and_drags() {
     let (a, _) = run(&mut view, down(card.map.center(), 1), &s);
     assert_eq!(a, [Action::LearnModulation(None)]);
     dispatch_all(&mut s, a);
-    // + Target lists the fader, the pan and the synth's cutoff.
+    // + Target lists the fader, the pan and, in the synth's submenu, its
+    // cutoff.
     let (_, req) = run(&mut view, down(card.add_route.center(), 1), &s);
     let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
         panic!("no menu");
     };
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     assert_eq!(labels[..2], ["Volume", "Pan"]);
-    let cutoff = items
-        .into_iter()
-        .find(|i| i.label == "FaderFrame Synth · Cutoff")
-        .unwrap();
-    s.dispatch(cutoff.action.unwrap()).unwrap();
+    assert!(items[2].separator_before && !items[2].children.is_empty());
+    assert!(labels.contains(&"FaderFrame Synth"), "{labels:?}");
+    let cutoff = menu::find(&items, &["FaderFrame Synth", "Cutoff"]).unwrap();
+    s.dispatch(cutoff.action.clone().unwrap()).unwrap();
     let m = s.project().track(lead).unwrap().modulators[0].clone();
     let plugin = s.project().track(lead).unwrap().inserts[0].id;
     assert_eq!(
@@ -267,7 +267,16 @@ fn per_note_modulators_offer_the_instrument() {
     };
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     assert!(!labels.contains(&"Volume") && !labels.contains(&"Pan"));
-    assert!(labels.contains(&"FaderFrame Synth · Cutoff"), "{labels:?}");
+    assert!(
+        menu::find(&items, &["FaderFrame Synth", "Cutoff"]).is_some(),
+        "{labels:?}"
+    );
+    // Search finds it with its device.
+    let found = menu::search(&items, "cutoff");
+    assert!(
+        found.iter().any(|m| m.label == "FaderFrame Synth · Cutoff"),
+        "{found:?}"
+    );
     let mut p = RecordingPainter::new();
     view.paint(&mut p, SIZE, &s, &Theme::default());
     assert!(p.texts().contains(&"PER NOTE"));

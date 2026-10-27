@@ -209,6 +209,56 @@ fn the_playhead_shows_what_is_heard() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Stop leaves the playhead where it is heard: the engine, 6400 frames of
+/// latency further on, goes back there (Insertion Follows Playback, the
+/// default: no return to where playback started).
+#[test]
+fn stop_stays_where_the_playhead_is_heard() {
+    let dir = std::env::temp_dir().join(format!("ff-session-pdc-stop-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut s, _) = session(6400, &dir);
+    wait_until(&mut s, |s| s.engine().graph_latency() == 6400, "the graph");
+    assert!(s.editor.insertion_follows_playback && !s.editor.stop_to_start);
+    s.dispatch(Action::Transport(TransportAction::Play))
+        .unwrap();
+    wait_until(&mut s, |s| s.processing_position() > 30_000, "30 000");
+    let heard = s.transport().position;
+    s.dispatch(Action::Transport(TransportAction::Stop))
+        .unwrap();
+    // Shown at once, and the engine follows.
+    let shown = s.transport().position;
+    assert!((shown - heard).abs() < 480, "shown {shown}, heard {heard}");
+    wait_until(
+        &mut s,
+        |s| !s.engine().transport_snapshot().playing && s.processing_position() == shown,
+        "the engine where it was heard",
+    );
+    for _ in 0..40 {
+        s.tick(0.005);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(s.transport().position, shown, "it stays");
+    }
+    // Space stops the same way.
+    s.dispatch(Action::Transport(TransportAction::TogglePlay))
+        .unwrap();
+    wait_until(
+        &mut s,
+        |s| s.processing_position() > shown + 20_000,
+        "playing on",
+    );
+    let heard = s.transport().position;
+    s.dispatch(Action::Transport(TransportAction::TogglePlay))
+        .unwrap();
+    let shown = s.transport().position;
+    assert!((shown - heard).abs() < 480, "shown {shown}, heard {heard}");
+    wait_until(
+        &mut s,
+        |s| !s.engine().transport_snapshot().playing && s.processing_position() == shown,
+        "the engine where it was heard",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A dry track playing beside one with half a second of plugin latency is
 /// heard half a second after it is processed: its meter waits for that.
 #[test]

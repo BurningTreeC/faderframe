@@ -111,6 +111,8 @@ pub struct Vst3Instance {
     mod_bases: Arc<ModBases>,
     /// Parameters modulation may move (continuous, automatable).
     modulatable: Vec<ParamID>,
+    /// Parameters' unit paths ("Scene A/Osc 1").
+    groups: HashMap<ParamID, String>,
     /// The plugin's gain-reduction meter (a read-only parameter): its id,
     /// its values in dB, and the cell the processor sets.
     reduction: Option<(ParamID, Arc<faderframe_plugin_host::ReductionTable>)>,
@@ -197,6 +199,7 @@ impl Vst3Instance {
             bases_tx: None,
             mod_bases: Arc::default(),
             modulatable: Vec::new(),
+            groups: HashMap::new(),
             reduction: None,
             reduction_cell: faderframe_plugin_host::Reduction::new(),
             pending: Vec::new(),
@@ -259,7 +262,8 @@ impl Vst3Instance {
         ok.then(|| stream.data())
     }
 
-    fn units(&self) -> HashMap<i32, String> {
+    /// The units below the root: (parent, name) by id.
+    fn units(&self) -> HashMap<i32, (i32, String)> {
         let mut out = HashMap::new();
         let Some(units) = self.controller.as_ref().and_then(|c| c.cast::<IUnitInfo>()) else {
             return out;
@@ -269,7 +273,7 @@ impl Vst3Instance {
             for i in 0..units.getUnitCount().clamp(0, 4096) {
                 let mut info: UnitInfo = std::mem::zeroed();
                 if units.getUnitInfo(i, &mut info) == kResultOk && info.id != 0 {
-                    out.insert(info.id, wstr(&info.name));
+                    out.insert(info.id, (info.parentUnitId, wstr(&info.name)));
                 }
             }
         }
@@ -292,6 +296,7 @@ impl Vst3Instance {
         let mut out = Vec::new();
         let mut steps = Vec::new();
         let mut modulatable = Vec::new();
+        let mut groups = HashMap::new();
         // A gain-reduction meter: (id, units).
         let mut meter = None;
         // The program-change parameter (often hidden): (id, unit, steps).
@@ -320,9 +325,12 @@ impl Vst3Instance {
                 }
                 let name = wstr(&info.title);
                 let name = match units.get(&info.unitId) {
-                    Some(u) if !u.is_empty() => format!("{u}/{name}"),
+                    Some((_, u)) if !u.is_empty() => format!("{u}/{name}"),
                     _ => name,
                 };
+                if let Some(path) = unit_path(&units, info.unitId) {
+                    groups.insert(info.id, path);
+                }
                 let s = info.stepCount.max(0) as u32;
                 if s > 0 {
                     steps.push((info.id, s));
@@ -353,6 +361,7 @@ impl Vst3Instance {
             meter.map(|(id, units)| (id, Arc::new(reduction_table(&ctrl, id, &units))));
         modulatable.sort_unstable();
         self.modulatable = modulatable;
+        self.groups = groups;
         self.map = Arc::new(ParamMap::new(steps));
         self.programs = program.map_or_else(Vec::new, |(id, unit, steps)| {
             self.program_names(id, unit, steps)
@@ -700,6 +709,10 @@ impl FfInstance for Vst3Instance {
 
     fn modulatable(&self, id: ParameterId) -> bool {
         self.modulatable.binary_search(&id.0).is_ok()
+    }
+
+    fn parameter_group(&self, id: ParameterId) -> Option<String> {
+        self.groups.get(&id.0).cloned()
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {
@@ -1225,6 +1238,25 @@ impl PluginEditor for Vst3Instance {
     }
 }
 
+/// The path of `unit` from below the root ("Scene A/Osc 1"); `None` for the
+/// root and units it does not know. An unknown parent ends the path, a loop
+/// is cut at 16 parts.
+fn unit_path(units: &HashMap<i32, (i32, String)>, unit: i32) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut at = unit;
+    while let Some((parent, name)) = units.get(&at) {
+        if parts.len() >= 16 {
+            break;
+        }
+        if !name.is_empty() {
+            parts.push(name.as_str());
+        }
+        at = *parent;
+    }
+    parts.reverse();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// A gain-reduction meter's values in dB taken off, from the plugin's own
 /// conversion (main thread): its plain value when its unit is dB, else the
 /// dB its text shows, else a plain 0…1 as a linear gain, else the plain
@@ -1265,4 +1297,27 @@ fn reduction_table(
         };
     }
     faderframe_plugin_host::ReductionTable(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn units_name_their_path_from_the_root() {
+        let units: HashMap<i32, (i32, String)> = [
+            (1, (0, "Scene A".to_string())),
+            (2, (1, "Osc 1".to_string())),
+            (3, (7, "Lost".to_string())),
+            (4, (5, "Loop".to_string())),
+            (5, (4, "Back".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(unit_path(&units, 2).as_deref(), Some("Scene A/Osc 1"));
+        assert_eq!(unit_path(&units, 1).as_deref(), Some("Scene A"));
+        assert_eq!(unit_path(&units, 3).as_deref(), Some("Lost"));
+        assert_eq!(unit_path(&units, 0), None);
+        assert_eq!(unit_path(&units, 4).map(|p| p.split('/').count()), Some(16));
+    }
 }

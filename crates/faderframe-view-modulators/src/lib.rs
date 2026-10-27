@@ -551,25 +551,22 @@ impl ModulatorsView {
             .collect()
     }
 
+    /// The track's fader and pan, then each device's parameters in a
+    /// submenu; those routed already checked.
     fn route_menu(model: &Session, track: TrackId, m: &Modulator) -> Vec<MenuItem<Action>> {
-        let mut items = Vec::new();
-        let mut group = String::new();
+        let mut entries = Vec::new();
         let notes = m.source.per_note();
         for c in model.modulation_targets(track) {
             // Per-note modulators move what gets the notes.
             if notes && !c.takes_notes {
                 continue;
             }
-            let mut label = if c.group == "Track" {
-                c.name.clone()
-            } else {
-                format!("{} · {}", c.group, c.name)
-            };
+            let mut label = c.menu_label().to_string();
             if notes && c.per_note {
                 label.push_str(" (per voice)");
             }
             let routed = m.routes.iter().any(|r| r.target == c.target);
-            let mut item = if routed {
+            let item = if routed {
                 MenuItem::disabled(label).checked(true)
             } else {
                 let mut with = m.clone();
@@ -585,17 +582,15 @@ impl ModulatorsView {
                     },
                 )
             };
-            if c.group != group {
-                item.separator_before = !group.is_empty();
-                group = c.group.clone();
-            }
-            items.push(item);
+            entries.push((c.menu, item));
         }
-        if notes && items.is_empty() {
+        let listed = entries.len();
+        let mut items = faderframe_ui_canvas::menu::grouped(entries);
+        if notes && listed == 0 {
             items.push(MenuItem::disabled(
                 "(no device on this track gets the notes)",
             ));
-        } else if !notes && items.len() <= 2 {
+        } else if !notes && listed <= 2 {
             items.push(MenuItem::disabled("(no device parameters take modulation)"));
         }
         items

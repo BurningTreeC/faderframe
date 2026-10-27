@@ -4122,3 +4122,203 @@ fn cue_mixes_do_not_allocate() {
     let heard = (2..8).any(|c| bufs.output_ref(c).iter().any(|v| v.abs() > 1e-4));
     assert!(heard, "the cue mixes play");
 }
+
+/// An instrument missing every other block (another graph's turn with it,
+/// a late helper): what the missed blocks end is kept and put before the
+/// next block's events without allocating.
+#[test]
+fn blocks_an_instrument_misses_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_graph::NodeIo;
+    use faderframe_core::{ChannelLayout, ParameterId};
+    use faderframe_plugin_host::{
+        AudioPortInfo, ParameterInfo, PluginCategory, PluginDescriptor, PluginError, PluginFactory,
+        PluginFormat, PluginInstance, PluginProcessContext, PluginProcessor, PluginRegistry,
+        ProcessConfig, ProcessStatus, TailLength,
+    };
+    use faderframe_project::{
+        Clip, ClipContent, ControllerLane, ControllerPoint, Impact, MidiClip, MidiController,
+        MidiNote, PluginRef, PluginSlot, TrackKind,
+    };
+    use faderframe_timeline::MusicalTime;
+    use std::sync::atomic::AtomicU64;
+
+    /// Note-offs and pedals up that reached it.
+    static ENDED: AtomicU64 = AtomicU64::new(0);
+
+    struct Factory;
+    struct Instance(PluginDescriptor);
+    struct Missing(u32);
+
+    impl PluginFactory for Factory {
+        fn format(&self) -> PluginFormat {
+            PluginFormat::Clap
+        }
+        fn scan(&self) -> Vec<PluginDescriptor> {
+            Vec::new()
+        }
+        fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
+            Ok(Box::new(Instance(PluginDescriptor {
+                format: PluginFormat::Clap,
+                id: id.into(),
+                name: "Missing".into(),
+                vendor: "FaderFrame".into(),
+                version: "1".into(),
+                category: PluginCategory::Instrument,
+                audio_inputs: Vec::new(),
+                audio_outputs: vec![AudioPortInfo {
+                    channels: 2,
+                    is_main: true,
+                }],
+                note_inputs: 1,
+                note_outputs: 0,
+            })))
+        }
+    }
+
+    impl PluginInstance for Instance {
+        fn descriptor(&self) -> &PluginDescriptor {
+            &self.0
+        }
+        fn parameters(&self) -> &[ParameterInfo] {
+            &[]
+        }
+        fn parameter(&mut self, _id: ParameterId) -> Option<f64> {
+            None
+        }
+        fn set_parameter(&mut self, id: ParameterId, _v: f64) -> Result<(), PluginError> {
+            Err(PluginError::UnknownParameter(id))
+        }
+        fn latency_samples(&self) -> u32 {
+            0
+        }
+        fn tail(&self) -> TailLength {
+            TailLength::None
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
+            Ok(Vec::new())
+        }
+        fn load_state(&mut self, _data: &[u8]) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn create_processor(
+            &mut self,
+            _c: &ProcessConfig,
+        ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+            Ok(Box::new(Missing(0)))
+        }
+    }
+
+    impl PluginProcessor for Missing {
+        fn process(
+            &mut self,
+            _ctx: &PluginProcessContext<'_>,
+            io: &mut NodeIo<'_>,
+        ) -> ProcessStatus {
+            for out in io.audio_out.iter_mut() {
+                out.clear();
+            }
+            self.0 += 1;
+            if self.0.is_multiple_of(2) {
+                return ProcessStatus::Missed;
+            }
+            if let Some(midi) = io.events_in.first() {
+                let ended = midi.iter().filter(|e| {
+                    matches!(
+                        e.event,
+                        faderframe_midi::MidiEvent::NoteOff { .. }
+                            | faderframe_midi::MidiEvent::ControlChange { value: 0, .. }
+                    )
+                });
+                ENDED.fetch_add(ended.count() as u64, Ordering::Relaxed);
+            }
+            ProcessStatus::Continue
+        }
+        fn reset(&mut self) {}
+    }
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+    tp.project.track_mut(t).unwrap().inserts = vec![PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef {
+            format: faderframe_project::PluginFormat::Clap,
+            id: "test.missing".into(),
+            name: "Missing".into(),
+        },
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    }];
+    // Thirty-second notes on four channels, a pedal stepping with them.
+    let mut notes = Vec::new();
+    let mut points = Vec::new();
+    for i in 0..64u8 {
+        let start = MusicalTime::from_quarters(f64::from(i) / 8.0);
+        notes.push(MidiNote {
+            id: tp.project.ids.allocate(),
+            start,
+            length: MusicalTime::from_quarters(1.0 / 8.0),
+            key: 48 + i % 24,
+            velocity: 100,
+            channel: i % 4,
+            muted: false,
+            release: None,
+        });
+        points.push(ControllerPoint {
+            time: start,
+            value: if i % 2 == 0 { 127 } else { 0 },
+        });
+    }
+    let id = tp.project.ids.allocate();
+    tp.project.clips.insert(
+        id,
+        Clip {
+            id,
+            track: t,
+            name: "Notes".into(),
+            color: None,
+            start: MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Midi(MidiClip {
+                length: MusicalTime::from_quarters_i(8),
+                notes,
+                controllers: vec![ControllerLane {
+                    controller: MidiController::Cc { number: 64 },
+                    channel: 0,
+                    points,
+                }],
+                expressions: Vec::new(),
+                sysex: Vec::new(),
+            }),
+        },
+    );
+    tp.project.track_mut(t).unwrap().clips.push(id);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let mut registry = PluginRegistry::with_builtins();
+    registry.add_factory(Box::new(Factory));
+    *r.controller.plugins() = faderframe_engine::PluginHost::new(registry);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, n) = armed(|| {
+        // The clip (two bars at 120 BPM) twice.
+        for _ in 0..750 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations with missed blocks");
+    let ended = ENDED.load(Ordering::Relaxed);
+    assert!(ended >= 64, "every note ended: {ended}");
+}

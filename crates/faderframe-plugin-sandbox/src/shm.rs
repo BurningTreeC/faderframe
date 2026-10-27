@@ -261,7 +261,7 @@ pub struct Header {
     pub reduction: AtomicU32,
     pub max_frames: u32,
     pub frames: u32,
-    /// 0 continue, 1 sleep, 2 error.
+    /// 0 continue, 1 sleep, 2 error, 3 missed.
     pub status: u32,
     pub n_in: u32,
     pub n_out: u32,
@@ -577,6 +577,7 @@ impl Block {
             match addr_of!((*h).status).read_volatile() {
                 1 => ProcessStatus::Sleep,
                 2 => ProcessStatus::Error,
+                3 => ProcessStatus::Missed,
                 _ => ProcessStatus::Continue,
             }
         }
@@ -731,6 +732,7 @@ impl Block {
                 ProcessStatus::Continue => 0,
                 ProcessStatus::Sleep => 1,
                 ProcessStatus::Error => 2,
+                ProcessStatus::Missed => 3,
             });
         }
         // Keep the buffers for the next block.

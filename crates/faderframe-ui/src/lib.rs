@@ -13,6 +13,7 @@
 
 pub mod access;
 mod actions;
+pub mod app_bundle;
 mod audio_prefs;
 pub mod canvas;
 mod console;
@@ -20,6 +21,7 @@ pub mod crash;
 mod cues;
 mod dialogs;
 pub mod dock;
+pub mod drawing;
 mod edit_keys;
 mod favorites;
 pub mod gpu;
@@ -136,8 +138,11 @@ fn build_session(
         match start {
             Start::Demo => Session::demo(config),
             Start::New | Start::Open(_) | Start::Template(_) => {
-                let mut s =
-                    Session::new(Project::new("Untitled", config.sample_rate), None, config)?;
+                let mut s = Session::new(
+                    Project::new(faderframe_session::UNTITLED, config.sample_rate),
+                    None,
+                    config,
+                )?;
                 match &start {
                     Start::Template(path) => s.new_from_template(path)?,
                     _ => s.new_project(false)?,
@@ -151,8 +156,12 @@ fn build_session(
         Err(e) => {
             tracing::error!("cannot create the session: {e}");
             #[allow(clippy::expect_used)]
-            let s = Session::new(Project::new("Untitled", config.sample_rate), None, config)
-                .expect("an empty session can always be created");
+            let s = Session::new(
+                Project::new(faderframe_session::UNTITLED, config.sample_rate),
+                None,
+                config,
+            )
+            .expect("an empty session can always be created");
             s
         }
     };

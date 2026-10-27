@@ -1119,6 +1119,30 @@ fn hosts_a_plugin_with_separate_controller() {
             "unlisted expressions are not sent"
         );
     }
+    // A note started again on a key still sounding ends the first by its
+    // id first (a plugin matching note-offs by id would hold it for ever).
+    SEEN.lock().unwrap().clear();
+    for e in [note(0, 74, true), note(10, 74, true), note(20, 74, false)] {
+        rig.events[0].push(e).unwrap();
+    }
+    rig.run(proc.as_mut(), &[]);
+    {
+        use Event_::EventTypes_::*;
+        let (on, off) = (kNoteOnEvent as u32, kNoteOffEvent as u32);
+        let seen: Vec<(u32, i32)> = SEEN
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.2 == 74)
+            .map(|e| (e.0, e.1))
+            .collect();
+        let ids: Vec<i32> = seen.iter().filter(|e| e.0 == on).map(|e| e.1).collect();
+        assert_eq!(ids.len(), 2, "{seen:?}");
+        assert_eq!(
+            seen,
+            [(on, ids[0]), (off, ids[0]), (on, ids[1]), (off, ids[1])]
+        );
+    }
     let listed = inst.note_expressions().unwrap();
     assert!(listed.contains(&NoteExpressionKind::Tuning));
     assert!(

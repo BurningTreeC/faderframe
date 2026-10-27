@@ -3,11 +3,12 @@ use crate::context::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ParameterId, PluginInstanceId, TrackId};
+use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
 use faderframe_plugin_host::{
     NoteParamMod, ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Most parameter events handed to a plugin per block.
 const EVENT_CAPACITY: usize = 1024;
@@ -16,6 +17,133 @@ const MAX_AUTOMATED: usize = 128;
 /// Most runs of the timeline one block's audio is read back in (a loop
 /// shorter than the block wraps more often; the rest is skipped).
 const MAX_RUNS: usize = 8;
+
+/// Controllers whose letting go a plugin must not miss: the pedals
+/// (sustain, portamento, sostenuto, soft, legato, hold 2) up, all sound
+/// off, all notes off.
+const RELEASES: [u8; 8] = [64, 65, 66, 67, 68, 69, 120, 123];
+
+/// What the blocks a plugin's processor missed ([`ProcessStatus::Missed`])
+/// would have ended — note-offs, pedals let go, all notes off — kept until
+/// one of its blocks gets through, which then starts with them. Missed
+/// note-ons stay missed. One per plugin instance, shared by its nodes in
+/// every graph (a missed block is mostly another graph's turn with it):
+/// atomic, never allocating.
+pub struct MissedReleases {
+    any: AtomicBool,
+    /// A bit per channel and key.
+    notes: [AtomicU64; 16 * 128 / 64],
+    /// Per channel a bit per [`RELEASES`] controller.
+    controls: [AtomicU64; 16 * RELEASES.len() / 64],
+}
+
+impl Default for MissedReleases {
+    fn default() -> Self {
+        Self {
+            any: AtomicBool::new(false),
+            notes: std::array::from_fn(|_| AtomicU64::new(0)),
+            controls: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl MissedReleases {
+    fn set(words: &[AtomicU64], bit: usize) {
+        if let Some(w) = words.get(bit / 64) {
+            w.fetch_or(1 << (bit % 64), Ordering::AcqRel);
+        }
+    }
+
+    /// Keep what a missed block's `events` end.
+    pub fn keep(&self, events: &MidiBuffer) {
+        let mut kept = false;
+        for e in events.iter() {
+            match e.event {
+                MidiEvent::NoteOff { channel, key, .. }
+                | MidiEvent::NoteOn {
+                    channel,
+                    key,
+                    velocity: 0,
+                } => {
+                    Self::set(
+                        &self.notes,
+                        usize::from(channel & 15) * 128 + usize::from(key & 127),
+                    );
+                    kept = true;
+                }
+                MidiEvent::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                } => {
+                    if let Some(j) = RELEASES.iter().position(|c| *c == controller)
+                        && (controller >= 120 || value < 64)
+                    {
+                        Self::set(
+                            &self.controls,
+                            usize::from(channel & 15) * RELEASES.len() + j,
+                        );
+                        kept = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if kept {
+            self.any.store(true, Ordering::Release);
+        }
+    }
+
+    /// Anything kept?
+    pub fn pending(&self) -> bool {
+        self.any.load(Ordering::Acquire)
+    }
+
+    /// What was kept into `out` at offset 0 (what does not fit stays kept).
+    pub fn take_into(&self, out: &mut MidiBuffer) {
+        if !self.any.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut left = false;
+        for (w, word) in self.notes.iter().enumerate() {
+            let mut bits = word.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let i = w * 64 + b;
+                let off = MidiEvent::NoteOff {
+                    channel: (i / 128) as u8,
+                    key: (i % 128) as u8,
+                    velocity: 0,
+                };
+                if out.push(TimedMidiEvent::new(0, off)).is_err() {
+                    word.fetch_or(1 << b, Ordering::AcqRel);
+                    left = true;
+                }
+            }
+        }
+        for (w, word) in self.controls.iter().enumerate() {
+            let mut bits = word.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let i = w * 64 + b;
+                let up = MidiEvent::ControlChange {
+                    channel: (i / RELEASES.len()) as u8,
+                    controller: RELEASES[i % RELEASES.len()],
+                    value: 0,
+                };
+                if out.push(TimedMidiEvent::new(0, up)).is_err() {
+                    word.fetch_or(1 << b, Ordering::AcqRel);
+                    left = true;
+                }
+            }
+        }
+        if left {
+            self.any.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// Hosts a plugin processor (insert or instrument) inside the graph.
 ///
@@ -29,6 +157,10 @@ const MAX_RUNS: usize = 8;
 /// bypass is a *soft* bypass: the plugin keeps running (so its latency and
 /// state stay consistent), and the output crossfades to the input delayed
 /// by the plugin's latency, keeping every summing point aligned.
+///
+/// A block the processor missed (its shared processor another graph's
+/// turn, its helper process late) loses no note-off: [`MissedReleases`]
+/// keeps them for the plugin's next block, in whichever graph.
 pub struct PluginNode {
     track: TrackId,
     plugin: PluginInstanceId,
@@ -51,6 +183,11 @@ pub struct PluginNode {
     delay_pos: usize,
     /// How late its input is (its automation is read that much earlier).
     input_latency: u32,
+    /// What blocks its processor missed would have ended (the plugin's).
+    missed: Arc<MissedReleases>,
+    /// A block's events after those (a node that takes events: one
+    /// buffer, else none).
+    merged: Vec<MidiBuffer>,
 }
 
 impl PluginNode {
@@ -63,6 +200,8 @@ impl PluginNode {
         bypass: bool,
         failed: Arc<AtomicBool>,
         channels: usize,
+        missed: Arc<MissedReleases>,
+        takes_events: bool,
     ) -> Self {
         let latency = if bypass { 0 } else { latency };
         Self {
@@ -83,6 +222,12 @@ impl PluginNode {
                 .collect(),
             delay_pos: 0,
             input_latency: 0,
+            missed,
+            merged: if takes_events {
+                vec![MidiBuffer::with_capacity(MidiBuffer::DEFAULT_CAPACITY)]
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -304,7 +449,40 @@ impl Processor<EngineContext> for PluginNode {
         };
         self.processor
             .set_callback_deadline(cx.data.callback_deadline);
-        let status = self.processor.process(&ctx, io);
+        // What blocks it missed would have ended first (in this graph or
+        // another).
+        let held = !self.merged.is_empty() && self.missed.pending();
+        if held && let Some(merged) = self.merged.first_mut() {
+            merged.clear();
+            self.missed.take_into(merged);
+            if let Some(input) = io.events_in.first() {
+                merged.merge_from(input, 0);
+            }
+        }
+        let status = if held {
+            let mut with = NodeIo {
+                frames: io.frames,
+                audio_in: io.audio_in,
+                audio_out: &mut *io.audio_out,
+                events_in: &self.merged,
+                events_out: &mut *io.events_out,
+            };
+            self.processor.process(&ctx, &mut with)
+        } else {
+            self.processor.process(&ctx, io)
+        };
+        if status == ProcessStatus::Missed {
+            // Its events never reached it: what they end waits for its
+            // next block.
+            let events = if held {
+                self.merged.first()
+            } else {
+                io.events_in.first()
+            };
+            if let Some(events) = events {
+                self.missed.keep(events);
+            }
+        }
         let underruns = self.processor.take_underruns();
         if underruns != 0 {
             cx.data
@@ -339,5 +517,76 @@ impl Processor<EngineContext> for PluginNode {
         for d in &mut self.delay {
             d.fill(0.0);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missed_blocks_keep_what_ends_notes_and_nothing_else() {
+        let missed = MissedReleases::default();
+        let mut block = MidiBuffer::with_capacity(16);
+        let cc = |channel, controller, value| MidiEvent::ControlChange {
+            channel,
+            controller,
+            value,
+        };
+        for e in [
+            MidiEvent::NoteOn {
+                channel: 3,
+                key: 70,
+                velocity: 90,
+            },
+            MidiEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 30,
+            },
+            MidiEvent::NoteOn {
+                channel: 15,
+                key: 127,
+                velocity: 0,
+            },
+            // Pedals down and the mod wheel stay missed.
+            cc(1, 64, 127),
+            cc(1, 1, 0),
+            cc(2, 66, 0),
+            cc(9, 123, 0),
+        ] {
+            block.push(TimedMidiEvent::new(5, e)).unwrap();
+        }
+        assert!(!missed.pending());
+        missed.keep(&block);
+        assert!(missed.pending());
+        let mut next = MidiBuffer::with_capacity(16);
+        missed.take_into(&mut next);
+        assert!(!missed.pending());
+        let got: Vec<(u32, MidiEvent)> = next.iter().map(|e| (e.sample_offset, e.event)).collect();
+        let off = |channel, key| MidiEvent::NoteOff {
+            channel,
+            key,
+            velocity: 0,
+        };
+        assert_eq!(
+            got,
+            [
+                (0, off(0, 60)),
+                (0, off(15, 127)),
+                (0, cc(2, 66, 0)),
+                (0, cc(9, 123, 0)),
+            ]
+        );
+        // What does not fit waits for the next block.
+        missed.keep(&block);
+        let mut small = MidiBuffer::with_capacity(1);
+        missed.take_into(&mut small);
+        assert_eq!(small.len(), 1);
+        assert!(missed.pending());
+        next.clear();
+        missed.take_into(&mut next);
+        assert_eq!(next.len(), 3);
     }
 }

@@ -298,6 +298,8 @@ fn imports_dmabufs(snapshot: &gtk::Snapshot) -> bool {
     use gtk::prelude::*;
     let _ = snapshot;
     std::env::var("FADERFRAME_GPU_DMABUF").as_deref() != Ok("0")
+        // Drawing in software, GTK would map the GPU's buffers to read them.
+        && !crate::drawing::software()
         && gtk::gdk::Display::default().is_some_and(|d| {
             takes_gpu_dmabufs(d.type_().name())
                 && d.dmabuf_formats().contains(

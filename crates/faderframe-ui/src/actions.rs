@@ -1322,8 +1322,18 @@ pub fn install(app: &Rc<AppState>) {
                     .and_then(|t| s.project().track(*t));
                 track.and_then(|t| {
                     let mut m = t.modulators.get(n)?.clone();
+                    // As listed, or as the menu's search lists it.
                     let target = s.modulation_targets(t.id).into_iter().find(|c| {
-                        c.name == label || format!("{} · {}", c.group, c.name) == label
+                        let searched = c
+                            .menu
+                            .iter()
+                            .map(String::as_str)
+                            .chain([c.menu_label()])
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        c.name == label
+                            || format!("{} · {}", c.group, c.name) == label
+                            || searched == label
                     })?;
                     m.routes.push(faderframe_project::modulation::ModRoute {
                         target: target.target,
@@ -2678,6 +2688,45 @@ pub fn install(app: &Rc<AppState>) {
         named("menu", |_, arg| {
             if !crate::canvas::activate_menu_entry(arg) {
                 tracing::warn!("menu: no entry '{arg}' shown");
+            }
+        }),
+        // Development aid: `menu-search:<text>` types into the open context
+        // menu's search field (long menus have one); `menu:<label>` then
+        // takes a match ("Device · Group · Name").
+        named("menu-search", |_, arg| {
+            if !crate::canvas::search_menu(arg) {
+                tracing::warn!("menu-search: no menu with a search field open");
+            }
+        }),
+        // Development aid: `automation-menu:<track>` opens the menu of the
+        // track's automatable parameters in the arranger (as the name on one
+        // of its lane headers does).
+        named("automation-menu", |a, arg| {
+            let canvas = a
+                .dock
+                .borrow()
+                .hosts
+                .get(&faderframe_workspace::ViewId::arranger())
+                .map(|(_, h)| h.canvas.clone());
+            let menu = {
+                let s = a.session.borrow();
+                let track = s.project().tracks.iter().find(|t| t.name == arg);
+                track.map(|t| {
+                    faderframe_view_arranger::ArrangerView::parameter_menu(
+                        &s,
+                        t.id,
+                        faderframe_ui_canvas::Point::new(260.0, 140.0),
+                    )
+                })
+            };
+            match (canvas, menu) {
+                (
+                    Some(canvas),
+                    Some(faderframe_ui_canvas::HostRequest::ContextMenu { at, items }),
+                ) => {
+                    crate::canvas::show_menu(canvas.upcast_ref(), at, items, a);
+                }
+                _ => tracing::warn!("automation-menu: no arranger or no track '{arg}'"),
             }
         }),
         named("menu-state", |_, _| match crate::canvas::open_menu() {

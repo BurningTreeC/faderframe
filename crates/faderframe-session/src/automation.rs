@@ -49,9 +49,19 @@ pub struct AutomationParam {
     pub kind: ParamKind,
     /// Unit suffix for display ("dB", "ms", "Hz", "%").
     pub unit: &'static str,
+    /// The submenus menus list it in: none for the track's own, else the
+    /// device and the plugin's own groups ("Surge XT", "Scene A", "Osc 1").
+    pub menu: Vec<String>,
+    /// Its label there when not `name` ("Pitch").
+    pub short: Option<String>,
 }
 
 impl AutomationParam {
+    /// Its label in its submenu.
+    pub fn menu_label(&self) -> &str {
+        self.short.as_deref().unwrap_or(&self.name)
+    }
+
     /// Plain value → lane position 0..=1.
     pub fn to_normal(&self, v: f64) -> f64 {
         match self.kind {
@@ -181,6 +191,27 @@ fn unit_label(u: ParameterUnit) -> &'static str {
     }
 }
 
+/// `name` without the group (or the group's last part) it starts with:
+/// "Pitch" of "Scene A/Osc 1/Pitch" and of "Osc 1/Pitch" in "Scene A/Osc
+/// 1", "Gain" of "Band 3 Gain" in "Band 3".
+pub(crate) fn within<'a>(name: &'a str, group: &str) -> &'a str {
+    let group = group.trim_matches('/');
+    let last = group.rsplit('/').next().unwrap_or(group);
+    let bare = name.trim_start_matches('/');
+    for prefix in [group, last] {
+        if let Some(rest) = bare.strip_prefix(prefix)
+            && !prefix.is_empty()
+            && rest.starts_with(['/', ' ', ':'])
+        {
+            let rest = rest.trim_start_matches(['/', ' ', ':']);
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    name
+}
+
 impl Session {
     // --- what can be automated -------------------------------------------------
 
@@ -203,6 +234,8 @@ impl Session {
                 default: 0.0,
                 kind: ParamKind::Gain,
                 unit: "dB",
+                menu: Vec::new(),
+                short: None,
             });
             // Into a surround bed the surround panner places it instead.
             if let Some(format) = self.project.surround_panned(t) {
@@ -229,6 +262,8 @@ impl Session {
                         default: default as f64,
                         kind,
                         unit,
+                        menu: Vec::new(),
+                        short: None,
                     });
                 }
                 // A stereo source balanced into the bed: its balance.
@@ -241,6 +276,8 @@ impl Session {
                         default: 0.0,
                         kind: ParamKind::Pan,
                         unit: "",
+                        menu: Vec::new(),
+                        short: None,
                     });
                 }
             } else if self.project.dual_panned(t) {
@@ -258,6 +295,8 @@ impl Session {
                         default,
                         kind: ParamKind::Pan,
                         unit: "",
+                        menu: Vec::new(),
+                        short: None,
                     });
                 }
             } else if !vca {
@@ -274,6 +313,8 @@ impl Session {
                     default: 0.0,
                     kind: ParamKind::Pan,
                     unit: "",
+                    menu: Vec::new(),
+                    short: None,
                 });
             }
             out.push(AutomationParam {
@@ -284,6 +325,8 @@ impl Session {
                 default: 0.0,
                 kind: ParamKind::Toggle,
                 unit: "",
+                menu: Vec::new(),
+                short: None,
             });
         }
         for s in &t.sends {
@@ -299,6 +342,8 @@ impl Session {
                 default: 0.0,
                 kind: ParamKind::Gain,
                 unit: "dB",
+                menu: Vec::new(),
+                short: None,
             });
         }
         // Its sends to the cue mixes (level, pan, on); the master: the cue
@@ -317,6 +362,8 @@ impl Session {
                     default: 0.0,
                     kind: ParamKind::Gain,
                     unit: "dB",
+                    menu: Vec::new(),
+                    short: None,
                 });
                 out.push(AutomationParam {
                     target: AutomationTarget::CueSend {
@@ -329,6 +376,8 @@ impl Session {
                     default: 0.0,
                     kind: ParamKind::Pan,
                     unit: "",
+                    menu: Vec::new(),
+                    short: None,
                 });
                 out.push(AutomationParam {
                     target: AutomationTarget::CueSend {
@@ -341,6 +390,8 @@ impl Session {
                     default: 1.0,
                     kind: ParamKind::Toggle,
                     unit: "",
+                    menu: Vec::new(),
+                    short: None,
                 });
             } else if t.kind == TrackKind::Master {
                 out.push(AutomationParam {
@@ -351,6 +402,8 @@ impl Session {
                     default: 0.0,
                     kind: ParamKind::Gain,
                     unit: "dB",
+                    menu: Vec::new(),
+                    short: None,
                 });
             }
         }
@@ -369,6 +422,7 @@ impl Session {
                 } else {
                     ParamKind::Linear
                 };
+                let (menu, short) = self.device_menu(&name, slot.id, p);
                 out.push(AutomationParam {
                     target: AutomationTarget::PluginParameter {
                         plugin: slot.id,
@@ -380,6 +434,8 @@ impl Session {
                     default: p.default,
                     kind,
                     unit: unit_label(p.unit),
+                    menu,
+                    short: Some(short),
                 });
             }
             out.push(AutomationParam {
@@ -390,9 +446,35 @@ impl Session {
                 default: 0.0,
                 kind: ParamKind::Toggle,
                 unit: "",
+                menu: vec![name.clone()],
+                short: Some("Bypass".into()),
             });
         }
         out
+    }
+
+    /// Where menus list a device's parameter: in the device's submenu and
+    /// there in the plugin's own groups, labelled without the group its
+    /// name starts with.
+    pub(crate) fn device_menu(
+        &self,
+        device: &str,
+        plugin: faderframe_core::PluginInstanceId,
+        p: &faderframe_plugin_host::ParameterInfo,
+    ) -> (Vec<String>, String) {
+        let mut menu = vec![device.to_string()];
+        let mut short = p.name.as_str();
+        if let Some(group) = self.engine.plugin_parameter_group(plugin, p.id) {
+            menu.extend(
+                group
+                    .split('/')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+            short = within(&p.name, &group);
+        }
+        (menu, short.to_string())
     }
 
     pub fn automation_param(
@@ -1111,4 +1193,21 @@ impl Session {
 /// Tracks that can hold automation lanes in the arranger.
 pub fn has_automation(kind: TrackKind) -> bool {
     kind != TrackKind::Midi
+}
+
+#[cfg(test)]
+mod tests {
+    use super::within;
+
+    #[test]
+    fn names_lose_the_group_they_start_with() {
+        assert_eq!(within("Scene A/Osc 1/Pitch", "Scene A/Osc 1"), "Pitch");
+        assert_eq!(within("Osc 1/Pitch", "Scene A/Osc 1"), "Pitch");
+        assert_eq!(within("/Scene A/Pitch", "/Scene A/"), "Pitch");
+        assert_eq!(within("Band 3 Gain", "Band 3"), "Gain");
+        assert_eq!(within("Band 10 Gain", "Band 1"), "Band 10 Gain");
+        assert_eq!(within("Cutoff", "Filter"), "Cutoff");
+        assert_eq!(within("Filter", "Filter"), "Filter");
+        assert_eq!(within("Early/Late", ""), "Early/Late");
+    }
 }

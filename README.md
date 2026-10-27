@@ -1533,6 +1533,11 @@ variables apply to one start. For example:
 - **Drawing on the GPU off:** Preferences → General → Drawing, or
   `FADERFRAME_GPU_PAINTER=0`. Try this for crashes or wrong pictures that
   could come from the graphics driver.
+- **Software rendering:** Preferences → General → Renderer → Software
+  (from the next start), or `GSK_RENDERER=cairo` for one start. GTK then
+  draws without the graphics driver. When the last run crashed inside the
+  driver (for example Mesa's `libgallium`), FaderFrame switches to
+  Software by itself and says so; choose Automatic there to go back.
 - **No GPU frame sharing:** `FADERFRAME_GPU_DMABUF=0` (Linux; Windows:
   `FADERFRAME_GPU_SHARE=0`).
 - **No zero-copy video:** `FADERFRAME_VIDEO_DMABUF=0` (Linux).

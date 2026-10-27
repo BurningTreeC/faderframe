@@ -25,6 +25,8 @@ pub struct ClapInstance {
     /// Parameters that take modulation, and how single voices are
     /// addressed (if they can be).
     modulation: Vec<(ParameterId, PerNote)>,
+    /// Parameters' module paths ("Scene A/Osc 1").
+    groups: std::collections::HashMap<ParameterId, String>,
     rt: Option<SharedRt>,
     config: Option<ProcessConfig>,
     params_tx: Option<rtrb::Producer<(u32, f64)>>,
@@ -81,6 +83,7 @@ impl ClapInstance {
             scanned: scanned.clone(),
             params: Vec::new(),
             modulation: Vec::new(),
+            groups: std::collections::HashMap::new(),
             rt: None,
             config: None,
             params_tx: None,
@@ -144,9 +147,11 @@ impl ClapInstance {
         let Some(params) = self.ext().params else {
             self.params.clear();
             self.modulation.clear();
+            self.groups.clear();
             return;
         };
         let mut modulation = Vec::new();
+        let mut groups = std::collections::HashMap::new();
         let handle = self.instance.plugin_handle();
         let mut buffer = ParamInfoBuffer::new();
         let mut out = Vec::new();
@@ -172,6 +177,10 @@ impl ClapInstance {
             }
             let module = text(info.module);
             let name = text(info.name);
+            let group = module.trim_matches('/');
+            if !group.is_empty() {
+                groups.insert(ParameterId(info.id.get()), group.to_string());
+            }
             out.push(ParameterInfo {
                 id: ParameterId(info.id.get()),
                 name: if module.is_empty() {
@@ -190,6 +199,7 @@ impl ClapInstance {
         }
         self.params = out;
         self.modulation = modulation;
+        self.groups = groups;
     }
 
     /// Handle what the plugin asked for (main-thread callbacks run here).
@@ -313,6 +323,10 @@ impl FfInstance for ClapInstance {
         self.modulation
             .iter()
             .any(|(p, n)| *p == id && *n != PerNote::No)
+    }
+
+    fn parameter_group(&self, id: ParameterId) -> Option<String> {
+        self.groups.get(&id).cloned()
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {

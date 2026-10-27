@@ -11,6 +11,10 @@ pub struct MenuItem<A> {
     pub separator_before: bool,
     /// A submenu (the entry opens it instead of acting).
     pub children: Vec<MenuItem<A>>,
+    /// The submenu is one range of a long list split up
+    /// ([`crate::menu::grouped`]): search leaves it out of where it says
+    /// an entry is.
+    pub range: bool,
 }
 
 impl<A> MenuItem<A> {
@@ -21,6 +25,7 @@ impl<A> MenuItem<A> {
             checked: None,
             separator_before: false,
             children: Vec::new(),
+            range: false,
         }
     }
 
@@ -31,6 +36,7 @@ impl<A> MenuItem<A> {
             checked: None,
             separator_before: false,
             children: Vec::new(),
+            range: false,
         }
     }
 
@@ -42,6 +48,7 @@ impl<A> MenuItem<A> {
             checked: None,
             separator_before: false,
             children,
+            range: false,
         }
     }
 

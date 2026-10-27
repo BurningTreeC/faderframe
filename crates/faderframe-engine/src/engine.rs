@@ -74,8 +74,6 @@ enum Message {
     StopAt(Option<i64>),
     BeginRecord(Box<Recorder>),
     EndRecord,
-    /// The pre-roll plays the click alone (see [`crate::record::RecordingNow`]).
-    CountIn(bool),
     MidiInput(Box<faderframe_midi::MidiInputQueue>),
     MidiOutput(Box<faderframe_midi::MidiOutputQueue>),
     BeginMidiRecord(Box<crate::midi::MidiRecorder>),
@@ -388,10 +386,10 @@ pub fn create_with_epoch(
         ping: None,
         callbacks: 0,
         count_in_end: i64::MIN,
+        counted_in: CountedIn::No,
     };
     let controller = EngineController {
         config,
-        count_in: false,
         live_sysex,
         readback,
         tx,
@@ -511,6 +509,19 @@ pub struct EngineProcessor {
     /// The play history's frame after the newest count-in frame (the click
     /// counts in until it is heard).
     count_in_end: i64,
+    /// Whether playback began with a count-in (the metronome may keep
+    /// quiet after it: [`MetronomeShared::count_in_only`]).
+    counted_in: CountedIn,
+}
+
+/// Playback after a count-in, until the next start without one (the
+/// clicks after a stop still sound for the graph's latency: as the run
+/// they belong to).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CountedIn {
+    No,
+    Playing,
+    Stopped,
 }
 
 impl EngineProcessor {
@@ -647,19 +658,14 @@ impl EngineProcessor {
                         self.click.reset();
                     }
                 }
-                Message::CountIn(on) => self.ctx.recording.count_in = on,
                 Message::BeginRecord(r) => {
-                    let count_in = self.ctx.recording.count_in;
                     self.ctx.recording = r.now();
-                    self.ctx.recording.count_in = count_in;
                     if let Some(old) = self.recorder.replace(r) {
                         self.retire(Garbage::Recorder(old));
                     }
                 }
                 Message::EndRecord => {
-                    let count_in = self.ctx.recording.count_in;
                     self.ctx.recording = Default::default();
-                    self.ctx.recording.count_in = count_in;
                     if let Some(old) = self.recorder.take() {
                         self.retire(Garbage::Recorder(old));
                     }
@@ -677,16 +683,6 @@ impl EngineProcessor {
                     }
                 }
                 Message::BeginMidiRecord(r) => {
-                    // Without an audio recording the window is the MIDI
-                    // take's (a count-in keeps the arrangement silent).
-                    if self.recorder.is_none() {
-                        let (from, to) = r.window();
-                        self.ctx.recording = crate::record::RecordingNow::window_only(
-                            from,
-                            to,
-                            self.ctx.recording.count_in,
-                        );
-                    }
                     if let Some(old) = self.midi_recorder.replace(r) {
                         self.retire(Garbage::MidiRecorder(old));
                     }
@@ -734,11 +730,6 @@ impl EngineProcessor {
                     }
                 }
                 Message::EndMidiRecord => {
-                    if self.recorder.is_none() {
-                        let count_in = self.ctx.recording.count_in;
-                        self.ctx.recording = Default::default();
-                        self.ctx.recording.count_in = count_in;
-                    }
                     if let Some(old) = self.midi_recorder.take() {
                         self.retire(Garbage::MidiRecorder(old));
                     }
@@ -1078,9 +1069,15 @@ impl EngineProcessor {
                 counting_in,
                 n,
             );
-            if counting_in > 0 {
-                self.count_in_end = self.ctx.history.end();
-            }
+            self.counted_in = match (counting_in > 0, info.playing, self.counted_in) {
+                (true, _, _) => {
+                    self.count_in_end = self.ctx.history.end();
+                    CountedIn::Playing
+                }
+                (false, false, CountedIn::Playing) => CountedIn::Stopped,
+                (false, true, CountedIn::Stopped) => CountedIn::No,
+                (false, _, c) => c,
+            };
             self.ctx.discontinuity = self.transport.take_discontinuity();
             self.ctx
                 .launch
@@ -1239,18 +1236,13 @@ impl EngineProcessor {
                     }
                 });
             }
-            // Counting in, the click plays whatever the metronome's mode.
-            let counting = self
-                .ctx
-                .recording
-                .silent_before(info.recording)
-                .is_some_and(|from| info.playing && pos < from);
-            let click = counting
-                || match self.shared.metronome.mode() {
-                    MetronomeMode::Off => false,
-                    MetronomeMode::Recording => info.recording,
-                    MetronomeMode::Always => true,
-                };
+            // After a count-in the take may record without the click.
+            let click = match self.shared.metronome.mode() {
+                MetronomeMode::Off => false,
+                MetronomeMode::Recording => info.recording,
+                MetronomeMode::Always => true,
+            } && !(self.counted_in != CountedIn::No
+                && self.shared.metronome.count_in_only());
             // A count-in before playback (the transport standing while it
             // counts) clicks whatever the metronome's mode: heard with
             // these frames while it ended less than the latency ago.
@@ -1518,8 +1510,6 @@ pub struct EngineController {
     /// Live SysEx to the tracks playing from an input port.
     live_sysex: crate::midi::LiveSysexSender,
     config: EngineConfig,
-    /// The count-in last sent ([`Self::set_count_in`]).
-    count_in: bool,
     tx: Producer<Message>,
     graph_tx: MailboxSender<CompiledGraph<EngineContext>>,
     timeline_tx: MailboxSender<Arc<TimelineSnapshot>>,
@@ -2171,6 +2161,15 @@ impl EngineController {
         self.plugins.parameters(plugin)
     }
 
+    /// The plugin's own group of a parameter ("Scene A/Osc 1").
+    pub fn plugin_parameter_group(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+        parameter: faderframe_core::ParameterId,
+    ) -> Option<String> {
+        self.plugins.parameter_group(plugin, parameter)
+    }
+
     /// Does the plugin take notes (per-note modulators move it)?
     pub fn plugin_takes_notes(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
         self.plugins.takes_notes(plugin)
@@ -2614,18 +2613,6 @@ impl EngineController {
     /// Start capturing `targets` (only while the transport records, and only
     /// timeline samples `from..to`). Ring capacity covers `seconds` of audio
     /// in case the writer stalls. Returns the ends for the writer thread.
-    /// Whether the pre-roll before a recording plays the click alone.
-    pub fn set_count_in(&mut self, on: bool) -> Result<(), EngineError> {
-        self.send(Message::CountIn(on))?;
-        self.count_in = on;
-        Ok(())
-    }
-
-    /// Whether a take's pre-roll plays the click alone (as last set).
-    pub fn count_in(&self) -> bool {
-        self.count_in
-    }
-
     pub fn begin_recording(
         &mut self,
         targets: Vec<RecordTarget>,

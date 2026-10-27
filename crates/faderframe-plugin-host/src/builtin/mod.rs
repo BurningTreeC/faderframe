@@ -90,6 +90,15 @@ impl Kind {
         Kind::LatencyProbe,
     ];
 
+    /// Are its processors built for where they run — on the audio thread
+    /// or not (reservoir workers, deadlines), and the device block? Only
+    /// the buffered devices'; any other's is handed on between the
+    /// render-ahead graph and the live one as it is (a MIDI effect made
+    /// anew there would leave the notes it had started sounding for ever).
+    fn buffered(self) -> bool {
+        matches!(self, Kind::Preamp(_) | Kind::ConsoleBus(_) | Kind::Guitar)
+    }
+
     /// The circuit a preamp or console bus solves (`Preamp` model).
     fn circuit_model(self) -> usize {
         match self {
@@ -413,6 +422,25 @@ impl Kind {
         }
     }
 
+    /// The group a parameter is in (an EQ band, a drum pad, a Guitar
+    /// Station pedal); its name starts with it.
+    fn parameter_group(self, id: ParameterId) -> Option<String> {
+        match self {
+            Kind::Eq => crate::eq::field_of(id).map(|(b, _)| format!("Band {}", b + 1)),
+            Kind::Drums => {
+                use crate::devices::drums::{PADS, id::pad};
+                let p = id.0.checked_sub(pad(0))? / (pad(1) - pad(0));
+                ((p as usize) < PADS).then(|| format!("Pad {}", p + 1))
+            }
+            Kind::Guitar => {
+                use crate::devices::guitar::{MAX_PEDALS, id::slot};
+                let s = id.0.checked_sub(slot(0, 0))? / (slot(1, 0) - slot(0, 0));
+                ((s as usize) < MAX_PEDALS).then(|| format!("Pedal {}", s + 1))
+            }
+            _ => None,
+        }
+    }
+
     /// Values the processor publishes through the tap.
     fn tap_values(self) -> Option<usize> {
         match self {
@@ -534,7 +562,7 @@ impl PluginProcessor for SharedProcessor {
             for out in io.audio_out.iter_mut() {
                 out.clear();
             }
-            return ProcessStatus::Continue;
+            return ProcessStatus::Missed;
         };
         if std::mem::take(&mut self.fresh) {
             p.reset();
@@ -589,11 +617,12 @@ impl BuiltinInstance {
     }
 
     fn made_for(&self, config: &ProcessConfig) -> MadeFor {
+        let buffered = self.kind.buffered();
         MadeFor {
             config: *config,
             channels: self.channels,
-            realtime: self.realtime,
-            sized_block: self.sized_block,
+            realtime: self.realtime && buffered,
+            sized_block: if buffered { self.sized_block } else { 0 },
             latency: self.latency_samples(),
             shape: self.shape(),
             reshaped: self.reshaped,
@@ -661,6 +690,10 @@ impl PluginInstance for BuiltinInstance {
             .infos()
             .iter()
             .any(|p| p.id == id && p.automatable && !p.stepped)
+    }
+
+    fn parameter_group(&self, id: ParameterId) -> Option<String> {
+        self.kind.parameter_group(id)
     }
 
     fn set_parameter(&mut self, id: ParameterId, value: f64) -> Result<(), PluginError> {

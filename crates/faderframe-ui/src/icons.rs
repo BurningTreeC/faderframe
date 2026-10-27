@@ -34,11 +34,19 @@ const ICONS: &[(&str, &str)] = &[
 ];
 
 /// Used only where the system has no hicolor theme: search paths added by
-/// the program come last, so an installed theme's index wins.
+/// the program come last, so an installed theme's index wins. Whichever
+/// index wins names every folder of the theme, GTK's own icons included
+/// (`image-missing`: GTK's fallback for any icon it cannot find recurses
+/// until it finds that one). GTK's built-in index lists them; this one
+/// stands in where GTK has none.
 const HICOLOR_INDEX: &str = "[Icon Theme]
 Name=Hicolor
 Comment=Fallback icon theme
-Directories=scalable/apps
+Directories=16x16/status,scalable/apps
+
+[16x16/status]
+Size=16
+Type=Threshold
 
 [scalable/apps]
 Size=16
@@ -46,6 +54,19 @@ MinSize=1
 MaxSize=512
 Type=Scalable
 ";
+
+/// GTK's built-in hicolor index (every folder of the freedesktop theme)
+/// when it has one that lists the folder of FaderFrame's icons.
+fn hicolor_index() -> String {
+    gtk::gio::resources_lookup_data(
+        "/org/gtk/libgtk/icons/hicolor.index.theme",
+        gtk::gio::ResourceLookupFlags::NONE,
+    )
+    .ok()
+    .and_then(|data| String::from_utf8(data.to_vec()).ok())
+    .filter(|index| index.contains("scalable/apps"))
+    .unwrap_or_else(|| HICOLOR_INDEX.to_string())
+}
 
 /// Write `contents` to `path` unless it holds them already.
 fn write_if_changed(path: &std::path::Path, contents: &str) {
@@ -67,13 +88,21 @@ pub fn install() {
         tracing::warn!("cannot create {}: {e}", apps.display());
         return;
     }
-    write_if_changed(&dir.join("hicolor").join("index.theme"), HICOLOR_INDEX);
+    write_if_changed(&dir.join("hicolor").join("index.theme"), &hicolor_index());
     for (name, svg) in ICONS {
         write_if_changed(&apps.join(format!("{name}.svg")), svg);
         // Earlier versions wrote them loose into the search path.
         let _ = std::fs::remove_file(dir.join(format!("{name}.svg")));
     }
-    gtk::IconTheme::for_display(&display).add_search_path(&dir);
+    let theme = gtk::IconTheme::for_display(&display);
+    theme.add_search_path(&dir);
+    // Without its fallback icon GTK recurses until the stack runs out on
+    // the first icon it lacks (an icon theme copied as broken links, an
+    // index without GTK's folders): GTK's own copy, as a loose icon.
+    if !theme.has_icon("image-missing") {
+        tracing::warn!("the icon theme has no image-missing icon: using GTK's own");
+        theme.add_resource_path("/org/gtk/libgtk/icons/16x16/status");
+    }
     gtk::Window::set_default_icon_name(crate::APP_ID);
 }
 

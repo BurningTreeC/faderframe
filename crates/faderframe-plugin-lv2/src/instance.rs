@@ -402,7 +402,7 @@ impl PluginProcessor for Lv2Processor {
                 for out in io.audio_out.iter_mut() {
                     out.clear();
                 }
-                ProcessStatus::Continue
+                ProcessStatus::Missed
             }
         }
     }

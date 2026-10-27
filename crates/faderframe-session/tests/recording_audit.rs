@@ -239,22 +239,28 @@ fn a_frozen_armed_track_is_left_out_and_the_others_record() {
     );
 }
 
-/// The count-in is part of the record settings: it survives the audio
-/// device reopening (which makes a new engine).
+/// The count-in's click setting is part of the record settings: it
+/// survives the audio device reopening (which makes a new engine), and
+/// holds only while counting in is on.
 #[test]
 fn the_count_in_survives_the_audio_device_reopening() {
     let (mut s, _) = session(1);
     let mut r = s.record;
+    assert!(r.count_in_click_only, "on by default");
+    assert!(!s.engine().metronome().count_in_only(), "not counting in");
     r.count_in = true;
     s.dispatch(Action::SetRecordSettings(r)).unwrap();
-    assert!(s.engine().count_in());
+    assert!(s.engine().metronome().count_in_only());
     s.stop_audio();
     s.start_audio(
         vec![Box::new(DummyBackend::with_input_tone(1_000.0))],
         &prefs(),
     )
     .unwrap();
-    assert!(s.engine().count_in(), "the new engine counts in too");
+    assert!(s.engine().metronome().count_in_only(), "the new engine too");
+    r.count_in_click_only = false;
+    s.dispatch(Action::SetRecordSettings(r)).unwrap();
+    assert!(!s.engine().metronome().count_in_only());
 }
 
 /// Flatten Comp plays what the comp played: a comp edge inside the folder

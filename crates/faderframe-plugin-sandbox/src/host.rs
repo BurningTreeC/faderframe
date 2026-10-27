@@ -95,13 +95,15 @@ impl Channel {
             started + Duration::from_secs_f64(frames as f64 * self.frame_seconds)
         });
         if let Some(sent) = self.in_flight {
-            // The block given up on last time: its answer first.
+            // The block given up on last time: its answer first. Still
+            // not here: this block's events never reach the helper (the
+            // engine keeps their note-offs for the next block sent).
             match self.wait_done(limit.max(started), sent) {
                 Wait::Done => self.in_flight = None,
                 Wait::Late => {
                     self.late += 1;
                     silence(io);
-                    return ProcessStatus::Continue;
+                    return ProcessStatus::Missed;
                 }
                 Wait::Dead => return fail(io),
             }
@@ -212,7 +214,7 @@ impl PluginProcessor for RemoteProcessor {
         }
         let Some(mut ch) = self.channel.try_lock() else {
             silence(io);
-            return ProcessStatus::Continue;
+            return ProcessStatus::Missed;
         };
         ch.process(ctx, io, &self.dead)
     }
@@ -246,6 +248,8 @@ pub struct RemoteInstance {
     params: Vec<ParameterInfo>,
     /// Parameters that take modulation: (id, per note too).
     modulation: Vec<(u32, bool)>,
+    /// Parameters' groups ("Scene A/Osc 1").
+    groups: HashMap<u32, String>,
     values: HashMap<u32, f64>,
     latency: u32,
     tail: TailLength,
@@ -320,6 +324,15 @@ fn failed(e: impl std::fmt::Display) -> PluginError {
     PluginError::Failed(e.to_string())
 }
 
+/// The parameters in a group, by id.
+fn groups_of(params: &[wire::Param]) -> HashMap<u32, String> {
+    params
+        .iter()
+        .filter(|p| !p.group.is_empty())
+        .map(|p| (p.id, p.group.clone()))
+        .collect()
+}
+
 impl RemoteInstance {
     /// Start a helper and instantiate `id` of `format` in it.
     pub fn spawn(launcher: &Launcher, format: PluginFormat, id: &str) -> Result<Self, PluginError> {
@@ -347,6 +360,7 @@ impl RemoteInstance {
             },
             params: Vec::new(),
             modulation: Vec::new(),
+            groups: HashMap::new(),
             values: HashMap::new(),
             latency: 0,
             tail: TailLength::None,
@@ -389,6 +403,7 @@ impl RemoteInstance {
                     .filter(|p| p.modulatable)
                     .map(|p| (p.id, p.per_note))
                     .collect();
+                inst.groups = groups_of(&i.params);
                 inst.values = i.values.into_iter().collect();
                 inst.latency = i.latency;
                 inst.tail = i.tail.into();
@@ -446,6 +461,7 @@ impl RemoteInstance {
                 .filter(|p| p.modulatable)
                 .map(|p| (p.id, p.per_note))
                 .collect();
+            self.groups = groups_of(params);
         }
         if let Some(programs) = p.programs {
             self.programs = programs;
@@ -627,6 +643,10 @@ impl PluginInstance for RemoteInstance {
 
     fn modulatable_per_note(&self, id: ParameterId) -> bool {
         self.modulation.iter().any(|(p, n)| *p == id.0 && *n)
+    }
+
+    fn parameter_group(&self, id: ParameterId) -> Option<String> {
+        self.groups.get(&id.0).cloned()
     }
 
     fn parameter(&mut self, id: ParameterId) -> Option<f64> {

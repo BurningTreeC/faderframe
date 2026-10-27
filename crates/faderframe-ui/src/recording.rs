@@ -42,6 +42,21 @@ fn roll_choices(current: Roll, off: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The count-in lengths the menu offers (and `current`).
+fn count_in_choices(current: Roll) -> Vec<(String, String)> {
+    let mut v = vec![
+        Roll::beats(1.0),
+        Roll::beats(2.0),
+        Roll::bars(1.0),
+        Roll::bars(2.0),
+        Roll::bars(4.0),
+    ];
+    if !v.contains(&current) && !current.is_off() {
+        v.push(current);
+    }
+    v.into_iter().map(|r| (r.label(), r.id())).collect()
+}
+
 /// Change the recording settings everywhere.
 pub fn apply(app: &Rc<AppState>, r: RecordSettings) {
     app.dispatch(Action::SetRecordSettings(r));
@@ -87,9 +102,11 @@ fn sync_actions(app: &Rc<AppState>, r: &RecordSettings) {
     set_state(app, "metronome", r.metronome.id());
     set_state(app, "preroll", &r.preroll.id());
     set_state(app, "postroll", &r.postroll.id());
+    set_state(app, "count-in-length", &r.count_in_length.id());
     for (name, on) in [
         ("preroll-on-bar", r.preroll_on_bar),
         ("count-in", r.count_in),
+        ("count-in-click-only", r.count_in_click_only),
     ] {
         if let Some(a) = app
             .app
@@ -287,6 +304,16 @@ pub fn install_actions(app: &Rc<AppState>) {
             r.preroll_on_bar = !r.preroll_on_bar;
         }),
         toggle(app, "count-in", r.count_in, |r| r.count_in = !r.count_in),
+        radio(app, "count-in-length", &r.count_in_length.id(), |r, id| {
+            if let Some(length) = Roll::from_id(id).filter(|l| !l.is_off()) {
+                r.count_in_length = length;
+                // Choosing a length means counting in.
+                r.count_in = true;
+            }
+        }),
+        toggle(app, "count-in-click-only", r.count_in_click_only, |r| {
+            r.count_in_click_only = !r.count_in_click_only;
+        }),
         punch_from_loop,
     ]);
     // Ctrl+P: `palette::DEFAULT_SHORTCUTS` (rebindable).
@@ -434,10 +461,22 @@ pub fn menu_for(r: &RecordSettings) -> gio::Menu {
         ),
     );
     opts.append(Some("Metronome Settings…"), Some("app.metronome-settings"));
+    let count = gio::Menu::new();
+    count.append(Some("Count In Before Recording"), Some("app.count-in"));
+    count.append_section(
+        None,
+        &radio_menu("app.count-in-length", count_in_choices(r.count_in_length)),
+    );
+    let click = gio::Menu::new();
+    click.append(
+        Some("Click Only During Count-in"),
+        Some("app.count-in-click-only"),
+    );
+    count.append_section(None, &click);
+    opts.append_submenu(Some("Count-in"), &count);
     let pre = radio_menu("app.preroll", roll_choices(r.preroll, "No pre-roll"));
     let how = gio::Menu::new();
     how.append(Some("Start on a Bar Line"), Some("app.preroll-on-bar"));
-    how.append(Some("Count-in (Click Only)"), Some("app.count-in"));
     pre.append_section(None, &how);
     opts.append_submenu(Some("Pre-roll"), &pre);
     opts.append_submenu(
@@ -493,16 +532,27 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     count_in.set_active(r.count_in);
     count_in.set_halign(gtk::Align::Start);
     count_in.set_tooltip_text(Some(
-        "During the pre-roll only the click plays; the song starts with the take.",
+        "Before recording from stop, the click alone counts in while the transport waits; \
+         then playback starts (from the pre-roll, if any).",
     ));
-    row(&g, 6, "Count-in (click only)", count_in.upcast_ref());
+    row(&g, 6, "Count in before recording", count_in.upcast_ref());
+    let (count_box, count_amount, count_unit) = roll_editor(r.count_in_length);
+    count_amount.set_range(0.5, 64.0);
+    row(&g, 7, "Count-in length", count_box.upcast_ref());
+    let click_only = gtk::Switch::new();
+    click_only.set_active(r.count_in_click_only);
+    click_only.set_halign(gtk::Align::Start);
+    click_only.set_tooltip_text(Some(
+        "After a count-in the take records without the click, whatever the metronome's mode.",
+    ));
+    row(&g, 8, "Click only during count-in", click_only.upcast_ref());
     let (postroll_box, post_amount, post_unit) = roll_editor(r.postroll);
     postroll_box.set_tooltip_text(Some(
         "With a punch range: playback goes on this long after the punch-out, then stops.",
     ));
     row(
         &g,
-        7,
+        9,
         "Post-roll after punch-out",
         postroll_box.upcast_ref(),
     );
@@ -531,7 +581,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     help.set_natural_wrap_mode(gtk::NaturalWrapMode::Word);
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
-    g.attach(&help, 0, 8, 2, 1);
+    g.attach(&help, 0, 10, 2, 1);
 
     let update = {
         let weak = Rc::downgrade(app);
@@ -542,7 +592,8 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
             post_amount.clone(),
             post_unit.clone(),
         );
-        let (on_bar, count_in) = (on_bar.clone(), count_in.clone());
+        let (on_bar, count_in, click_only) = (on_bar.clone(), count_in.clone(), click_only.clone());
+        let (count_amount, count_unit) = (count_amount.clone(), count_unit.clone());
         move || {
             let Some(app) = weak.upgrade() else { return };
             let mut r = app.session.borrow().record;
@@ -560,6 +611,11 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
             };
             r.preroll_on_bar = on_bar.is_active();
             r.count_in = count_in.is_active();
+            r.count_in_length = Roll {
+                amount: count_amount.value(),
+                unit: unit(&count_unit),
+            };
+            r.count_in_click_only = click_only.is_active();
             r.latency_offset = offset.value() as i64;
             if r != app.session.borrow().record {
                 apply(&app, r);
@@ -567,15 +623,15 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
         }
     };
     let update = Rc::new(update);
-    for d in [&mode, &loop_mode, &pre_unit, &post_unit] {
+    for d in [&mode, &loop_mode, &pre_unit, &post_unit, &count_unit] {
         let u = Rc::clone(&update);
         d.connect_selected_notify(move |_| u());
     }
-    for s in [&pre_amount, &post_amount] {
+    for s in [&pre_amount, &post_amount, &count_amount] {
         let u = Rc::clone(&update);
         s.connect_value_changed(move |_| u());
     }
-    for s in [&on_bar, &count_in] {
+    for s in [&on_bar, &count_in, &click_only] {
         let u = Rc::clone(&update);
         s.connect_active_notify(move |_| u());
     }

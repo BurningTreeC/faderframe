@@ -607,13 +607,6 @@ pub struct MidiRecorder {
     next: Option<i64>,
 }
 
-impl MidiRecorder {
-    /// The record window.
-    pub(crate) fn window(&self) -> (i64, i64) {
-        (self.from, self.to)
-    }
-}
-
 /// A recorder for `targets` inside `from..to` and the session's end.
 pub fn midi_recording(
     targets: Vec<MidiRecordTarget>,

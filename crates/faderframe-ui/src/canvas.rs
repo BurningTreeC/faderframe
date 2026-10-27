@@ -1588,7 +1588,7 @@ impl CanvasWidget {
 /// its largest level, so the popover is placed once with room for all of
 /// them and moving between levels never resizes or moves it (a popover
 /// that grows by the edge of the screen may otherwise be closed by the
-/// compositor).
+/// compositor). A long menu gets a search field over its levels.
 pub fn show_menu(
     parent: &gtk::Widget,
     at: Point,
@@ -1610,7 +1610,17 @@ pub fn show_menu(
     scroller.set_propagate_natural_height(true);
     scroller.set_max_content_height(520);
     scroller.set_child(Some(&stack));
-    popover.set_child(Some(&scroller));
+    let search = faderframe_ui_canvas::menu::searchable(&items)
+        .then(|| menu_search(&popover, &stack, items, app));
+    match &search {
+        Some(entry) => {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            column.append(entry);
+            column.append(&scroller);
+            popover.set_child(Some(&column));
+        }
+        None => popover.set_child(Some(&scroller)),
+    }
     popover.set_parent(parent);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(at.x as i32, at.y as i32, 1, 1)));
     popover.connect_closed(|p| {
@@ -1618,49 +1628,236 @@ pub fn show_menu(
         let p = p.clone();
         glib::idle_add_local_once(move || p.unparent());
     });
-    OPEN_MENU.with(|m| *m.borrow_mut() = Some((popover.clone(), stack)));
+    OPEN_MENU.with(|m| {
+        *m.borrow_mut() = Some(OpenMenu {
+            popover: popover.clone(),
+            stack,
+            search: search.clone(),
+        })
+    });
     popover.popup();
+    if let Some(entry) = search {
+        entry.grab_focus();
+    }
+}
+
+/// The stack page of a menu's search results.
+const SEARCH_PAGE: &str = "menu-search";
+/// Search results listed at most.
+const SEARCH_SHOWN: usize = 150;
+
+/// The search field over a long menu: what is typed lists the entries of
+/// every level that match, each with the submenus it is in, on a page of
+/// their own (it scrolls within the stack's size, so the popover never
+/// grows). Enter takes the first, Down goes into the list, Escape closes
+/// the menu; an empty field goes back to the level shown before.
+fn menu_search(
+    popover: &gtk::Popover,
+    stack: &gtk::Stack,
+    items: Vec<MenuItem<Action>>,
+    app: &Rc<AppState>,
+) -> gtk::SearchEntry {
+    let entry = gtk::SearchEntry::new();
+    entry.set_placeholder_text(Some("Search"));
+    entry.update_property(&[gtk::accessible::Property::Label("Search the menu")]);
+    // Typing while an entry has the focus searches too.
+    entry.set_key_capture_widget(Some(popover));
+    let results = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let page = gtk::ScrolledWindow::new();
+    page.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    page.set_min_content_height(240);
+    page.set_vexpand(true);
+    page.set_child(Some(&results));
+    stack.add_named(&page, Some(SEARCH_PAGE));
+    let items = Rc::new(items);
+    let before = Rc::new(RefCell::new(page_name(&[])));
+    let first: Rc<RefCell<Option<Action>>> = Rc::default();
+    let weak = Rc::downgrade(app);
+    entry.connect_changed(glib::clone!(
+        #[weak]
+        stack,
+        #[weak]
+        popover,
+        #[strong]
+        first,
+        move |e| {
+            while let Some(c) = results.first_child() {
+                results.remove(&c);
+            }
+            let text = e.text();
+            if text.trim().is_empty() {
+                first.borrow_mut().take();
+                stack.set_visible_child_full(&before.borrow(), gtk::StackTransitionType::None);
+                return;
+            }
+            if let Some(level) = stack
+                .visible_child_name()
+                .filter(|n| n.as_str() != SEARCH_PAGE)
+            {
+                *before.borrow_mut() = level.to_string();
+            }
+            let found = faderframe_ui_canvas::menu::search(&items, &text);
+            let entry_of = |m: &faderframe_ui_canvas::menu::MenuMatch| {
+                faderframe_ui_canvas::menu::entry_at(&items, &m.path)
+            };
+            *first.borrow_mut() = found
+                .iter()
+                .find_map(|m| entry_of(m).and_then(|i| i.action.clone()));
+            for m in found.iter().take(SEARCH_SHOWN) {
+                let Some(item) = entry_of(m) else { continue };
+                let button = menu_row(&format!("{}{}", check_mark(item.checked), m.label));
+                if let Some(label) = button.child().and_downcast::<gtk::Label>() {
+                    label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                }
+                button.set_tooltip_text(Some(&m.label));
+                match item.action.clone() {
+                    Some(action) => {
+                        let weak = weak.clone();
+                        let popover = popover.downgrade();
+                        button.connect_clicked(move |_| {
+                            if let Some(p) = popover.upgrade() {
+                                p.popdown();
+                            }
+                            if let Some(app) = weak.upgrade() {
+                                app.dispatch(action.clone());
+                            }
+                        });
+                    }
+                    None => button.set_sensitive(false),
+                }
+                results.append(&button);
+            }
+            let rest = match found.len() {
+                0 => Some("No matches".to_string()),
+                n if n > SEARCH_SHOWN => Some(format!("{} more…", n - SEARCH_SHOWN)),
+                _ => None,
+            };
+            if let Some(rest) = rest {
+                let row = menu_row(&rest);
+                row.set_sensitive(false);
+                results.append(&row);
+            }
+            stack.set_visible_child_full(SEARCH_PAGE, gtk::StackTransitionType::None);
+            e.announce(
+                &match found.len() {
+                    1 => "1 match".to_string(),
+                    n => format!("{n} matches"),
+                },
+                gtk::AccessibleAnnouncementPriority::Low,
+            );
+        }
+    ));
+    let weak = Rc::downgrade(app);
+    entry.connect_activate(glib::clone!(
+        #[weak]
+        popover,
+        move |_| {
+            let Some(action) = first.borrow().clone() else {
+                return;
+            };
+            popover.popdown();
+            if let Some(app) = weak.upgrade() {
+                app.dispatch(action);
+            }
+        }
+    ));
+    entry.connect_stop_search(glib::clone!(
+        #[weak]
+        popover,
+        move |_| popover.popdown()
+    ));
+    // Down before the text takes it.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        stack,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, _| {
+            if key != gdk::Key::Down {
+                return glib::Propagation::Proceed;
+            }
+            if let Some((button, _)) = stack.visible_child().and_then(|page| {
+                menu_buttons(&page)
+                    .into_iter()
+                    .find(|(b, _)| b.is_sensitive())
+            }) {
+                button.grab_focus();
+            }
+            glib::Propagation::Stop
+        }
+    ));
+    entry.add_controller(keys);
+    entry
+}
+
+/// The context menu open now (for scripted checks).
+struct OpenMenu {
+    popover: gtk::Popover,
+    stack: gtk::Stack,
+    search: Option<gtk::SearchEntry>,
 }
 
 thread_local! {
-    /// The context menu open now (for scripted checks).
-    static OPEN_MENU: RefCell<Option<(gtk::Popover, gtk::Stack)>> = const { RefCell::new(None) };
+    static OPEN_MENU: RefCell<Option<OpenMenu>> = const { RefCell::new(None) };
 }
 
 /// The open context menu and the name of the level it shows.
 pub fn open_menu() -> Option<(gtk::Popover, String)> {
     OPEN_MENU.with(|m| {
-        m.borrow().as_ref().map(|(p, s)| {
+        m.borrow().as_ref().map(|m| {
             (
-                p.clone(),
-                s.visible_child_name()
+                m.popover.clone(),
+                m.stack
+                    .visible_child_name()
                     .map_or_else(String::new, |n| n.to_string()),
             )
         })
     })
 }
 
+/// Type `text` into the open context menu's search field (scripted
+/// checks); false when no menu with one is open.
+pub fn search_menu(text: &str) -> bool {
+    let Some(entry) = OPEN_MENU.with(|m| m.borrow().as_ref().and_then(|m| m.search.clone())) else {
+        return false;
+    };
+    entry.set_text(text);
+    true
+}
+
+/// The entries (buttons and their labels) on a menu page, in order.
+fn menu_buttons(page: &gtk::Widget) -> Vec<(gtk::Button, glib::GString)> {
+    let mut out = Vec::new();
+    let mut child = page.first_child();
+    while let Some(c) = child {
+        match c.clone().downcast::<gtk::Button>() {
+            Ok(button) => {
+                if let Some(text) = button
+                    .child()
+                    .and_downcast::<gtk::Label>()
+                    .map(|l| l.text())
+                {
+                    out.push((button, text));
+                }
+            }
+            Err(other) => out.extend(menu_buttons(&other)),
+        }
+        child = c.next_sibling();
+    }
+    out
+}
+
 /// Click the entry of the open context menu's shown level labelled
 /// `label` — or, failing that, the first whose label contains it (as a
 /// pointer click would; scripted checks).
 pub fn activate_menu_entry(label: &str) -> bool {
-    let Some(page) = OPEN_MENU.with(|m| m.borrow().as_ref().and_then(|(_, s)| s.visible_child()))
+    let Some(page) = OPEN_MENU.with(|m| m.borrow().as_ref().and_then(|m| m.stack.visible_child()))
     else {
         return false;
     };
-    let mut entries = Vec::new();
-    let mut child = page.first_child();
-    while let Some(c) = child {
-        if let Ok(button) = c.clone().downcast::<gtk::Button>()
-            && let Some(text) = button
-                .child()
-                .and_then(|l| l.downcast::<gtk::Label>().ok())
-                .map(|l| l.text())
-        {
-            entries.push((button, text));
-        }
-        child = c.next_sibling();
-    }
+    let entries = menu_buttons(&page);
     // Without the check mark and the submenu arrow.
     let bare = |t: &str| {
         t.trim_start_matches(['✓', ' '])
@@ -1675,6 +1872,25 @@ pub fn activate_menu_entry(label: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// A menu entry: a flat button with its label at the start.
+fn menu_row(text: &str) -> gtk::Button {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    let button = gtk::Button::new();
+    button.set_child(Some(&label));
+    button.add_css_class("flat");
+    button
+}
+
+/// What goes before an entry's label for its check.
+fn check_mark(checked: Option<bool>) -> &'static str {
+    match checked {
+        Some(true) => "✓  ",
+        Some(false) => "    ",
+        None => "",
     }
 }
 
@@ -1699,16 +1915,8 @@ fn add_menu_pages(
     app: &Rc<AppState>,
 ) {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let row = |text: &str| {
-        let label = gtk::Label::new(Some(text));
-        label.set_xalign(0.0);
-        let button = gtk::Button::new();
-        button.set_child(Some(&label));
-        button.add_css_class("flat");
-        button
-    };
     if let Some(title) = title {
-        let back = row(&format!("‹  {title}"));
+        let back = menu_row(&format!("‹  {title}"));
         let up = page_name(&path[..path.len() - 1]);
         back.connect_clicked(glib::clone!(
             #[weak]
@@ -1722,17 +1930,12 @@ fn add_menu_pages(
         if item.separator_before && list.first_child().is_some() {
             list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         }
-        let mark = match item.checked {
-            Some(true) => "✓  ",
-            Some(false) => "    ",
-            None => "",
-        };
         let more = if item.children.is_empty() {
             ""
         } else {
             "  ›"
         };
-        let button = row(&format!("{mark}{}{more}", item.label));
+        let button = menu_row(&format!("{}{}{more}", check_mark(item.checked), item.label));
         if !item.children.is_empty() {
             let mut deeper = path.to_vec();
             deeper.push(i);

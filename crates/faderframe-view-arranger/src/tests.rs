@@ -556,6 +556,67 @@ fn automation_lanes_show_and_edit_points() {
     );
 }
 
+/// Issue #26: a lane name's menu lists the track's own parameters, then
+/// each device's in a submenu (by the device's own groups), checked where a
+/// lane is shown.
+#[test]
+fn the_parameter_menu_lists_devices_in_submenus() {
+    use faderframe_ui_canvas::menu;
+    let mut s = session();
+    let t = ArrangerView::lane_tracks(&s)[0].id;
+    let index = s.project().track(t).unwrap().inserts.len();
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::EQ, "Test EQ"),
+    })
+    .unwrap();
+    let freq = s
+        .automatable_parameters(t)
+        .into_iter()
+        .find(|p| p.name == "Test EQ: Band 1 Frequency")
+        .unwrap()
+        .target;
+    s.dispatch(Action::ShowAutomation {
+        track: t,
+        target: freq,
+    })
+    .unwrap();
+    let HostRequest::ContextMenu { items, .. } =
+        ArrangerView::parameter_menu(&s, t, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu");
+    };
+    let own: Vec<&str> = items
+        .iter()
+        .take_while(|i| i.children.is_empty())
+        .map(|i| i.label.as_str())
+        .collect();
+    assert!(own.contains(&"Volume"), "{own:?}");
+    let eq = items.iter().find(|i| i.label == "Test EQ").unwrap();
+    assert_eq!(eq.checked, Some(true), "a lane of it is shown");
+    let band = menu::find(&items, &["Test EQ", "Band 1"]).unwrap();
+    assert_eq!(band.checked, Some(true));
+    assert_eq!(
+        menu::find(&items, &["Test EQ", "Band 2"]).unwrap().checked,
+        Some(false)
+    );
+    let f = menu::find(&items, &["Test EQ", "Band 1", "Frequency"]).unwrap();
+    assert_eq!(f.checked, Some(true));
+    assert!(matches!(f.action, Some(Action::HideAutomationLane(_))));
+    let g = menu::find(&items, &["Test EQ", "Band 2", "Gain"]).unwrap();
+    assert!(matches!(
+        g.action,
+        Some(Action::ShowAutomation { target, .. }) if target != freq
+    ));
+    // Search names each entry with its device and band.
+    let found = menu::search(&items, "band 2 gain");
+    assert!(
+        found.iter().any(|m| m.label == "Test EQ · Band 2 · Gain"),
+        "{found:?}"
+    );
+}
+
 #[test]
 fn header_column_resizes_horizontally() {
     let mut s = session();

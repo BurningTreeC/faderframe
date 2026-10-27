@@ -77,6 +77,51 @@ fn every_parameter_is_listed_with_a_usable_range() {
     assert!((time.from_normal(time.to_normal(250.0)) - 250.0).abs() < 1e-6);
 }
 
+/// Issue #26: menus list a track's own parameters, then each device's in a
+/// submenu of its own and there in the device's own groups.
+#[test]
+fn menus_list_parameters_by_device_and_the_devices_groups() {
+    let (mut s, t) = session();
+    for (index, id, name) in [
+        (0, builtin::EQ, "EQ"),
+        (1, builtin::ECHO, "Delay"),
+        (2, builtin::ECHO, "Delay"),
+    ] {
+        s.dispatch(Action::InsertPlugin {
+            track: t,
+            index,
+            plugin: PluginRef::builtin(id, name),
+        })
+        .unwrap();
+    }
+    let params = s.automatable_parameters(t);
+    let find = |name: &str| params.iter().find(|p| p.name == name).unwrap();
+    let volume = find("Volume");
+    assert!(volume.menu.is_empty());
+    assert_eq!(volume.menu_label(), "Volume");
+    // The EQ's bands are its groups.
+    let gain = find("EQ: Band 3 Gain");
+    assert_eq!(gain.menu, ["EQ", "Band 3"]);
+    assert_eq!(gain.menu_label(), "Gain");
+    let output = find("EQ: Output");
+    assert_eq!(output.menu, ["EQ"]);
+    assert_eq!(output.menu_label(), "Output");
+    // Devices are named as everywhere else.
+    let bypass = find("Delay (2): Bypass");
+    assert_eq!(bypass.menu, ["Delay (2)"]);
+    assert_eq!(bypass.menu_label(), "Bypass");
+    assert_eq!(find("Delay (2): Time").menu_label(), "Time");
+    // Modulation targets alike.
+    let targets = s.modulation_targets(t);
+    assert!(targets[0].menu.is_empty());
+    let freq = targets
+        .iter()
+        .find(|c| c.name == "Band 3 Frequency")
+        .unwrap();
+    assert_eq!(freq.menu, ["EQ", "Band 3"]);
+    assert_eq!(freq.menu_label(), "Frequency");
+}
+
 #[test]
 fn lanes_show_hide_and_drive_the_displayed_value() {
     let (mut s, t) = session();

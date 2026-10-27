@@ -539,6 +539,97 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
     );
 }
 
+/// A second note-on on a key still sounding (two sources, a graph handing
+/// the plugin on) ends the first note by its id: a plugin matching
+/// note-offs by id would hold it for ever otherwise.
+#[test]
+fn a_note_started_again_ends_the_one_sounding_by_its_id() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            sample_rate: 48_000.0,
+            max_block_size: 64,
+            sidechain: false,
+            double_precision: false,
+        })
+        .unwrap();
+    NOTES.lock().unwrap().clear();
+    let on = MidiEvent::NoteOn {
+        channel: 0,
+        key: 60,
+        velocity: 100,
+    };
+    let mut midi = MidiBuffer::with_capacity(8);
+    for (at, e) in [
+        (0, on),
+        (10, on),
+        (
+            20,
+            MidiEvent::NoteOff {
+                channel: 0,
+                key: 60,
+                velocity: 0,
+            },
+        ),
+    ] {
+        midi.push(TimedMidiEvent::new(at, e)).unwrap();
+    }
+    let inputs = [{
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    }];
+    let mut outputs = [{
+        let mut b = AudioBuffer::new(ChannelLayout::Stereo, 64);
+        b.set_len(64);
+        b
+    }];
+    let events = [midi];
+    let mut io = NodeIo {
+        frames: 64,
+        audio_in: &inputs,
+        audio_out: &mut outputs,
+        events_in: &events,
+        events_out: &mut [],
+    };
+    let transport = faderframe_transport::TransportInfo::default();
+    proc.process(
+        &PluginProcessContext {
+            transport: &transport,
+            param_events: &[],
+            harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
+            note_mods: &[],
+        },
+        &mut io,
+    );
+    let seen: Vec<(String, i32)> = NOTES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| n.2 == 60)
+        .map(|n| (n.0.clone(), n.1))
+        .collect();
+    let ids: Vec<i32> = seen.iter().filter(|n| n.0 == "on").map(|n| n.1).collect();
+    assert_eq!(ids.len(), 2, "{seen:?}");
+    assert_ne!(ids[0], ids[1]);
+    // Each started note ends by its own id, the first before the second
+    // starts.
+    let expected: Vec<(String, i32)> = [
+        ("on", ids[0]),
+        ("off", ids[0]),
+        ("on", ids[1]),
+        ("off", ids[1]),
+    ]
+    .iter()
+    .map(|(w, id)| (w.to_string(), *id))
+    .collect();
+    assert_eq!(seen, expected);
+}
+
 #[test]
 fn modulation_moves_the_plugin_not_its_value_and_reaches_single_voices() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -871,10 +962,22 @@ fn play_an_installed_instrument(f: &ClapFactory, p: &ScannedPlugin) {
         infos.iter().filter(|i| inst.modulatable(i.id)).count(),
         per_note.len()
     );
+    // Module paths name the groups automation menus list.
+    let groups: std::collections::BTreeSet<String> = infos
+        .iter()
+        .filter_map(|i| inst.parameter_group(i.id))
+        .collect();
+    eprintln!("{}: {} parameter groups", p.name, groups.len());
+    for i in &infos {
+        if let Some(g) = inst.parameter_group(i.id) {
+            assert!(i.name.starts_with(&format!("{g}/")), "{}", i.name);
+        }
+    }
     if std::env::var_os("FADERFRAME_TEST_LIST").is_some() {
         for i in &per_note {
             eprintln!("  per note: {} ({}..{})", i.name, i.min, i.max);
         }
+        eprintln!("  groups: {groups:?}");
     }
     drop(inst);
     let target = per_note

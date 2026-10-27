@@ -1,5 +1,6 @@
 //! Control-side ownership of plugin instances.
 
+use crate::nodes::MissedReleases;
 use faderframe_core::{ParameterId, PluginInstanceId};
 use faderframe_plugin_host::{
     PluginEditor, PluginError, PluginEventSources, PluginFd, PluginFormat, PluginInstance,
@@ -60,6 +61,8 @@ struct Hosted {
     /// Its output buses (as instantiated).
     outputs: Vec<OutputBus>,
     failed: Arc<AtomicBool>,
+    /// What blocks its processors missed would have ended (every graph's).
+    missed: Arc<MissedReleases>,
     /// Explicit slot values last pushed to the instance.
     applied: HashMap<ParameterId, f64>,
     /// The plugin's own value before the first explicit one (restored when
@@ -102,6 +105,8 @@ pub struct ActivatedPlugin {
     /// The instance's activation the processor belongs to.
     pub activation: u64,
     pub failed: Arc<AtomicBool>,
+    /// The instance's (shared by the nodes of all graphs).
+    pub missed: Arc<MissedReleases>,
 }
 
 impl PluginHost {
@@ -178,6 +183,7 @@ impl PluginHost {
                     instance,
                     outputs,
                     failed: Arc::new(AtomicBool::new(false)),
+                    missed: Arc::default(),
                     applied,
                     baseline,
                     state: slot.state.clone(),
@@ -469,6 +475,13 @@ impl PluginHost {
         self.instances.get(&plugin).map(|h| h.instance.parameters())
     }
 
+    /// The plugin's own group of a parameter.
+    pub fn parameter_group(&self, plugin: PluginInstanceId, id: ParameterId) -> Option<String> {
+        self.instances
+            .get(&plugin)
+            .and_then(|h| h.instance.parameter_group(id))
+    }
+
     /// Does the parameter take modulation that leaves its value alone?
     pub fn modulatable(&self, plugin: PluginInstanceId, id: ParameterId) -> bool {
         self.instances
@@ -520,6 +533,7 @@ impl PluginHost {
             latency: hosted.instance.latency_samples(),
             activation: hosted.instance.activation(),
             failed: Arc::clone(&hosted.failed),
+            missed: Arc::clone(&hosted.missed),
         })
     }
 

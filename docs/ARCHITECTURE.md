@@ -1946,7 +1946,12 @@ interface with a small buffer is still to be listened to.
 **Where Stop leaves the playhead, and where Play starts.** Three ways,
 persisted in the preferences (`return_to_play_start`, `stop_to_start`):
 it stays where playback stopped (the default; the edit toolbar's
-Insertion Follows Playback), it returns to where playback started
+Insertion Follows Playback) — where it was *heard*: the engine has
+processed the output latency (the graph's and the device's) further and
+stops there, so a user's Stop (`Session::stop_here`: the button, Space)
+locates back to the heard position (`after_stop(Some(heard))`; stops the
+engine makes on a frame — the post-roll, a show — end where they are
+heard anyway; test `stop_stays_where_the_playhead_is_heard`), it returns to where playback started
 (*Return to Start on Stop*: `EditorSettings::insertion_follows_playback`
 off), or to the start of the project (`stop_to_start`, which wins). The
 play start (`Session::play_started_at`) is where the playhead was when
@@ -2036,8 +2041,31 @@ sounding — so the last count-in beat and bar 1's downbeat are a beat
 apart as heard, behind plugin latency too. A pre-roll partly before the
 start counts in only what is missing: from beat 3 of bar 1 a one-bar
 pre-roll (not on a bar) counts two beats in and plays the first two
-beats, silent with clicks under *Count-in*; a launcher slot's count-in
-(`Launcher::count_in`) recorded from the start counts in the same way.
+beats; a launcher slot's count-in (`Launcher::count_in`) recorded from
+the start counts in the same way.
+
+**Count-in** (#23; until 0.31 it was a pre-roll with the click alone,
+which did nothing without a pre-roll). `RecordSettings::{count_in,
+count_in_length}`: recording from stop counts in its own length (bars,
+beats or seconds, measured back on the timeline by `rolled_back`, the
+place in the bar kept) before everything else — `play` adds those frames
+to the `PlayAfterCountIn` (on top of what a pre-roll could not reach
+before the project's start), so the transport stands at the pre-roll's
+start (or the record start) while the click counts, then the pre-roll
+plays the song. `count_in_click_only` (on by default): the metronome
+keeps quiet after it — `MetronomeShared::count_in_only` (set while
+counting in is on, `Session::apply_count_in_click`, again for every new
+engine), and the processor's `CountedIn` (Playing from a count-in,
+Stopped after it so the take's last clicks still on their way stay
+quiet, back to No when playback starts without one) silences the clicks
+of that playback, through loop wraps, whatever the metronome's mode.
+Older preferences with the pre-roll's Count-in become a count-in as long,
+without the pre-roll (`Preferences::record_settings`). Menus: Transport →
+Count-in (on/off, lengths, Click Only During Count-in); Preferences →
+Recording. Tests `the_click_can_keep_quiet_after_counting_in` (engine),
+`a_count_in_counts_its_bars_then_records_from_the_playhead`,
+`a_count_in_comes_before_the_pre_roll` (session),
+`older_count_ins_become_count_ins_of_their_own` (ui prefs).
 The session sees a count-in as playing (started): the tick sets
 `TransportSnapshot::playing` from `started()`, so Stop, Abort (and Abort
 and Restart, which counts in again), the play button and the requested
@@ -2057,8 +2085,9 @@ Stop/Play while counting), `a_count_in_rendered_ahead_starts_on_the_same_frame`
 count-in in `rendering_ahead_does_not_allocate_on_the_audio_thread`,
 transport `a_count_in_stands_then_plays_on_the_frame_after_it`, history
 `a_count_in_counts_down_standing_then_plays`, session
-`tests/count_in.rs` (from the start, partial, the Count-in setting, Stop,
-Abort, Toggle, Abort and Restart, a launcher slot).
+`tests/count_in.rs` (from the start, partial, a count-in of its own,
+before a pre-roll, Stop, Abort, Toggle, Abort and Restart, a launcher
+slot).
 
 ## 7. MIDI and instruments
 
@@ -2286,9 +2315,31 @@ EQ's filters, the reverb's lines are not built anew on the UI thread at
 each rebuild. A graph that adopts the running processor (same node) keeps
 its state; one that gets it handed out again (its node changed: bypass,
 latency) resets it when it first runs, as a new processor would be
-(`rebuilds_share_the_processor_made_and_start_it_clean`). The live and the
-render-ahead graphs configure built-ins differently (`realtime`), so a
-processor never moves between them with state rendered ahead.
+(`rebuilds_share_the_processor_made_and_start_it_clean`). Only the
+buffered built-ins (`Kind::buffered`: preamps, console buses, the Guitar
+Station — reservoir workers and deadlines) are made anew for the live
+graph rather than the render-ahead one (`realtime`, the sized block);
+every other processor moves between them as it is, reset on the way, so
+a MIDI effect ends the notes it had started (#27: an arpeggiator made
+anew when its track moved to the live graph — opening an editor does that
+— left them sounding in the instrument for ever).
+
+**Blocks a plugin misses.** A shared processor busy in another graph (the
+`try_lock` lost while two graphs overlap during a move), or a sandbox
+helper still working on an earlier block, answers
+`ProcessStatus::Missed`: silence, its events never taken. The plugin's
+`MissedReleases` (`nodes::plugin`; one per instance, atomic bitsets
+shared by its nodes in every graph) keeps what those events would have
+ended — note-offs, pedals let go, all sound/notes off — and the plugin's
+next block, in any graph, starts with them (missed note-ons stay
+missed). CLAP and VST3 processors end a key's sounding note id before a
+new note-on on the same key (plugins matching offs by id kept the first
+voice), CLAP takes a velocity-0 note-on as an off. Tests
+`engine/tests/note_offs.rs` (an arpeggiator moving between the graphs
+with an editor open while playing; missed note-offs and pedals reaching
+the instrument), `blocks_a_late_helper_never_gets_say_they_missed_it`
+(sandbox), `a_note_started_again_ends_the_one_sounding_by_its_id` (CLAP,
+VST3), `blocks_an_instrument_misses_do_not_allocate`.
 
 ### Built-in devices
 
@@ -4077,7 +4128,8 @@ plain clips with the same fades.
 | Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged · *Replace* — overlapped clips are cut back (tape style) |
 | Loop recording | *Passes as takes* · *Keep last pass* · *New track per pass* (earlier passes on new, muted tracks) |
 | Metronome | Off · While recording · Always (`click.rs`: decaying sine per beat, accented downbeats, follows tempo and meter, live output only) |
-| Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::pre_roll`); what lies before the project's start is counted in before playback (§6, *Counting in before playback*); *Count-in* (`count_in`): the pre-roll plays the click alone |
+| Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::pre_roll`); what lies before the project's start is counted in before playback (§6, *Counting in before playback*) |
+| Count-in | `count_in` + `count_in_length` (a `Roll`): the click alone, the transport standing, before the pre-roll (§6, *Count-in*); `count_in_click_only`: no click during the take after it |
 | Post-roll | `Roll` after a punch-out, then playback stops (`EngineController::stop_at`, `Session::roll_on`; the tick ends the take when it ran out, a user stop disarms it) |
 | Punch | `Project::punch_range` + `punch_enabled` (`Command::SetPunch`); capture only inside it |
 
@@ -4137,16 +4189,10 @@ Inside the window a recorded track's clip player is silent and its Auto
 monitoring passes the input (`MonitorGate`, sample-accurate at the
 window's edges); before and after it the track plays its clips — so what
 is heard while recording over a clip is the new take, not the old one
-under it. A count-in (`RecordingNow::silent_before`) keeps every clip
-player (audio and MIDI) silent before the window and forces the click
-there, whatever the metronome's mode. A MIDI-only take sets the window too (`RecordingNow::window_only`
-on `BeginMidiRecord` when no audio recorder runs), so its count-in keeps the
-song silent as well; the count-in setting goes to every new engine
-(`recreate_engine`, `EngineController::count_in`). Tests
+under it. (A count-in stands before playback instead of playing the
+pre-roll silently: §6, *Count-in*.) Tests
 `engine/tests/recording.rs`
-(`a_recorded_track_plays_its_input_not_its_clip_inside_the_window`,
-`a_count_in_plays_the_click_alone_before_the_take`,
-`a_count_in_before_a_midi_only_take_keeps_the_song_silent`), session
+(`a_recorded_track_plays_its_input_not_its_clip_inside_the_window`), session
 `pre_and_post_roll_lengths_and_the_post_roll_stop`,
 `the_count_in_survives_the_audio_device_reopening`.
 
@@ -4195,7 +4241,22 @@ replacement coalesces while dragging, so a point drag is one undo step.
 `Session::automatable_parameters` lists everything automatable — strip
 parameters, sends, and every `automatable` parameter plus bypass of the
 instrument and inserts, from the plugin's `ParameterInfo` — with ranges and
-a mapping to lane height (fader law for gains, log for Hz/ms).
+a mapping to lane height (fader law for gains, log for Hz/ms). Each one
+also carries where menus list it (#26: `AutomationParam::{menu, short}`):
+the track's own parameters at the top, then a submenu per device (named
+as `Track::name_of` names it, nested container devices too) and inside it
+the plugin's own groups (`PluginInstance::parameter_group`: CLAP's module
+path, VST3's unit path, the EQ's bands, the Drum Sampler's pads, the
+Guitar Station's pedals; sandboxed plugins send theirs in `Param::group`),
+the entry's label without its group's prefix. The arranger's lane menu,
+the Automation view's "+" and the modulators' "+ Target"
+(`ModTargetChoice` likewise) build them with
+`faderframe_ui_canvas::menu::grouped` (levels past `LONG_LEVEL` entries
+split into ranges); the GTK host puts a search field over any context
+menu of `SEARCH_FROM` entries or more (`menu::search`: every word, any
+case, own-label matches first; results flat with their submenus as
+context on a stack page of their own; Enter takes the first, Escape
+closes). Dev actions `automation-menu:<track>`, `menu-search:<text>`.
 
 **Playback.** The timeline snapshot carries each track's driving lanes
 converted to engine samples (`SampleLane`: binary search + interpolation,

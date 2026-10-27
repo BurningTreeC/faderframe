@@ -454,3 +454,72 @@ fn an_adopted_processor_keeps_its_tail() {
     }
     assert!(peak > 0.1, "the echo carries on ({peak})");
 }
+
+/// Menus list the big devices' parameters by band, pad and pedal.
+#[test]
+fn big_devices_group_their_parameters() {
+    for (id, word, groups) in [
+        (builtin::EQ, "Band", crate::eq::BANDS),
+        (builtin::DRUMS, "Pad", crate::devices::drums::PADS),
+        (
+            builtin::GUITAR_STATION,
+            "Pedal",
+            crate::devices::guitar::MAX_PEDALS,
+        ),
+    ] {
+        let inst = BuiltinFactory.instantiate(id).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for p in inst.parameters() {
+            let group = inst.parameter_group(p.id);
+            let named = p
+                .name
+                .strip_prefix(word)
+                .and_then(|r| r.trim_start().split_once(' '))
+                .and_then(|(n, _)| n.parse::<usize>().ok());
+            assert_eq!(
+                group,
+                named.map(|n| format!("{word} {n}")),
+                "{id}: {}",
+                p.name
+            );
+            seen.extend(group);
+        }
+        assert_eq!(seen.len(), groups, "{id}");
+    }
+    let synth = BuiltinFactory.instantiate(builtin::SYNTH).unwrap();
+    assert!(
+        synth
+            .parameters()
+            .iter()
+            .all(|p| synth.parameter_group(p.id).is_none())
+    );
+}
+
+/// A MIDI effect is not made anew when its track moves between the
+/// render-ahead graph and the live one: the processor it hands on starts
+/// clean by ending the notes it had sounding.
+#[test]
+fn a_midi_effect_moving_to_the_audio_thread_ends_its_notes() {
+    let mut inst = BuiltinFactory.instantiate(builtin::ARPEGGIATOR).unwrap();
+    inst.configure_realtime(false);
+    let mut ahead = inst.create_processor(&config()).unwrap();
+    let mut rig = Rig::new();
+    rig.ev_out = vec![MidiBuffer::with_capacity(64)];
+    let on = MidiEvent::NoteOn {
+        channel: 0,
+        key: 60,
+        velocity: 100,
+    };
+    rig.ev_in[0].push(TimedMidiEvent::new(0, on)).unwrap();
+    rig.run(ahead.as_mut());
+    assert!(rig.ev_out[0].iter().any(|e| e.event == on), "it plays");
+    rig.ev_in[0].clear();
+    inst.configure_realtime(true);
+    let mut live = inst.create_processor(&config()).unwrap();
+    rig.ev_out[0].clear();
+    rig.run(live.as_mut());
+    let ended = rig.ev_out[0]
+        .iter()
+        .any(|e| matches!(e.event, MidiEvent::NoteOff { key: 60, .. }));
+    assert!(ended, "{:?}", rig.ev_out[0].as_slice());
+}

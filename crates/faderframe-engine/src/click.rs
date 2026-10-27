@@ -193,6 +193,9 @@ pub struct MetronomeShared {
     /// The cue mixes it may click in (the first `cue_count`).
     cues: [AtomicU64; MAX_CUE_CLICKS],
     cue_count: AtomicU8,
+    /// It clicks only while counting in, never in the run a count-in
+    /// started.
+    count_in_only: AtomicBool,
 }
 
 impl Default for MetronomeShared {
@@ -208,6 +211,7 @@ impl Default for MetronomeShared {
             main: AtomicBool::new(true),
             cues: std::array::from_fn(|_| AtomicU64::new(0)),
             cue_count: AtomicU8::new(0),
+            count_in_only: AtomicBool::new(false),
         }
     }
 }
@@ -219,6 +223,17 @@ impl MetronomeShared {
 
     pub fn mode(&self) -> MetronomeMode {
         MetronomeMode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
+
+    /// Click only while counting in: once a count-in has counted in, the
+    /// metronome keeps quiet until the transport stops, whatever its mode
+    /// (the take records without the click).
+    pub fn set_count_in_only(&self, on: bool) {
+        self.count_in_only.store(on, Ordering::Relaxed);
+    }
+
+    pub fn count_in_only(&self) -> bool {
+        self.count_in_only.load(Ordering::Relaxed)
     }
 
     /// The overall volume (linear).

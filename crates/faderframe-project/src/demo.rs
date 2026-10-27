@@ -64,6 +64,9 @@ fn param(slot: &PluginSlot, id: u32) -> ModTarget {
     }
 }
 
+/// The demo project's name.
+pub const DEMO_NAME: &str = "Demo Session";
+
 const BPM: f64 = 112.0;
 const BARS: u32 = 8;
 
@@ -78,7 +81,7 @@ fn chords() -> Vec<Vec<u8>> {
 }
 
 pub fn demo_project(sample_rate: u32) -> Project {
-    let mut p = Project::new("Demo Session", sample_rate);
+    let mut p = Project::new(DEMO_NAME, sample_rate);
     p.timeline.tempo.set_initial_bpm(BPM);
     let master = p.master_id().unwrap_or(TrackId(0));
     let bar = |n: i64| p.timeline.meter.bar_start(n as i32);

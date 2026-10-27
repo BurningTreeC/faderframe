@@ -18,7 +18,7 @@ use faderframe_audio::OwnedBuffers;
 use faderframe_automation::AutomationTarget;
 use faderframe_core::{ChannelLayout, CueId, ParameterId, TrackId, builtin, db_to_gain};
 use faderframe_engine::offline::OfflineRenderer;
-use faderframe_engine::{ClickKind, ClickSounds, EngineConfig, MetronomeMode, RecordTarget};
+use faderframe_engine::{ClickKind, ClickSounds, EngineConfig, MetronomeMode};
 use faderframe_project::{
     CueMix, CueSend, Impact, OutputRouting, PluginRef, PluginSlot, SavedParameter, SendTap,
     TrackColor, TrackKind,
@@ -271,24 +271,10 @@ fn a_count_in_clicks_in_the_cue_mixes() {
     let mut r = live(&tp, 4);
     r.controller.metronome().set_mode(MetronomeMode::Off);
     r.controller.metronome().set_main(false);
-    r.controller.set_count_in(true).unwrap();
-    let _s = r
-        .controller
-        .begin_recording(
-            vec![RecordTarget {
-                track: TrackId(999_999),
-                first_channel: 0,
-                channels: 2,
-            }],
-            60_000,
-            i64::MAX,
-            2.0,
-        )
-        .unwrap();
+    r.controller.transport(TransportCommand::Locate(0)).unwrap();
     r.controller
-        .transport(TransportCommand::SetRecording(true))
+        .transport(TransportCommand::PlayAfterCountIn(2 * Q as u64))
         .unwrap();
-    r.play_from(0).unwrap();
     let out = play(&mut r, 4, 30_000, None);
     let click = out[2][Q..Q + 2_000]
         .iter()

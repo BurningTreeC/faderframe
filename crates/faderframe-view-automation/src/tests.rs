@@ -190,6 +190,13 @@ fn lane_tools_write_thin_clear_and_modes() {
 #[test]
 fn the_plus_offers_the_missing_parameters() {
     let (mut s, drums) = session();
+    let index = s.project().track(drums).unwrap().inserts.len();
+    s.dispatch(Action::InsertPlugin {
+        track: drums,
+        index,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::EQ, "Test EQ"),
+    })
+    .unwrap();
     let mut view = AutomationView::new(Theme::default());
     let l = view.layout(SIZE);
     let rows = view.rows(&s);
@@ -205,4 +212,17 @@ fn the_plus_offers_the_missing_parameters() {
         !items.iter().any(|m| m.label == "Volume"),
         "already has a lane"
     );
+    // The devices' parameters in their submenus, the EQ's by band.
+    let eq = items.iter().position(|m| m.label == "Test EQ").unwrap();
+    assert!(eq > 0 && items[..eq].iter().any(|m| m.children.is_empty()));
+    let gain = faderframe_ui_canvas::menu::find(items, &["Test EQ", "Band 2", "Gain"]).unwrap();
+    s.dispatch(gain.action.clone().unwrap()).unwrap();
+    let want = s
+        .automatable_parameters(drums)
+        .into_iter()
+        .find(|p| p.name == "Test EQ: Band 2 Gain")
+        .unwrap()
+        .target;
+    let lanes = &s.project().track(drums).unwrap().automation.lanes;
+    assert!(lanes.iter().any(|l| l.target == want));
 }

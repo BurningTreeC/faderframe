@@ -352,7 +352,7 @@ impl PluginProcessor for AuProcessor {
     fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
         let Some(mut guard) = self.cell.try_lock() else {
             silence(io);
-            return ProcessStatus::Continue;
+            return ProcessStatus::Missed;
         };
         let st = &mut *guard;
         let Some(UnitPtr(unit)) = st.unit else {

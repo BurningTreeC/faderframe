@@ -70,6 +70,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
     let mut o = RunOptions::default();
     let mut args = args.peekable();
     while let Some(a) = args.next() {
+        if faderframe_ui::app_bundle::is_launch_argument(&a) {
+            continue;
+        }
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
             "-h" | "--help" => {
@@ -130,8 +133,17 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
 }
 
 fn main() -> ExitCode {
-    // Before any thread: it sets the environment.
+    // Before any thread: they set the environment.
+    faderframe_ui::app_bundle::prepare_environment();
     faderframe_ui::plugins::prepare_plugin_toolkits();
+    let helper = std::env::args().nth(1).is_some_and(|a| {
+        a.starts_with("--plugin-sandbox")
+            || a.starts_with("--check-plugin")
+            || a.starts_with("--scan-")
+    });
+    if !helper {
+        faderframe_ui::drawing::prepare_renderer();
+    }
     // A realtime time limit inherited (a sandbox helper's from FaderFrame)
     // or set by the desktop: a thread running realtime past it must lose
     // its priority, never get the process killed.

@@ -170,7 +170,7 @@ impl crate::Session {
         let dir = path.parent().map(Path::to_path_buf);
         let mut project = template::without_content(&loaded.project);
         let from = loaded.project.name.clone();
-        project.name = "Untitled".into();
+        project.name = crate::UNTITLED.into();
         // Nothing in it counts samples: it plays at the device's rate.
         project.sample_rate = self.engine.sample_rate();
         // The template's samples are copied into the new project's
