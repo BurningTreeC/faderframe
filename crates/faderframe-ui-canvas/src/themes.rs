@@ -999,6 +999,13 @@ impl Theme {
 
     /// Every built-in skin, the default first.
     pub fn all() -> Vec<Theme> {
+        let mut all = Self::builtin();
+        all.extend(crate::custom::custom_themes());
+        all
+    }
+
+    /// The skins that come with the app.
+    pub fn builtin() -> Vec<Theme> {
         vec![
             Theme::studio(),
             daylight(),
@@ -1027,7 +1034,7 @@ mod tests {
 
     #[test]
     fn skins_are_distinct_and_found_by_id() {
-        let all = Theme::all();
+        let all = Theme::builtin();
         assert_eq!(all.len(), 9);
         let mut ids: Vec<_> = all.iter().map(|t| t.id).collect();
         ids.sort_unstable();

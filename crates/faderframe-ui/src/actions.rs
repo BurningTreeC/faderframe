@@ -45,6 +45,8 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "open", |a| {
             crate::dialogs::confirm_discard(a, crate::dialogs::open_project)
         }),
+        entry(app, "start-window", crate::start::present),
+        entry(app, "edit-themes", crate::theme_editor::open),
         entry(app, "clear-recent", crate::recent::clear),
         entry(app, "import-audio", crate::dialogs::import_audio),
         entry(app, "import-adm", crate::dialogs::import_adm),
@@ -3184,6 +3186,115 @@ pub fn install(app: &Rc<AppState>) {
                 Some(id)
             };
             a.dispatch(Action::SetTrackHeight { track, height });
+        }),
+        // Development aids for take folders: `takes-demo:<track>` makes the
+        // track's first audio clip a folder of three takes (its source,
+        // the second comped in the middle) with its lanes open;
+        // `take-lane-height:<track>=<px>`; `audition-take:<track>=<n|off>`
+        // (n from 1).
+        named("takes-demo", |a, arg| {
+            let found = {
+                let s = a.session.borrow();
+                let p = s.project();
+                p.tracks
+                    .iter()
+                    .find(|t| t.name == arg)
+                    .and_then(|t| {
+                        p.clips_of(t.id)
+                            .into_iter()
+                            .find(|c| c.as_audio().is_some())
+                    })
+                    .cloned()
+            };
+            let Some(c) = found else {
+                tracing::warn!("takes-demo: no audio clip on '{arg}'");
+                return;
+            };
+            let Some(audio) = c.as_audio() else { return };
+            let mut f = faderframe_project::TakeFolder::new(audio.length);
+            for i in 0..3 {
+                f.add_take(faderframe_project::Take {
+                    name: format!("Take {}", i + 1),
+                    source: audio.source,
+                    source_offset: audio.source_offset,
+                    start: 0,
+                    end: audio.length,
+                    gain_db: -2.0 * i as f32,
+                    rating: 0,
+                });
+            }
+            f.use_take(0);
+            f.set_comp(audio.length / 3, audio.length * 2 / 3, Some(1));
+            a.dispatch(Action::Edit(faderframe_project::Command::SetClipContent {
+                clip: c.id,
+                start: c.start,
+                content: Box::new(faderframe_project::ClipContent::Takes(f)),
+            }));
+            if !a.session.borrow().takes_open(c.id) {
+                a.dispatch(Action::ToggleTakeLanes(c.id));
+            }
+        }),
+        // `piano-notes:<auto|bars|diamonds>`: how the piano roll draws notes.
+        named("piano-notes", |a, arg| {
+            use faderframe_session::NoteStyle;
+            let style = match arg {
+                "auto" => NoteStyle::Auto,
+                "bars" => NoteStyle::Bars,
+                "diamonds" => NoteStyle::Diamonds,
+                _ => {
+                    tracing::warn!("piano-notes: '{arg}' is not auto, bars or diamonds");
+                    return;
+                }
+            };
+            let mut pr = a.session.borrow().editor.piano;
+            pr.note_style = style;
+            a.dispatch(Action::SetPianoRoll(pr));
+        }),
+        named("take-lane-height", |a, arg| {
+            let Some((name, height)) = arg.split_once('=') else {
+                tracing::warn!("take-lane-height: '{arg}' is not <track>=<px>");
+                return;
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            if let (Some(track), Ok(height)) = (track, height.trim().parse::<f32>()) {
+                a.dispatch(Action::SetTakeLaneHeight { track, height });
+            }
+        }),
+        named("audition-take", |a, arg| {
+            let Some((name, take)) = arg.split_once('=') else {
+                tracing::warn!("audition-take: '{arg}' is not <track>=<n|off>");
+                return;
+            };
+            let clip = {
+                let s = a.session.borrow();
+                let p = s.project();
+                p.tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| {
+                        p.clips_of(t.id)
+                            .into_iter()
+                            .find(|c| c.as_takes().is_some())
+                    })
+                    .map(|c| c.id)
+            };
+            let Some(clip) = clip else {
+                tracing::warn!("audition-take: no take folder on '{name}'");
+                return;
+            };
+            let take = take
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1));
+            a.dispatch(Action::AuditionTake { clip, take });
         }),
         named("set-key", |a, arg| {
             let Some(key) = faderframe_project::harmony::Key::parse(arg) else {

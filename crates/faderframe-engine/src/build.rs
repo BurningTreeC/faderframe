@@ -549,9 +549,34 @@ struct PluginCx<'a> {
     /// shadow* (a second instance, [`PluginInstanceId::cue_shadow`]),
     /// keyed apart from the main one.
     shadow: bool,
+    /// Per track, the MIDI tracks playing it and their MIDI effects (what
+    /// else feeds its instruments' notes).
+    played_by: HashMap<TrackId, Vec<u64>>,
 }
 
 impl PluginCx<'_> {
+    /// What feeds `slot`'s notes on `track`: the MIDI effects before it
+    /// there, the MIDI tracks playing the track and their effects (bypass
+    /// aside: a bypassed effect's node passes the notes itself). Part of
+    /// the node's key: a change makes a new node, which ends what the
+    /// plugin was given before ([`crate::nodes::NoteLedger`]).
+    fn upstream_of(&mut self, track: &Track, slot: &PluginSlot) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+        for s in self.audio_chain(track) {
+            if s.id == slot.id {
+                break;
+            }
+            if self.note_effect(s) {
+                mix(s.id.raw());
+            }
+        }
+        for v in self.played_by.get(&track.id).into_iter().flatten() {
+            mix(*v);
+        }
+        h
+    }
+
     /// The track id node keys are made with (a cue path's apart from the
     /// main path's).
     fn key_track(&self, t: &Track) -> TrackId {
@@ -711,6 +736,12 @@ impl PluginCx<'_> {
             instance.configure_taken_outputs(taken);
         }
         let key_track = self.key_track(track);
+        let takes_events = spec.event_inputs > 0;
+        let upstream = if takes_events {
+            self.upstream_of(track, slot)
+        } else {
+            0
+        };
         match self.plugins.activate(host_slot, &process) {
             Ok(p) => {
                 // Latency and bypass change the node's behaviour, and a
@@ -725,7 +756,8 @@ impl PluginCx<'_> {
                     ^ ((buffered as u64) << 62)
                     ^ ((p.latency as u64) << 40)
                     ^ ((bypass as u64) << 63)
-                    ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ upstream.rotate_left(23);
                 let channels = spec.audio_outputs.first().map_or(0, |l| l.channel_count());
                 let latency = if bypass { 0 } else { p.latency };
                 let node = PluginNode::new(
@@ -737,7 +769,9 @@ impl PluginCx<'_> {
                     p.failed,
                     channels,
                     p.missed,
-                    spec.event_inputs > 0,
+                    p.notes,
+                    takes_events,
+                    upstream,
                 );
                 (
                     b.add_node(
@@ -984,6 +1018,17 @@ pub fn build_graph(
         monitor_limit: monitoring.limit,
         bypassed_for_monitoring: Vec::new(),
         shadow: false,
+        played_by: {
+            let mut by: HashMap<TrackId, Vec<u64>> = HashMap::new();
+            for m in project.tracks.iter().filter(|t| t.kind == TrackKind::Midi) {
+                if let faderframe_project::OutputRouting::Track { track } = m.output {
+                    let list = by.entry(track).or_default();
+                    list.push(m.id.raw() ^ (1 << 62));
+                    list.extend(m.inserts.iter().map(|s| s.id.raw()));
+                }
+            }
+            by
+        },
     };
     // Nodes (in the audio thread's graph) of plugins whose extra outputs
     // tracks take.

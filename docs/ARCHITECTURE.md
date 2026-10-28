@@ -2341,6 +2341,26 @@ the instrument), `blocks_a_late_helper_never_gets_say_they_missed_it`
 (sandbox), `a_note_started_again_ends_the_one_sounding_by_its_id` (CLAP,
 VST3), `blocks_an_instrument_misses_do_not_allocate`.
 
+**Switching what plays the notes.** Each plugin instance also has a
+`NoteLedger` (`nodes::plugin`, atomic, shared by its nodes in every graph):
+the keys held at its event input (with velocities), the keys its processor
+was given, the keys its event output has sounding, whether the processor
+got the last block, where the last block's output came from, and what fed
+it. A MIDI effect bypassed (by hand: a new node; automated: the processor
+keeps running, its output replaced) ends the notes it had sounding and
+sounds the keys held at its input; played again, its processor first gets
+note-offs for what it was given and note-ons for the keys held now, and
+the notes that passed it end (#27: bypassing the arpeggiator while playing
+left notes stuck). Instruments get the same catch-up after a bypass. A node
+that takes notes is keyed by what feeds them (`PluginCx::upstream_of`: the
+MIDI effects before it, the MIDI tracks playing its track and their
+effects; bypass aside): removing, adding or moving one, or a MIDI track
+going, makes a new node, which ends what the plugin was given on its first
+block. Notes generated at offset 0 sort after these offs. Tests
+`engine/tests/note_offs.rs` (bypassed by hand and by automation, removed,
+a MIDI track taken away), the arpeggiator bypass lane in
+`the_midi_effects_do_not_allocate`.
+
 ### Built-in devices
 
 The EQ and the Program EQ are built-ins with editors of their own
@@ -4225,7 +4245,16 @@ bottom edge, Alt+wheel for all, View → Track Height). Open take folders
 take below the track; clicking a lane puts that take into the comp section
 under the pointer (between the comp boundaries around it — never the whole
 comp), dragging comps the swiped range (snapped), right-click offers
-Use (the whole take)/Delete Take and Flatten.
+Use (the whole take)/Delete Take and Flatten. Take lanes have a height per
+track (`WorkspaceSet::take_lane_heights`, `TAKE_LANE_HEIGHT` 30 px,
+20–240; drag their bottom edge — each lane grows by its share —,
+double-click it for the default, or the lane menu's Take Lane Height).
+Each lane's ▶ auditions its take (`Action::AuditionTake`,
+`session::take_audition`): the folder plays that take whole instead of the
+comp (`EngineController::set_take_audition` → `TimelineSnapshot::build_with`
+→ `take_pieces`), playback starting at the folder when stopped; nothing in
+the project changes, and a change to the folder's comp or takes (an edit,
+undo), clicking again or another project ends it.
 While recording, armed tracks show a growing red region; the punch range is
 drawn in the ruler.
 
@@ -5169,6 +5198,15 @@ the event loop. DAW work surfaces are **custom-rendered views**:
   desktop theme for light skins); the choice is a preference. Overlays
   drawn over editor backgrounds derive from the theme's text and selection
   colours so they work on light skins too.
+* **Themes of the user's own** (View → Theme → Edit Themes…, Preferences →
+  General): `faderframe_ui_canvas::custom` names every colour a user may set
+  (`COLORS`, by section; each key sets all the theme's fields showing that
+  colour) and registers `CustomTheme`s (a built-in base skin + changed
+  colours) so `Theme::all`/`by_id` find them (ids `custom:<file>`;
+  `Theme::builtin` lists the skins). The shell keeps them as JSON files in
+  `<settings>/themes` (`user_themes`: `{"name", "base", "colors": {key:
+  "#rrggbb"}}`, loaded before the first window) and edits them in
+  `theme_editor` (a colour button and a reset per key, seen at once).
 * **Lumen** (`themes::lumen`) is drawn with light instead of hardware, on
   look options that default to the older skins' drawing (so those draw
   exactly as before — `only_lumen_takes_the_newer_looks`; their painted
@@ -5239,7 +5277,14 @@ arrive there, not through a user action; what only changes the picture
 shell's full `after_change`. Warnings and errors also pop up as a toast at
 the top of the main window. The start-up project opens after the
 window's first frame (`open_after_first_frame`, "Opening …" meanwhile);
-scripted start-up actions run after it.
+scripted start-up actions run after it. By default a start window shows
+over a new project (`start.rs`, `StartupProject::Ask`; File → Start
+Window…): recent projects, an empty project, the templates, a file, the
+demo; scripted runs (`FADERFRAME_STARTUP_ACTIONS`) open the last project
+instead. The arranger's zoom and scroll are saved with the project
+(`WorkspaceSet::arranger_place`: noted on the session as the arranger
+paints the song, `Session::note_arranger_place`, written by every save;
+`Session::project_serial` tells the arranger another project opened).
 
 **What a frame costs** (the demo playing, arranger and mixer, 2524×1371,
 dev build; `FADERFRAME_PAINT_STATS=1` and the UI thread's CPU time from

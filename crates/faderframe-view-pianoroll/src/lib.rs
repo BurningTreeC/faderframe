@@ -231,6 +231,8 @@ pub struct PianoRollView {
     last_transform: faderframe_project::midi_tools::Tool,
     last_generator: faderframe_project::midi_tools::Tool,
     value_drag: Option<tools::ValueDrag>,
+    /// Notes are diamonds where they start (a drum grid), not bars.
+    pub(crate) diamonds: bool,
 }
 
 /// The regions of the view.
@@ -281,6 +283,7 @@ impl PianoRollView {
             last_transform: faderframe_project::midi_tools::Tool::Strum,
             last_generator: faderframe_project::midi_tools::Tool::Euclid,
             value_drag: None,
+            diamonds: false,
         }
     }
 
@@ -418,8 +421,10 @@ impl PianoRollView {
         j.and_then(|j| self.rows.get(j)).copied() == white && white.is_some()
     }
 
-    /// Recompute the visible rows from the fold setting.
+    /// Recompute the visible rows from the fold setting, and how notes
+    /// are drawn.
     fn update_rows(&mut self, model: &Session, m: &MidiClip) {
+        self.diamonds = model.editor_clip().is_some_and(|c| model.piano_diamonds(c));
         let pr = &model.editor.piano;
         let mut rows: Vec<u8> = match pr.fold {
             KeyFold::Off => (0..=127u8).collect(),
@@ -485,7 +490,20 @@ impl PianoRollView {
         self.ppq = fit.clamp(16.0, 200.0);
     }
 
+    /// Where a note is drawn and hit: its bar, or (drum grid) the box of
+    /// the diamond on its start.
     fn note_rect(&self, n: &MidiNote) -> Option<Rect> {
+        if !self.diamonds {
+            return self.bar_rect(n);
+        }
+        let y = self.y_of(n.key)?;
+        let h = (self.row_h - 1.0).max(3.0);
+        let w = (h * 1.2).max(7.0);
+        Some(Rect::new(self.x_of(n.start) - w * 0.5, y + 0.5, w, h))
+    }
+
+    /// The note's span as a bar.
+    fn bar_rect(&self, n: &MidiNote) -> Option<Rect> {
         let y = self.y_of(n.key)?;
         let x0 = self.x_of(n.start);
         let x1 = self.x_of(n.end());
@@ -493,12 +511,15 @@ impl PianoRollView {
     }
 
     /// Topmost note under `pos` and whether an edge was grabbed
-    /// (`Some(true)` = end, `Some(false)` = start).
+    /// (`Some(true)` = end, `Some(false)` = start; diamonds have none).
     fn note_at(&self, m: &MidiClip, pos: Point) -> Option<(MidiNote, Option<bool>)> {
         m.notes.iter().rev().find_map(|n| {
             let r = self.note_rect(n)?;
             if !r.contains(pos) {
                 return None;
+            }
+            if self.diamonds {
+                return Some((*n, None));
             }
             let grab = EDGE_GRAB.min(r.w * 0.3);
             let edge = if pos.x >= r.right() - grab {

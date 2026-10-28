@@ -331,7 +331,7 @@ fn icon_button(icon: &str, tooltip: &str, action: &str) -> gtk::Button {
     b
 }
 
-pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
+pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
     let menu = gio::Menu::new();
     let section = |items: &[(&str, &str)]| {
         let s = gio::Menu::new();
@@ -343,6 +343,7 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let file = gio::Menu::new();
     file.append_section(None, &{
         let s = section(&[
+            ("Start Window…", "app.start-window"),
             ("New Project", "app.new"),
             ("New from Template…", "app.new-from-template"),
             ("New Demo Session", "app.new-demo"),
@@ -727,11 +728,15 @@ pub fn menu_model(recent: &gio::Menu) -> gio::Menu {
     }
     view.append_submenu(Some("Track Height (all tracks · Alt+wheel)"), &heights);
     let themes = gio::Menu::new();
-    for t in faderframe_ui_canvas::Theme::all() {
+    let builtin = gio::Menu::new();
+    for t in faderframe_ui_canvas::Theme::builtin() {
         let item = gio::MenuItem::new(Some(t.name), None);
         item.set_action_and_target_value(Some("app.theme"), Some(&t.id.to_variant()));
-        themes.append_item(&item);
+        builtin.append_item(&item);
     }
+    themes.append_section(None, &builtin);
+    themes.append_section(None, custom_themes);
+    themes.append_section(None, &section(&[("Edit Themes…", "app.edit-themes")]));
     view.append_submenu(Some("Theme"), &themes);
     menu.append_submenu(Some("View"), &view);
 
@@ -777,7 +782,10 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         .build();
 
     let header = gtk::HeaderBar::new();
-    let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model(&app.recent_menu)));
+    let menubar = gtk::PopoverMenuBar::from_model(Some(&menu_model(
+        &app.recent_menu,
+        &app.custom_themes_menu,
+    )));
     header.pack_start(&menubar);
 
     let transport = gtk::Box::new(gtk::Orientation::Horizontal, 4);

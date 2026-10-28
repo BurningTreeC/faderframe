@@ -198,6 +198,25 @@ pub struct WorkspaceSet {
     /// The mixer's meter bridge: a moving-coil VU meter over every strip.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub meter_bridge: bool,
+    /// Where the arranger looked at the song when the project was saved
+    /// (opened again, it looks there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arranger_place: Option<ViewPlace>,
+    /// Height of each open take lane per track (`None`/missing =
+    /// [`TAKE_LANE_HEIGHT`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub take_lane_heights: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
+}
+
+/// Where a timeline editor looks: its zoom and scroll.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ViewPlace {
+    /// Pixels per quarter note.
+    pub zoom: f32,
+    /// The time at the left edge (quarter notes).
+    pub left: f64,
+    /// How far down it is scrolled (logical pixels).
+    pub top: f32,
 }
 
 /// What a level meter shows and how it moves.
@@ -273,6 +292,10 @@ pub const HEADER_WIDTH_RANGE: (f32, f32) = (190.0, 640.0);
 /// Smallest and largest arranger track heights.
 pub const TRACK_HEIGHT_RANGE: (f32, f32) = (40.0, 480.0);
 
+/// A take lane's height in the arranger unless set, and the range.
+pub const TAKE_LANE_HEIGHT: f32 = 30.0;
+pub const TAKE_LANE_HEIGHT_RANGE: (f32, f32) = (20.0, 240.0);
+
 impl Default for WorkspaceSet {
     fn default() -> Self {
         Self {
@@ -297,6 +320,8 @@ impl Default for WorkspaceSet {
             meter_modes: Default::default(),
             vu_reference: None,
             meter_bridge: false,
+            arranger_place: None,
+            take_lane_heights: Default::default(),
         }
     }
 }
@@ -321,6 +346,24 @@ impl WorkspaceSet {
                 self.track_height = Some(h);
                 self.track_heights.clear();
             }
+        }
+    }
+
+    /// Height of a track's take lanes.
+    pub fn take_lane_height(&self, track: faderframe_core::TrackId) -> f32 {
+        self.take_lane_heights
+            .get(&track)
+            .copied()
+            .unwrap_or(TAKE_LANE_HEIGHT)
+    }
+
+    /// Set a track's take lane height (clamped; the default forgets it).
+    pub fn set_take_lane_height(&mut self, track: faderframe_core::TrackId, height: f32) {
+        let h = height.clamp(TAKE_LANE_HEIGHT_RANGE.0, TAKE_LANE_HEIGHT_RANGE.1);
+        if (h - TAKE_LANE_HEIGHT).abs() < 0.5 {
+            self.take_lane_heights.remove(&track);
+        } else {
+            self.take_lane_heights.insert(track, h);
         }
     }
 

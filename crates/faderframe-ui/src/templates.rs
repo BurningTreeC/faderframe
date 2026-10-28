@@ -37,7 +37,7 @@ pub fn new_project(app: &Rc<AppState>) {
     }
 }
 
-fn from_template(app: &Rc<AppState>, path: &Path) {
+pub(crate) fn from_template(app: &Rc<AppState>, path: &Path) {
     app.with_session(|s| s.new_from_template(path));
 }
 

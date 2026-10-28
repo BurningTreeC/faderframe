@@ -352,9 +352,40 @@ impl PianoRollView {
                     && r.right() >= g.x
                     && r.x <= g.right()
                 {
-                    p.stroke_rounded(r, 2.0, 1.0, pr.ghost_note);
+                    if self.diamonds {
+                        p.stroke_path(&diamond(r), 1.0, pr.ghost_note);
+                    } else {
+                        p.stroke_rounded(r, 2.0, 1.0, pr.ghost_note);
+                    }
                 }
             }
+        }
+    }
+
+    /// A drum hit: a diamond on the note's start, lit by its velocity.
+    fn paint_diamond(
+        &self,
+        p: &mut dyn Painter,
+        r: Rect,
+        c: Color,
+        muted: bool,
+        selected: bool,
+        swept: bool,
+    ) {
+        let d = diamond(r);
+        if muted {
+            p.fill_path(&d, c.with_alpha(0.18));
+            p.stroke_path(&d, 1.0, c.with_alpha(0.7));
+        } else {
+            p.fill_path_paint(&d, &Paint::vertical(r, c.lighten(0.18), c.darken(0.12)));
+        }
+        if swept {
+            p.fill_path(&d, Color::rgba(1.0, 0.3, 0.2, 0.45));
+        }
+        if selected {
+            p.stroke_path(&d, 1.5, self.theme.ui.selection.lighten(0.45));
+        } else if !muted {
+            p.stroke_path(&d, 1.0, c.darken(0.5));
         }
     }
 
@@ -447,6 +478,10 @@ impl PianoRollView {
             let selected = model.selection.notes.contains(&n.id);
             let swept = sweep.contains(&n.id);
             let c = Self::note_color(color, n.velocity);
+            if self.diamonds {
+                self.paint_diamond(p, r, c, n.muted, selected || preview, swept);
+                continue;
+            }
             if n.muted {
                 p.fill_rounded(r, 2.0, &Paint::Solid(c.with_alpha(0.18)));
                 p.stroke_rounded(r, 2.0, 1.0, c.with_alpha(0.7));
@@ -511,8 +546,14 @@ impl PianoRollView {
                 };
                 if let Some(r) = self.note_rect(&n) {
                     let c = Self::note_color(color, pr.velocity);
-                    p.fill_rounded(r, 2.0, &Paint::Solid(c.with_alpha(0.75)));
-                    p.stroke_rounded(r, 2.0, 1.5, th.ui.selection.lighten(0.45));
+                    if self.diamonds {
+                        let d = diamond(r);
+                        p.fill_path(&d, c.with_alpha(0.75));
+                        p.stroke_path(&d, 1.5, th.ui.selection.lighten(0.45));
+                    } else {
+                        p.fill_rounded(r, 2.0, &Paint::Solid(c.with_alpha(0.75)));
+                        p.stroke_rounded(r, 2.0, 1.5, th.ui.selection.lighten(0.45));
+                    }
                 }
             }
         }
@@ -962,7 +1003,7 @@ impl PianoRollView {
         p.push_clip(g);
         for e in m.expressions.iter().filter(|e| !e.pitch.is_empty()) {
             let Some(n) = m.note(e.note) else { continue };
-            let (Some(r), Some(row)) = (self.note_rect(n), self.y_of(n.key)) else {
+            let (Some(r), Some(row)) = (self.bar_rect(n), self.y_of(n.key)) else {
                 continue;
             };
             if r.right() < g.x || r.x > g.right() {
@@ -1130,4 +1171,16 @@ impl PianoRollView {
             }
         }
     }
+}
+
+/// The diamond inscribed in `r`.
+pub(crate) fn diamond(r: Rect) -> Path {
+    let c = r.center();
+    let mut d = Path::new();
+    d.move_to(Point::new(c.x, r.y));
+    d.line_to(Point::new(r.right(), c.y));
+    d.line_to(Point::new(c.x, r.bottom()));
+    d.line_to(Point::new(r.x, c.y));
+    d.close();
+    d
 }

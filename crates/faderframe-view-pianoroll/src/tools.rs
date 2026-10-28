@@ -940,7 +940,14 @@ impl PianoRollView {
         }
         for n in m.notes.iter().filter(|n| preview.removed.contains(&n.id)) {
             if let Some(r) = self.note_rect(n) {
-                p.fill_rounded(r, 2.0, &Paint::Solid(th.piano.background.with_alpha(0.6)));
+                if self.diamonds {
+                    p.fill_path(
+                        &crate::paint::diamond(r),
+                        th.piano.background.with_alpha(0.6),
+                    );
+                } else {
+                    p.fill_rounded(r, 2.0, &Paint::Solid(th.piano.background.with_alpha(0.6)));
+                }
             }
         }
         for n in &preview.notes {
@@ -948,8 +955,14 @@ impl PianoRollView {
             if r.right() < g.x || r.x > g.right() {
                 continue;
             }
-            p.fill_rounded(r, 2.0, &Paint::Solid(accent.with_alpha(0.22)));
-            p.stroke_rounded(r, 2.0, 1.5, accent.with_alpha(0.95));
+            if self.diamonds {
+                let d = crate::paint::diamond(r);
+                p.fill_path(&d, accent.with_alpha(0.22));
+                p.stroke_path(&d, 1.5, accent.with_alpha(0.95));
+            } else {
+                p.fill_rounded(r, 2.0, &Paint::Solid(accent.with_alpha(0.22)));
+                p.stroke_rounded(r, 2.0, 1.5, accent.with_alpha(0.95));
+            }
         }
     }
 }

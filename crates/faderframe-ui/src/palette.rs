@@ -195,7 +195,7 @@ fn shortcut_label(accel: &str) -> String {
 }
 
 fn commands(app: &Rc<AppState>) -> Vec<Command> {
-    let model = crate::window::menu_model(&app.recent_menu);
+    let model = crate::window::menu_model(&app.recent_menu, &app.custom_themes_menu);
     menu_commands(model.upcast_ref())
 }
 

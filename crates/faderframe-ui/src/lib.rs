@@ -48,13 +48,16 @@ mod render;
 mod render_report;
 mod screenshot;
 mod speaker_layouts;
+mod start;
 pub mod state;
 mod style;
 mod surface_prefs;
 mod templates;
+mod theme_editor;
 mod toggles;
 mod transport_display;
 mod transport_keys;
+mod user_themes;
 mod video;
 mod window;
 
@@ -81,6 +84,12 @@ enum Start {
     Demo,
 }
 
+/// A scripted run (`FADERFRAME_STARTUP_ACTIONS`): no start window, the
+/// last project opens.
+pub(crate) fn scripted_run() -> bool {
+    std::env::var_os("FADERFRAME_STARTUP_ACTIONS").is_some()
+}
+
 /// A new project: from the default template when one is set.
 fn new_start() -> Start {
     templates::default_template().map_or(Start::New, |t| Start::Template(t.path))
@@ -103,10 +112,13 @@ fn start_choice(
     if options.demo {
         return (Start::Demo, None);
     }
-    match S::from_id(&prefs.startup_project).unwrap_or_default() {
+    match recent::startup_choice(prefs, scripted_run()) {
+        // The start window chooses (a plain project until then: quick to
+        // make, nothing to load).
+        S::Ask => (Start::New, None),
         S::New => (new_start(), None),
         S::Demo => (Start::Demo, None),
-        S::Last => match recent::startup_path(prefs) {
+        S::Last => match recent::startup_path(prefs, scripted_run()) {
             Some(p) if p.exists() => (Start::Open(p), None),
             // The last project is gone.
             Some(p) => (new_start(), Some(p)),
@@ -335,6 +347,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         // Control surfaces (OSC too: scripted runs keep them all closed).
         session.set_control_surfaces(prefs.control_surfaces.clone());
     }
+    let chosen = options.project.is_some() || options.empty || options.demo;
     let state = AppState::new(app, session, options);
     transport_keys::install(&state);
     let window = window::build(&state);
@@ -350,6 +363,9 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     dialogs::install_close_guard(&state, &window);
     dock::realize(&state);
     window.present();
+    if start::wanted_at_start(chosen, &prefs) {
+        start::present(&state);
+    }
     // The last run ended without closing: its crash report (or that there
     // is none) and where its files are.
     crash::offer_previous_run(window.upcast_ref());
@@ -437,6 +453,8 @@ pub fn run(options: RunOptions) -> glib::ExitCode {
         .build();
     let holder: Rc<RefCell<Option<Rc<AppState>>>> = Rc::default();
     app.connect_startup(|_| {
+        // The user's own themes first: the preferences may name one.
+        user_themes::install();
         style::install(&faderframe_ui_canvas::Theme::by_id(
             &prefs::Preferences::load().theme,
         ));

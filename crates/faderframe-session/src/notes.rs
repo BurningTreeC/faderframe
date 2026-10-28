@@ -105,6 +105,30 @@ pub enum KeyFold {
     Used,
 }
 
+/// How the piano roll draws notes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteStyle {
+    /// Diamonds for drums ([`Session::piano_diamonds`]), bars otherwise.
+    #[default]
+    Auto,
+    /// Bars as long as the notes.
+    Bars,
+    /// A diamond where each note starts (a drum grid: lengths hidden).
+    Diamonds,
+}
+
+impl NoteStyle {
+    pub const ALL: [NoteStyle; 3] = [Self::Auto, Self::Bars, Self::Diamonds];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic: diamonds for drums",
+            Self::Bars => "Bars",
+            Self::Diamonds => "Diamonds (drum grid)",
+        }
+    }
+}
+
 /// The piano roll's musical settings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PianoRollSettings {
@@ -131,6 +155,7 @@ pub struct PianoRollSettings {
     pub tool: Option<Tool>,
     /// Every tool's settings.
     pub tools: ToolSettings,
+    pub note_style: NoteStyle,
 }
 
 impl Default for PianoRollSettings {
@@ -149,6 +174,7 @@ impl Default for PianoRollSettings {
             expression: None,
             tool: None,
             tools: ToolSettings::default(),
+            note_style: NoteStyle::Auto,
         }
     }
 }
@@ -411,6 +437,48 @@ impl Session {
         self.set_midi_clip(clip, p.tool.label(), m)?;
         self.selection.select_notes(&selected, SelectMode::Replace);
         Ok(())
+    }
+
+    /// Does the piano roll draw `clip`'s notes as diamonds? As set, or
+    /// (automatic) when the clip is drums: its track plays a drum
+    /// instrument (the Drum Sampler, or a device named so — a MIDI track
+    /// the instrument of the track it plays), or every note is on MIDI
+    /// channel 10.
+    pub fn piano_diamonds(&self, clip: ClipId) -> bool {
+        match self.editor.piano.note_style {
+            NoteStyle::Bars => false,
+            NoteStyle::Diamonds => true,
+            NoteStyle::Auto => self.is_drum_clip(clip),
+        }
+    }
+
+    fn is_drum_clip(&self, clip: ClipId) -> bool {
+        let Some(c) = self.project.clip(clip) else {
+            return false;
+        };
+        if let Some(m) = c.as_midi()
+            && !m.notes.is_empty()
+            && m.notes.iter().all(|n| n.channel == 9)
+        {
+            return true;
+        }
+        let Some(track) = self.project.track(c.track) else {
+            return false;
+        };
+        let player = match track.output {
+            faderframe_project::OutputRouting::Track { track: to }
+                if track.kind == faderframe_project::TrackKind::Midi =>
+            {
+                self.project.track(to)
+            }
+            _ => Some(track),
+        };
+        player.is_some_and(|t| {
+            t.slots().iter().any(|s| {
+                s.plugin.id == faderframe_core::builtin::DRUMS
+                    || s.plugin.name.to_lowercase().contains("drum")
+            })
+        })
     }
 
     /// Does the piano roll's scale come from the key track (following it,

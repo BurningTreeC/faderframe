@@ -3710,7 +3710,29 @@ fn the_midi_effects_do_not_allocate() {
         ),
         slot(builtin::SYNTH, &[]),
     ];
-    tp.project.track_mut(t).unwrap().inserts = inserts;
+    // The arpeggiator bypassed and played again every half quarter: its
+    // notes and the passed ones end at each switch.
+    let arp = inserts[0].id;
+    let lane = tp.project.ids.allocate();
+    let points = (0..14)
+        .map(|i| faderframe_automation::AutomationPoint {
+            time: MusicalTime::from_quarters(f64::from(i) * 0.5),
+            value: f64::from(i % 2),
+            shape: faderframe_automation::CurveShape::Step,
+        })
+        .collect();
+    let track = tp.project.track_mut(t).unwrap();
+    track.inserts = inserts;
+    track
+        .automation
+        .lanes
+        .push(faderframe_automation::AutomationLane {
+            id: lane,
+            target: faderframe_automation::AutomationTarget::PluginBypass(arp),
+            curve: faderframe_automation::AutomationCurve::from_points(points),
+            mode: faderframe_automation::AutomationMode::Read,
+            visible: true,
+        });
     tp.project.chords = ["Am7/G", "F", "Cmaj9", "G"]
         .iter()
         .enumerate()

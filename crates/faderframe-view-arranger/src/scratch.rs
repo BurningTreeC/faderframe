@@ -4,7 +4,7 @@
 //! back), the entries the section and clip menus get, the tint of the
 //! ruler while a pad is shown, and each arrangement's own scroll and zoom.
 
-use crate::ArrangerView;
+use crate::{ArrangerView, DEFAULT_PPQ, MAX_PPQ, MIN_PPQ};
 use faderframe_core::ScratchPadId;
 use faderframe_session::scratch::{PadMaterial, ScratchOp, SongPlacement};
 use faderframe_session::{Action, Session};
@@ -335,9 +335,40 @@ impl ArrangerView {
         );
     }
 
+    /// Another project opened: look where it was saved looking (the start
+    /// at the default zoom, if it says nothing), its arrangements' places
+    /// forgotten.
+    fn follow_project(&mut self, model: &Session) {
+        let opened = model.project_serial();
+        let first = self.opened_seen.is_none();
+        if self.opened_seen == Some(opened) {
+            return;
+        }
+        self.opened_seen = Some(opened);
+        let place = model.workspace().arranger_place;
+        if first && place.is_none() {
+            return;
+        }
+        self.places.clear();
+        self.arrangement_seen = None;
+        match place {
+            Some(p) if p.zoom.is_finite() && p.left.is_finite() && p.top.is_finite() => {
+                self.ppq = p.zoom.clamp(MIN_PPQ, MAX_PPQ);
+                self.scroll_x = (p.left * f64::from(self.ppq)).max(0.0);
+                self.scroll_y = p.top.max(0.0);
+            }
+            _ => {
+                self.ppq = DEFAULT_PPQ;
+                self.scroll_x = 0.0;
+                self.scroll_y = 0.0;
+            }
+        }
+    }
+
     /// Keep each arrangement's scroll and zoom: showing another puts back
     /// where it was left (the start, for one never shown).
     pub(crate) fn follow_arrangement(&mut self, model: &Session) {
+        self.follow_project(model);
         let now = model.shown_pad();
         if let Some(before) = self.arrangement_seen
             && before != now

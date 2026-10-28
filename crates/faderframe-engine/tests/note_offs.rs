@@ -435,3 +435,195 @@ fn what_missed_blocks_end_reaches_the_instrument_with_the_next() {
     assert_eq!(heard.sounding(), [] as [u8; 0], "ended with the next block");
     assert!(!heard.pedal.load(Ordering::SeqCst), "the pedal let go too");
 }
+
+/// An arpeggiator playing a held chord into the test instrument, at 120
+/// BPM, legato (one of its notes always sounds).
+fn arp_rig(id: &str) -> (TestProject, TrackId, faderframe_core::PluginInstanceId) {
+    install();
+    let mut tp = TestProject::new(SR);
+    tp.project.timeline.tempo = faderframe_timeline::TempoMap::new(120.0);
+    let t = tp.track(TrackKind::Instrument, "Arp", ChannelLayout::Stereo);
+    let arp = builtin_slot(
+        &mut tp,
+        builtin::ARPEGGIATOR,
+        &[(arpeggiator::id::GATE, 1.5)],
+    );
+    let arp_id = arp.id;
+    let voices = voices_slot(&mut tp, id);
+    tp.project.track_mut(t).unwrap().inserts = vec![arp, voices];
+    chords(&mut tp, t, &[(0.0, 12.0, &[60, 64, 67])]);
+    (tp, t, arp_id)
+}
+
+/// Steps until late in arpeggiator step `k` (its notes overlap the next
+/// step's first half: then only one sounds).
+fn late_in_step(r: &mut OfflineRenderer, k: i64) {
+    while position(r) < k * SIXTEENTH + SIXTEENTH * 3 / 4 {
+        r.step();
+    }
+}
+
+/// Bypassing the arpeggiator while it plays (issue #27) ends the note it
+/// had sounding, and the held chord passes it by; playing it again ends
+/// the chord and arpeggiates the keys held; nothing stays after stopping.
+#[test]
+fn bypassing_an_arpeggiator_while_it_plays_leaves_no_note_sounding() {
+    let id = "test.voices.bypass";
+    let (mut tp, t, _) = arp_rig(id);
+    let mut r = renderer(&tp);
+    r.play_from(0).unwrap();
+    let heard = heard(id);
+    late_in_step(&mut r, 8);
+    assert_eq!(heard.sounding().len(), 1, "{:?}", heard.sounding());
+    let bypass = |tp: &mut TestProject, r: &mut OfflineRenderer, on: bool| {
+        tp.project.track_mut(t).unwrap().inserts[0].bypass = on;
+        r.controller
+            .sync(&tp.project, &tp.sources, Impact::Graph)
+            .unwrap();
+        r.step();
+        r.step();
+    };
+    bypass(&mut tp, &mut r, true);
+    assert_eq!(heard.sounding(), [60, 64, 67], "the chord as it is");
+    late_in_step(&mut r, 14);
+    assert_eq!(heard.sounding(), [60, 64, 67]);
+    bypass(&mut tp, &mut r, false);
+    assert!(
+        heard.sounding().len() <= 1,
+        "the chord ended: {:?}",
+        heard.sounding()
+    );
+    // It arpeggiates the held chord again.
+    let ons = heard.ons();
+    late_in_step(&mut r, 16);
+    assert!(heard.ons() > ons);
+    assert_eq!(heard.sounding().len(), 1, "{:?}", heard.sounding());
+    late_in_step(&mut r, 17);
+    assert_eq!(heard.sounding().len(), 1, "{:?}", heard.sounding());
+    // Bypassed and stopped at once.
+    bypass(&mut tp, &mut r, true);
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    assert!(
+        run_until(&mut r, |_| heard.sounding().is_empty()),
+        "stuck: {:?}",
+        heard.sounding()
+    );
+}
+
+/// Automated bypass (the arpeggiator keeps running, its notes pass it by
+/// while the lane says so) ends what the other side left sounding at each
+/// switch.
+#[test]
+fn an_automated_arpeggiator_bypass_leaves_no_note_sounding() {
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    let id = "test.voices.automated";
+    let (mut tp, t, arp) = arp_rig(id);
+    let point = |q: f64, value: f64| AutomationPoint {
+        time: MusicalTime::from_quarters(q),
+        value,
+        shape: CurveShape::Step,
+    };
+    let lane = tp.project.ids.allocate();
+    tp.project
+        .track_mut(t)
+        .unwrap()
+        .automation
+        .lanes
+        .push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::PluginBypass(arp),
+            // Bypassed from the middle of step 4 to that of step 8.
+            curve: AutomationCurve::from_points(vec![
+                point(0.0, 0.0),
+                point(1.1, 1.0),
+                point(2.1, 0.0),
+            ]),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+    let mut r = renderer(&tp);
+    r.play_from(0).unwrap();
+    let heard = heard(id);
+    late_in_step(&mut r, 3);
+    assert_eq!(heard.sounding().len(), 1, "arpeggiated");
+    late_in_step(&mut r, 6);
+    assert_eq!(heard.sounding(), [60, 64, 67], "passed by");
+    late_in_step(&mut r, 10);
+    assert_eq!(heard.sounding().len(), 1, "arpeggiated again");
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    assert!(
+        run_until(&mut r, |_| heard.sounding().is_empty()),
+        "stuck: {:?}",
+        heard.sounding()
+    );
+}
+
+/// Taking the arpeggiator out while it plays ends the note it had
+/// sounding at the instrument (the instrument, fed by something else now,
+/// ends what it was given), and putting it back arpeggiates again.
+#[test]
+fn removing_an_arpeggiator_while_it_plays_leaves_no_note_sounding() {
+    let id = "test.voices.removed";
+    let (mut tp, t, _) = arp_rig(id);
+    let mut r = renderer(&tp);
+    r.play_from(0).unwrap();
+    let heard = heard(id);
+    late_in_step(&mut r, 6);
+    assert_eq!(heard.sounding().len(), 1, "{:?}", heard.sounding());
+    let arp = tp.project.track_mut(t).unwrap().inserts.remove(0);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    r.step();
+    r.step();
+    assert_eq!(
+        heard.sounding(),
+        [] as [u8; 0],
+        "the arpeggiated note ended"
+    );
+    late_in_step(&mut r, 10);
+    assert_eq!(heard.sounding(), [] as [u8; 0], "nothing stuck");
+    tp.project.track_mut(t).unwrap().inserts.insert(0, arp);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    late_in_step(&mut r, 13);
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    assert!(
+        run_until(&mut r, |_| heard.sounding().is_empty()),
+        "stuck: {:?}",
+        heard.sounding()
+    );
+}
+
+/// A MIDI track playing an instrument track, taken away while its note
+/// sounds: the note ends.
+#[test]
+fn a_midi_track_taken_away_while_it_plays_leaves_no_note_sounding() {
+    install();
+    let id = "test.voices.midi-track";
+    let mut tp = TestProject::new(SR);
+    tp.project.timeline.tempo = faderframe_timeline::TempoMap::new(120.0);
+    let keys = tp.track(TrackKind::Instrument, "Keys", ChannelLayout::Stereo);
+    let voices = voices_slot(&mut tp, id);
+    tp.project.track_mut(keys).unwrap().inserts = vec![voices];
+    let m = tp.track(TrackKind::Midi, "Notes", ChannelLayout::Stereo);
+    tp.project.track_mut(m).unwrap().output =
+        faderframe_project::OutputRouting::Track { track: keys };
+    chords(&mut tp, m, &[(0.0, 8.0, &[64])]);
+    let mut r = renderer(&tp);
+    r.play_from(0).unwrap();
+    let heard = heard(id);
+    late_in_step(&mut r, 2);
+    assert_eq!(heard.sounding(), [64]);
+    tp.project.track_mut(m).unwrap().output = faderframe_project::OutputRouting::Master;
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    r.step();
+    r.step();
+    assert_eq!(heard.sounding(), [] as [u8; 0]);
+}

@@ -6,7 +6,7 @@ use crate::{PianoRollView, Tool, note_name};
 use faderframe_project::MidiNote;
 use faderframe_project::midi_ops::{ChordKind, PITCH_NAMES, Scale, ScaleKind};
 use faderframe_session::{
-    Action, KeyFold, NoteLength, NoteOp, PianoRollSettings, Session, StepInput,
+    Action, KeyFold, NoteLength, NoteOp, NoteStyle, PianoRollSettings, Session, StepInput,
 };
 use faderframe_timeline::{GridDivision, MusicalTime};
 use faderframe_ui_canvas::{
@@ -22,6 +22,8 @@ pub(crate) enum Item {
     Length,
     Scale,
     Fold,
+    /// Bars or drum diamonds.
+    Notes,
     Chord,
     Quantize,
     QuantizeMenu,
@@ -165,6 +167,7 @@ impl PianoRollView {
             pr.fold != KeyFold::Off,
             40.0,
         );
+        add(&mut flow, Item::Notes, "Drums".into(), self.diamonds, 50.0);
         add(
             &mut flow,
             Item::Chord,
@@ -304,6 +307,7 @@ impl PianoRollView {
             Item::Velocity => "Velocity of new notes".into(),
             Item::Scale => "Key and scale: highlight, snap, fold".into(),
             Item::Fold => "Show all keys, only the scale, or only used keys".into(),
+            Item::Notes => "Notes as bars, or as diamonds on a drum grid".into(),
             Item::Chord => "Draw chords instead of single notes".into(),
             Item::Quantize => "Quantize the selection (or all notes) — Q".into(),
             Item::QuantizeMenu => "Quantize and Humanize settings".into(),
@@ -479,6 +483,23 @@ impl PianoRollView {
                     )
                 })
                 .collect();
+                cx.request(Self::settings_menu(at, entries));
+            }
+            Item::Notes => {
+                let entries = NoteStyle::ALL
+                    .into_iter()
+                    .map(|st| {
+                        (
+                            st.label().to_string(),
+                            PianoRollSettings {
+                                note_style: st,
+                                ..pr
+                            },
+                            pr.note_style == st,
+                            st == NoteStyle::Bars,
+                        )
+                    })
+                    .collect();
                 cx.request(Self::settings_menu(at, entries));
             }
             Item::Chord => {

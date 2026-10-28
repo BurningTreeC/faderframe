@@ -498,7 +498,7 @@ fn toolbar_wraps_in_narrow_views() {
         view.paint(&mut p, size, &s, &Theme::default());
         let l = view.layout(size);
         let items = view.toolbar_items(l.toolbar, &s);
-        assert_eq!(items.len(), 23, "every control stays reachable at {w}");
+        assert_eq!(items.len(), 24, "every control stays reachable at {w}");
         assert!(
             items
                 .iter()
@@ -970,4 +970,67 @@ fn notes_snap_to_other_notes_and_objects() {
     run(&mut view, up(to, Modifiers::NONE), &mut s);
     let resized = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
     assert_eq!(clip_start + resized.end(), hit.at);
+}
+
+/// Drum clips show diamonds on the notes' starts (issue #28): on by
+/// themselves for drums (here: every note on MIDI channel 10), or chosen;
+/// a diamond is grabbed where the note starts and moves it whole (no
+/// length edges).
+#[test]
+fn drum_notes_are_diamonds_grabbed_at_their_start() {
+    use faderframe_session::NoteStyle;
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    assert!(!view.diamonds, "the demo's melody: bars");
+    let clip = s.editor_clip().unwrap();
+    s.dispatch(Action::SetMidiChannel {
+        clips: vec![clip],
+        channel: 9,
+    })
+    .unwrap();
+    paint(&mut view, &s);
+    assert!(view.diamonds, "channel 10: drums");
+    let bars = PianoRollSettings {
+        note_style: NoteStyle::Bars,
+        ..s.editor.piano
+    };
+    s.dispatch(Action::SetPianoRoll(bars)).unwrap();
+    paint(&mut view, &s);
+    assert!(!view.diamonds, "bars chosen");
+    s.dispatch(Action::SetPianoRoll(PianoRollSettings {
+        note_style: NoteStyle::Diamonds,
+        ..bars
+    }))
+    .unwrap();
+    let n = notes(&s)[0];
+    let y = row_y(&mut view, &s, n.key);
+    assert!(view.diamonds);
+    let r = view.note_rect(&n).unwrap();
+    assert!(
+        (r.center().x - view.x_of(n.start)).abs() < 0.01,
+        "on its start"
+    );
+    assert!(r.w < view.row_h * 2.0, "{r:?}");
+    let p = paint(&mut view, &s);
+    assert!(
+        p.ops
+            .iter()
+            .any(|o| matches!(o, faderframe_ui_canvas::DrawOp::Path)),
+        "drawn as paths"
+    );
+    // Its end is no edge to grab: a press on the diamond moves the note.
+    view.set_tool(Tool::Pointer);
+    let x = view.x_of(n.start) + r.w * 0.3;
+    run(
+        &mut view,
+        down(Point::new(x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    let to = view.x_of(n.start + MusicalTime::from_quarters_i(1)) + r.w * 0.3;
+    run(&mut view, drag(Point::new(to, y), Modifiers::NONE), &mut s);
+    run(&mut view, up(Point::new(to, y), Modifiers::NONE), &mut s);
+    let moved = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    assert_eq!(moved.start, n.start + MusicalTime::from_quarters_i(1));
+    assert_eq!(moved.length, n.length, "its length kept");
 }

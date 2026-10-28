@@ -756,16 +756,18 @@ impl TimelineSnapshot {
 
     /// Build from the project (control thread; allocates).
     pub fn build(project: &Project, sources: &SourceMap, sample_rate: u32) -> Self {
-        Self::build_with(project, sources, sample_rate, &HashSet::new())
+        Self::build_with(project, sources, sample_rate, &HashSet::new(), None)
     }
 
     /// Like [`TimelineSnapshot::build`]; lanes in `suspended` are being
-    /// written by the user and do not drive their parameter.
+    /// written by the user and do not drive their parameter, and the take
+    /// folder `audition` names plays that take whole instead of its comp.
     pub fn build_with(
         project: &Project,
         sources: &SourceMap,
         sample_rate: u32,
         suspended: &HashSet<AutomationLaneId>,
+        audition: Option<(faderframe_core::ClipId, usize)>,
     ) -> Self {
         let sr = sample_rate as f64;
         let project_rate = project.sample_rate.max(1) as f64;
@@ -883,7 +885,11 @@ impl TimelineSnapshot {
                     }
                 }
                 ClipContent::Takes(f) => {
-                    for piece in comp_pieces(f) {
+                    let pieces = match audition {
+                        Some((c, take)) if c == clip.id => take_pieces(f, take),
+                        _ => comp_pieces(f),
+                    };
+                    for piece in pieces {
                         if let Some(r) = piece.region(start, sources, sr, project_rate) {
                             lane_for(&mut lanes, &mut launch_lanes, clip.track, slot)
                                 .audio
@@ -1363,6 +1369,42 @@ fn comp_pieces(f: &TakeFolder) -> Vec<AudioPiece> {
         });
     }
     out
+}
+
+/// A take of a folder played whole (auditioned): where it has material,
+/// with the folder's fades at the folder's edges.
+fn take_pieces(f: &TakeFolder, k: usize) -> Vec<AudioPiece> {
+    let Some(take) = f.takes.get(k) else {
+        return Vec::new();
+    };
+    let (a, b) = (take.start.max(0), take.end.min(f.length));
+    if b <= a {
+        return Vec::new();
+    }
+    let fade_in = if a == 0 {
+        (f.fades.fade_in, f.fades.fade_in_shape, f.fades.fade_in_bend)
+    } else {
+        (DECLICK, FadeShape::Linear, 0)
+    };
+    let fade_out = if b == f.length {
+        (
+            f.fades.fade_out,
+            f.fades.fade_out_shape,
+            f.fades.fade_out_bend,
+        )
+    } else {
+        (DECLICK, FadeShape::Linear, 0)
+    };
+    vec![AudioPiece {
+        source: take.source,
+        source_offset: take.source_offset + a,
+        rel_start: a,
+        length: b - a,
+        gain_db: f.gain_db + take.gain_db,
+        fade_in,
+        fade_out,
+        reversed: false,
+    }]
 }
 
 /// A streamed region as seen by the disk loader.

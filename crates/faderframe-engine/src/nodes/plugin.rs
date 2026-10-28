@@ -8,7 +8,7 @@ use faderframe_plugin_host::{
     NoteParamMod, ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus,
 };
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// Most parameter events handed to a plugin per block.
 const EVENT_CAPACITY: usize = 1024;
@@ -145,6 +145,243 @@ impl MissedReleases {
     }
 }
 
+/// Where a plugin's event output came from in its last block.
+const FROM_NOTHING: u8 = 0;
+const FROM_PROCESSOR: u8 = 1;
+const FROM_INPUT: u8 = 2;
+
+/// A bit per channel and key.
+type KeyBits = [AtomicU64; 16 * 128 / 64];
+
+fn key_bit(channel: u8, key: u8) -> usize {
+    usize::from(channel & 15) * 128 + usize::from(key & 127)
+}
+
+fn set_key(bits: &KeyBits, i: usize, on: bool) {
+    if let Some(w) = bits.get(i / 64) {
+        if on {
+            w.fetch_or(1 << (i % 64), Ordering::AcqRel);
+        } else {
+            w.fetch_and(!(1 << (i % 64)), Ordering::AcqRel);
+        }
+    }
+}
+
+/// Note-ons and note-offs in `events` into `bits` (all notes off, all
+/// sound off clear a channel).
+fn follow_keys(bits: &KeyBits, events: &MidiBuffer) {
+    for e in events.iter() {
+        match e.event {
+            MidiEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } => set_key(bits, key_bit(channel, key), velocity > 0),
+            MidiEvent::NoteOff { channel, key, .. } => set_key(bits, key_bit(channel, key), false),
+            MidiEvent::ControlChange {
+                channel,
+                controller: 120 | 123,
+                ..
+            } => {
+                let first = usize::from(channel & 15) * 2;
+                for w in &bits[first..first + 2] {
+                    w.store(0, Ordering::Release);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Note-offs at offset 0 for every key in `bits` (cleared as they go;
+/// what does not fit stays).
+fn end_keys(bits: &KeyBits, out: &mut MidiBuffer) {
+    for (w, word) in bits.iter().enumerate() {
+        let mut keys = word.swap(0, Ordering::AcqRel);
+        while keys != 0 {
+            let b = keys.trailing_zeros() as usize;
+            keys &= keys - 1;
+            let i = w * 64 + b;
+            let off = MidiEvent::NoteOff {
+                channel: (i / 128) as u8,
+                key: (i % 128) as u8,
+                velocity: 0,
+            };
+            if out.push(TimedMidiEvent::new(0, off)).is_err() {
+                word.fetch_or(1 << b, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+/// What notes reach a plugin and leave it, so that switching between
+/// playing it and passing its notes by (bypass, by hand or automated; a
+/// failed plugin) leaves nothing sounding: what one side started, the
+/// other cannot end. A MIDI effect passed by ends the notes it made and
+/// sounds the keys held at its input; played again, it is told that what
+/// it was given ended and given the keys held now, and the notes that
+/// passed it end. An instrument played again likewise. One per plugin
+/// instance, shared by its nodes in every graph (a bypass change builds
+/// a new node): atomic, never allocating.
+pub struct NoteLedger {
+    /// Velocity per channel and key held at the plugin's event input
+    /// (0 = up), whichever way the notes went.
+    held: [AtomicU8; 16 * 128],
+    /// Keys the processor was given and not let go.
+    given: KeyBits,
+    /// Keys sounding at the plugin's event output (a MIDI effect's).
+    out: KeyBits,
+    /// The processor got the last block's notes.
+    fed: AtomicBool,
+    /// Where the last block's event output came from (`FROM_*`).
+    source: AtomicU8,
+    /// What fed its notes in the last block (the node's `upstream`; 0:
+    /// none ran yet).
+    fed_by: AtomicU64,
+}
+
+impl Default for NoteLedger {
+    fn default() -> Self {
+        Self {
+            held: std::array::from_fn(|_| AtomicU8::new(0)),
+            given: std::array::from_fn(|_| AtomicU64::new(0)),
+            out: std::array::from_fn(|_| AtomicU64::new(0)),
+            fed: AtomicBool::new(true),
+            source: AtomicU8::new(FROM_NOTHING),
+            fed_by: AtomicU64::new(0),
+        }
+    }
+}
+
+impl NoteLedger {
+    /// Keys held at the input after `events`.
+    fn follow_input(&self, events: &MidiBuffer) {
+        for e in events.iter() {
+            match e.event {
+                MidiEvent::NoteOn {
+                    channel,
+                    key,
+                    velocity,
+                } => self.held[key_bit(channel, key)].store(velocity, Ordering::Release),
+                MidiEvent::NoteOff { channel, key, .. } => {
+                    self.held[key_bit(channel, key)].store(0, Ordering::Release);
+                }
+                MidiEvent::ControlChange {
+                    channel,
+                    controller: 120 | 123,
+                    ..
+                } => {
+                    let first = usize::from(channel & 15) * 128;
+                    for k in &self.held[first..first + 128] {
+                        k.store(0, Ordering::Release);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Note-ons at offset 0 for the keys held at the input, but those the
+    /// block's own `input` starts or ends at offset 0.
+    fn sound_held(&self, input: Option<&MidiBuffer>, out: &mut MidiBuffer) {
+        let mut own = [0u64; 16 * 128 / 64];
+        for e in input.into_iter().flat_map(|i| i.range(0, 1)) {
+            if let MidiEvent::NoteOn { channel, key, .. }
+            | MidiEvent::NoteOff { channel, key, .. } = e.event
+            {
+                let i = key_bit(channel, key);
+                own[i / 64] |= 1 << (i % 64);
+            }
+        }
+        for (i, held) in self.held.iter().enumerate() {
+            let velocity = held.load(Ordering::Acquire);
+            if velocity == 0 || own[i / 64] & (1 << (i % 64)) != 0 {
+                continue;
+            }
+            let on = MidiEvent::NoteOn {
+                channel: (i / 128) as u8,
+                key: (i % 128) as u8,
+                velocity,
+            };
+            let _ = out.push(TimedMidiEvent::new(0, on));
+        }
+    }
+
+    /// A node fed by `upstream` plays now: `true` when the last block was
+    /// fed by something else (a MIDI effect before it removed, added or
+    /// moved; a MIDI track playing it gone) — what that started, nothing
+    /// will end.
+    fn rewired(&self, upstream: u64) -> bool {
+        if self.fed_by.load(Ordering::Acquire) == upstream {
+            return false;
+        }
+        self.fed_by.swap(upstream, Ordering::AcqRel) != 0
+    }
+
+    /// Rewired: what the processor was given ends (into `out`, before the
+    /// block's notes), and the keys held at the input are forgotten (they
+    /// came from what fed it before).
+    fn start_over(&self, out: &mut MidiBuffer) {
+        end_keys(&self.given, out);
+        self.forget_held();
+    }
+
+    fn forget_held(&self) {
+        for k in &self.held {
+            k.store(0, Ordering::Release);
+        }
+    }
+
+    /// The processor gets this block's notes after blocks it did not get
+    /// (`true`: it is to be told the news first, [`Self::catch_up`]).
+    fn feeds(&self) -> bool {
+        !self.fed.swap(true, Ordering::AcqRel)
+    }
+
+    /// Blocks went by the processor.
+    fn starve(&self) {
+        self.fed.store(false, Ordering::Release);
+    }
+
+    /// For a processor played again: what it was given ends, the keys
+    /// held now begin (into `out`, before the block's notes).
+    fn catch_up(&self, input: Option<&MidiBuffer>, out: &mut MidiBuffer) {
+        end_keys(&self.given, out);
+        self.sound_held(input, out);
+    }
+
+    /// What the processor was given (it did not miss the block).
+    fn follow_given(&self, events: &MidiBuffer) {
+        follow_keys(&self.given, events);
+    }
+
+    /// This block's event output came from `source`; when the last one's
+    /// came from elsewhere, what that left sounding ends first, and a
+    /// MIDI effect passed by sounds the keys held at its input.
+    fn switch_output(&self, source: u8, input: Option<&MidiBuffer>, out: &mut MidiBuffer) {
+        let was = self.source.swap(source, Ordering::AcqRel);
+        if was == source || was == FROM_NOTHING {
+            return;
+        }
+        end_keys(&self.out, out);
+        if source == FROM_INPUT {
+            self.sound_held(input, out);
+        }
+    }
+
+    /// What the event output sounds after `events`.
+    fn follow_output(&self, events: &MidiBuffer) {
+        follow_keys(&self.out, events);
+    }
+
+    /// A reset processor holds nothing, and what it sent is silenced.
+    fn forget(&self) {
+        for w in self.given.iter().chain(self.out.iter()) {
+            w.store(0, Ordering::Release);
+        }
+    }
+}
+
 /// Hosts a plugin processor (insert or instrument) inside the graph.
 ///
 /// Bypassed or failed plugins pass audio through (instruments go silent).
@@ -185,6 +422,11 @@ pub struct PluginNode {
     input_latency: u32,
     /// What blocks its processor missed would have ended (the plugin's).
     missed: Arc<MissedReleases>,
+    /// What notes reached the plugin and left it (the plugin's).
+    notes: Arc<NoteLedger>,
+    /// What feeds its notes (a signature of the MIDI effects before it and
+    /// the MIDI tracks playing its track; part of its node key).
+    upstream: u64,
     /// A block's events after those (a node that takes events: one
     /// buffer, else none).
     merged: Vec<MidiBuffer>,
@@ -201,7 +443,9 @@ impl PluginNode {
         failed: Arc<AtomicBool>,
         channels: usize,
         missed: Arc<MissedReleases>,
+        notes: Arc<NoteLedger>,
         takes_events: bool,
+        upstream: u64,
     ) -> Self {
         let latency = if bypass { 0 } else { latency };
         Self {
@@ -223,6 +467,8 @@ impl PluginNode {
             delay_pos: 0,
             input_latency: 0,
             missed,
+            notes,
+            upstream,
             merged: if takes_events {
                 vec![MidiBuffer::with_capacity(MidiBuffer::DEFAULT_CAPACITY)]
             } else {
@@ -322,7 +568,9 @@ impl PluginNode {
             .sort_unstable_by_key(|e| (e.sample_offset, e.parameter.0));
     }
 
-    fn soft_bypass(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+    /// Mix towards the dry input as the bypass lane says; `true` when a MIDI
+    /// effect's notes are to pass it by (unchanged) this block.
+    fn soft_bypass(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) -> bool {
         let target = cx
             .data
             .timeline
@@ -332,11 +580,8 @@ impl PluginNode {
             .map_or(0.0, |v| if v >= 0.5 { 1.0 } else { 0.0 });
         // A MIDI effect (no audio): bypassed, its notes pass unchanged.
         if io.audio_out.is_empty() {
-            if target >= 0.5 {
-                pass_events(io);
-            }
             self.dry = target;
-            return;
+            return target >= 0.5;
         }
         let n = io.frames;
         let latency = self.latency as usize;
@@ -344,7 +589,7 @@ impl PluginNode {
         let from = self.dry;
         let step = ramp_step(from, target, n);
         let Some(out) = io.audio_out.first_mut() else {
-            return;
+            return false;
         };
         for c in 0..out.num_channels() {
             let input = io
@@ -373,16 +618,43 @@ impl PluginNode {
             self.delay_pos = (start_pos + n) % latency;
         }
         self.dry = target;
+        false
     }
-}
 
-/// Events through unchanged (a bypassed MIDI effect; other bypassed
-/// plugins have no event outputs).
-fn pass_events(io: &mut NodeIo<'_>) {
-    for (i, out) in io.events_out.iter_mut().enumerate() {
-        out.clear();
-        if let Some(input) = io.events_in.get(i) {
-            out.merge_from(input, 0);
+    /// The event outputs after the block: the processor's, or (`passed`) the
+    /// inputs unchanged — a bypassed MIDI effect's; other bypassed plugins
+    /// have none. A change of side ends what the other left sounding.
+    fn notes_out(&self, io: &mut NodeIo<'_>, passed: bool, rewired: bool) {
+        let source = if passed { FROM_INPUT } else { FROM_PROCESSOR };
+        for (i, out) in io.events_out.iter_mut().enumerate() {
+            let input = io.events_in.get(i);
+            if passed {
+                out.clear();
+            }
+            if i == 0 {
+                // Rewired: what it had sounding came from what fed it
+                // before.
+                if rewired {
+                    end_keys(&self.notes.out, out);
+                }
+                self.notes.switch_output(source, input, out);
+            }
+            if passed && let Some(input) = input {
+                out.merge_from(input, 0);
+            }
+            if i == 0 {
+                self.notes.follow_output(out);
+            }
+        }
+    }
+
+    /// The keys held at the input after the block (a node that takes
+    /// events).
+    fn notes_in(&self, io: &NodeIo<'_>) {
+        if !self.merged.is_empty()
+            && let Some(input) = io.events_in.first()
+        {
+            self.notes.follow_input(input);
         }
     }
 }
@@ -405,6 +677,8 @@ impl Processor<EngineContext> for PluginNode {
     }
 
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        let takes = !self.merged.is_empty();
+        let rewired = takes && self.notes.rewired(self.upstream);
         if self.bypass || self.failed.load(Ordering::Relaxed) {
             for (i, out) in io.audio_out.iter_mut().enumerate() {
                 match io.audio_in.get(i) {
@@ -412,7 +686,16 @@ impl Processor<EngineContext> for PluginNode {
                     None => out.clear(),
                 }
             }
-            pass_events(io);
+            if takes {
+                self.notes.starve();
+            }
+            if rewired {
+                // The held keys came from what fed it before (what the
+                // processor was given ends when it is played again).
+                self.notes.forget_held();
+            }
+            self.notes_out(io, true, rewired);
+            self.notes_in(io);
             return;
         }
         self.collect_events(cx, io.frames);
@@ -449,11 +732,18 @@ impl Processor<EngineContext> for PluginNode {
         };
         self.processor
             .set_callback_deadline(cx.data.callback_deadline);
-        // What blocks it missed would have ended first (in this graph or
-        // another).
-        let held = !self.merged.is_empty() && self.missed.pending();
+        // Played again after blocks that went by it, it hears first what
+        // ended and what is held now; then what blocks it missed would have
+        // ended (in this graph or another).
+        let catch_up = takes && self.notes.feeds();
+        let held = takes && (rewired || catch_up || self.missed.pending());
         if held && let Some(merged) = self.merged.first_mut() {
             merged.clear();
+            if rewired {
+                self.notes.start_over(merged);
+            } else if catch_up {
+                self.notes.catch_up(io.events_in.first(), merged);
+            }
             self.missed.take_into(merged);
             if let Some(input) = io.events_in.first() {
                 merged.merge_from(input, 0);
@@ -471,16 +761,18 @@ impl Processor<EngineContext> for PluginNode {
         } else {
             self.processor.process(&ctx, io)
         };
-        if status == ProcessStatus::Missed {
-            // Its events never reached it: what they end waits for its
-            // next block.
-            let events = if held {
-                self.merged.first()
-            } else {
-                io.events_in.first()
-            };
-            if let Some(events) = events {
+        let given = if held {
+            self.merged.first()
+        } else {
+            io.events_in.first()
+        };
+        if let Some(events) = given.filter(|_| takes) {
+            if status == ProcessStatus::Missed {
+                // Its events never reached it: what they end waits for its
+                // next block.
                 self.missed.keep(events);
+            } else {
+                self.notes.follow_given(events);
             }
         }
         let underruns = self.processor.take_underruns();
@@ -498,6 +790,8 @@ impl Processor<EngineContext> for PluginNode {
             for out in io.audio_out.iter_mut() {
                 out.clear();
             }
+            self.notes_out(io, false, rewired);
+            self.notes_in(io);
             return;
         }
         let automated_bypass = cx
@@ -505,13 +799,14 @@ impl Processor<EngineContext> for PluginNode {
             .timeline
             .automation(self.track)
             .is_some_and(|a| a.bypass(self.plugin).is_some());
-        if automated_bypass || self.dry > 0.0 {
-            self.soft_bypass(cx, io);
-        }
+        let passed = (automated_bypass || self.dry > 0.0) && self.soft_bypass(cx, io);
+        self.notes_out(io, passed, rewired);
+        self.notes_in(io);
     }
 
     fn reset(&mut self) {
         self.processor.reset();
+        self.notes.forget();
         self.sent.clear();
         self.voices.reset();
         for d in &mut self.delay {

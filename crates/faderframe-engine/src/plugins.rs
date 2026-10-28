@@ -1,6 +1,6 @@
 //! Control-side ownership of plugin instances.
 
-use crate::nodes::MissedReleases;
+use crate::nodes::{MissedReleases, NoteLedger};
 use faderframe_core::{ParameterId, PluginInstanceId};
 use faderframe_plugin_host::{
     PluginEditor, PluginError, PluginEventSources, PluginFd, PluginFormat, PluginInstance,
@@ -63,6 +63,8 @@ struct Hosted {
     failed: Arc<AtomicBool>,
     /// What blocks its processors missed would have ended (every graph's).
     missed: Arc<MissedReleases>,
+    /// What notes reached it and left it (every graph's).
+    notes: Arc<NoteLedger>,
     /// Explicit slot values last pushed to the instance.
     applied: HashMap<ParameterId, f64>,
     /// The plugin's own value before the first explicit one (restored when
@@ -107,6 +109,7 @@ pub struct ActivatedPlugin {
     pub failed: Arc<AtomicBool>,
     /// The instance's (shared by the nodes of all graphs).
     pub missed: Arc<MissedReleases>,
+    pub notes: Arc<NoteLedger>,
 }
 
 impl PluginHost {
@@ -184,6 +187,7 @@ impl PluginHost {
                     outputs,
                     failed: Arc::new(AtomicBool::new(false)),
                     missed: Arc::default(),
+                    notes: Arc::default(),
                     applied,
                     baseline,
                     state: slot.state.clone(),
@@ -534,6 +538,7 @@ impl PluginHost {
             activation: hosted.instance.activation(),
             failed: Arc::clone(&hosted.failed),
             missed: Arc::clone(&hosted.missed),
+            notes: Arc::clone(&hosted.notes),
         })
     }
 

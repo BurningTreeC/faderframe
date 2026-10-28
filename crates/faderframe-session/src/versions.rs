@@ -110,7 +110,7 @@ impl crate::Session {
         for v in stored.video.sources.values_mut() {
             v.path = media::to_stored(&v.path, Some(&project_dir));
         }
-        file::save(&path, &stored, Some(&self.workspace))?;
+        file::save(&path, &stored, Some(&self.workspace_to_save()))?;
         self.notify(
             NoticeLevel::Info,
             format!("saved version {number} ‘{name}’"),

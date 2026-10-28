@@ -96,3 +96,72 @@ fn comp_selects_takes_with_crossfades() {
     assert!(out[2_000].abs() < 1e-6, "take B starts at 4000");
     assert!((out[6_000] / reference - 0.5).abs() < 1e-4);
 }
+
+/// An auditioned take plays whole where the folder plays its comp (the
+/// arranger's ▶ on a take lane), until the audition ends.
+#[test]
+fn an_auditioned_take_plays_whole_instead_of_the_comp() {
+    use faderframe_engine::offline::OfflineRenderer;
+    use faderframe_project::Impact;
+    let mut tp = TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Vox", ChannelLayout::Mono);
+    let a = tp.dc(1, 0.25, 20_000);
+    let b = tp.dc(1, 0.5, 20_000);
+    let mut f = TakeFolder::new(16_000);
+    let take = |name: &str, source| Take {
+        name: name.into(),
+        source,
+        source_offset: 0,
+        start: 0,
+        end: 16_000,
+        gain_db: 0.0,
+        rating: 0,
+    };
+    let ta = f.add_take(take("A", a));
+    let tb = f.add_take(take("B", b));
+    f.use_take(ta);
+    f.set_comp(8_000, 12_000, Some(tb));
+    let id = tp.project.ids.allocate();
+    tp.project.clips.insert(
+        id,
+        Clip {
+            id,
+            track: t,
+            name: "takes".into(),
+            color: None,
+            start: MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Takes(f),
+        },
+    );
+    tp.project.track_mut(t).unwrap().clips.push(id);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let play = |audition: Option<usize>| {
+        let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 1).unwrap();
+        r.controller.set_take_audition(audition.map(|k| (id, k)));
+        r.controller
+            .sync(&tp.project, &tp.sources, Impact::Timeline)
+            .unwrap();
+        r.play_from(0).unwrap();
+        let mut out = Vec::new();
+        while out.len() < 16_000 {
+            out.extend_from_slice(r.step().output_ref(0));
+        }
+        out
+    };
+    let comp = play(None);
+    let reference = comp[2_000] / 0.25;
+    let level = |out: &[f32], i: usize| out[i] / reference;
+    assert!((level(&comp, 10_000) - 0.5).abs() < 1e-4, "B in the comp");
+    let heard = play(Some(ta));
+    for i in [2_000, 10_000, 14_000] {
+        assert!((level(&heard, i) - 0.25).abs() < 1e-4, "A whole at {i}");
+    }
+    let heard = play(Some(tb));
+    for i in [2_000, 10_000, 14_000] {
+        assert!((level(&heard, i) - 0.5).abs() < 1e-4, "B whole at {i}");
+    }
+}

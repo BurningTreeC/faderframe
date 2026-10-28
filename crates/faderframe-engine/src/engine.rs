@@ -419,6 +419,7 @@ pub fn create_with_epoch(
         bypassed_for_monitoring: Vec::new(),
         plan: Arc::new(StreamPlan::default()),
         suspended_lanes: Default::default(),
+        take_audition: None,
         midi_routing: crate::build::MidiRouting {
             shared: Arc::clone(&shared_midi),
             ..Default::default()
@@ -1531,6 +1532,8 @@ pub struct EngineController {
     plan: Arc<StreamPlan>,
     /// Automation lanes being written (they do not drive their parameter).
     suspended_lanes: std::collections::HashSet<faderframe_core::AutomationLaneId>,
+    /// A take folder playing one take instead of its comp.
+    take_audition: Option<(faderframe_core::ClipId, usize)>,
     /// MIDI port maps and shared MIDI state for graph builds.
     midi_routing: crate::build::MidiRouting,
     /// Tracks taking live MIDI input.
@@ -2212,6 +2215,12 @@ impl EngineController {
 
     /// Lanes being written by the user; takes effect with the next
     /// timeline sync.
+    /// A take folder plays take `.1` whole instead of its comp (`None`:
+    /// every folder its comp); applies with the next timeline update.
+    pub fn set_take_audition(&mut self, take: Option<(faderframe_core::ClipId, usize)>) {
+        self.take_audition = take;
+    }
+
     pub fn set_suspended_lanes(
         &mut self,
         lanes: std::collections::HashSet<faderframe_core::AutomationLaneId>,
@@ -2506,6 +2515,7 @@ impl EngineController {
             sources,
             self.config.sample_rate,
             &self.suspended_lanes,
+            self.take_audition,
         );
         self.plan = Arc::new(snapshot.stream_plan());
         let snapshot = Arc::new(snapshot);

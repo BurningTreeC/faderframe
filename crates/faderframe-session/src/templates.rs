@@ -147,7 +147,7 @@ impl crate::Session {
             stored
         });
         let file = partial.join(format!("{name}.{}", file::FILE_EXTENSION));
-        file::save(&file, &t, Some(&self.workspace))?;
+        file::save(&file, &t, Some(&self.workspace_to_save()))?;
         let folder = root.join(&name);
         if folder.exists() {
             std::fs::remove_dir_all(&folder).map_err(io(&folder))?;

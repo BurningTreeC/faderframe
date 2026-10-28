@@ -91,6 +91,7 @@ pub mod slip;
 pub mod snapping;
 pub mod sync;
 mod sysex;
+mod take_audition;
 pub mod templates;
 mod transients;
 pub mod versions;
@@ -108,7 +109,7 @@ pub use editing::{
     NudgeValue, ZoomRequest, format_position, format_timecode_length, parse_position,
 };
 pub use faderframe_workspace::{
-    DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE,
+    DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE, ViewPlace,
 };
 pub use ripple::{RippleMenuEntry, RippleOp, RippleScope, RippleSettings, RippleShift};
 pub use snapping::{SnapHit, SnapObject, SnapSkip};
@@ -144,7 +145,7 @@ pub use metronome::{MetronomeSettings, MetronomeSound};
 pub use midi::{
     KEYBOARD_PORT, LiveNote, MidiOutputStatus, MidiPortStatus, MidiPreferences, StepInput,
 };
-pub use notes::{KeyFold, NoteLength, NoteOp, PianoRollSettings, ToolPreview};
+pub use notes::{KeyFold, NoteLength, NoteOp, NoteStyle, PianoRollSettings, ToolPreview};
 pub use record::{
     LiveTake, LoopRecordMode, RecordMode, RecordSettings, RecordedTake, Roll, RollUnit,
 };
@@ -1006,6 +1007,19 @@ pub enum Action {
         track: Option<TrackId>,
         height: f32,
     },
+    /// Height of a track's take lanes in the arranger; not undoable, saved
+    /// with the layout.
+    SetTakeLaneHeight {
+        track: TrackId,
+        height: f32,
+    },
+    /// Play take `take` of a take folder instead of its comp (`None`: the
+    /// comp again); not undoable, not saved. Stopped, playback starts at
+    /// the folder (unless the playhead is in it).
+    AuditionTake {
+        clip: ClipId,
+        take: Option<usize>,
+    },
     /// Width of the arranger's track header column (saved with the layout).
     SetHeaderWidth(f32),
     /// What one strip's meter shows, or every strip's (`None`); `mode:
@@ -1470,6 +1484,12 @@ pub struct Session {
     /// The playhead last presented (see [`Session::transport`]): its
     /// position, when, and the run of playback it was in.
     presented: std::cell::Cell<Option<Presented>>,
+    /// Where the arranger looks at the song now (saved with the project;
+    /// the arranger notes it as it paints).
+    arranger_place: std::cell::Cell<Option<ViewPlace>>,
+    /// Bumped whenever another project takes this one's place (open, new,
+    /// template, demo, a version restored).
+    project_serial: u64,
     /// Low-latency monitoring keeps effects with at most this latency on a
     /// live input's path (ms).
     low_latency_limit_ms: f32,
@@ -1524,6 +1544,8 @@ pub struct Session {
     finishing: Vec<ActiveRecording>,
     /// Take folders whose take lanes are shown.
     open_takes: HashSet<ClipId>,
+    /// A take folder playing one take instead of its comp.
+    take_audition: Option<take_audition::TakeAudition>,
     preset_dir: PathBuf,
     presets: Vec<PresetEntry>,
     automation_writer: automation::AutomationWriter,
@@ -1825,6 +1847,8 @@ impl Session {
             transport: TransportSnapshot::default(),
             shown_position: None,
             presented: std::cell::Cell::new(None),
+            arranger_place: std::cell::Cell::new(None),
+            project_serial: 0,
             low_latency_limit_ms: DEFAULT_LOW_LATENCY_LIMIT_MS,
             metronome: metronome::MetronomeSettings::default(),
             metronome_rate: 0,
@@ -1857,6 +1881,7 @@ impl Session {
             recording: None,
             finishing: Vec::new(),
             open_takes: HashSet::new(),
+            take_audition: None,
             preset_dir: media::data_dir().join("track-presets"),
             presets: Vec::new(),
             automation_writer: Default::default(),
@@ -1956,6 +1981,26 @@ impl Session {
 
     pub fn workspace(&self) -> &WorkspaceSet {
         &self.workspace
+    }
+
+    /// The arranger looks at the song there now (kept for the next save).
+    pub fn note_arranger_place(&self, place: ViewPlace) {
+        self.arranger_place.set(Some(place));
+    }
+
+    /// The workspace as saved: the layout with where the arranger looks.
+    pub(crate) fn workspace_to_save(&self) -> WorkspaceSet {
+        let mut ws = self.workspace.clone();
+        if let Some(place) = self.arranger_place.get() {
+            ws.arranger_place = Some(place);
+        }
+        ws
+    }
+
+    /// Bumped whenever another project takes this one's place: views
+    /// start over (the arranger at the project's saved place).
+    pub fn project_serial(&self) -> u64 {
+        self.project_serial
     }
 
     /// Direct layout access for the shell (divider ratios, tab switches,
@@ -2370,6 +2415,11 @@ impl Session {
     /// Arranger height of a track (`None`: the theme default).
     pub fn track_height(&self, track: TrackId) -> Option<f32> {
         self.workspace.track_height(track)
+    }
+
+    /// Height of a track's take lanes in the arranger.
+    pub fn take_lane_height(&self, track: TrackId) -> f32 {
+        self.workspace.take_lane_height(track)
     }
 
     /// A mixer strip's width, if not the theme's.
@@ -3455,9 +3505,14 @@ impl Session {
         self.end_recordings_for_close();
         self.forget_video();
         self.project = project;
-        if let Some(ws) = workspace {
-            self.workspace = ws;
+        match workspace {
+            Some(ws) => self.workspace = ws,
+            // A new project keeps the layout, not where the last one was
+            // looked at.
+            None => self.workspace.arranger_place = None,
         }
+        self.arranger_place.set(self.workspace.arranger_place);
+        self.project_serial += 1;
         self.history.clear();
         self.saved_revision = self.history.revision();
         self.selection.clear();
@@ -3471,6 +3526,8 @@ impl Session {
         self.missing.clear();
         self.media_moves.clear();
         self.render_sources();
+        self.take_audition = None;
+        self.engine.set_take_audition(None);
         self.editor_clip = self.first_midi_clip();
         self.engine.transport(TransportCommand::Stop)?;
         self.engine.transport(TransportCommand::Locate(0))?;
@@ -3585,7 +3642,7 @@ impl Session {
         for v in stored.video.sources.values_mut() {
             v.path = media::to_stored(&v.path, Some(&dir));
         }
-        file::save(&path, &stored, Some(&self.workspace))?;
+        file::save(&path, &stored, Some(&self.workspace_to_save()))?;
         self.media_dir = project_media;
         self.unsaved_media = false;
         self.path = Some(path.clone());
@@ -3694,6 +3751,9 @@ impl Session {
         {
             self.engine.set_album_monitor(None);
             impact = Impact::Graph;
+        }
+        if !self.audition_still_holds() && impact < Impact::Timeline {
+            impact = Impact::Timeline;
         }
         if impact >= Impact::Timeline {
             self.open_media();
@@ -4609,6 +4669,11 @@ impl Session {
                 self.workspace.set_track_height(track, height);
                 self.revision += 1;
             }
+            Action::SetTakeLaneHeight { track, height } => {
+                self.workspace.set_take_lane_height(track, height);
+                self.revision += 1;
+            }
+            Action::AuditionTake { clip, take } => self.audition_take(clip, take)?,
             Action::SetStripWidth { track, width } => {
                 self.workspace.set_strip_width(track, width);
                 self.revision += 1;

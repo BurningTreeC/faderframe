@@ -42,6 +42,8 @@ use faderframe_ui_canvas::{
 };
 
 const MIN_PPQ: f32 = 1.5;
+/// A new project's zoom.
+const DEFAULT_PPQ: f32 = 34.0;
 /// Deep enough to see single samples (≈16 px per sample at 120 BPM and
 /// 48 kHz) for redrawing them with the Pencil.
 const MAX_PPQ: f32 = 400_000.0;
@@ -119,7 +121,6 @@ fn ruler_label(
 }
 const DRAG_THRESHOLD: f32 = 3.0;
 /// Height of one take lane under an open take folder.
-const LANE_H: f32 = 30.0;
 /// Width of the take-folder disclosure triangle in a clip header.
 const DISCLOSURE_W: f32 = 15.0;
 /// Header controls never spread over more than this height.
@@ -201,6 +202,13 @@ pub enum Hit {
         take: usize,
         pos: i64,
     },
+    /// A take lane's ▶: hear that take instead of the comp.
+    TakeAudition {
+        clip: ClipId,
+        take: usize,
+    },
+    /// The bottom edge of a track's take lanes: drag to size them.
+    TakeLanesEdge(TrackId),
     Empty(MusicalTime),
     /// The "+" under the last track header.
     AddTrack,
@@ -281,6 +289,13 @@ enum Drag {
         start_h: f32,
         /// Alt: every track at once.
         all: bool,
+    },
+    /// A track's take lanes sized by their bottom edge (`lanes` of them).
+    TakeLanes {
+        track: TrackId,
+        start_y: f32,
+        start_h: f32,
+        lanes: usize,
     },
 }
 
@@ -428,6 +443,8 @@ pub struct ArrangerView {
     /// Each arrangement's scroll, zoom and vertical scroll when it was
     /// left.
     places: std::collections::HashMap<Option<faderframe_core::ScratchPadId>, (f64, f32, f32)>,
+    /// The project last looked at ([`Session::project_serial`]).
+    opened_seen: Option<u64>,
 }
 
 /// A folder header's triangle.
@@ -591,7 +608,7 @@ impl ArrangerView {
         let header_width = theme.arranger.header_width;
         Self {
             theme,
-            ppq: 34.0,
+            ppq: DEFAULT_PPQ,
             scroll_x: 0.0,
             bar_held: false,
             seen_jumps: None,
@@ -621,6 +638,7 @@ impl ArrangerView {
             snap_guide: None,
             arrangement_seen: None,
             places: std::collections::HashMap::new(),
+            opened_seen: None,
         }
     }
 
@@ -735,13 +753,46 @@ impl ArrangerView {
             .map(|i| tracks[i].id)
     }
 
+    /// The track whose take lanes' bottom edge is under `pos` (lanes
+    /// open; anywhere along the row).
+    fn take_edge_hit(&self, model: &Session, pos: Point, size: Size) -> Option<TrackId> {
+        if pos.y < self.ruler_h() {
+            return None;
+        }
+        let tracks = Self::lane_tracks(model);
+        self.visible_rows(tracks.len(), size)
+            .find(|&i| {
+                let n = Self::open_lanes(tracks[i], model);
+                n > 0 && (pos.y - self.take_lanes_bottom(model, i, tracks[i], size)).abs() <= 3.0
+            })
+            .map(|i| tracks[i].id)
+    }
+
+    /// Where row `i`'s take lanes end.
+    fn take_lanes_bottom(&self, model: &Session, i: usize, t: &Track, size: Size) -> f32 {
+        self.resize_edge(model, i, t.id, size)
+            + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id)
+    }
+
+    /// A take lane's ▶ (none on lanes too low for it).
+    fn audition_rect(&self, clip_rect: Rect, lane_y: f32, lane_h: f32) -> Option<Rect> {
+        (lane_h >= 18.0).then(|| {
+            Rect::new(
+                clip_rect.x.max(self.header_w()) + 3.0,
+                lane_y + 3.0,
+                18.0,
+                14.0,
+            )
+        })
+    }
+
     fn update_rows(&mut self, model: &Session) {
         self.rows.clear();
         let mut y = 0.0;
         self.rows.push(y);
         for t in Self::lane_tracks(model) {
             y += self.base_h(model, t.id)
-                + Self::open_lanes(t, model) as f32 * LANE_H
+                + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id)
                 + model.shown_lanes(t.id).len() as f32 * AUTO_LANE_H;
             self.rows.push(y);
         }
@@ -980,6 +1031,9 @@ impl ArrangerView {
         if let Some(track) = self.resize_hit(model, pos, size) {
             return Some(Hit::Header(track, HeaderPart::Resize));
         }
+        if let Some(track) = self.take_edge_hit(model, pos, size) {
+            return Some(Hit::TakeLanesEdge(track));
+        }
         let tracks = Self::lane_tracks(model);
         let Some(i) = self.row_at(pos.y).filter(|&i| i < tracks.len()) else {
             if self.add_track_rect(tracks.len(), size).contains(pos) {
@@ -1067,7 +1121,19 @@ impl ArrangerView {
                 && pos.x < rect.right()
             {
                 let lanes_top = row.y + self.base_h(model, t.id);
-                let k = ((pos.y - lanes_top) / LANE_H).floor();
+                let lane_h = model.take_lane_height(t.id);
+                let k = ((pos.y - lanes_top) / lane_h).floor();
+                if k >= 0.0
+                    && (k as usize) < f.takes.len()
+                    && self
+                        .audition_rect(rect, lanes_top + k * lane_h, lane_h)
+                        .is_some_and(|b| b.contains(pos))
+                {
+                    return Some(Hit::TakeAudition {
+                        clip: clip.id,
+                        take: k as usize,
+                    });
+                }
                 if k >= 0.0 && (k as usize) < f.takes.len() {
                     let rate = p.sample_rate as f64;
                     let frame =
@@ -1486,7 +1552,7 @@ impl ArrangerView {
         &self,
         p: &mut dyn Painter,
         clip_rect: Rect,
-        lanes_top: f32,
+        (lanes_top, lane_h): (f32, f32),
         lanes: Rect,
         clip: &Clip,
         f: &TakeFolder,
@@ -1503,12 +1569,15 @@ impl ArrangerView {
         }
         let pieces = f.pieces();
         let text = TextStyle::new(self.theme.fonts.small, Color::hex(0xe8e4dc));
+        let auditioned = model
+            .auditioned_take()
+            .and_then(|(c, k)| (c == clip.id).then_some(k));
         for (k, take) in f.takes.iter().enumerate() {
             let lane = Rect::new(
                 clip_rect.x,
-                lanes_top + k as f32 * LANE_H,
+                lanes_top + k as f32 * lane_h,
                 clip_rect.w,
-                LANE_H - 1.0,
+                lane_h - 1.0,
             );
             p.fill(
                 Rect::new(vis.0, lane.y, vis.1 - vis.0, lane.h),
@@ -1571,11 +1640,44 @@ impl ArrangerView {
                 );
                 p.stroke_rounded(r, 1.5, 1.0, color.lighten(0.35));
             }
+            // The ▶ that auditions it; the take heard is outlined.
+            let mut label_x = vis.0 + 3.0;
+            if let Some(b) = self.audition_rect(clip_rect, lane.y, lane_h)
+                && b.right() < vis.1 - 4.0
+            {
+                let on = auditioned == Some(k);
+                let accent = self.theme.ui.accent;
+                p.fill_rounded(
+                    b,
+                    3.0,
+                    &Paint::Solid(if on {
+                        accent
+                    } else {
+                        Color::rgba(0.05, 0.05, 0.06, 0.72)
+                    }),
+                );
+                let c = b.center();
+                let mut tri = Path::new();
+                tri.move_to(Point::new(c.x - 3.0, c.y - 4.0));
+                tri.line_to(Point::new(c.x + 4.0, c.y));
+                tri.line_to(Point::new(c.x - 3.0, c.y + 4.0));
+                tri.close();
+                p.fill_path(&tri, if on { Color::hex(0x141414) } else { text.color });
+                label_x = b.right() + 3.0;
+            }
+            if auditioned == Some(k) {
+                p.stroke_rounded(
+                    Rect::new(vis.0, lane.y, vis.1 - vis.0, lane.h),
+                    2.0,
+                    1.5,
+                    self.theme.ui.accent,
+                );
+            }
             // Label on a dark chip so it stays readable over comped parts.
             let label_text = format!("{} · {}", k + 1, take.name);
-            let w = (p.text_width(&label_text, &text) + 10.0).min(vis.1 - vis.0 - 4.0);
+            let w = (p.text_width(&label_text, &text) + 10.0).min(vis.1 - label_x - 1.0);
             if w > 16.0 {
-                let chip = Rect::new(vis.0 + 3.0, lane.y + 3.0, w, 14.0);
+                let chip = Rect::new(label_x, lane.y + 3.0, w, 14.0);
                 p.fill_rounded(
                     chip,
                     3.0,
@@ -3429,7 +3531,7 @@ impl ArrangerView {
         HostRequest::ContextMenu { at, items }
     }
 
-    fn take_menu(clip: &Clip, take: usize, at: Point) -> HostRequest<Action> {
+    fn take_menu(model: &Session, clip: &Clip, take: usize, at: Point) -> HostRequest<Action> {
         let Some(f) = clip.as_takes() else {
             return HostRequest::ContextMenu {
                 at,
@@ -3455,6 +3557,38 @@ impl ArrangerView {
         if f.takes.len() <= 1 {
             items[1] = MenuItem::disabled("Delete take (the only one)");
         }
+        let hearing = model.auditioned_take() == Some((clip.id, take));
+        items.push(
+            MenuItem::new(
+                format!("Audition “{name}”"),
+                Action::AuditionTake {
+                    clip: clip.id,
+                    take: (!hearing).then_some(take),
+                },
+            )
+            .checked(hearing)
+            .separated(),
+        );
+        let now = model.take_lane_height(clip.track);
+        let heights = [
+            ("Small", 20.0),
+            ("Normal", 30.0),
+            ("Large", 60.0),
+            ("Huge", 120.0),
+        ]
+        .into_iter()
+        .map(|(label, h)| {
+            MenuItem::new(
+                label,
+                Action::SetTakeLaneHeight {
+                    track: clip.track,
+                    height: h,
+                },
+            )
+            .checked((now - h).abs() < 0.5)
+        })
+        .collect();
+        items.push(MenuItem::submenu("Take Lane Height", heights));
         items.push(MenuItem::new("Flatten Comp", Action::FlattenTakes(clip.id)).separated());
         items.push(MenuItem::new(
             "Hide Takes",
@@ -3505,6 +3639,30 @@ impl ArrangerView {
             return true;
         }
         match hit {
+            Hit::TakeAudition { clip, take } => {
+                let on = model.auditioned_take() == Some((clip, take));
+                cx.emit(Action::AuditionTake {
+                    clip,
+                    take: (!on).then_some(take),
+                });
+            }
+            Hit::TakeLanesEdge(track) if clicks >= 2 => cx.emit(Action::SetTakeLaneHeight {
+                track,
+                height: faderframe_workspace::TAKE_LANE_HEIGHT,
+            }),
+            Hit::TakeLanesEdge(track) => {
+                let lanes = model
+                    .project()
+                    .track(track)
+                    .map_or(1, |t| Self::open_lanes(t, model));
+                self.drag = Some(Drag::TakeLanes {
+                    track,
+                    start_y: pos.y,
+                    start_h: model.take_lane_height(track),
+                    lanes,
+                });
+                cx.set_cursor(Cursor::ResizeVertical);
+            }
             Hit::HeaderEdge if clicks >= 2 => {
                 cx.emit(Action::SetHeaderWidth(self.theme.arranger.header_width));
             }
@@ -4179,6 +4337,17 @@ impl ArrangerView {
                     });
                 }
             }
+            Some(Drag::TakeLanes {
+                track,
+                start_y,
+                start_h,
+                lanes,
+            }) => {
+                let h = (start_h + (pos.y - start_y) / lanes.max(1) as f32).round();
+                if (h - model.take_lane_height(track)).abs() >= 1.0 {
+                    cx.emit(Action::SetTakeLaneHeight { track, height: h });
+                }
+            }
             Some(Drag::Pan2D { origin, sx, sy }) => {
                 self.scroll_x = sx - (pos.x - origin.x) as f64;
                 self.scroll_y = sy - (pos.y - origin.y);
@@ -4304,6 +4473,13 @@ impl CanvasView<Session, Action> for ArrangerView {
         self.apply_zoom_request(model, size);
         self.follow(model, size);
         self.clamp_scroll(model, size);
+        if model.shown_pad().is_none() {
+            model.note_arranger_place(faderframe_session::ViewPlace {
+                zoom: self.ppq,
+                left: self.scroll_x / f64::from(self.ppq),
+                top: self.scroll_y,
+            });
+        }
         let a = &theme.arranger;
         p.fill(Rect::from_size(size), a.background);
         let lanes = Rect::new(
@@ -4394,7 +4570,8 @@ impl CanvasView<Session, Action> for ArrangerView {
                 {
                     let color = color_of(clip.color.unwrap_or(t.color));
                     let top = row.y + self.base_h(model, t.id);
-                    self.paint_take_lanes(p, rect, top, lanes, clip, f, model, color);
+                    let lane_h = model.take_lane_height(t.id);
+                    self.paint_take_lanes(p, rect, (top, lane_h), lanes, clip, f, model, color);
                 }
             }
             // The track plays the clip launcher, not the arrangement.
@@ -4505,6 +4682,20 @@ impl CanvasView<Session, Action> for ArrangerView {
             let y = self.resize_edge(model, i, tracks[i].id, size);
             p.fill(
                 Rect::new(0.0, y - 1.0, self.header_w(), 2.0),
+                theme.ui.accent.with_alpha(0.85),
+            );
+        }
+        // The bottom of take lanes being sized, or under the pointer.
+        let take_sizing = match (self.drag, self.hover) {
+            (Some(Drag::TakeLanes { track, .. }), _) | (_, Some(Hit::TakeLanesEdge(track))) => {
+                Some(track)
+            }
+            _ => None,
+        };
+        if let Some(i) = take_sizing.and_then(|id| tracks.iter().position(|t| t.id == id)) {
+            let y = self.take_lanes_bottom(model, i, tracks[i], size);
+            p.fill(
+                Rect::new(0.0, y - 1.0, size.w, 2.0),
                 theme.ui.accent.with_alpha(0.85),
             );
         }
@@ -4714,9 +4905,9 @@ impl CanvasView<Session, Action> for ArrangerView {
                         cx.request(menu);
                     }
                     Some(Hit::Global(g)) => cx.request(self.global_menu(g, model, pos)),
-                    Some(Hit::TakeLane { clip, take, .. }) => {
+                    Some(Hit::TakeLane { clip, take, .. } | Hit::TakeAudition { clip, take }) => {
                         if let Some(c) = model.project().clip(clip) {
-                            cx.request(Self::take_menu(c, take, pos));
+                            cx.request(Self::take_menu(model, c, take, pos));
                         }
                     }
                     Some(Hit::Automation { track, header, .. }) => {
@@ -4765,7 +4956,14 @@ impl CanvasView<Session, Action> for ArrangerView {
                 if hit != self.hover {
                     // Hover highlights: the "+" and a track's resize edge.
                     let lit = |h: Option<Hit>| {
-                        matches!(h, Some(Hit::AddTrack | Hit::Header(_, HeaderPart::Resize)))
+                        matches!(
+                            h,
+                            Some(
+                                Hit::AddTrack
+                                    | Hit::Header(_, HeaderPart::Resize)
+                                    | Hit::TakeLanesEdge(_)
+                            )
+                        )
                     };
                     if lit(hit) || lit(self.hover) {
                         cx.redraw();
@@ -4776,6 +4974,8 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::TakeToggle(_)) => Cursor::Pointer,
                         Some(Hit::HeaderEdge) => Cursor::ResizeHorizontal,
                         Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
+                        Some(Hit::TakeAudition { .. }) => Cursor::Pointer,
+                        Some(Hit::TakeLanesEdge(_)) => Cursor::ResizeVertical,
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
                         Some(Hit::Ruler(_) | Hit::LoopBand(_)) => Cursor::Pointer,
@@ -5079,6 +5279,18 @@ impl CanvasView<Session, Action> for ArrangerView {
                     "{}\nClick: this take in the comp section here · Drag: comp the swiped range · Right-click: use the whole take, more",
                     f.takes.get(take)?.name
                 ))
+            }
+            Hit::TakeAudition { clip, take } => {
+                let f = model.project().clip(clip)?.as_takes()?;
+                let name = &f.takes.get(take)?.name;
+                Some(if model.auditioned_take() == Some((clip, take)) {
+                    format!("Hearing “{name}” instead of the comp · Click: the comp again")
+                } else {
+                    format!("Hear “{name}” whole instead of the comp")
+                })
+            }
+            Hit::TakeLanesEdge(_) => {
+                Some("Drag to size the take lanes · Double-click: the default height".into())
             }
             Hit::Automation { header: true, .. } => {
                 Some("Click the name to choose parameters · the mode button sets Off/Read/Touch/Latch/Write".into())

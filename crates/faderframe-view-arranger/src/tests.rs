@@ -2,6 +2,7 @@ use super::*;
 use faderframe_engine::EngineConfig;
 use faderframe_session::ClipEdge;
 use faderframe_ui_canvas::{DrawOp, RecordingPainter};
+use faderframe_workspace::TAKE_LANE_HEIGHT;
 
 fn session() -> Session {
     Session::demo(EngineConfig::default()).unwrap()
@@ -92,6 +93,48 @@ fn zoom_keeps_the_time_under_the_pointer() {
         (before.quarters() - after.quarters()).abs() < 0.05,
         "{before:?} vs {after:?}"
     );
+}
+
+/// The zoom and scroll are saved with the project (issue #28): opened
+/// again, the arranger looks where it did; a new project starts at the
+/// default zoom.
+#[test]
+fn the_zoom_and_scroll_are_saved_with_the_project() {
+    let dir = std::env::temp_dir().join(format!("ff-arranger-place-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("place.ffproj");
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1200.0, 400.0);
+    let paint = |view: &mut ArrangerView, s: &Session| {
+        view.paint(&mut RecordingPainter::new(), size, s, &theme);
+    };
+    paint(&mut view, &s);
+    view.zoom_at(700.0, 3.0, &s, size);
+    view.scroll_x += 500.0;
+    view.scroll_y = 60.0;
+    paint(&mut view, &s);
+    let (ppq, x, y) = (view.ppq, view.scroll_x, view.scroll_y);
+    assert!((ppq - DEFAULT_PPQ * 3.0).abs() < 1e-3);
+    s.save_as(&path).unwrap();
+    s.new_project(false).unwrap();
+    paint(&mut view, &s);
+    assert_eq!(
+        (view.ppq, view.scroll_x, view.scroll_y),
+        (DEFAULT_PPQ, 0.0, 0.0)
+    );
+    s.open(&path).unwrap();
+    paint(&mut view, &s);
+    assert!((view.ppq - ppq).abs() < 1e-3, "{} vs {ppq}", view.ppq);
+    assert!((view.scroll_x - x).abs() < 0.01, "{} vs {x}", view.scroll_x);
+    assert_eq!(view.scroll_y, y);
+    // A fresh view (the next start of the app) looks there too.
+    let mut fresh = ArrangerView::new(Theme::default());
+    paint(&mut fresh, &s);
+    assert!((fresh.ppq - ppq).abs() < 1e-3);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -289,13 +332,13 @@ fn take_lanes_open_and_comp_by_click_and_swipe() {
     let mut p = RecordingPainter::new();
     view.paint(&mut p, size, &s, &theme);
     let row = view.row_rect(row_i, size);
-    assert_eq!(row.h, view.row_h() + 3.0 * LANE_H);
+    assert_eq!(row.h, view.row_h() + 3.0 * TAKE_LANE_HEIGHT);
     assert!(p.texts().iter().any(|t| t.contains("Take 1")));
     assert!(p.balanced_clips());
 
     // Clicking lane 1 uses take 1 in the one comp section: everywhere.
     let base_h = view.row_h();
-    let lane_y = |k: usize| row.y + base_h + LANE_H * (k as f32 + 0.5);
+    let lane_y = |k: usize| row.y + base_h + TAKE_LANE_HEIGHT * (k as f32 + 0.5);
     let x0 = view.x_of(start + MusicalTime::from_quarters_i(1));
     let mut actions = run(&mut view, down(Point::new(x0, lane_y(0))), size, &s).0;
     actions.extend(run(&mut view, up(Point::new(x0, lane_y(0))), size, &s).0);
@@ -378,6 +421,89 @@ fn take_lanes_open_and_comp_by_click_and_swipe() {
     let labels: Vec<_> = items.iter().map(|i| i.label.clone()).collect();
     assert!(labels.contains(&"Flatten Comp".to_string()), "{labels:?}");
     assert!(labels.iter().any(|l| l.starts_with("Use")));
+}
+
+/// Take lanes are sized by dragging their bottom edge (each lane grows by
+/// its share; a double-click resets them), and each lane's ▶ auditions
+/// that take instead of the comp (issue #28).
+#[test]
+fn take_lanes_resize_and_each_take_is_auditioned() {
+    let (mut s, clip, row_i) = session_with_takes();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let theme = Theme::default();
+    s.dispatch(Action::ToggleTakeLanes(clip)).unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let track = s.project().clip(clip).unwrap().track;
+    let row = view.row_rect(row_i, size);
+    let base_h = view.row_h();
+    let edge = row.y + base_h + 3.0 * TAKE_LANE_HEIGHT;
+    let x = 700.0;
+    assert_eq!(
+        view.hit_test(Point::new(x, edge + 1.0), size, &s),
+        Some(Hit::TakeLanesEdge(track))
+    );
+    // Dragged 90 px down: three lanes, 30 px taller each.
+    let mut actions = run(&mut view, down(Point::new(x, edge)), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(x, edge + 90.0)), size, &s).0);
+    actions.extend(run(&mut view, up(Point::new(x, edge + 90.0)), size, &s).0);
+    assert_eq!(
+        actions.last(),
+        Some(&Action::SetTakeLaneHeight {
+            track,
+            height: TAKE_LANE_HEIGHT + 30.0
+        })
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let lane_h = s.take_lane_height(track);
+    assert_eq!(lane_h, TAKE_LANE_HEIGHT + 30.0);
+    assert_eq!(view.row_rect(row_i, size).h, base_h + 3.0 * lane_h);
+    // A lane's ▶ plays that take; again: the comp.
+    let start = s.project().clip(clip).unwrap().start;
+    let lane_y = |k: usize| row.y + base_h + lane_h * k as f32;
+    let button = Point::new(
+        view.x_of(start).max(view.header_w()) + 10.0,
+        lane_y(1) + 10.0,
+    );
+    let (a, _) = run(&mut view, down(button), size, &s);
+    assert_eq!(
+        a,
+        vec![Action::AuditionTake {
+            clip,
+            take: Some(1)
+        }]
+    );
+    s.dispatch(a[0].clone()).unwrap();
+    assert_eq!(s.auditioned_take(), Some((clip, 1)));
+    let p = paint_texts(&mut view, size, &s, &theme);
+    assert!(p.iter().any(|t| t.contains("Take 2")));
+    let (a, _) = run(&mut view, down(button), size, &s);
+    assert_eq!(a, vec![Action::AuditionTake { clip, take: None }]);
+    // Double-clicking the edge: the default height.
+    let edge = row.y + base_h + 3.0 * lane_h;
+    let ev = ViewEvent::PointerDown {
+        pos: Point::new(x, edge),
+        button: PointerButton::Primary,
+        modifiers: Modifiers::NONE,
+        clicks: 2,
+    };
+    let (a, _) = run(&mut view, ev, size, &s);
+    assert_eq!(
+        a,
+        vec![Action::SetTakeLaneHeight {
+            track,
+            height: TAKE_LANE_HEIGHT
+        }]
+    );
+}
+
+fn paint_texts(view: &mut ArrangerView, size: Size, s: &Session, theme: &Theme) -> Vec<String> {
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, s, theme);
+    p.texts().into_iter().map(str::to_string).collect()
 }
 
 #[test]

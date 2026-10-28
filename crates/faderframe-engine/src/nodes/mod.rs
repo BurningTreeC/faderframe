@@ -24,7 +24,7 @@ pub use io::{
 pub use listen::{ListenLink, ListenOut, Listening};
 pub use midi_player::MidiClipPlayer;
 pub(crate) use midi_player::chase_key;
-pub use plugin::{MissedReleases, PluginNode};
+pub use plugin::{MissedReleases, NoteLedger, PluginNode};
 pub use send::SendNode;
 pub use strip::{ChannelStrip, ObjectRenderer, StripEcho};
 

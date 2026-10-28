@@ -116,7 +116,21 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     let theme = gtk::DropDown::from_strings(&names);
     let current = app.theme.borrow().id;
     theme.set_selected(themes.iter().position(|t| t.id == current).unwrap_or(0) as u32);
-    row(&g, 3, "Theme", &theme);
+    theme.set_hexpand(true);
+    let theme_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let edit_themes = gtk::Button::with_label("Edit Themes…");
+    edit_themes.set_tooltip_text(Some("Themes of your own: every colour can be changed"));
+    theme_row.append(&theme);
+    theme_row.append(&edit_themes);
+    row(&g, 3, "Theme", &theme_row);
+    {
+        let weak = Rc::downgrade(app);
+        edit_themes.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                crate::theme_editor::open(&app);
+            }
+        });
+    }
     let storage = match faderframe_core::paths::portable_root() {
         Some(dir) => format!(
             "Portable: settings, caches, presets and unsaved recordings are kept in {}",

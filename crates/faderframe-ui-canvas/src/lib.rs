@@ -19,6 +19,7 @@
 pub mod access;
 mod color;
 pub mod controls;
+pub mod custom;
 mod event;
 pub mod flow;
 mod geometry;

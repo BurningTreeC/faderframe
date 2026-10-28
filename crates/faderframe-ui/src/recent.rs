@@ -14,8 +14,11 @@ pub const MAX_RECENT: usize = 10;
 /// What a new start of the app opens (Preferences → General).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StartupProject {
-    /// The project used last (the demo session on a first start).
+    /// The start window: recent projects, new ones (empty or from a
+    /// template), a file, the demo; a new project until one is chosen.
     #[default]
+    Ask,
+    /// The project used last (the demo session on a first start).
     Last,
     /// A new, empty project.
     New,
@@ -24,10 +27,11 @@ pub enum StartupProject {
 }
 
 impl StartupProject {
-    pub const ALL: [StartupProject; 3] = [Self::Last, Self::New, Self::Demo];
+    pub const ALL: [StartupProject; 4] = [Self::Ask, Self::Last, Self::New, Self::Demo];
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::Ask => "ask",
             Self::Last => "last",
             Self::New => "new",
             Self::Demo => "demo",
@@ -40,6 +44,7 @@ impl StartupProject {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Ask => "Show the start window (recent projects, new, templates)",
             Self::Last => "Open the last project",
             Self::New => "Start a new project (from the default template, if one is set)",
             Self::Demo => "Open the demo session",
@@ -56,21 +61,27 @@ pub fn push(list: &mut Vec<String>, path: &Path) {
     list.truncate(MAX_RECENT);
 }
 
+/// "~/Music/Projects": the folder a project file is in, the home folder
+/// shortened.
+pub fn folder_label(path: &Path) -> String {
+    let dir = path
+        .parent()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let home = gtk::glib::home_dir().to_string_lossy().to_string();
+    match dir.strip_prefix(&home) {
+        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        _ => dir,
+    }
+}
+
 /// "Song — ~/Music/Projects" for a menu entry.
 pub fn label(path: &str) -> String {
     let p = Path::new(path);
     let name = p
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().to_string());
-    let dir = p
-        .parent()
-        .map(|d| d.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let home = gtk::glib::home_dir().to_string_lossy().to_string();
-    let dir = match dir.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() => format!("~{rest}"),
-        _ => dir,
-    };
+    let dir = folder_label(p);
     // Menu labels treat '_' as a mnemonic.
     format!("{name} — {dir}").replace('_', "__")
 }
@@ -158,10 +169,20 @@ pub fn clear(app: &Rc<AppState>) {
     rebuild_menu(&app.recent_menu, &prefs.recent_projects);
 }
 
+/// What a new start opens: the preference, except that a scripted run
+/// (`FADERFRAME_STARTUP_ACTIONS`) opens the last project where the start
+/// window would show.
+pub fn startup_choice(prefs: &Preferences, scripted: bool) -> StartupProject {
+    match StartupProject::from_id(&prefs.startup_project).unwrap_or_default() {
+        StartupProject::Ask if scripted => StartupProject::Last,
+        choice => choice,
+    }
+}
+
 /// The project a new start opens: `Some(path)` for the last project when
-/// that is the choice and it still exists.
-pub fn startup_path(prefs: &Preferences) -> Option<PathBuf> {
-    (StartupProject::from_id(&prefs.startup_project).unwrap_or_default() == StartupProject::Last)
+/// that is the choice.
+pub fn startup_path(prefs: &Preferences, scripted: bool) -> Option<PathBuf> {
+    (startup_choice(prefs, scripted) == StartupProject::Last)
         .then(|| prefs.recent_projects.first().map(PathBuf::from))
         .flatten()
 }
@@ -194,12 +215,18 @@ mod tests {
     #[test]
     fn startup_choice_and_fallbacks() {
         let mut p = Preferences::default();
-        assert_eq!(startup_path(&p), None, "nothing used yet");
+        assert_eq!(startup_choice(&p, false), StartupProject::Ask);
+        assert_eq!(startup_path(&p, true), None, "nothing used yet");
         p.recent_projects = vec!["/a/b.ffproj".into()];
-        assert_eq!(startup_path(&p), Some(PathBuf::from("/a/b.ffproj")));
+        // The start window shows; a scripted run opens the last project.
+        assert_eq!(startup_path(&p, false), None);
+        assert_eq!(startup_path(&p, true), Some(PathBuf::from("/a/b.ffproj")));
+        p.startup_project = "last".into();
+        assert_eq!(startup_path(&p, false), Some(PathBuf::from("/a/b.ffproj")));
         p.startup_project = "new".into();
-        assert_eq!(startup_path(&p), None);
+        assert_eq!(startup_path(&p, true), None);
         assert_eq!(StartupProject::from_id("demo"), Some(StartupProject::Demo));
+        assert_eq!(StartupProject::from_id("ask"), Some(StartupProject::Ask));
     }
 
     #[test]

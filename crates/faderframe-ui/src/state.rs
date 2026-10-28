@@ -221,6 +221,10 @@ pub struct AppState {
     pub recent_menu: gio::Menu,
     /// The project file the recent list last recorded.
     pub shown_path: RefCell<Option<PathBuf>>,
+    /// The start window, while it is open.
+    pub start_window: RefCell<Option<gtk::glib::WeakRef<gtk::Window>>>,
+    /// View → Theme's section of the user's own themes.
+    pub custom_themes_menu: gio::Menu,
     /// Background CLAP scan in progress.
     pub plugin_scan: RefCell<Option<std::sync::mpsc::Receiver<crate::plugins::ScanReport>>>,
 }
@@ -254,6 +258,12 @@ impl AppState {
                 m
             },
             shown_path: RefCell::new(None),
+            start_window: RefCell::new(None),
+            custom_themes_menu: {
+                let m = gio::Menu::new();
+                crate::user_themes::rebuild_menu(&m);
+                m
+            },
         })
     }
 

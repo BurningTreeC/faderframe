@@ -382,3 +382,45 @@ fn midi_tools_preview_and_apply_in_one_step() {
     assert!(p.notes.iter().all(|n| n.start >= bar.0 && n.start < bar.1));
     assert!(p.removed.is_empty(), "added, not replacing");
 }
+
+/// The piano roll draws drums as diamonds by itself: clips of a track
+/// with the Drum Sampler, and of a MIDI track playing that track; as
+/// chosen otherwise.
+#[test]
+fn drum_clips_show_as_diamonds() {
+    use faderframe_session::{NoteStyle, PianoRollSettings};
+    let (mut s, c) = setup();
+    assert!(!s.piano_diamonds(c), "an instrument track without drums");
+    let t = s.project().clip(c).unwrap().track;
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: faderframe_project::PluginRef::builtin(
+            faderframe_core::builtin::DRUMS,
+            "Drum Sampler",
+        ),
+    })
+    .unwrap();
+    assert!(s.piano_diamonds(c), "the Drum Sampler plays it");
+    // A MIDI track playing the drums.
+    let m = s.add_track(TrackKind::Midi).unwrap();
+    s.dispatch(Action::Edit(faderframe_project::Command::SetTrackOutput {
+        track: m,
+        output: faderframe_project::OutputRouting::Track { track: t },
+    }))
+    .unwrap();
+    s.dispatch(Action::CreateMidiClip {
+        track: m,
+        start: MusicalTime::ZERO,
+        length: MusicalTime::from_quarters_i(4),
+    })
+    .unwrap();
+    let mc = s.project().clips_of(m)[0].id;
+    assert!(s.piano_diamonds(mc));
+    s.dispatch(Action::SetPianoRoll(PianoRollSettings {
+        note_style: NoteStyle::Bars,
+        ..s.editor.piano
+    }))
+    .unwrap();
+    assert!(!s.piano_diamonds(mc), "bars chosen");
+}

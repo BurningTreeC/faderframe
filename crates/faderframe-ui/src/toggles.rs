@@ -525,7 +525,8 @@ pub(crate) fn show_menu(app: &Rc<AppState>, name: &str) {
                 .flatten()
         })
     }
-    let model: gio::MenuModel = crate::window::menu_model(&app.recent_menu).upcast();
+    let model: gio::MenuModel =
+        crate::window::menu_model(&app.recent_menu, &app.custom_themes_menu).upcast();
     let sub = name
         .split('/')
         .try_fold(model, |m, label| find(&m, label.trim()));
@@ -719,7 +720,7 @@ mod tests {
     #[test]
     fn the_menus_show_every_toggle() {
         let recent = gio::Menu::new();
-        let model = crate::window::menu_model(&recent);
+        let model = crate::window::menu_model(&recent, &gio::Menu::new());
         let commands = crate::palette::menu_commands(model.upcast_ref());
         for t in TOGGLES {
             let name = format!("app.{}", t.name);
