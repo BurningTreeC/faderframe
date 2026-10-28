@@ -320,10 +320,26 @@ impl LaneWork {
         if shifts.is_empty() {
             return;
         }
+        // A time-locked track's automation moves by the time each shift
+        // takes out or opens, as its clips do.
+        let in_time = p
+            .track(track)
+            .is_some_and(|t| t.is_time_locked())
+            .then(|| (p.timeline.clone(), f64::from(p.sample_rate.max(1))));
         for target in Self::targets(p, track) {
             if let Some(l) = self.lane(p, track, target, false) {
-                for s in &shifts {
-                    l.curve.ripple(s.cut, s.delta);
+                match &in_time {
+                    Some((tl, rate)) => faderframe_project::time_lock::ripple_curve_in_time(
+                        &mut l.curve,
+                        &shifts,
+                        tl,
+                        *rate,
+                    ),
+                    None => {
+                        for s in &shifts {
+                            l.curve.ripple(s.cut, s.delta);
+                        }
+                    }
                 }
             }
         }
@@ -975,13 +991,23 @@ impl Session {
     ) -> Vec<Command> {
         let clips: Vec<Clip> = self.project.clips_of(track).into_iter().cloned().collect();
         let mut cmds = Vec::new();
+        // A time-locked track opens the time `len` lasts at `at` (what
+        // follows keeps its spacing in time).
+        let opened = crate::ripple::RippleShift::open(at, len);
+        let rate = f64::from(self.project.sample_rate.max(1));
+        let locked = self.is_time_locked(track);
         for c in clips {
             let end = self.clip_end(&c);
             if c.start >= at {
+                let start = if locked {
+                    opened.map_in_time(c.start, &self.project.timeline, rate)
+                } else {
+                    c.start + len
+                };
                 cmds.push(Command::MoveClip {
                     clip: c.id,
                     track,
-                    start: c.start + len,
+                    start,
                 });
             } else if end > at
                 && (!c.content.is_audio()

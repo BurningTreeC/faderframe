@@ -37,7 +37,7 @@ const MAX_OVERSAMPLING: usize = 8;
 
 /// The amplifiers the Guitar Station offers, in the order of their stable
 /// parameter values: append, never reorder.
-pub const AMPS: [Gain; 20] = [
+pub const AMPS: [Gain; 24] = [
     Gain::Plexi,
     Gain::Brit45,
     Gain::PlexiBass,
@@ -58,6 +58,11 @@ pub const AMPS: [Gain; 20] = [
     Gain::AmericanSvt,
     Gain::AmericanV4b,
     Gain::American800RB,
+    // FaderFrame's own, after the extraction (2026-10-28).
+    Gain::TweedLux,
+    Gain::TweedLuxNormal,
+    Gain::Seattle100,
+    Gain::Seattle100Normal,
 ];
 
 /// An amplifier's name on the panel (upstream's).
@@ -83,6 +88,14 @@ pub fn amp_name(amp: Gain) -> &'static str {
         Gain::AmericanSvt => "American SVT",
         Gain::AmericanV4b => "American V-4B",
         Gain::American800RB => "American 800RB",
+        // A tweed-covered Deluxe: the cloth it is known by, not its maker's
+        // model name. Its channels as the American Deluxe's are named.
+        Gain::TweedLux => "Tweed Lux",
+        Gain::TweedLuxNormal => "Tweed Lux Normal",
+        // Where the SLO was built, and its wattage, as the Brum 100 is the
+        // Laney's: Soldano's shop is in Seattle.
+        Gain::Seattle100 => "Seattle 100",
+        Gain::Seattle100Normal => "Seattle 100 Normal",
         _ => "",
     }
 }
@@ -844,6 +857,32 @@ impl Chain {
         }
         if let Some((which, _)) = voice.own_sweep() {
             sim.set_control(which, s.sweep.clamp(0.0, 1.0));
+        }
+        self.set_power_sweep(voice.power_sweep().map(|(which, _)| (which, s.sweep)));
+    }
+
+    /// The fourth knob on the power stage behind the preamplifier, where the
+    /// voice puts it there (`Gain::power_sweep`: the Seattle 100's DEPTH).
+    /// Every other voice rests that control where its stage was voiced, so a
+    /// knob turned on one amplifier does not stay turned on the next.
+    fn set_power_sweep(&mut self, knob: Option<(usize, f64)>) {
+        let which = knob.map_or(power::RESONANCE, |(which, _)| which);
+        let power = self.power;
+        let loaded = self
+            .power_selection
+            .resolved(self.voice)
+            .and_then(|model| self.loaded[model.slot()].as_mut())
+            .map(|l| &mut l.sim);
+        let resistive = self.powers.get_mut(power).and_then(Option::as_mut);
+        for sim in resistive.into_iter().chain(loaded) {
+            let position = match knob {
+                Some((_, value)) => value.clamp(0.0, 1.0),
+                None => match sim.resting_position(which) {
+                    Some(rest) => rest,
+                    None => continue,
+                },
+            };
+            sim.set_control(which, position);
         }
     }
 

@@ -35,12 +35,14 @@ pub mod adm;
 pub mod album;
 mod album_master;
 mod aliases;
+pub mod align;
 pub mod analysis;
 pub mod audio_device;
 pub mod capture;
 pub mod cleanup;
 pub mod clip_fx;
 pub mod clipboard;
+pub mod compare;
 pub mod conform;
 pub mod console;
 pub mod containers;
@@ -67,6 +69,7 @@ pub mod leadsheet;
 pub mod listening;
 mod merge;
 pub mod metronome;
+pub mod mix;
 pub mod outputs;
 pub mod plugin_favorites;
 mod programs;
@@ -83,6 +86,7 @@ mod midi2file;
 mod midifile;
 pub mod presets;
 pub mod record;
+pub mod references;
 pub mod render;
 pub mod ripple;
 mod selection;
@@ -93,6 +97,7 @@ pub mod sync;
 mod sysex;
 mod take_audition;
 pub mod templates;
+mod time_lock;
 mod transients;
 pub mod versions;
 pub mod video;
@@ -472,6 +477,13 @@ pub enum Action {
         clip: ClipId,
         op: clip_fx::ClipFxOp,
     },
+    /// Show one of a clip's effects in its own editor window: the
+    /// device's GUI, or (`generic`, or when it has none) the generic one.
+    OpenClipEffectEditor {
+        clip: ClipId,
+        index: usize,
+        generic: bool,
+    },
     /// An audio clip's notes on a new instrument track (melody, harmony
     /// or drums; after listening to it).
     ConvertToMidi {
@@ -506,6 +518,9 @@ pub enum Action {
     SongStructure {
         clips: Vec<ClipId>,
     },
+    /// Mix Intelligence: analyse the mix, select and show findings,
+    /// audition, apply or reject their experiments ([`mix`]).
+    Mix(mix::MixOp),
     /// Edit the setlist.
     Setlist(setlist::SetlistOp),
     /// Make, show, change or remove scratch pads, and move material into
@@ -1198,6 +1213,17 @@ pub enum Action {
     },
     SeparateAtTransients(Vec<ClipId>),
     ToggleFollowPlayhead,
+    /// Auto-Align: the microphones of one source in time and polarity
+    /// (see [`align`]).
+    AutoAlign(align::AlignOp),
+    /// Hear the project as it was with this many steps of the history
+    /// done beside the mix as it is (rendered on a copy: nothing is undone;
+    /// see [`compare`]).
+    AuditionHistory(usize),
+    /// Switch between the mix and what it is compared with.
+    Compare(compare::CompareOp),
+    /// Reference tracks: the list, which is compared, EQ Match.
+    Reference(references::ReferenceOp),
 }
 
 /// Editing preferences shared by the arranger and the piano roll.
@@ -1586,6 +1612,9 @@ pub struct Session {
     poly: polypitch::PolyState,
     clip_analyses: detect::ClipAnalyses,
     structure_jobs: structure::StructureJobs,
+    auto_align: align::AlignState,
+    /// Mix Intelligence: its analysis, results, cache and audition.
+    mix: mix::MixState,
     show: setlist::ShowState,
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
@@ -1663,6 +1692,8 @@ pub struct Session {
     midi: midi::MidiState,
     /// Voice ports: singing into MIDI.
     voice: voice::VoiceState,
+    /// A/B listening: the undo history auditioned, reference tracks.
+    compare: compare::CompareState,
 }
 
 /// Where a plugin chosen in the browser goes.
@@ -1742,6 +1773,8 @@ pub enum UiRequest {
         what: String,
         files: Vec<render::Rendered>,
     },
+    /// Show the Auto-Align window ([`Session::auto_align`]).
+    AutoAlign,
 }
 
 /// What a picked colour is for.
@@ -1904,6 +1937,8 @@ impl Session {
             poly: polypitch::PolyState::default(),
             clip_analyses: detect::ClipAnalyses::default(),
             structure_jobs: structure::StructureJobs::default(),
+            auto_align: align::AlignState::default(),
+            mix: mix::MixState::default(),
             show: setlist::ShowState::default(),
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
@@ -1948,6 +1983,7 @@ impl Session {
             perf: Default::default(),
             midi,
             voice: voice::VoiceState::default(),
+            compare: compare::CompareState::default(),
         };
         s.rescan_track_presets();
         s.render_sources();
@@ -2799,6 +2835,8 @@ impl Session {
         &mut self,
         mut settings: render::RenderSettings,
     ) -> std::result::Result<render::RenderJob, render::RenderError> {
+        // A Mix Intelligence candidate is never rendered.
+        self.end_mix_audition();
         if matches!(settings.channels, render::RenderChannels::Binaural(_))
             && settings.head.is_none()
         {
@@ -2930,6 +2968,7 @@ impl Session {
         self.poll_video();
         self.poll_album();
         self.poll_ddp();
+        self.poll_compare();
         self.poll_analysis(dt);
         self.pump_idle();
         self.poll_recording();
@@ -3007,6 +3046,7 @@ impl Session {
         self.tick_programs();
         // Moves in plugins' own editors write automation like ours do.
         let edits = self.engine.take_plugin_edits();
+        let edits = self.clip_fx_editor_edits(edits);
         self.plugin_editor_edits(edits);
         if was_playing && !self.transport.playing {
             // Stopped (by the user, the end of a bounce, a dropped stream):
@@ -3204,6 +3244,8 @@ impl Session {
         self.poll_polyphonic();
         self.poll_clip_analyses();
         self.poll_structure();
+        self.poll_auto_align();
+        self.poll_mix();
         self.tick_show();
         self.poll_conversions();
         self.poll_lead_sheets();
@@ -3611,6 +3653,8 @@ impl Session {
     }
 
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
+        // A Mix Intelligence candidate is never saved.
+        self.end_mix_audition();
         let mut path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         if path.extension().is_none() {
             path.set_extension(file::FILE_EXTENSION);
@@ -3781,6 +3825,18 @@ impl Session {
 
     /// Apply an undoable edit.
     pub fn edit(&mut self, cmd: Command) -> Result<()> {
+        // No recorded step may hold a Mix Intelligence candidate.
+        if self.mix.auditioning() {
+            self.end_mix_audition();
+        }
+        // A clip effect in an editor window of its own: an edit of its
+        // chain, whatever the window sent.
+        if let Some(edits) = self.clip_fx_commands(&cmd) {
+            for (clip, op) in edits {
+                self.edit_clip_fx(clip, op)?;
+            }
+            return Ok(());
+        }
         if let Some(name) = self.frozen_target(&cmd) {
             return Err(SessionError::Other(format!(
                 "'{name}' is frozen: unfreeze it to edit it"
@@ -3815,18 +3871,23 @@ impl Session {
         // others (one undo step).
         let cmd = self.unlink_split_aliases(cmd);
         let aliases = self.aliases_before(&cmd);
+        // Time-locked tracks keep their material in time (one undo step).
+        let time_lock = self.time_lock_before(&cmd);
         if removes_plugins(&cmd) {
             // Undo restores removed plugins from their slots: keep the
             // slots' state current.
             self.capture_plugin_states();
         }
-        if aliases.is_empty() {
+        if aliases.is_empty() && time_lock.is_none() {
             let impact = self.history.apply(&mut self.project, cmd)?;
             return self.sync(impact);
         }
         self.history.begin(cmd.label());
         let impact = match self.history.apply(&mut self.project, cmd) {
-            Ok(i) => self.mirror_aliases(aliases).map(|m| m.max(i)),
+            Ok(i) => self
+                .mirror_aliases(aliases)
+                .and_then(|m| Ok(self.keep_time_locked(time_lock)?.max(m)))
+                .map(|m| m.max(i)),
             Err(e) => Err(e.into()),
         };
         self.history.end();
@@ -3834,6 +3895,11 @@ impl Session {
     }
 
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
+        // A Mix Intelligence audition ends before anything that edits the
+        // project (edits of its own candidate stay in it).
+        let Some(action) = self.mix_before(action)? else {
+            return Ok(());
+        };
         // Edits of clips in a folder group reach the clips at the same
         // place on the group's other tracks.
         let action = self.grouped_action(action);
@@ -4204,6 +4270,7 @@ impl Session {
             Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::SongStructure { clips } => self.song_structure(&clips)?,
+            Action::Mix(op) => self.mix_op(op)?,
             Action::Setlist(op) => self.edit_setlist(op)?,
             Action::ScratchPad(op) => self.scratch_op(op)?,
             Action::Cue(op) => self.cue_op(op)?,
@@ -4231,6 +4298,11 @@ impl Session {
             }
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
+            Action::OpenClipEffectEditor {
+                clip,
+                index,
+                generic,
+            } => self.open_clip_fx_editor(clip, index, generic)?,
             Action::ImportAdm(path) => self.start_adm_import(path),
             Action::SetMonoCheck(on) => self.set_mono_check(on)?,
             Action::SetBassManagement(b) => self.set_bass_management(b)?,
@@ -4910,6 +4982,10 @@ impl Session {
                 self.editor.follow_playhead = !self.editor.follow_playhead;
                 self.revision += 1;
             }
+            Action::AutoAlign(op) => self.auto_align_op(op)?,
+            Action::AuditionHistory(done) => self.audition_history(done)?,
+            Action::Compare(op) => self.compare_op(op)?,
+            Action::Reference(op) => self.reference_op(op)?,
         }
         Ok(())
     }
@@ -5385,6 +5461,9 @@ impl Session {
         if let Some((t, s)) = self.plugin_slot(plugin) {
             return Some(t.name_of(s));
         }
+        if let Some(name) = self.clip_fx_device_name(plugin) {
+            return Some(name);
+        }
         let (song, s) = self.project.album.insert(plugin)?;
         Some(faderframe_project::device_name(&song.inserts, s))
     }
@@ -5397,6 +5476,11 @@ impl Session {
     ) -> Option<(TrackId, &PluginSlot)> {
         if let Some((t, s)) = self.plugin_slot(plugin) {
             return Some((t.id, s));
+        }
+        // A clip effect in its own editor window: the clip's track (its
+        // commands become edits of the clip's chain).
+        if let Some((clip, _, s)) = self.clip_fx_slot(plugin) {
+            return Some((self.project.clip(clip)?.track, s));
         }
         let (_, s) = self.project.album.insert(plugin)?;
         Some((self.project.master_id()?, s))
@@ -5446,9 +5530,8 @@ impl Session {
             .map(<[_]>::to_vec)
             .unwrap_or_default();
         let explicit: Vec<faderframe_core::ParameterId> = self
-            .plugin_slot(plugin)
+            .plugin_owner(plugin)
             .map(|(_, s)| s)
-            .or_else(|| self.project.album.insert(plugin).map(|(_, s)| s))
             .map(|s| s.parameters.iter().map(|p| p.id).collect())
             .unwrap_or_default();
         infos

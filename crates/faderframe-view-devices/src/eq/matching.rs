@@ -1,15 +1,18 @@
 //! EQ Match in the editor: listen to this EQ's input and to a reference —
-//! the sidechain, another EQ's output, or this input recorded earlier
-//! (another part of the song, an earlier take) — build both long-term
-//! spectra, show their difference, and propose bands that make the input
-//! sound like the reference ([`faderframe_plugin_host::eq::matching`]).
+//! the sidechain, another EQ's output, this input recorded earlier
+//! (another part of the song, an earlier take), or a reference track of
+//! the project (its long-term spectrum as measured by the session,
+//! `Session::reference_spectrum`; the Reference view's "Send to EQ Match"
+//! chooses it and opens this panel) — build both long-term spectra, show
+//! their difference, and propose bands that make the input sound like the
+//! reference ([`faderframe_plugin_host::eq::matching`]).
 //! More or fewer bands follow the difference more or less closely; Apply
 //! adds them as one undo step.
 
 use super::analyser::Line;
 use super::geometry::{FreqAxis, GainAxis, Layout};
 use super::key;
-use faderframe_core::PluginInstanceId;
+use faderframe_core::{PluginInstanceId, ReferenceId};
 use faderframe_plugin_host::eq::design::{AnalogBand, BandShape};
 use faderframe_plugin_host::eq::matching;
 use faderframe_plugin_host::tap::{AnalysisTap, RING_FRAMES};
@@ -28,11 +31,20 @@ pub(crate) enum Reference {
     /// This EQ's input, recorded at another time.
     Input,
     Instance(PluginInstanceId),
+    /// A reference track of the project.
+    Track(ReferenceId),
 }
 
 impl Reference {
-    pub fn from_value(v: f64) -> Self {
-        if v <= -1.5 {
+    /// The reference a stored value names (`track`: the reference track's
+    /// id, stored beside it).
+    pub fn from_values(v: f64, track: Option<f64>) -> Self {
+        if v <= -2.5 {
+            match track {
+                Some(t) if t >= 0.0 => Reference::Track(ReferenceId(t as u64)),
+                _ => Reference::Sidechain,
+            }
+        } else if v <= -1.5 {
             Reference::Input
         } else if v < 0.0 {
             Reference::Sidechain
@@ -45,17 +57,37 @@ impl Reference {
         match self {
             Reference::Sidechain => -1.0,
             Reference::Input => -2.0,
+            Reference::Track(_) => faderframe_session::references::MATCH_FROM_REFERENCE,
             Reference::Instance(p) => p.0 as f64,
         }
     }
 
+    /// The editor settings that choose it.
+    pub fn values(self) -> Vec<(&'static str, f64)> {
+        match self {
+            Reference::Track(id) => vec![
+                (key::MATCH_REFERENCE, self.value()),
+                (key::MATCH_TRACK, id.raw() as f64),
+            ],
+            _ => vec![(key::MATCH_REFERENCE, self.value())],
+        }
+    }
+
     pub fn of(model: &Session, plugin: PluginInstanceId) -> Self {
-        Self::from_value(
+        Self::from_values(
             model
                 .device_view(plugin, key::MATCH_REFERENCE)
                 .unwrap_or(-1.0),
+            model.device_view(plugin, key::MATCH_TRACK),
         )
     }
+}
+
+/// A reference track's measured spectrum on `freqs`, and the seconds
+/// measured.
+fn track_spectrum(model: &Session, id: ReferenceId, freqs: &[f64]) -> Option<(Vec<f64>, f64)> {
+    let s = model.reference_spectrum(id)?;
+    Some((s.on(freqs)?, s.seconds))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +115,8 @@ pub(crate) struct Match {
     pub freqs: Vec<f64>,
     pub target: Option<Vec<f64>>,
     scratch: [Vec<f32>; 2],
+    /// A reference track's measured seconds (`None`: another reference).
+    track_seconds: Option<f64>,
 }
 
 impl Match {
@@ -101,6 +135,7 @@ impl Match {
             freqs: matching::grid(25.0, 18_000.0f64.min(0.45 * r), PER_OCTAVE),
             target: None,
             scratch: [vec![0.0; RING_FRAMES], vec![0.0; RING_FRAMES]],
+            track_seconds: None,
         }
     }
 
@@ -111,7 +146,7 @@ impl Match {
             // A new reference: start it over (the input keeps its record).
             self.from = Some(reference);
             self.reference.reset_average();
-            self.reference.averaging = reference != Reference::Input;
+            self.reference.averaging = !matches!(reference, Reference::Input | Reference::Track(_));
             if reference == Reference::Input {
                 self.input.averaging = false;
             }
@@ -139,15 +174,23 @@ impl Match {
                             .feed(&other.output, &mut self.scratch, 40.0, false);
                     }
                 }
+                Reference::Track(_) => {}
             }
         }
-        self.target = match (
-            self.input.average(&self.freqs),
-            self.reference.average(&self.freqs),
-        ) {
+        let (reference_avg, reference_seconds) = match reference {
+            Reference::Track(id) => match track_spectrum(model, id, &self.freqs) {
+                Some((avg, seconds)) => (Some(avg), seconds),
+                None => (None, 0.0),
+            },
+            _ => (
+                self.reference.average(&self.freqs),
+                self.reference.averaged_seconds(),
+            ),
+        };
+        self.track_seconds = matches!(reference, Reference::Track(_)).then_some(reference_seconds);
+        self.target = match (self.input.average(&self.freqs), reference_avg) {
             (Some(a), Some(b))
-                if self.input.averaged_seconds() >= 0.5
-                    && self.reference.averaged_seconds() >= 0.5 =>
+                if self.input.averaged_seconds() >= 0.5 && reference_seconds >= 0.5 =>
             {
                 let diff: Vec<f64> = b.iter().zip(&a).map(|(r, i)| r - i).collect();
                 Some(matching::target(&diff, PER_OCTAVE, 1.0 / 3.0))
@@ -159,7 +202,14 @@ impl Match {
     pub fn ready(&self) -> bool {
         self.target.is_some()
             && self.input.averaged_seconds() >= ENOUGH
-            && self.reference.averaged_seconds() >= ENOUGH
+            && self.reference_seconds() >= ENOUGH
+    }
+
+    /// Seconds of the reference's spectrum (a reference track's: as
+    /// measured).
+    pub fn reference_seconds(&self) -> f64 {
+        self.track_seconds
+            .unwrap_or_else(|| self.reference.averaged_seconds())
     }
 
     /// Fit bands (`count` of them at most).
@@ -218,6 +268,10 @@ impl Match {
                 .into_iter()
                 .find(|(i, _, _)| *i == id)
                 .map_or_else(|| "Another EQ".into(), |(_, l, _)| l),
+            Reference::Track(id) => model
+                .references()
+                .get(id)
+                .map_or_else(|| "A reference track".into(), |r| format!("‘{}’", r.name)),
         }
     }
 
@@ -243,6 +297,13 @@ impl Match {
             && self.reference.averaged_seconds() < ENOUGH
         {
             "Play the part to match to and record it as the reference".to_string()
+        } else if let Reference::Track(id) = reference
+            && model.reference_spectrum(id).is_none()
+        {
+            "The reference track is being measured…".to_string()
+        } else if matches!(reference, Reference::Track(_)) {
+            "Play the mix: its input is listened to, the reference track's spectrum is measured"
+                .to_string()
         } else {
             "Listening… let the music play".to_string()
         };
@@ -302,9 +363,13 @@ impl Match {
                 Hit::RecordReference => button(
                     p,
                     ir,
-                    &format!("● Reference {:.0} s", self.reference.averaged_seconds()),
+                    &if self.track_seconds.is_some() {
+                        format!("Measured {:.0} s", self.reference_seconds())
+                    } else {
+                        format!("● Reference {:.0} s", self.reference.averaged_seconds())
+                    },
                     self.reference.averaging,
-                    true,
+                    self.track_seconds.is_none(),
                 ),
                 Hit::Match => button(p, ir, "Match", false, self.ready()),
                 Hit::Fewer => button(p, ir, "−", false, self.count > 1),

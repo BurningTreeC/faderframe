@@ -1857,6 +1857,22 @@ impl ArrangerView {
             }
         } else if name_rect.w > 12.0 {
             let mut name_rect = name_rect;
+            if track.is_time_locked() && name_rect.w > 30.0 {
+                // Placed in time (its track is time-locked): a small
+                // padlock before its name.
+                let y = name_rect.center().y;
+                controls::lock_glyph(
+                    p,
+                    Rect::new(name_rect.x, y - 4.5, 6.0, 9.0),
+                    text_color.with_alpha(0.8),
+                );
+                name_rect = Rect::new(
+                    name_rect.x + 10.0,
+                    name_rect.y,
+                    name_rect.w - 10.0,
+                    name_rect.h,
+                );
+            }
             if model.is_alias(clip.id) && name_rect.w > 30.0 {
                 // An alias: two overlapping frames before its name.
                 let y = name_rect.center().y;
@@ -1953,6 +1969,17 @@ impl ArrangerView {
     }
 
     /// A folder's header: its triangle, name, what it holds, mute and solo.
+    /// A time-locked track's padlock before its name (in `name`, the
+    /// name's rect); returns the rect left for the name.
+    fn paint_time_lock(&self, p: &mut dyn Painter, t: &Track, name: Rect) -> Rect {
+        if !t.is_time_locked() {
+            return name;
+        }
+        let (glyph, rest) = header::lock_rect(name);
+        controls::lock_glyph(p, glyph, self.theme.arranger.time_lock);
+        rest
+    }
+
     fn paint_folder_header(
         &self,
         p: &mut dyn Painter,
@@ -2002,6 +2029,7 @@ impl ArrangerView {
                     .center(),
             );
         }
+        let name = self.paint_time_lock(p, t, name);
         p.text(
             &t.name,
             name,
@@ -2117,9 +2145,10 @@ impl ArrangerView {
             self.paint_folder_header(p, l, t, model);
             return;
         }
+        let name = self.paint_time_lock(p, t, l.name);
         p.text(
             &t.name,
-            l.name,
+            name,
             &TextStyle::new(th.fonts.normal, th.ui.text).bold(),
         );
         if let Some(info) = l.info {
@@ -2855,6 +2884,16 @@ impl ArrangerView {
                 .separated(),
             );
         }
+        // Placed with the music or in time (tempo changes leave a
+        // time-locked track's material where it sounds).
+        let bases: Vec<MenuItem<Action>> = model
+            .time_base_choices(t.id)
+            .into_iter()
+            .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+            .collect();
+        if !bases.is_empty() {
+            items.push(MenuItem::submenu("Time Base", bases));
+        }
         // Freezing and bouncing (tracks with clips).
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
             let busy = model.bouncing().contains(&t.id);
@@ -2876,6 +2915,9 @@ impl ArrangerView {
                 ));
             }
         }
+        // The microphones of one source in time and polarity; the
+        // track's own delay back to none.
+        items.extend(model.auto_align_menu(t.id).into_iter().map(entry_item));
         // Instrument (instrument tracks): the plugin browser.
         if t.kind == TrackKind::Instrument {
             let current = model
@@ -5438,6 +5480,9 @@ mod scratch_tests;
 
 #[cfg(test)]
 mod ripple_tests;
+
+#[cfg(test)]
+mod time_lock_tests;
 
 /// The launcher clips a payload carries (arrangement clips move inside the
 /// arranger's own drag).

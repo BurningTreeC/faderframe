@@ -539,12 +539,15 @@ impl Session {
         let (mut cmds, after) = self.clear_commands(r.start, r.end, &tracks);
         let shift = RippleShift::remove(r.start, r.end);
         if ripple.is_some() {
+            let rate = f64::from(self.project.sample_rate.max(1));
             for (clip, track, start) in after {
-                cmds.push(Command::MoveClip {
-                    clip,
-                    track,
-                    start: shift.map(start),
-                });
+                // A time-locked track closes up by the time taken out.
+                let start = if self.is_time_locked(track) {
+                    shift.map_in_time(start, &self.project.timeline, rate)
+                } else {
+                    shift.map(start)
+                };
+                cmds.push(Command::MoveClip { clip, track, start });
             }
         }
         // The tracks' automation of the range goes too: the time itself

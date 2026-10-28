@@ -77,6 +77,17 @@ impl HeaderLayout {
     }
 }
 
+/// Room the time-lock glyph takes before a track's name.
+pub const LOCK_W: f32 = 12.0;
+
+/// Where a time-locked track's padlock goes: before its name (`name`, the
+/// name's rect), and the rect left for the name.
+pub fn lock_rect(name: Rect) -> (Rect, Rect) {
+    let glyph = Rect::new(name.x, name.y + 2.0, 8.0, (name.h - 4.0).clamp(6.0, 11.0));
+    let rest = Rect::new(name.x + LOCK_W, name.y, (name.w - LOCK_W).max(0.0), name.h);
+    (glyph, rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

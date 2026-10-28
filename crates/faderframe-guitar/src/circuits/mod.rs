@@ -34,6 +34,7 @@ pub mod brit_drive;
 pub mod brum100;
 #[rustfmt::skip]
 pub mod cabinet;
+pub mod carbon_echo;
 #[rustfmt::skip]
 pub mod clean_boost;
 #[rustfmt::skip]
@@ -44,6 +45,8 @@ pub mod deluxe;
 pub mod distortion_plus;
 #[rustfmt::skip]
 pub mod dr103;
+#[cfg(test)]
+pub(crate) mod dynamics;
 #[rustfmt::skip]
 pub mod evh5150;
 #[rustfmt::skip]
@@ -60,6 +63,8 @@ pub mod jc120_power;
 pub mod jfet;
 #[rustfmt::skip]
 pub mod jtm45;
+#[rustfmt::skip]
+pub mod juicer;
 #[rustfmt::skip]
 pub mod markiic;
 #[rustfmt::skip]
@@ -87,6 +92,8 @@ pub mod preamp;
 #[rustfmt::skip]
 pub mod rectifier;
 #[rustfmt::skip]
+pub mod red_squeeze;
+#[rustfmt::skip]
 pub mod rodent;
 #[rustfmt::skip]
 pub mod round_fuzz;
@@ -104,3 +111,6 @@ pub mod twin;
 pub mod valve;
 #[rustfmt::skip]
 pub mod wah;
+// Written for FaderFrame, not taken from upstream: formatted as ours.
+pub mod seattle100;
+pub mod tweed_lux;

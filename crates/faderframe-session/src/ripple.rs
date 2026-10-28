@@ -856,10 +856,25 @@ impl Session {
         let mut cmds = Vec::new();
         let mut lanes = LaneWork::default();
         let mut pushed = BTreeSet::new();
+        let (tl, rate) = (
+            self.project.timeline.clone(),
+            f64::from(self.project.sample_rate.max(1)),
+        );
         for (&track, &at) in &from {
+            // A time-locked track's clips are pushed by the time the move
+            // takes (see `crate::time_lock`).
+            let in_time = self
+                .project
+                .track(track)
+                .is_some_and(|t| t.is_time_locked());
             for c in self.project.clips_of(track) {
                 if !skip.contains(&c.id) && c.start >= at {
-                    let start = (c.start + by).max(MusicalTime::ZERO);
+                    let start = if in_time {
+                        RippleShift::new(at, by).map_in_time(c.start, &tl, rate)
+                    } else {
+                        c.start + by
+                    }
+                    .max(MusicalTime::ZERO);
                     cmds.push(Command::MoveClip {
                         clip: c.id,
                         track,

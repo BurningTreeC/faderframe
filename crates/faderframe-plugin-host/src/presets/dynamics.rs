@@ -1859,3 +1859,93 @@ pub(super) fn compressor_76() -> Vec<FactoryPreset> {
         ),
     ]
 }
+
+/// The 2A Leveler's: what the optical leveller is reached for — the voice
+/// held steady and in front, bass notes evened, a bus glued, the
+/// broadcast limiter with its HF emphasis. Peak Reduction sets how much
+/// (Compress about 3:1, Limit flattening as it deepens), Gain brings the
+/// level back to the dry signal's; the cell's own timing does the rest.
+pub(super) fn leveler_2a() -> Vec<FactoryPreset> {
+    use crate::devices::leveler::id::*;
+    const COMPRESS: f64 = 0.0;
+    const LIMIT: f64 = 1.0;
+    vec![
+        // The classic: 4–6 dB of levelling on a vocal, Compress.
+        preset(
+            "Vocal Leveler",
+            &[(MODE, COMPRESS), (PEAK_REDUCTION, 62.0), (GAIN, 57.6)],
+        ),
+        // A little less, for a voice that is nearly there.
+        preset(
+            "Vocal Gentle",
+            &[(MODE, COMPRESS), (PEAK_REDUCTION, 52.0), (GAIN, 52.4)],
+        ),
+        // Limit and more: the voice pinned in front of the track.
+        preset(
+            "Vocal Upfront",
+            &[(MODE, LIMIT), (PEAK_REDUCTION, 72.0), (GAIN, 64.9)],
+        ),
+        // The spoken word for broadcast: Limit, R37 turned for the highs
+        // (sibilance levels harder, as the 3-66 manual meant it for FM).
+        preset(
+            "Broadcast Voice",
+            &[
+                (MODE, LIMIT),
+                (PEAK_REDUCTION, 66.0),
+                (EMPHASIS, 0.6),
+                (GAIN, 54.0),
+            ],
+        ),
+        // Bass notes evened: the slow release keeps them from pumping.
+        preset(
+            "Bass Even",
+            &[(MODE, COMPRESS), (PEAK_REDUCTION, 66.0), (GAIN, 59.3)],
+        ),
+        // Limit, pushed: a thick, steady bass line.
+        preset(
+            "Bass Thick",
+            &[(MODE, LIMIT), (PEAK_REDUCTION, 76.0), (GAIN, 66.9)],
+        ),
+        // A couple of decibels across a bus, both sides together.
+        preset(
+            "Bus Glue",
+            &[
+                (MODE, COMPRESS),
+                (PEAK_REDUCTION, 48.0),
+                (GAIN, 50.9),
+                (LINK, 1.0),
+            ],
+        ),
+        // Squeezed hard and blended under the dry bus.
+        preset(
+            "Bus Parallel",
+            &[
+                (MODE, LIMIT),
+                (PEAK_REDUCTION, 82.0),
+                (GAIN, 72.0),
+                (MIX, 0.4),
+                (LINK, 1.0),
+            ],
+        ),
+        // Strummed or picked: the dynamics smoothed, the attack let through.
+        preset(
+            "Acoustic Guitar",
+            &[(MODE, COMPRESS), (PEAK_REDUCTION, 56.0), (GAIN, 54.7)],
+        ),
+        // A room or overheads squashed into a bloom.
+        preset(
+            "Room Bloom",
+            &[
+                (MODE, LIMIT),
+                (PEAK_REDUCTION, 88.0),
+                (GAIN, 74.0),
+                (MIX, 0.6),
+            ],
+        ),
+        // Strings and pads lifted where they thin out.
+        preset(
+            "Strings Smooth",
+            &[(MODE, COMPRESS), (PEAK_REDUCTION, 58.0), (GAIN, 55.8)],
+        ),
+    ]
+}

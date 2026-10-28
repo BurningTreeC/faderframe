@@ -196,7 +196,8 @@ pub fn solve(circuit: &Circuit, controls: &[f64], hz: f64) -> C {
             | Part::Jfet { .. }
             | Part::Core { .. }
             | Part::Bipolar { .. }
-            | Part::Transconductor { .. } => unreachable!("checked above"),
+            | Part::Transconductor { .. }
+            | Part::Ota { .. } => unreachable!("checked above"),
         }
     }
 

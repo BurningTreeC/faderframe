@@ -83,6 +83,28 @@ impl RippleShift {
         }
     }
 
+    /// Where a position on a time-locked track goes (see
+    /// [`crate::time_lock`]): as [`Self::map`], but the shift takes out or
+    /// opens the time its span lasts under `tl` — in samples — so what
+    /// follows keeps its spacing in time whatever the tempo between. A
+    /// position that moves lands on a whole sample; one that stays is
+    /// given back as it is.
+    pub fn map_in_time(&self, t: MusicalTime, tl: &Timeline, rate: f64) -> MusicalTime {
+        let s = |m: MusicalTime| MusicalTime(tl.to_samples(m, rate));
+        let cut = s(self.cut);
+        let timed = RippleShift {
+            cut,
+            delta: s(self.cut + self.delta) - cut,
+        };
+        let from = s(t);
+        let to = timed.map(from);
+        if to == from {
+            t
+        } else {
+            tl.at_sample(to.ticks(), rate)
+        }
+    }
+
     /// Where the end of a range goes: as [`Self::map`], except that an end
     /// on the cut of an opening stays (the range lies before it).
     pub fn map_end(&self, t: MusicalTime) -> MusicalTime {
@@ -181,11 +203,21 @@ pub fn clip_commands(
 ) -> Vec<Command> {
     let shifts = RippleShift::ordered(shifts);
     let (tl, rate) = (&p.timeline, p.sample_rate);
+    // A time-locked track's clips move by the time a shift takes out or
+    // opens, not by its bars and beats (see `crate::time_lock`).
+    let in_time = p.track(track).is_some_and(|t| t.is_time_locked());
+    let shift = |s: &RippleShift, t: MusicalTime| {
+        if in_time {
+            s.map_in_time(t, tl, f64::from(rate.max(1)))
+        } else {
+            s.map(t)
+        }
+    };
     let mut clips: Vec<Clip> = p.clips_of(track).into_iter().cloned().collect();
     let mut cmds = Vec::new();
     if let ClipRipple::Moved { skip } = how {
         for c in clips.iter().filter(|c| !skip.contains(&c.id)) {
-            let start = shifts.iter().fold(c.start, |t, s| s.map(t));
+            let start = shifts.iter().fold(c.start, |t, s| shift(s, t));
             if start != c.start {
                 cmds.push(Command::MoveClip {
                     clip: c.id,
@@ -221,7 +253,11 @@ pub fn clip_commands(
             None => {
                 for c in clips {
                     if starts_from(&c, s.cut, tl, rate) {
-                        let start = c.start + s.delta;
+                        let start = if in_time {
+                            shift(s, c.start)
+                        } else {
+                            c.start + s.delta
+                        };
                         moved(c, start, &mut cmds, &mut next);
                     } else if cuts_inside(&c, s.cut, tl, rate) {
                         match split(&c, s.cut, &mut cmds, ids) {
@@ -241,7 +277,11 @@ pub fn clip_commands(
             Some((a, b)) => {
                 for c in clips {
                     if starts_from(&c, b, tl, rate) {
-                        let start = (c.start + s.delta).max(a);
+                        let start = if in_time {
+                            shift(s, c.start).max(a)
+                        } else {
+                            (c.start + s.delta).max(a)
+                        };
                         moved(c, start, &mut cmds, &mut next);
                         continue;
                     }

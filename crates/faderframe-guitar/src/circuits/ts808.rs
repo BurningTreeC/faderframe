@@ -45,7 +45,7 @@ const DRIVE_SPAN: f64 = (51_000.0 + 500_000.0) / 51_000.0;
 /// clipping stage's small-signal gain twelve decibels below the arithmetic its
 /// own resistors say, because diodes that soft conduct before the stage has
 /// finished amplifying. See `docs/experiments/ts808-diode-choice.md`.
-const D1N4148: DiodeSpec = DiodeSpec {
+pub(crate) const D1N4148: DiodeSpec = DiodeSpec {
     saturation: 4.352e-9,
     emission: 1.906,
 };

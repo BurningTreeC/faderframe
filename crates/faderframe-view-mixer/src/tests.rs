@@ -2503,3 +2503,35 @@ fn a_folder_bus_is_a_full_strip_that_folds() {
     let shown: Vec<TrackId> = MixerView::channel_tracks(&s).iter().map(|t| t.id).collect();
     assert!(shown.contains(&folder) && !shown.contains(&bass) && !shown.contains(&pad));
 }
+
+/// The strip menu's Time Base: musical or time-locked.
+#[test]
+fn the_strip_menu_chooses_the_time_base() {
+    let mut s = session();
+    let t = MixerView::channel_tracks(&s)[0].clone();
+    let menu = |s: &Session, t: &Track| {
+        let HostRequest::ContextMenu { items, .. } =
+            MixerView::track_menu(s, t, Point::new(0.0, 0.0))
+        else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Time Base")
+            .unwrap()
+            .children
+    };
+    let items = menu(&s, &t);
+    let labels: Vec<_> = items
+        .iter()
+        .map(|i| (i.label.as_str(), i.checked))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![("Musical", Some(true)), ("Time-locked", Some(false))]
+    );
+    s.dispatch(items[1].action.clone().unwrap()).unwrap();
+    assert!(s.is_time_locked(t.id));
+    let t = s.project().track(t.id).unwrap().clone();
+    assert_eq!(menu(&s, &t)[1].checked, Some(true));
+}

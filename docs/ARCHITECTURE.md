@@ -1200,8 +1200,9 @@ master can be a bed (Channel Format in the track menus,
   * **LFE**: a separate send (`lfe_db`, shared by a source's channels),
     never reached by a position and never part of the panners'
     normalisation. Nothing filters it: what is sent reaches the LFE
-    channel full range (bass management is not implemented; binaural
-    listening low-passes it at 120 Hz for the ears only).
+    channel full range (bass management acts only on the way to the
+    speakers, see *Listening*; binaural listening low-passes it at 120 Hz
+    for the ears only).
   A bed into its own format passes straight; into another bed each of its
   speakers is placed where it stands (7.1.4 into 5.1, 5.1 opened up into
   7.1.4), LFE to LFE; into stereo or mono it folds by the project's
@@ -2598,6 +2599,52 @@ covered by `the_stock_devices_do_not_allocate`.
   presses several), a backlit VU with standard ballistics (gain reduction,
   or the output at +4/+8; its bias swings with several buttons in, all four
   pin it), input and output peak meters either side.
+* **2A Leveler** (`devices::leveler`, id `faderframe.2a-leveler`): an
+  optical leveling amplifier in the LA-2A's manner, written from UREI
+  C-10953 / Teletronix S-1014 and the published T4 behaviour. Three
+  netlists cut at the Gain and Peak Reduction wipers (`circuits::leveler`;
+  the grids draw no current, so the wiper voltage is exact and a knob costs
+  no solving): the input (T1 A-10 with its iron, the R6/R7/cell attenuator,
+  the cell a resistor set every sample), the make-up amplifier at 2× (two
+  12AX7, the 12BH7 totem pole, 20 dB of feedback, the A-24) and the
+  sidechain at the host rate (V3, R37 ∥ C12, the 6AQ5 — every drawing has
+  a 6AQ5, not a 6BA6 — into the 2 nF panel). The T4 (`leveler::cell`): the
+  EL panel's light is the charge the field moves under the Alfrey–Taylor
+  law with two relaxations and a phosphor afterglow; the CdS cell's
+  carriers recombine linearly and through Rose's n^(4/3) spread (γ ≈ 0.75),
+  with three trap levels giving the history-dependent release (a 0.3 s
+  burst: half released in 44 ms, under 0.5 dB in 0.52 s; an 8 s burst:
+  63 ms and 4.7 s). SW3: Compress is the feedback (about 3:1), Limit
+  takes the sidechain above R7 (flattening). The 3-66 manual's 15 dB pad
+  ahead of the input, −18 dBFS = +4 dBm; gain 41.3 dB (spec 40 ± 1), THD
+  0.19 % at +10 dBm. Modern: Mix, an external key, a stereo link (one
+  side runs while the pair is exactly mono, the other wakes bit-exactly).
+  Its editor (`view-devices::leveler`) is a panel in the theme's colours
+  with the VU (`fet76::Needle`), the big knobs, the bat-handle switch and
+  the meter selector. About 18 % of a core a side, the valve amplifier at
+  2× the largest share.
+* **Tape Machine** (`devices::tape`, id `faderframe.tape-machine`):
+  recording to and playing back from tape, modelled physically and fitted
+  to published tape and machine figures. The record side is Jiles–Atherton
+  magnetisation (`tape/media.rs`: a tanh anhysteretic for oriented
+  particles with a negative mean field acting on the anhysteretic state,
+  solved by an exponential integrator — stable where RK4 diverges). AC
+  bias is the anhysteretic process itself, so at the aligned bias the
+  anhysteretic curve is what is heard; under-biased, the particles the
+  bias does not switch record on the loop (crossover-like distortion),
+  over-biased the drive falls and the recording zone grows. Formulations
+  456-type, 632-type and a GP9-like high output (456: 0.10 % third
+  harmonic at 250 nWb/m, 3 % at about 1067, against the sheet's 1077).
+  Heads and EQ (`tape/heads.rs`): NAB/IEC/AES per speed, thickness, zone,
+  gap and spacing losses, the head bump. Transport (`tape/transport.rs`):
+  capstan rotation lines, random and scrape flutter at the IEC 386 2σ
+  figures of a studio machine (0.053/0.042/0.033 % weighted at 7½/15/30
+  ips), held inside the oversampler's latency (`tape/os.rs`), so the device
+  reports only the oversampling's (64/72/74 samples at 2/4/8×; 2× by
+  default). Level-neutral at the operating level, Auto Output takes the
+  input trim back; hiss off by default (on every track it would add up),
+  at the sheet's level when on. Editor `view-devices::tape::TapeFace`: two
+  VUs, the response and the M–H curve. About 1.6 % of a core at 2×.
 * **Hardware Insert** (`devices::hardware_insert`): outboard gear in the
   chain — the graph sends the input to an interface output and takes the
   return from an input (`NodeSpec::after` orders the return after the send
@@ -4593,6 +4640,24 @@ come from an instance made for the asking (`EngineController::
 describe_parameters`, cached per plugin). Editor `faderframe-view-clipfx`
 (`ViewKind::ClipFx`, a card per device with parameter bars).
 
+A card's "Open Window" (`Action::OpenClipEffectEditor { clip, index,
+generic }`) shows the device in the window an insert gets — its own GUI,
+a built-in's editor, or the generic one. The engine hosts an instance of
+the slot outside the graph, as it does an album song's inserts
+(`EngineController::host_plugin`, kept through rebuilds by
+`keep_plugins`, pushed to by `sync_plugin_slot`, dropped by
+`release_plugin` once the slot leaves its chain). The session answers for
+the slot as a plugin's owner (`Session::clip_fx_slot`: `plugin_owner`
+gives the clip's track, `device_name` the chain's name), so the editor
+windows work unchanged; the track commands they send about it
+(`SetPluginParameter`, `SetPluginBypass`, `SetPluginState`, batches of
+them) become chain edits in `Session::edit` (`clip_fx_commands`;
+`ClipFxOp::{ForgetParameter, SetState}`). What the plugin's own GUI
+changes (its editor edits, a dirty state) is taken into the chain once it
+has rested 300 ms — its state, and every value it moved as an explicit
+one, since explicit values are applied after the state — and rendered at
+once. A bar dragged in the view keeps the device's state.
+
 ### Speech and lyrics
 
 `faderframe-speech` is OpenAI's Whisper in plain Rust (no runtime, no
@@ -5961,12 +6026,21 @@ devices with editors of their own (compressor, true-peak limiter,
 gate/expander/ducker, de-esser, a console channel strip, the Guitar Station (GainStageFx's pedals,
 amplifiers, power stages and miked cabinets), saturator, utility, delay, algorithmic
 reverb, chorus/flanger/phaser, tuner; a virtual analogue synth, a sampler
-with SFZ import and a drum sampler); offline render and export (stems,
-normalise, dither); freeze and bounce in place. Audio: native PipeWire,
+with SFZ import and a drum sampler), the 76 Compressor (a FET limiting
+amplifier), the 2A Leveler (an optical leveller, its T4 cell and valve
+make-up amplifier modelled), the Tape Machine (Jiles–Atherton tape, heads,
+transport), six circuit-modelled microphone preamplifiers, circuit-modelled
+console summing (six families), a hardware insert with its round trip
+measured, and gain-reduction meters from every plugin format; offline
+render and export (stems, normalise, dither); freeze and bounce in place. Audio: native PipeWire,
 JACK, the system API (WASAPI, CoreAudio, ALSA), ASIO (opt-in) and a dummy
 device. Render-ahead (anticipative processing) of every track nobody plays
 live.
-Recording with punch, pre-roll, metronome, take folders and comping.
+Recording with punch, pre- and post-roll, count-in, metronome, take
+folders and comping (take lanes of any height, each take auditioned on
+its own), aborting or restarting a take, cue mixes for the performers'
+headphones, and singing or playing into MIDI (voice ports, monophonic and
+polyphonic).
 Automation of every automatable parameter, written from controls, MIDI
 controllers and plugin editors. Media import (Symphonia, rubato) and
 lock-free disk streaming.
@@ -5974,7 +6048,9 @@ lock-free disk streaming.
 MIDI: devices with hotplug, live play with constant latency, recording,
 always-on capture of what was played (Capture MIDI), MIDI learn, MIDI output and clock, clock/MTC sync, MPE and native note
 expressions for CLAP and VST3 instruments, SysEx to devices and plugins,
-Standard MIDI File import and export, and a full piano roll.
+Standard MIDI File import and export, a full piano roll (drum notes as
+diamonds) and a MIDI event list, input quantize, and MIDI 2.0 on Linux
+(UMP devices through ALSA, `.midi2` clip files).
 
 Plugins: CLAP and VST3 hosting with crash-safe scanning, LV2 on Linux and
 Audio Units on macOS, sandboxed instances (a process each) on all three
@@ -5985,8 +6061,15 @@ move and copy between tracks, sidechain inputs, multi-output instruments
 with tracks for their extra outputs.
 
 Mixing: an analogue-console mixer, sends in banks, track groups with
-linked controls, VCAs, relative edits of every selected track, track
-presets, and the Tools view for mastering (EBU R128 loudness and true peak,
+linked controls, VCAs, folder buses and folder groups, relative edits of
+every selected track, track presets, pan laws and dual panning, surround
+panning (room or VBAP, diffuse spread, custom speaker layouts, bass
+management), meter styles (peak and RMS, VU, PPM, K-System) with a VU
+meter bridge, track delays to a fraction of a sample with microphone
+Auto-Align, A/B listening (the mix against a step of the undo history or a
+loudness-matched reference track), Mix Intelligence (masking between
+tracks, levels and mono compatibility, measured and explained, with
+auditionable experiments), and the Tools view for mastering (EBU R128 loudness and true peak,
 loudness range, PLR, crest factor and DR value, levels with K-System
 scales, phase, spectrum). Delivery: loudness
 normalisation and true-peak limiting on export, noise-shaped dither,
@@ -6002,12 +6085,23 @@ track, on chosen tracks or across the whole project with the timeline,
 automation moving in sync), edit-selection ranges, clip gain, shaped fades, transient detection, warp markers and pitch-preserving
 playback, sample-level waveform redraw, global lanes for markers, song
 sections (moved, copied and deleted with their content), time signatures
-and the tempo map, and track colours from a colour chooser.
+and the tempo map, and track colours from a colour chooser. Snapping to
+samples, zero crossings and objects; a clipboard for ranges and clips;
+slip editing; scratch pads beside the song; spectral editing; polyphonic
+pitch editing; song structure found in a jam; tempo through hit points;
+lead sheets and guitar tab (MusicXML, PDF); clip effects, each device in
+its own window too; time-locked tracks (material kept in time through
+tempo changes, ADR cues locked to the picture).
 
 Shell: docking and detaching, workspaces (Recording, Editing, Mixing,
-MIDI, Mastering), nine skins switched live, performance meter,
-preferences, recent projects and start-up choice, project templates (a
-project's set-up without its content; a default one for New Project).
+MIDI, Mastering), nine skins switched live and themes of the user's own,
+performance meter, preferences, recent projects, a start window and
+start-up choice, project templates (a project's set-up without its
+content; a default one for New Project), project versions, the Inspector
+and Channel Overview, a command palette with a shortcut editor, the undo
+history, crash reports (with software drawing after a graphics driver's
+crash, and from the start on the chips whose driver crashes), plugin
+checks, screen readers, and a setlist with a show mode.
 Windows and macOS builds and packages for all three platforms (see §14).
 
 Picture (video, phase 1): `faderframe-video` on GStreamer as a library
@@ -6138,18 +6232,19 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
 then ideas: what FaderFrame's pieces make possible, and pro features no
 DAW does well yet):
 
-11. **Time-locked audio**: tracks (or clips) placed in absolute time, as
-    video tracks are. Audio clips are placed musically today, so a
-    movie's sound moves with a tempo change while its picture does not —
-    the gap that matters most for scoring to picture.
+11. ~~**Time-locked audio**~~ — done (see *Time-locked tracks*): a
+    per-track time base, Musical or Time-locked; ADR cues always locked to
+    the picture. Open: a per-note lock inside MIDI clips; markers placed
+    in time.
 12. ~~**Video, phase 2 — display and playback**~~ — done but for shared
     D3D12 frames on Windows and real-machine tries (see *Picture, phases
     2 and 3* above): zero-copy display (dmabuf
     on Wayland, shared D3D12 textures on Windows) and decoding at device
     pixels on HiDPI screens; a late-frame meter (the session counts
     already) and presentation feedback; shuttle and reverse play from the
-    proxies; several video tracks with A/B (side by side or wiped; the
-    model has tracks, the UI adds none yet); trimming clips in the lane
+    proxies; several video tracks with A/B (side by side or wiped; tracks
+    are added from the Video lane, `VideoOp::AddTrack`); trimming clips in
+    the lane
     and exporting a trimmed span (cut at keyframes, or an edit list); a
     timecode track in exported movies and timecode in the transport
     display; proxy settings (size, where they live, clearing the cache);
@@ -6187,31 +6282,34 @@ DAW does well yet):
       OSC (supported already) turn the binaural scene.
     - *Panning that follows the picture*: an object tracked on screen
       becomes the automation of an object or surround pan.
-    - *Circuit-modelled console summing*: the circuit solver behind the
-      preamps and the Guitar Station as transformer and summing colour
-      per channel and bus.
-    - *Auditioning the undo history*: every edit is a command, so the
+    - ~~*Circuit-modelled console summing*~~ — done (see Console
+      summing): the circuit solver behind the preamps and the Guitar
+      Station as transformer and summing colour per channel and bus.
+    - ~~*Auditioning the undo history*~~ — done (see *A/B listening*): every edit is a command, so the
       mix as it was some steps ago can play beside the mix as it is (A/B)
       without undoing anything.
 16. **Pro features no DAW does well yet**:
-    - *Auto-align*: delay and polarity between overheads, close and room
+    - ~~*Auto-align*~~ — done (see *Track delay and Auto-Align*; the
+      health check is open): delay and polarity between overheads, close and room
       microphones by cross-correlation, set in one undo step; and a
       project health check (phase, DC offset, clipping inside chains,
       unused plugins costing DSP).
-    - *Reference tracks*: a loudness-matched A/B player in the monitor
+    - ~~*Reference tracks*~~ — done (see *A/B listening*): a loudness-matched A/B player in the monitor
       path, its spectral balance compared and handed to EQ Match.
-    - *A masking map*: the EQ's collision detection between every pair
-      of tracks, with suggested cuts.
-    - *Spectral editing*: a spectrogram to paint noises away in (from the
-      EQ's STFT stage and the warp engine).
+    - ~~*A masking map*~~ — done (see *Mix Intelligence*): every pair of
+      tracks compared in time and frequency, with auditionable cuts; with
+      level and mono diagnostics, the start of the health check.
+    - ~~*Spectral editing*~~ — done (see Spectral editing): a
+      spectrogram to paint noises away in.
     - *Mix scenes*: console snapshots recalled, compared and crossfaded.
-    - *Song structure from a jam*: self-similarity of the chroma finds
-      verses and choruses as sections and markers.
+    - ~~*Song structure from a jam*~~ — done (see Song structure from a
+      jam): self-similarity of the chroma finds verses and choruses as
+      sections and markers.
     - *Adaptive music for games*: sections and launcher scenes with
       transition rules, exported as stems and metadata for Wwise or FMOD.
-    - *Show mode*: songs back to back with click and backing tracks to
-      in-ear outputs and program changes to external gear per song (from
-      the album).
+    - ~~*Show mode*~~ — done (see Setlist and show mode, and Cue mixes
+      for the in-ear outputs) but for program changes to external gear
+      per song.
 17. **Further out**: MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`) and
     Windows (Windows MIDI Services), and clips that keep MIDI 2.0's
     resolution (16-bit velocities, 32-bit controllers: today they arrive
@@ -6220,9 +6318,10 @@ DAW does well yet):
     toolbar: they only name themselves so far); merging project versions
     (three-way, from `faderframe_project::compare`) for collaborators.
 
-Suggested next: 11 and the auto-align of 16, then reference tracks and
-lead sheets — the first three everyday tools, the last one FaderFrame's
-own.
+Suggested next: Mix Intelligence's phase/timing rule and the rest of the
+health check (DC offset, clipping inside chains, unused plugins costing
+DSP), then mix scenes — 11, the auto-align, reference tracks and the
+masking map, the earlier suggestions, are done.
 
 
 ### Guitar Station
@@ -6251,6 +6350,47 @@ stage for the DI, which leaves on the second output bus at unity. Offline
 and ahead the stages run inline with the same delays (bit-identical to the
 workers). The editor (`view-devices::guitar`) draws the rig as hardware
 with the Program EQ's renders.
+
+Added here since (`UPSTREAM.md`, "Added here"), each from published
+drawings, data sheets and measurements:
+
+* **Compressors** (family Dynamics): the Red Squeeze (the MXR Dyna Comp,
+  CA3080 version, `circuits::red_squeeze`, held to a built unit's voltages
+  and the DAFx-11 measurements: +34 dB on a quiet note, ceiling about
+  −12 dBV, release 0.31 s to two thirds) and the Juicer (the Orange
+  Squeezer, `circuits::juicer`: a JFET shunt linearised by half its drain
+  swing ahead of a ×23 op-amp, a germanium detector). The solver gained
+  an operational transconductance amplifier for them (`device::Ota`,
+  `Netlist::ota`, `OtaSpec::CA3080`: Iout = I_ABC·tanh(ΔV/2V_T), the bias
+  pin a junction above V−, input bias currents, a current output
+  saturating inside its headroom; `faderframe-circuit/tests/ota.rs`). The
+  Ross was modelled too and measured as the same compressor within the
+  Dyna Comp's own knobs (`ROSS`, kept for that test). The Juicer's bias,
+  a trimmer whose whole squeeze lies in a fifth of its turn, is drawn over
+  what the circuit measured (`juicer::BIAS_LAW`, a `Taper::Table`): the
+  squeeze in even decibels to 0.7, the bias procedure's point at noon,
+  then the limiter into clipping.
+* **The Carbon Echo** (family Delay; the MXR M169 from a traced REV D3
+  board: four BL3208A, 8192 stages, a CD4047 clock, the DM-2's emphasis
+  and filters): two netlists, the audio board and a clock board stepped
+  at about 12 kHz; the SA571 compander's gain cells are resistors set by
+  per-sample rectifier models; the clock is a law tabulated from a
+  transient model of the 4047 and its modulation network, kept in the
+  tests. Its line is a clocked bucket brigade (`dsp::bbd::Clocked`):
+  sampled each clock period, held a period, the steps band-limited into
+  the netlist's rate, so a slow clock aliases and images as the chip does
+  and turning the delay bends the pitch; sized by stages, never by time.
+  18.7–600 ms; the wet response within about 2 dB of a measured unit's.
+  About 37 % of a core at 1x (`is_expensive`).
+* **Amplifiers**: the Tweed Lux (Fender 5E3: both channels, the volumes
+  interacting through the shared grid, the cathodyne inverter
+  (`power::CathodyneFront`), cathode-biased 6V6s, the 5Y3's sag) and the
+  Seattle 100 (Soldano SLO-100: all eight triodes, the LDR channel
+  switching, Crunch and Bright, the depth network `power::DepthNetwork`
+  on the SWEEP knob), each two `Gain`s (one per channel; the other channel
+  is built and loads the played one), their power stages matched, their
+  calibration and power-trim rows measured by
+  `tests/calibrate_new_amps.rs`.
 
 ### Modelled microphone preamplifiers
 
@@ -7111,3 +7251,160 @@ arriving within a dB, the others ±0.01 dB; a note removed; each note followed
 to a cent; vibrato straightened; untouched audio bit for bit) and
 `session/tests/polypitch.rs` (a recorded chord found, moved, undone, redone,
 muted, removed).
+
+### Time-locked tracks
+
+A track's `TimeBase` (`Track::time_base`, `Command::SetTrackTimeBase`,
+Impact None) places its material with the music (Musical, the default)
+or in time (Time-locked), as Cubase's linear tracks and Pro Tools' sample
+time base do. Positions stay `MusicalTime`: `Session::edit` runs
+`faderframe_project::time_lock::plan` before every edit and applies
+`TimeLock::keep`'s moves after it in the same undo step. The rule:
+material keeps its sample unless the edit places it; a position an edit
+gives is read against the tempo map in effect where it gives it (a
+ripple's clip commands: the old tempo; a rearrangement: its own
+timeline). Every conversion goes through whole samples at the project
+rate (`TempoMap::musical_at_sample`), so tempo-lane drags never drift and
+undo is exact. Covered: audio clips and take folders, MIDI clips' starts
+(their notes follow the tempo from the start: Logic's region lock),
+automation points, a frozen render. Material placed on a locked track
+lands on whole samples (the grid snaps onto the sample under its line).
+Ripples move locked tracks by the time they take out or open
+(`RippleShift::map_in_time`, `time_lock::ripple_curve_in_time`); section
+moves carry locked material with its section; tempo from hit points
+always keeps locked tracks. ADR cues are always locked, whatever any
+track's time base — they mark the picture's dialogue (`keep_adr`, one
+`SetAdr` in the same step) — and the ADR beeps' track is made
+time-locked. No per-clip lock: the track is the unit. The arranger marks
+locked tracks and clips with a padlock (`controls::lock_glyph`); Time
+Base in the track menus and the Inspector.
+
+### Track delay and Auto-Align
+
+`Track::delay_ms` is the track delay of Pro Tools and Cubase:
+non-destructive, to a fraction of a sample, within ±`MAX_TRACK_DELAY_MS`
+(250 ms), `Command::SetTrackDelay` a parameter edit (coalesced), not the
+master's. With a delay the track's input node is a `nodes::TrackDelay`
+(live and ahead graphs): whole samples from a ring, the fraction through
+a 64-tap Kaiser-windowed sinc (within 0.001 dB and 0.0001 samples of
+ideal to 20 kHz at 44.1 kHz), the taps summed in a fixed order (render
+ahead bit-exact). It needs 32 samples of look-ahead: a delay of a
+millisecond or more reports no latency, a smaller or negative one
+reports the look-ahead plus the whole milliseconds of advance and delays
+itself by that minus the advance, so the graph's compensation hears the
+track early by exactly its delay. Only a change of `DelayShape` (none,
+later, each whole millisecond ahead) rebuilds the graph; within a shape
+the node follows its slot with a 10 ms crossfade. Not automated (a moving
+delay is a pitch effect). A frozen track plays its file through its delay
+and polarity, so freeze renders leave both out (bounces keep them).
+
+Auto-Align (`session::align`, `Action::AutoAlign`, window
+`faderframe-ui/src/auto_align.rs`, in the track menus and the Inspector's
+Delay menu) renders the selected tracks' input stages (the clips as
+played, no devices) over the edit range, else where their clips overlap,
+else everything (the busiest 30 s), and `faderframe_analysis::align`
+compares every pair: cross-spectra averaged over the busiest frames where
+both play, maximum-likelihood weighted (Hannan–Thomson: the coherence's
+weight, debiased) over 30 Hz–18 kHz; the strongest peak within ±30 ms
+gives lag and polarity, its robust z-score the confidence (below a floor:
+no common signal, left alone), the next peak's height the clarity
+(bleed-only pairs); the lag refined between samples, twice. Arrival times
+run through the track sharing the most (the overheads, mostly); the
+default reference is the earliest. Apply is one undo step: each included
+track's delay and polarity. On synthetic kits (delays, filters, rooms,
+level, flips, noise, bleed) within 0.004 samples.
+
+### A/B listening: the undo history and reference tracks
+
+A compare source can be heard instead of the mix: `nodes::compare` inside
+`ListenOut`, before listening, so headphones, the mono check and bass
+management apply to both sides. The control side hands a `CompareSource`
+(a `StreamSource` of its own, read only by this node; the disk loader
+keeps its pages resident round where it reads) to the `CompareLink`
+inside `ListenLink` through a mailbox (and back through another); the
+link keeps the wanted source, so a listening node built later starts with
+it. Switching is a 20 ms equal-power crossfade, nothing rebuilt. The
+position comes from the play history at the node's input latency, so
+locates, loop wraps and plugin latency land on the same frame as the mix
+(`Follow { anchor }`), or a region loops on its own while the transport
+plays (`Loop`). Monitoring only — renders build their own engine — and
+never on a meter or analyser (the master strip meters before it).
+
+Auditioning the undo history (`session::compare`,
+`Action::AuditionHistory(done)`, the History view's A/B): 
+`History::project_at` makes the project as undoing (or redoing) to that
+step would, on a copy; over the loop, else the edit selection, else 16
+bars from two before the playhead (with 2 s of run-up for tails), "Then"
+and "Now" are rendered into a per-session temporary folder, measured (EBU
+R128 with the master's channel weights), and Now/Then flips instantly,
+loudness-matched on request (the gain on the other side only). The
+render is bit-for-bit a render after really undoing.
+
+Reference tracks (`faderframe_project::reference`,
+`Command::SetReferences`, `session::references`, the Reference view
+`faderframe-view-reference`): files imported into the media folder (on no
+track, never exported); the chosen one plays along the timeline from a
+point or loops its region; a job renders the mix over the same stretch,
+matches the loudness (EBU R128) and compares long-term spectra
+(`faderframe_analysis::ltas`); Send to EQ Match gives the master's (or a
+track's) first EQ the reference's spectrum as EQ Match's reference (a
+"reference track" source in the EQ editor). Ctrl+Alt+A flips.
+
+### Mix Intelligence
+
+Mix Intelligence analyses the mix deterministically: no models, no
+network; the same audio and settings give the same findings (`ALGORITHM_VERSION`
+and FNV fingerprints keep ids and cache keys stable). Three layers:
+
+* `faderframe-mix-intelligence` (pure, on `faderframe-analysis`) measures
+  rendered audio: Hann frames of about 0.17 s at half overlap summed into
+  third octaves (IEC 61260 centres, 25 Hz–20 kHz) as mean-square power
+  (one-sided, Parseval-scaled: a full-scale sine reads −3.01 dB), per frame
+  and band the left/right levels and their correlation, plus `FileMeter`
+  levels (sample and 4× true peak, RMS, overs) and BS.1770 loudness by
+  section. Explicit rules (`config.rs` thresholds, each documented as a
+  heuristic; `RuleId::{method, limitations}`) turn these into findings
+  with evidence in units, severity and confidence kept apart (each shown
+  with the terms it came from), caveats and conservative experiments.
+  *Spectral Masking Radar*: a target band counts while it is prominent in
+  its frame; another track covers it by how close its level comes (fully
+  at the target's level or above), weighted by how alike their stereo
+  placements are; covered bands group into ranges of up to two octaves and
+  into events (gaps up to 1 s merged, 1 s at least), persistent,
+  recurring or isolated; severity = role weight × √persistence × depth ×
+  importance, confidence = signal × roles × amount × level × resolution.
+  Track roles (`Track::role`, `Command::SetTrackRole`, set only by the
+  user; names are never taken for roles) weigh the pair (drum-kit pairs
+  are not compared, kick/bass and foreground targets weigh most).
+  *Levels*: master true peak over −1 dBTP, overs, a track over full scale
+  alone, non-finite samples, adjacent sections 8 LU apart. *Stereo*:
+  fold-down loss against the sum without cancellation (`(√L+√R)²/4`: a
+  panned source loses nothing, uncorrelated channels 3 dB), an inverted
+  channel.
+* `faderframe_session::mix` renders what is analysed offline on a thread
+  of its own: *processed* — each track solo in place through the whole mix
+  (its devices, automation, sidechains, fader, sends, buses and the master
+  chain), and the master; *source* — each track's clips before any device.
+  Renders take the graph's latency off the front, so every signal shares
+  the range's time reference (no second delay compensation). Profiles are
+  cached (LRU, 256 MB) by track, signal, range, rate, settings and a
+  fingerprint of the project without presentation; a superseded or
+  replaced job's results are dropped, and results whose project changed
+  show as stale with their experiments refused. Experiments are auditioned
+  by applying them unrecorded with their inverses kept (a built-in EQ
+  appended to the masker — keyed from the target for a dynamic cut — or a
+  fader): A/B by the band's bypass or the fader's two values, loudness
+  matched by an offline BS.1770 measurement and the listening-only
+  `EngineController::set_monitor_trim` (the real level change shown beside
+  it). Anything that edits, undoes, saves or renders takes the candidate
+  out first; Apply is one undo step ("Mix Intelligence: …").
+* `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
+  ranked findings (filtered, sorted), each one's measurements (clickable
+  events: the tracks selected and the range shown), a band chart,
+  interpretation, method, limitations and experiments; levels; roles.
+
+Next: a phase/timing rule on the pairs a finding names through Auto-Align's
+estimator (and its per-track delay as the experiment), the audition on the
+A/B compare source (one listening gain instead of two), reference-track
+comparisons from the reference profiles, a one-pass multi-tap render
+instead of one render per track.

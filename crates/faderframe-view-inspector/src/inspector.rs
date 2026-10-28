@@ -112,11 +112,16 @@ pub enum Field {
     Automation,
     /// Whether ripples of edits elsewhere move it (`Track::ripple_excluded`).
     Ripple,
+    /// The track's own delay (`Track::delay_ms`): typed in; its menu
+    /// resets it or aligns microphones.
+    Delay,
     Freeze,
     /// The master: speakers or headphones, the mono check.
     Listen,
     /// The master: the console's summing.
     Console,
+    /// Placed with the music or in time (`Track::time_base`).
+    TimeBase,
 }
 
 /// What a line's value does when pressed.
@@ -454,6 +459,9 @@ impl InspectorView {
                         Kind::Toggle(t.folder_group),
                     );
                 }
+                if t.takes_delay() {
+                    push(Field::Delay, "Delay", delay_label(model, t), Kind::Button);
+                }
                 if t.kind.has_audio() || t.kind == TrackKind::Vca {
                     let lanes = &t.automation.lanes;
                     let value = match lanes.first() {
@@ -479,6 +487,15 @@ impl InspectorView {
                         }
                         .into(),
                         Kind::Toggle(!t.ripple_excluded),
+                    );
+                }
+                let bases = model.time_base_choices(t.id);
+                if !bases.is_empty() {
+                    push(
+                        Field::TimeBase,
+                        "Time Base",
+                        chain::checked_label(&bases),
+                        Kind::Menu,
                     );
                 }
                 if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
@@ -523,6 +540,7 @@ impl InspectorView {
             Field::MidiOut => Some(MixerView::midi_out_menu(model, t, at)),
             Field::Format => menu(choice_items(model.format_choices(t.id))),
             Field::PanMode => menu(choice_items(model.pan_mode_choices(t.id))),
+            Field::TimeBase => menu(choice_items(model.time_base_choices(t.id))),
             Field::Group => menu(
                 model
                     .group_menu(t.id)
@@ -562,6 +580,13 @@ impl InspectorView {
                 }
                 menu(items)
             }
+            Field::Delay => menu(
+                model
+                    .auto_align_menu(t.id)
+                    .into_iter()
+                    .map(faderframe_view_mixer::menu_item)
+                    .collect(),
+            ),
             Field::Listen => menu(choice_items(model.listen_choices())),
             Field::Console => menu(choice_items(model.console_choices())),
             _ => None,
@@ -872,6 +897,27 @@ impl InspectorView {
             Hit::Section(s) => {
                 self.toggle_section(s);
                 cx.redraw();
+            }
+            Hit::Field(Field::Delay) => {
+                // Typed in: milliseconds, or samples ("smp").
+                let l = self.layout(model, t, size);
+                let Some(at) = l
+                    .rows
+                    .iter()
+                    .find(|(r, _)| r.field == Field::Delay)
+                    .map(|(_, r)| Self::value_rect(*r))
+                else {
+                    return false;
+                };
+                let (id, rate) = (t.id, f64::from(model.project().sample_rate.max(1)));
+                cx.request(HostRequest::TextInput {
+                    at,
+                    initial: format!("{:.3}", t.delay_ms),
+                    commit: Box::new(move |text| {
+                        parse_delay(text, rate)
+                            .map(|ms| Action::Edit(Command::SetTrackDelay { track: id, ms }))
+                    }),
+                });
             }
             Hit::Field(f) => {
                 let l = self.layout(model, t, size);
@@ -1614,6 +1660,10 @@ impl CanvasView<Session, Action> for InspectorView {
                 Field::FolderGroup => "Click to switch · When on, arming, selecting and editing \
                                        clips or a range on one of its tracks reach the others"
                     .into(),
+                Field::TimeBase => "Musical: its clips and automation follow tempo changes · \
+                                    Time-locked: they keep their place in time (sound to \
+                                    picture)"
+                    .into(),
                 Field::Ripple => "Click to switch · Left out, ripples of edits on other tracks \
                                   never move it (a music bed, a reference); its own edits \
                                   still ripple"
@@ -1625,6 +1675,9 @@ impl CanvasView<Session, Action> for InspectorView {
                 }
                 Field::Surround => "The surround panner".into(),
                 Field::Freeze => "Render the track and play the render (or back)".into(),
+                Field::Delay => "Its own delay: click to type milliseconds (negative: earlier), \
+                                 or samples with “smp” · Right-click: reset, Auto-Align"
+                    .into(),
                 _ => "Click to choose".into(),
             },
             Hit::Segment(..) => "Monitoring: never, tape-style (armed or selected), always".into(),
@@ -1879,4 +1932,37 @@ impl ActivateOpt for AccessNode<Action> {
             None => self,
         }
     }
+}
+
+/// A track's delay as the Inspector shows it.
+fn delay_label(model: &Session, t: &Track) -> String {
+    if t.delay_ms == 0.0 {
+        return "none".into();
+    }
+    let rate = f64::from(model.project().sample_rate.max(1));
+    format!(
+        "{:+.3} ms · {:+.1} smp",
+        t.delay_ms,
+        t.delay_ms * rate / 1000.0
+    )
+}
+
+/// A typed delay in milliseconds: "−2.5", "-2.5 ms", "+120 smp" (samples
+/// at `rate`), "0"; `None` when it is no number.
+pub(crate) fn parse_delay(text: &str, rate: f64) -> Option<f64> {
+    let t = text.trim().replace('−', "-").to_lowercase();
+    let (number, samples) = if let Some(n) = t
+        .strip_suffix("samples")
+        .or_else(|| t.strip_suffix("sample"))
+        .or_else(|| t.strip_suffix("smp"))
+    {
+        (n, true)
+    } else {
+        (t.strip_suffix("ms").unwrap_or(&t), false)
+    };
+    let v: f64 = number.trim().trim_start_matches('+').parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    Some(if samples { v / rate * 1000.0 } else { v })
 }

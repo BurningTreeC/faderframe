@@ -171,7 +171,17 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          every changing curve on the CPU. Without a usable GPU they stay as they are.",
     ));
     row(&g, 7, "Drawing", &gpu);
-    let renderers: Vec<&str> = crate::drawing::RENDERERS.iter().map(|r| r.1).collect();
+    // GTK's choice is software on a chip Mesa's crocus driver draws with.
+    let automatic = crate::drawing::software_for_chip()
+        .map(|family| format!("Automatic (software on {family} graphics)"));
+    let renderers: Vec<&str> = crate::drawing::RENDERERS
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match (i, &automatic) {
+            (0, Some(label)) => label.as_str(),
+            _ => r.1,
+        })
+        .collect();
     let renderer = gtk::DropDown::from_strings(&renderers);
     renderer.set_selected(
         crate::drawing::RENDERERS
@@ -181,7 +191,9 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     );
     renderer.set_tooltip_text(Some(
         "What GTK draws the windows with, from the next start. Software needs no graphics \
-         driver: use it when the driver crashes or draws wrongly.",
+         driver: use it when the driver crashes or draws wrongly. Automatic draws in \
+         software on Intel graphics up to Haswell (Mesa's crocus driver crashes under \
+         GTK's renderer); choose OpenGL to try the graphics chip anyway.",
     ));
     row(&g, 8, "Renderer", &renderer);
     renderer.connect_selected_notify(|d| {

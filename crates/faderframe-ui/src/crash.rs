@@ -281,6 +281,20 @@ fn header(role: Role, pid: u32, started: &str, log: Option<&Path>) -> String {
         gtk::minor_version(),
         gtk::micro_version(),
     );
+    if let Some(chips) = crate::drawing::chips_line() {
+        h.push_str(&format!("graphics: {chips}\n"));
+    }
+    if role == Role::App {
+        h.push_str(&format!(
+            "renderer: {}{}\n",
+            std::env::var("GSK_RENDERER")
+                .ok()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "GTK's choice".into()),
+            crate::drawing::software_for_chip()
+                .map_or_else(String::new, |f| format!(" (software for {f} graphics)")),
+        ));
+    }
     if let Some(l) = log {
         h.push_str(&format!("log: {}\n", l.display()));
     }

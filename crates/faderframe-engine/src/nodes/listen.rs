@@ -13,6 +13,7 @@
 //! (and key) across graph rebuilds, so a rebuild never cuts what is heard.
 
 use super::bass::BassManager;
+use super::compare::{Compare, CompareLink};
 use super::strip::MatrixMix;
 use crate::context::EngineContext;
 use crate::slots::MixSlots;
@@ -67,6 +68,9 @@ impl Listening {
 pub struct ListenLink {
     to_audio: (MailboxSender<Listening>, MailboxReceiver<Listening>),
     back: (MailboxSender<Listening>, MailboxReceiver<Listening>),
+    /// The compare source heard instead of the mix (see
+    /// [`super::compare`]).
+    compare: Arc<CompareLink>,
 }
 
 impl ListenLink {
@@ -74,7 +78,14 @@ impl ListenLink {
         Arc::new(Self {
             to_audio: mailbox(),
             back: mailbox(),
+            compare: CompareLink::new(),
         })
+    }
+
+    /// The compare source's way to the listening node (A/B against the
+    /// mix: the undo history auditioned, reference tracks).
+    pub fn compare(&self) -> &Arc<CompareLink> {
+        &self.compare
     }
 
     /// Control thread: hand `listening` over. Drop what comes back (one
@@ -112,11 +123,17 @@ pub struct ListenOut {
     retired: Option<Box<Listening>>,
     stages: Stages,
     mono: ParamSlot,
+    /// The monitor trim (dB) and the gain it was at the end of the last
+    /// block (ramped from there).
+    trim: ParamSlot,
+    trim_gain: f32,
     /// Bass management's settings ([`BassManagement::values`]).
     bass_slots: [ParamSlot; 4],
     shared: MixSlots,
     /// The incoming way's output while crossfading.
     alt: AudioBuffer,
+    /// What may be heard instead of the mix (before listening).
+    compare: Compare,
 }
 
 /// What a way of listening passes after its render.
@@ -151,6 +168,7 @@ impl ListenOut {
         rate: u32,
         block: usize,
         mono: ParamSlot,
+        trim: ParamSlot,
         bass_slots: [ParamSlot; 4],
         shared: MixSlots,
     ) -> Self {
@@ -188,10 +206,28 @@ impl ListenOut {
                 scratch: vec![vec![0.0; block]; 2],
             },
             mono,
+            trim,
+            trim_gain: 1.0,
             bass_slots,
             shared,
             alt,
+            compare: Compare::new(&listen.link.compare, input, rate, block),
         }
+    }
+
+    /// The monitor trim, ramped over the block from where it was.
+    fn apply_trim(&mut self, target: f32, out: &mut AudioBuffer, n: usize) {
+        let from = self.trim_gain;
+        if from == 1.0 && target == 1.0 {
+            return;
+        }
+        let step = (target - from) / n.max(1) as f32;
+        for c in 0..out.num_channels() {
+            for (i, v) in out.channel_mut(c)[..n].iter_mut().enumerate() {
+                *v *= from + step * (i + 1) as f32;
+            }
+        }
+        self.trim_gain = target;
     }
 
     /// `input` heard by `listening` into `out` (cleared first): rendered
@@ -313,6 +349,11 @@ impl Processor<EngineContext> for ListenOut {
         self.now.latency()
     }
 
+    fn set_input_latency(&mut self, frames: u32) {
+        // The compare source plays where the mix arriving here was played.
+        self.compare.input_latency = frames;
+    }
+
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let n = io.frames;
         let (Some(input), Some(out)) = (io.audio_in.first(), io.audio_out.first_mut()) else {
@@ -341,6 +382,8 @@ impl Processor<EngineContext> for ListenOut {
             mono: params.get(self.mono) >= 0.5,
             bass: BassManagement::from_values(&self.bass_slots.map(|s| params.get(s))),
         };
+        // The mix, or what is compared with it (A/B), heard alike.
+        let input = self.compare.process(cx, input, n);
         Self::hear(&mut self.now, &mut self.stages, block, input, out, n);
         if let Some(next) = self.next.as_mut() {
             Self::hear(next, &mut self.stages, block, input, &mut self.alt, n);
@@ -363,5 +406,7 @@ impl Processor<EngineContext> for ListenOut {
                 self.give_back();
             }
         }
+        let trim = faderframe_core::db_to_gain(params.get(self.trim));
+        self.apply_trim(trim, out, n);
     }
 }

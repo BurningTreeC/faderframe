@@ -132,6 +132,14 @@ impl ViewId {
     pub fn channel_overview() -> Self {
         Self::new("channel-overview")
     }
+
+    pub fn reference() -> Self {
+        Self::new("reference")
+    }
+
+    pub fn mix_intelligence() -> Self {
+        Self::new("mix-intelligence")
+    }
 }
 
 impl fmt::Debug for ViewId {

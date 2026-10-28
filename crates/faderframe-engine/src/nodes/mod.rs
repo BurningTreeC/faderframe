@@ -3,8 +3,10 @@
 mod bass;
 mod chain;
 mod clip_player;
+pub mod compare;
 mod console;
 mod crosstalk;
+mod delay;
 mod diffuse;
 mod io;
 mod listen;
@@ -16,8 +18,10 @@ mod strip;
 
 pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
+pub use compare::{CompareLink, CompareSettings, CompareShared, CompareSource, CompareSync};
 pub use console::ConsoleChannel;
 pub use crosstalk::Crosstalk;
+pub use delay::{DelayShape, TrackDelay};
 pub use io::{
     DeviceInputTap, DeviceOutputSink, FoldDown, HardwareReturn, HardwareSendGain, MonitorGate,
 };

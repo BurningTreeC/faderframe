@@ -179,6 +179,7 @@ fn build(s: Spec) -> Theme {
             sub_line: line(GRID_ALPHAS[2]),
             fine_line: line(GRID_ALPHAS[3]),
             snap_guide: c(s.selection),
+            time_lock: c(s.selection),
             loop_on: accent.with_alpha(0.22),
             loop_off: line(0.07),
             playhead: accent,

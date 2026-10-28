@@ -155,6 +155,11 @@ struct LoaderState {
     sample_rate: u32,
     /// Album playback's file (kept resident round its own position).
     preview: Option<Arc<StreamSource>>,
+    /// The compare source (A/B in the monitor path) and where it reads.
+    compare: Option<(
+        Arc<StreamSource>,
+        Arc<faderframe_engine::nodes::CompareShared>,
+    )>,
 }
 
 struct LoaderShared {
@@ -182,6 +187,7 @@ impl DiskLoader {
                 loop_range: None,
                 sample_rate,
                 preview: None,
+                compare: None,
             }),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -210,7 +216,7 @@ impl DiskLoader {
             // Every engine of a session shares one epoch (see
             // `faderframe_engine::create_with_epoch`), so retired pages stay
             // valid across engine replacement.
-            let (plan, engine, loop_range, rate, preview) = {
+            let (plan, engine, loop_range, rate, preview, compare) = {
                 let Ok(guard) = shared.state.lock() else {
                     return;
                 };
@@ -221,8 +227,39 @@ impl DiskLoader {
                     st.loop_range,
                     st.sample_rate,
                     st.preview.clone(),
+                    st.compare.clone(),
                 )
             };
+            if let Some((src, wants)) = &compare {
+                // Round where it reads, where the transport is (and is
+                // going: a locate, the loop's start) mapped into the file.
+                let pos = engine.transport.snapshot().position;
+                let ahead = (AHEAD_SECONDS * f64::from(src.sample_rate().max(1))) as i64;
+                let mut frames: Vec<i64> = wants.wanted_frames(pos).into_iter().flatten().collect();
+                if let Some(to) = engine.recent_locate(Duration::from_secs(2)) {
+                    frames.extend(wants.file_frame_at(to));
+                }
+                if let Some((a, _)) = loop_range {
+                    frames.extend(wants.file_frame_at(a));
+                }
+                let mut keep = Vec::with_capacity(frames.len());
+                for f in frames {
+                    let range = src.page_range(f - PAGE_FRAMES as i64, f + ahead);
+                    match src.ensure(range.clone(), &engine.epoch, &mut reclaimer, &mut scratch) {
+                        Ok(n) => {
+                            shared.pages_loaded.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            shared.errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!("compare: {e}");
+                        }
+                    }
+                    keep.push(range.start.saturating_sub(1)..range.end + 1);
+                }
+                if tick.is_multiple_of(10) {
+                    src.evict_except(&keep, &engine.epoch, &mut reclaimer);
+                }
+            }
             if let Some(src) = &preview {
                 let pos = engine.preview.position();
                 let ahead = (AHEAD_SECONDS * f64::from(src.sample_rate().max(1))) as i64;
@@ -311,6 +348,21 @@ impl DiskLoader {
     pub fn set_preview(&self, preview: Option<Arc<StreamSource>>) {
         if let Ok(mut st) = self.shared.state.lock() {
             st.preview = preview;
+        }
+        self.shared.wake.notify_all();
+    }
+
+    /// Keep the compare source's pages resident round where it plays (or
+    /// stop).
+    pub fn set_compare(
+        &self,
+        compare: Option<(
+            Arc<StreamSource>,
+            Arc<faderframe_engine::nodes::CompareShared>,
+        )>,
+    ) {
+        if let Ok(mut st) = self.shared.state.lock() {
+            st.compare = compare;
         }
         self.shared.wake.notify_all();
     }

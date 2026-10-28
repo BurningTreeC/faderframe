@@ -138,12 +138,17 @@ pub struct SlotRegistry {
     chains: HashMap<(PluginInstanceId, usize), ChainSlots>,
     /// 1.0 while the mono check is on (listening only).
     monitor_mono: Option<ParamSlot>,
+    /// A gain (dB) on what the device plays of the master, for listening
+    /// only (loudness-matched comparisons); never in renders.
+    monitor_trim: Option<ParamSlot>,
     /// The console's channel drive (dB).
     console_drive: Option<ParamSlot>,
     /// The pan law and the downmix.
     mix: Option<MixSlots>,
     /// Bass management of the speaker monitoring (listening only).
     bass: Option<[ParamSlot; 4]>,
+    /// Tracks' own delays (milliseconds), once they have one.
+    delays: HashMap<TrackId, ParamSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -166,10 +171,26 @@ impl SlotRegistry {
             midi_mute: HashMap::new(),
             chains: HashMap::new(),
             monitor_mono: None,
+            monitor_trim: None,
             console_drive: None,
             mix: None,
             bass: None,
+            delays: HashMap::new(),
         }
+    }
+
+    /// A track's own delay in milliseconds (`Track::delay_ms`).
+    pub fn track_delay(&mut self, track: TrackId) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.delays.get(&track) {
+            return Ok(*s);
+        }
+        let slot = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.delays.insert(track, slot);
+        Ok(slot)
     }
 
     /// The slots of chain `index` of `container`.
@@ -232,6 +253,20 @@ impl SlotRegistry {
                 .ok_or(SlotsExhausted("parameters"))?,
         );
         self.monitor_mono = Some(s);
+        Ok(s)
+    }
+
+    /// The monitor trim (dB; one for the session; see the field).
+    pub fn monitor_trim(&mut self) -> Result<ParamSlot, SlotsExhausted> {
+        if let Some(s) = self.monitor_trim {
+            return Ok(s);
+        }
+        let s = ParamSlot(
+            self.params
+                .allocate(1)
+                .ok_or(SlotsExhausted("parameters"))?,
+        );
+        self.monitor_trim = Some(s);
         Ok(s)
     }
 
@@ -593,6 +628,10 @@ impl SlotRegistry {
             table.set(s.mute, if t.mute { 1.0 } else { 0.0 });
             table.set(s.solo_mute, if solo_muted { 1.0 } else { 0.0 });
             table.set(s.phase, if t.phase_invert { 1.0 } else { 0.0 });
+            if t.delay_ms != 0.0 || self.delays.contains_key(&t.id) {
+                let slot = self.track_delay(t.id)?;
+                table.set(slot, t.delay_ms as f32);
+            }
             for send in &t.sends {
                 let slot = self.send(send.id)?;
                 table.set(slot, faderframe_core::db_to_gain(send.level_db));

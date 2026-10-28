@@ -197,6 +197,38 @@ impl BinauralRender {
     }
 }
 
+/// How a track's material is placed in time: with the music (its bars and
+/// beats, so a tempo change moves it) or at its place in time (its
+/// samples, whatever the tempo does — a film's dialogue and effects, a
+/// recorded performance, sound to picture). Cubase's "time base"
+/// (musical or linear), Pro Tools' ticks or samples. See
+/// [`crate::time_lock`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeBase {
+    /// Placed in bars and beats: clips and automation follow tempo changes.
+    #[default]
+    Musical,
+    /// Placed in time: clips (audio, and MIDI clips' starts) and automation
+    /// keep their samples when the tempo map changes.
+    TimeLocked,
+}
+
+impl TimeBase {
+    pub const ALL: [TimeBase; 2] = [TimeBase::Musical, TimeBase::TimeLocked];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeBase::Musical => "Musical",
+            TimeBase::TimeLocked => "Time-locked",
+        }
+    }
+
+    pub fn is_musical(&self) -> bool {
+        *self == TimeBase::Musical
+    }
+}
+
 /// An external MIDI device a track plays (MIDI tracks).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MidiOutputRouting {
@@ -387,6 +419,13 @@ pub fn device_name<'a>(
     name.clone()
 }
 
+/// Furthest a track's own delay goes either way (milliseconds).
+pub const MAX_TRACK_DELAY_MS: f64 = 250.0;
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// A channel of the project: audio/instrument/MIDI track, bus, aux or master.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Track {
@@ -450,6 +489,14 @@ pub struct Track {
     pub binaural: Option<BinauralRender>,
     #[serde(default)]
     pub phase_invert: bool,
+    /// The track's own delay in milliseconds (the *track delay* of Pro
+    /// Tools and Cubase): positive later, negative earlier, to a fraction
+    /// of a sample, in its input stage (before its devices). Microphones
+    /// of one source are aligned with it (Auto-Align); an earlier track
+    /// reports less latency to the graph's delay compensation, so the
+    /// rest waits for it. Within ±[`MAX_TRACK_DELAY_MS`]; not automated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub delay_ms: f64,
 
     #[serde(default)]
     pub mute: bool,
@@ -509,6 +556,18 @@ pub struct Track {
     /// [`crate::Command::SetTrackRippleExcluded`] switches it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ripple_excluded: bool,
+    /// Placed with the music or in time ([`TimeBase`]): a time-locked
+    /// track's clips and automation keep their samples when the tempo
+    /// changes. Musical by default; [`crate::Command::SetTrackTimeBase`]
+    /// switches it (moving nothing).
+    #[serde(default, skip_serializing_if = "TimeBase::is_musical")]
+    pub time_base: TimeBase,
+    /// What the track plays in the mix, as the user said (`None`: not
+    /// said). Mix Intelligence reads it; nothing else does, and track
+    /// names are never taken for roles. [`crate::Command::SetTrackRole`]
+    /// sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<faderframe_core::TrackRole>,
     /// Sources that move the track's parameters (LFOs, followers, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modulators: Vec<crate::modulation::Modulator>,
@@ -607,6 +666,7 @@ impl Track {
             object: false,
             binaural: None,
             phase_invert: false,
+            delay_ms: 0.0,
             mute: false,
             solo: false,
             record_arm: false,
@@ -624,14 +684,27 @@ impl Track {
             folder_bus: false,
             folder_group: false,
             ripple_excluded: false,
+            time_base: TimeBase::Musical,
+            role: None,
             modulators: Vec::new(),
             containers: Default::default(),
         }
     }
 
+    /// Placed in time rather than with the music ([`TimeBase::TimeLocked`]).
+    pub fn is_time_locked(&self) -> bool {
+        self.time_base == TimeBase::TimeLocked
+    }
+
     /// Holds tracks: a folder, or a folder bus (see [`Track::folder_bus`]).
     pub fn is_folder(&self) -> bool {
         self.kind == TrackKind::Folder || self.is_folder_bus()
+    }
+
+    /// Can it have a delay of its own ([`Track::delay_ms`])? Tracks with
+    /// audio, not the master (it would only move everything).
+    pub fn takes_delay(&self) -> bool {
+        self.kind.has_audio() && self.kind != TrackKind::Master
     }
 
     /// A folder that is a bus: it sums what it holds.

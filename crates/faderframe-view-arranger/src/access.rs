@@ -50,9 +50,14 @@ impl ArrangerView {
             )
             .at(row)
             .described(format!(
-                "{} clip{}",
+                "{} clip{}{}",
                 clips.len(),
-                if clips.len() == 1 { "" } else { "s" }
+                if clips.len() == 1 { "" } else { "s" },
+                if t.is_time_locked() {
+                    ", time-locked"
+                } else {
+                    ""
+                }
             ));
             let toggle = |kind: u64, label: &str, r: Rect, on: bool, cmd: Command| {
                 AccessNode::new(access_id(&[kind, id.0]), AccessRole::ToggleButton, label)

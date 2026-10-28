@@ -92,6 +92,10 @@ pub struct PluginHost {
     realtime: bool,
     /// New instances may load what their state names in the background.
     background_loading: bool,
+    /// Instances hosted for slots outside the project's tracks and album
+    /// (a clip effect's own editor window): [`Self::retain_project`]
+    /// keeps them.
+    kept: HashSet<PluginInstanceId>,
 }
 
 impl Default for PluginHost {
@@ -121,7 +125,21 @@ impl PluginHost {
             double_precision: false,
             realtime: true,
             background_loading: false,
+            kept: HashSet::new(),
         }
+    }
+
+    /// Keep these instances whatever the project holds (they are hosted
+    /// for slots outside it); others kept before are no longer.
+    pub fn set_kept(&mut self, kept: HashSet<PluginInstanceId>) {
+        self.kept = kept;
+    }
+
+    /// Drop an instance now (a slot outside the project that is gone).
+    pub fn release(&mut self, plugin: PluginInstanceId) {
+        self.kept.remove(&plugin);
+        self.instances.remove(&plugin);
+        self.dirty.remove(&plugin);
     }
 
     /// Instances made from now on may load what their state names (a
@@ -366,41 +384,53 @@ impl PluginHost {
             let Some(h) = self.instances.get_mut(&id) else {
                 continue;
             };
-            if h.state != slot.state {
-                // A new state (preset, undo): load it; explicit values follow.
-                if let Some(bytes) = slot.state.as_deref().and_then(decode_state)
-                    && let Err(e) = h.instance.load_state(&bytes)
-                {
-                    tracing::warn!("{}: cannot load the state: {e}", slot.plugin.name);
-                }
-                h.state = slot.state.clone();
-                h.applied.clear();
-                h.baseline.clear();
+            Self::sync_hosted(h, slot);
+        }
+    }
+
+    /// Push a slot outside the project (see [`Self::set_kept`]) to its
+    /// instance as [`Self::sync_parameters`] does the project's.
+    pub fn sync_slot(&mut self, slot: &PluginSlot) {
+        if let Some(h) = self.instances.get_mut(&slot.id) {
+            Self::sync_hosted(h, slot);
+        }
+    }
+
+    fn sync_hosted(h: &mut Hosted, slot: &PluginSlot) {
+        if h.state != slot.state {
+            // A new state (preset, undo): load it; explicit values follow.
+            if let Some(bytes) = slot.state.as_deref().and_then(decode_state)
+                && let Err(e) = h.instance.load_state(&bytes)
+            {
+                tracing::warn!("{}: cannot load the state: {e}", slot.plugin.name);
             }
-            for p in &slot.parameters {
-                if h.applied.get(&p.id) == Some(&p.value) {
-                    continue;
-                }
-                if !h.baseline.contains_key(&p.id)
-                    && let Some(v) = h.instance.parameter(p.id)
-                {
-                    h.baseline.insert(p.id, v);
-                }
-                let _ = h.instance.set_parameter(p.id, p.value);
-                h.applied.insert(p.id, p.value);
+            h.state = slot.state.clone();
+            h.applied.clear();
+            h.baseline.clear();
+        }
+        for p in &slot.parameters {
+            if h.applied.get(&p.id) == Some(&p.value) {
+                continue;
             }
-            if h.applied.len() != slot.parameters.len() {
-                let dropped: Vec<ParameterId> = h
-                    .applied
-                    .keys()
-                    .filter(|id| !slot.parameters.iter().any(|p| p.id == **id))
-                    .copied()
-                    .collect();
-                for id in dropped {
-                    h.applied.remove(&id);
-                    if let Some(v) = h.baseline.get(&id) {
-                        let _ = h.instance.set_parameter(id, *v);
-                    }
+            if !h.baseline.contains_key(&p.id)
+                && let Some(v) = h.instance.parameter(p.id)
+            {
+                h.baseline.insert(p.id, v);
+            }
+            let _ = h.instance.set_parameter(p.id, p.value);
+            h.applied.insert(p.id, p.value);
+        }
+        if h.applied.len() != slot.parameters.len() {
+            let dropped: Vec<ParameterId> = h
+                .applied
+                .keys()
+                .filter(|id| !slot.parameters.iter().any(|p| p.id == **id))
+                .copied()
+                .collect();
+            for id in dropped {
+                h.applied.remove(&id);
+                if let Some(v) = h.baseline.get(&id) {
+                    let _ = h.instance.set_parameter(id, *v);
                 }
             }
         }
@@ -552,6 +582,7 @@ impl PluginHost {
             .filter(|t| t.freeze.is_none())
             .flat_map(|t| t.slots().into_iter().map(|s| s.id))
             .chain(project.album.inserts().map(|s| s.id))
+            .chain(self.kept.iter().copied())
             .collect();
         let shadowed: HashSet<PluginInstanceId> = if project.cue_mixes.is_empty() {
             HashSet::new()

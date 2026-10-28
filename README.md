@@ -11,52 +11,100 @@ instruments with a key, a chord track and MIDI effects, modulators and
 parallel effect containers, automation, CLAP/VST3 hosting (LV2 on Linux,
 Audio Units on macOS), an analogue-console-style mixer with modelled
 preamps, console summing and cue mixes for the performers' headphones, a
-full set of stock devices, mastering meters, surround, object-based (ADM
-BWF) and IAMF masters with binaural monitoring, album delivery down to CD
-and vinyl masters, video for working to picture, lead sheets, scratch
-pads, project templates, and dockable, detachable editors.
+full set of stock devices (circuit-modelled ones among them: an optical
+leveller, a FET compressor, a tape machine, a guitar rig), mastering meters,
+Mix Intelligence (masking between tracks, levels and mono compatibility,
+measured and explained, with experiments to audition), A/B listening
+against reference tracks or earlier steps of the undo history, surround,
+object-based (ADM BWF) and IAMF masters with binaural monitoring, album
+delivery down to CD and vinyl masters, video for working to picture with
+time-locked tracks, lead sheets, scratch pads, project templates, and
+dockable, detachable editors.
 
-> **Status: in active development** (version 0.23.0). Most of a working
+> **Status: in active development** (version 0.34.0). Most of a working
 > DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
 > comes next.
 
-## What's new in 0.23
+## What's new in 0.34
 
-* **Arranger**: a clip clipboard (copy, cut and paste across tracks; Shuffle
-  inserts), Select All (Ctrl+A), splits that keep every piece selected, slip
-  editing (Ctrl+Alt+drag), Snap to Objects with a guide line, a grid drawn
-  at every zoom (its strength in Preferences → Editing), folder buses and
-  folder groups, scratch pads, a Play Start Marker, and an audit of the
-  arranger and recording that fixed 33 defects.
-* **Transport**: the loop dragged or resized while playing without a
-  glitch; Return to Start on Stop beside Return to Project Start on Stop
-  (also on the Stop button's right-click menu); abort the take (Ctrl+Space)
-  or abort it and record again (Ctrl+Shift+Space); a count-in before bar 1
-  when the pre-roll cannot reach back (the counter shows bar 0 and
-  COUNT-IN); show mode arms each song's stop ahead.
-* **Mixing**: a send or cue send with a pan of its own places its source;
-  cue mixes are complete (buses and returns solo- and mute-safe,
-  automation, MIDI learn, control surfaces, talkback); the Inspector (F11)
-  and the Channel Overview; check marks on every menu toggle.
-* **Rendering**: a report measured from the written files after every
-  render and album export; every export asks before replacing a file and
-  swaps the new one in only once it is complete.
-* **Audio**: a new Audio preferences page (devices, a second device through
-  PipeWire or JACK, rate, buffer, channels, where each channel goes,
-  latency); buffer changes applied live where the audio system can;
-  recovery when a device goes and comes back; recordings placed by the
-  device's real latency.
-* **Plugins and devices**: favorites in categories (plugin browser and
-  insert menus); sandboxed editors no longer close right after opening
-  (#12); the Synth's second wave in a three-deck editor with 33 more
-  presets — 470 factory presets across the built-in devices.
-* **Stability**: the 0.22 crashes fixed — realtime threads past rtkit's
-  time limit are demoted instead of the process being killed, and memory
-  prefaulting, GPU errors and GStreamer's MXF demuxer no longer bring it
-  down — and a crash reporter: a crash leaves a report in the Crash
-  Reports folder, and the next start offers it.
-* **Look**: Lumen, a ninth skin drawn with light instead of hardware.
+* **Mix Intelligence** (View → Mix Intelligence; first milestone):
+  deterministic mix analysis with no AI, model or network. Each track is
+  rendered offline as it sounds in the mix (or its clips before any
+  device), and explicit, documented rules find:
+  * spectral masking between pairs of tracks over time ("Bass may mask
+    Pad at 355 Hz–1.4 kHz, for 7 s in the Verse");
+  * level problems (true peak, overs, a track over full scale, loudness
+    jumps between sections);
+  * mono fold-down losses.
+
+  Every finding shows its measurements, a separate severity and
+  confidence with the terms they came from, the rule's method and
+  limitations, and a few conservative experiments (an EQ cut, a dynamic
+  cut, a level change). An experiment can be auditioned A/B,
+  loudness-matched, and is applied only on Apply, as one undo step. Track
+  roles (kick, bass, lead vocal …) are set by you, never guessed from
+  names.
+* **A/B listening**: hear the mix as it was at an earlier step of the undo
+  history beside the mix as it is (the History view's A/B), without
+  undoing anything, loudness-matched. A Reference view loads reference
+  songs, plays them along the song or looping, matches their loudness,
+  compares spectra and sends a reference to an EQ's EQ Match. Ctrl+Alt+A
+  flips.
+* **Time-locked tracks** (a track's menu or the Inspector → Time Base):
+  a time-locked track's clips, automation and frozen render stay on their
+  samples when the tempo changes, as dialogue and effects must stay with
+  the picture. ADR cues are always locked to the picture.
+* **Track delay and Auto-Align**: every track has its own delay, later or
+  earlier, to a fraction of a sample (Inspector). Auto-Align Microphones…
+  (track menus) measures the delay and polarity between microphones of one
+  source — a kit's close, overhead and room microphones, a cabinet's, a
+  bass's DI and microphone — and sets them in one undo step.
+* **2A Leveler**: an optical leveller in the LA-2A's manner. Its valve
+  make-up amplifier and transformers are modelled, and its optical cell
+  releases fast after a short burst and slowly after long, hard levelling.
+  Compress and Limit, Mix, an external key, a stereo link, 11 presets.
+* **Tape Machine**: recording to tape and back, modelled physically —
+  magnetic hysteresis with AC bias (over- and under-biased too), three tape
+  formulations, NAB/IEC EQ at 3¾–30 ips, the head bump, wow and flutter at
+  a studio machine's figures, optional hiss. 13 presets.
+* **Guitar Station**: three new pedals — Red Squeeze (after the MXR Dyna
+  Comp), Juicer (after the Orange Squeezer) and Carbon Echo (after the MXR
+  Carbon Copy bucket-brigade delay) — and two new amplifiers with both
+  their channels, the Tweed Lux (Fender 5E3 Deluxe) and the Seattle 100
+  (Soldano SLO-100). Pedal rigs moved into a "Pedals" preset group.
+* **Clip effects**: each effect's card has Open Window, which shows the
+  plugin's own window (or a built-in's editor); what you change there is
+  rendered into the clip.
+* **Graphics driver crashes** (#22): Intel graphics driven by Mesa's
+  crocus driver (GMA up to Haswell) crashed under GTK's renderer; on those
+  chips FaderFrame now draws in software from the first start (Preferences
+  → General → Renderer can still choose OpenGL), and crash reports name
+  the graphics chip.
+* **Smaller**: the Juicer's bias knob spreads its squeeze over the whole
+  turn; the Tape Machine's display reads in light themes.
+
+### Since 0.23 (0.24–0.33)
+
+* Ripple editing per track, on selected tracks or across the project with
+  the timeline, automation moving along.
+* Third-party plugin GUIs under FaderFrame's editor header on Linux,
+  Windows and macOS; LV2 plugin UIs (embedded or floating).
+* A count-in of its own (Transport → Count-in); Stop stays where the
+  playhead is heard; automation menus grouped by device with a search
+  field.
+* A start window (recent projects, a new or template project, the demo);
+  the arranger's zoom and scroll saved with the project; themes of your
+  own (View → Theme → Edit Themes…).
+* Take lanes of any height, each take auditioned on its own; a click on a
+  lane comps only the section under it (#20).
+* Drum notes drawn as diamonds in the piano roll (Automatic, Bars or
+  Diamonds).
+* Stuck notes fixed: opening a plugin editor or bypassing, removing or
+  moving a MIDI effect while it plays (#27).
+* Renderer choice (Preferences → General → Renderer), macOS start-up and
+  Apple-silicon fixes (#25), dragging clips no longer runs out of file
+  descriptors (#18), the TAP pad no longer maximises the window (#21).
 
 ## Screenshots
 
@@ -244,7 +292,12 @@ long sessions), Neon, High Contrast and Lumen:
 
 ![The nine skins](docs/screenshots/themes.png)
 
-Lumen, the newest, is drawn with light instead of hardware: ink planes
+Themes of your own: View → Theme → Edit Themes… starts from a built-in
+skin and changes any of its 56 colours, applied as you edit; they are JSON
+files in the settings' `themes` folder and appear after the built-in
+skins.
+
+Lumen, the newest skin, is drawn with light instead of hardware: ink planes
 stepped by luminance, halo knobs with glowing value arcs, pill faders and
 buttons that light from within, fine gradient meters with a bloom, clips
 as translucent cards, a glass transport display in tabular figures and one
@@ -473,7 +526,9 @@ cyan-to-violet accent:
   clips, auditioning, step input from a MIDI keyboard, copy/paste/duplicate,
   clip-length handle, inspector with numeric entry, live keys on the
   keyboard, zoom buttons (−, +, Sel, Fit) and Alt+wheel for taller or
-  shorter rows; moved and resized notes snap to the other notes' edges.
+  shorter rows; moved and resized notes snap to the other notes' edges;
+  drum clips (a drum sampler's, or all on channel 10) show their notes as
+  diamonds (toolbar → Drums).
   MIDI Tools (toolbar): transform the selection — strum, chop,
   join, connect with scale runs, arpeggiate, recombine, conform to the
   chord track, accent, time scale, ornaments — or generate Euclidean
@@ -631,6 +686,35 @@ cyan-to-violet accent:
 * Clip effects (an audio clip's menu → Clip Effects…): a chain of devices
   on one clip, rendered into the audio it plays as you change it; the
   original stays with the clip, so the effects can change again or go.
+  Open Window shows an effect's own window (its GUI, a built-in's editor,
+  or the parameter list), and what you change there is rendered too.
+* Time-locked tracks (a track's menu or the Inspector → Time Base:
+  Musical or Time-locked): on a time-locked track clips, MIDI clips'
+  starts, automation and a frozen render keep their samples whatever the
+  tempo does, in the same undo step as the tempo change; a padlock marks
+  them. ADR cues are always locked to the picture, and the ADR beeps'
+  track is time-locked.
+* Track delay and Auto-Align: a track's own delay (Inspector → Delay,
+  milliseconds or samples), later or earlier, to a fraction of a sample,
+  compensated like plugin latency. Auto-Align Microphones… (the track
+  menus) measures the delay and polarity of microphones on one source by
+  cross-correlation and sets them in one undo step; tracks without a
+  common signal are left alone.
+* A/B listening: the History view's A/B renders the project as it was at
+  that step (on a copy — nothing is undone) and flips Now/Then in step
+  with the transport, loudness-matched on request. Reference tracks (View →
+  Reference Tracks): songs to compare with, playing along the song or
+  looping their region, matched in loudness, their spectrum against the
+  mix's, and Send to EQ Match. Ctrl+Alt+A flips; meters always show the
+  mix.
+* Mix Intelligence (View → Mix Intelligence): analyses the project, the
+  edit range or the selected tracks — processed (as mixed) or the source —
+  without AI, models or network, and lists potential masking conflicts
+  between tracks, level problems and mono losses, ranked, each with its
+  measurements, severity and confidence and how they were reached, the
+  rule's limitations, and experiments to audition (A/B,
+  loudness-matched) and apply as one undo step. Clicking a finding selects
+  its tracks and shows its time. Track roles help it weigh pairs.
 * Meters: each strip's meter shows sample peaks, peaks with the RMS, a
   VU (0 VU at −18 dBFS or another reference), the EBU PPM or a K-System
   meter (K-20, K-14, K-12) — chosen from its right-click menu, per strip
@@ -802,6 +886,19 @@ cyan-to-violet accent:
   20 µs or Off, the ratio buttons in any combination (all four in: the
   "all buttons" sound, where louder input comes out quieter), the FET's
   colour, a backlit VU with real ballistics and a panel of its own.
+* 2A Leveler: an optical leveling amplifier in the LA-2A's manner, from
+  the factory drawings — the input transformer, the T4 optical cell (an
+  electroluminescent panel lighting photoresistors whose release depends on
+  how long and how hard they were lit), the valve make-up amplifier and
+  output transformer — with Gain, Peak Reduction, Compress/Limit, a VU
+  (gain reduction, +4, +10), and Mix, an external key and a stereo link.
+* Tape Machine: a studio tape deck modelled physically — Jiles–Atherton
+  magnetisation with AC bias (under- and over-biased too), three tape
+  formulations at five operating levels (185 to 520 nWb/m), NAB/IEC/AES EQ
+  at 3¾, 7½, 15 and 30 ips, head losses and the head bump, wow and flutter
+  fitted to a studio machine's figures, azimuth and crosstalk, optional hiss
+  at the tape's level; level-neutral at the operating level, two VUs, the
+  response and the tape's M–H curve drawn.
 * Hardware Insert: outboard gear in a chain — the signal goes out of an
   interface output and comes back on an input; a ping measures the round
   trip, which delay compensation then takes into account.
@@ -860,11 +957,13 @@ cyan-to-violet accent:
   (the low end trick falls out of the circuit), with its hardware panel,
   input and output meters, drive and oversampling.
 * Guitar Station: GainStageFx's guitar rig as one device. A pedal line of
-  up to eight pedals and wahs (drives, distortions, fuzzes, a bass preamp,
-  a phaser, a chorus, two wahs with an envelope follower), each on a
-  true-bypass footswitch, dragged into any order; twenty circuit-modelled
-  guitar and bass amplifiers with their own switches, reverbs, tremolos and
-  power stages (or another amplifier's), the power stage working into a
+  up to eight pedals and wahs (drives, distortions, fuzzes, two
+  compressors, a bass preamp, a phaser, a chorus, a bucket-brigade delay,
+  two wahs with an envelope follower), each on a true-bypass footswitch,
+  dragged into any order; twenty-four circuit-modelled guitar and bass
+  amplifiers (the Tweed Lux and Seattle 100 newest, each with both
+  channels) with their own switches, reverbs, tremolos and power stages (or
+  another amplifier's), the power stage working into a
   physical loudspeaker in a cabinet, and two microphones placed on the cone
   (position, distance, angle, pan). A DI on a second output (the input,
   after the pedals or the preamp's direct out), factory rigs, and a panel
@@ -872,9 +971,10 @@ cyan-to-violet accent:
   with its microphones. Every pedal is a stage of its own on its own thread
   (a stereo signal on two), which reports its buffer as latency.
   GainStageFx's noise gate sits after the input (switch and threshold in
-  the output strip). 61 factory presets: the rigs, every amplifier on its
-  own (Amplifiers) and guitar sounds researched from well-known records,
-  named for the record (Sounds). A mono
+  the output strip). 71 factory presets: the rigs, rigs round the newer
+  pedals (Pedals), every amplifier on its own (Amplifiers) and guitar
+  sounds researched from well-known records, named for the record
+  (Sounds). A mono
   track turns stereo from the Guitar Station on, so the microphones' pans
   are heard, and the IN and OUT meters always show left and right.
 * Audio: native PipeWire (one node with a port per channel, linked to the
@@ -918,7 +1018,9 @@ cyan-to-violet accent:
   it lands, without delaying what you hear. Warnings and errors pop up at
   the top of the window.
 * Takes and comping: take folders with take lanes — click a lane to use a
-  take, drag across it to comp a section, flatten when done. Record mode
+  take, drag across it to comp a section, flatten when done; drag a
+  folder's lanes taller (or pick a size from a lane's menu), and its ▶
+  plays that take whole instead of the comp until you stop it. Record mode
   (keep as takes / replace) and loop-record mode (takes / last pass / new
   track per pass) are selectable in Transport and Preferences → Recording.
 * Track presets: save a track's channel settings (format, input, plugins
@@ -1078,9 +1180,11 @@ cyan-to-violet accent:
   editing defaults and the grid's strength, recording options, the
   metronome's sounds, MIDI devices, sync and controllers, live DSP
   statistics …), undo/redo, versioned project files (`.ffproj`). A new
-  start opens the last project, a new one (from the default template, if
-  one is set) or the demo session (Preferences → General; `--empty` /
-  `--demo` / a project path override it once); File → Open Recent lists
+  start shows the start window — recent projects, an empty project, the
+  templates, Open…, the demo — or opens the last project, a new one (from
+  the default template, if one is set) or the demo session (Preferences →
+  General; `--empty` / `--demo` / a project path override it once; File →
+  Start Window… any time); File → Open Recent lists
   the last ten projects. Closing a saved project offers to move the audio
   files no saved version uses any more to the trash (Preferences →
   General: ask, move or keep).
@@ -1538,6 +1642,10 @@ variables apply to one start. For example:
   draws without the graphics driver. When the last run crashed inside the
   driver (for example Mesa's `libgallium`), FaderFrame switches to
   Software by itself and says so; choose Automatic there to go back.
+  Automatic is Software on Intel graphics up to Haswell (GMA, Ironlake,
+  Sandy Bridge, Ivy Bridge, Bay Trail, Haswell, Cherry View): Mesa's
+  crocus driver for them crashes under GTK's renderer. Choose OpenGL to
+  use the chip anyway.
 - **No GPU frame sharing:** `FADERFRAME_GPU_DMABUF=0` (Linux; Windows:
   `FADERFRAME_GPU_SHARE=0`).
 - **No zero-copy video:** `FADERFRAME_VIDEO_DMABUF=0` (Linux).

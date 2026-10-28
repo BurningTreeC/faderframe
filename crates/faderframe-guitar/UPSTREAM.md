@@ -38,7 +38,7 @@ out.
   stage into a resistor or the loudspeaker, horn, cabinet and microphones,
   the switch fade, and the DI taps (input, pedals, preamplifier/direct out).
   Without upstream's pedal slot, wah, output iron, microphone preamplifiers,
-  plugin tone stack and dry/wet handling. It builds only the 20 amplifiers
+  plugin tone stack and dry/wet handling. It builds only the amplifiers
   the Guitar Station offers (`AMPS`) and their power stages; the oversampling
   is fixed per chain, so the latency never moves.
 - `pedal.rs`: each pedal or wah is a stage of its own (`PedalStage`), at its
@@ -55,6 +55,15 @@ out.
   unchanged (renamed `NoiseGate`): the input expander after the Input trim,
   one detector on the hotter channel, threshold -90…-30 dBFS.
 
+## Added here
+
+Not upstream's, written for FaderFrame: the compressors `circuits::red_squeeze`
+(MXR Dyna Comp, CA3080 version, with the Ross Compressor's values as
+`red_squeeze::ROSS`) and `circuits::juicer` (Dan Armstrong Orange Squeezer),
+`Pedal::{RedSqueeze, Juicer}` on the line only (no `Gain` of their own), and
+the CA3080 the Red Squeeze is built round (`faderframe_circuit`'s
+`device::Ota`, `netlist::OtaSpec::CA3080`).
+
 ## Checked
 
 A scratch harness built upstream's untouched `voice.rs` on these modules and
@@ -67,3 +76,23 @@ multiplication order).
 A full set of pedal circuits is about 5.8 MB per channel (the Bass Driver
 alone 1.1 MB), so a place on the line holds only its pedal's circuit, built
 when it is chosen (about 1-2 ms).
+
+## Added in FaderFrame
+
+Circuits written for FaderFrame after the extraction, in upstream's manner
+(component-level netlists on the same solver, every part value against its
+reference designator, sources cited in each module) but not upstream's:
+
+- `circuits/tweed_lux.rs`, `power::PowerSpec::TWEED_6V6` with
+  `power::CathodyneFront` and `power::T5Y3GT`: the Fender Deluxe 5E3, both
+  channels (`Gain::TweedLux`, `Gain::TweedLuxNormal`).
+- `circuits/seattle100.rs`, `power::PowerSpec::SEATTLE_6L6` with
+  `power::DepthNetwork`: the Soldano SLO-100, both channels
+  (`Gain::Seattle100`, `Gain::Seattle100Normal`).
+
+Their rows in `calibration.rs` and `power_trim.rs` are measured by
+`tests/calibrate_new_amps.rs`, which follows upstream's procedure and anchor
+(it re-measures the JTM45's committed row to the printed digit before it
+prints anything). Upstream's rows are untouched. The two power stages are
+matched only: neither is a `PowerAmp` choice, so `POWER_TRIM_DB` gained rows
+but no column.

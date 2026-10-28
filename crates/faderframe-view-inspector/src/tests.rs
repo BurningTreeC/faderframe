@@ -795,3 +795,84 @@ fn a_track_can_be_left_out_of_ripples() {
     let t = rows_of(&mut view, &s);
     assert!(t.iter().any(|x| x == "left out · stays put"), "{t:?}");
 }
+
+/// A track's Time Base line: its menu chooses musical or time-locked.
+#[test]
+fn the_time_base_line_chooses_musical_or_time_locked() {
+    let mut s = session();
+    select(&mut s, &["Bass"]);
+    let bass = id(&s, "Bass");
+    let mut view = InspectorView::new(Theme::default());
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "Time Base"), "{t:?}");
+    let pt = find(COLUMN, 3.0, |p| {
+        view.hit(p, COLUMN, &s) == Some(InspectorHit::Field(Field::TimeBase))
+    })
+    .unwrap();
+    let (_, requests) = emitted(&mut view, down(pt), COLUMN, &s);
+    assert_eq!(
+        menu_labels(&requests[0]),
+        vec![
+            ("Musical".to_string(), Some(true)),
+            ("Time-locked".to_string(), Some(false)),
+        ]
+    );
+    let HostRequest::ContextMenu { items, .. } = &requests[0] else {
+        panic!("a menu")
+    };
+    s.dispatch(items[1].action.clone().unwrap()).unwrap();
+    assert!(s.project().track(bass).unwrap().is_time_locked());
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "Time-locked"), "{t:?}");
+}
+
+/// A track's own delay: typed in (milliseconds, or samples), shown in
+/// both, its menu resetting it or aligning the selected microphones.
+#[test]
+fn a_track_s_delay_is_typed_in_and_shown() {
+    let mut s = session();
+    select(&mut s, &["Bass"]);
+    let bass = id(&s, "Bass");
+    let mut view = InspectorView::new(Theme::default());
+    assert!(rows_of(&mut view, &s).iter().any(|x| x == "none"));
+    let pt = find(COLUMN, 3.0, |p| {
+        view.hit(p, COLUMN, &s) == Some(InspectorHit::Field(Field::Delay))
+    })
+    .unwrap();
+    let (actions, requests) = emitted(&mut view, down(pt), COLUMN, &s);
+    assert!(actions.is_empty());
+    let Some(HostRequest::TextInput {
+        initial, commit, ..
+    }) = requests.into_iter().next()
+    else {
+        panic!("a text field");
+    };
+    assert_eq!(initial, "0.000");
+    assert!(commit("loud").is_none());
+    assert_eq!(
+        commit("+2.5 ms"),
+        Some(Action::Edit(Command::SetTrackDelay {
+            track: bass,
+            ms: 2.5
+        }))
+    );
+    s.dispatch(commit("−96 smp").unwrap()).unwrap();
+    assert_eq!(s.project().track(bass).unwrap().delay_ms, -2.0);
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "-2.000 ms · -96.0 smp"), "{t:?}");
+    // Its menu: Auto-Align (the selected tracks) and the reset.
+    let requests = send(&mut view, right(pt), COLUMN, &mut s);
+    let Some(HostRequest::ContextMenu { items, .. }) = requests.into_iter().next() else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["Auto-Align Microphones…", "Reset Track Delay (-2.000 ms)"]
+    );
+    s.dispatch(items[1].action.clone().unwrap()).unwrap();
+    assert_eq!(s.project().track(bass).unwrap().delay_ms, 0.0);
+    // The master has none.
+    select(&mut s, &["Master"]);
+    assert!(!rows_of(&mut view, &s).iter().any(|x| x == "Delay"));
+}

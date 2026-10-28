@@ -668,6 +668,8 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("MIDI Event List", "app.view-events"),
             ("Automation", "app.view-automation"),
             ("Tools (Loudness, Level, Phase, Spectrum)", "app.view-tools"),
+            ("Reference Tracks (A/B with the Mix)", "app.view-reference"),
+            ("Mix Intelligence (Masking, Levels, Mono)", "app.view-mix"),
             ("Album (Songs, Loudness, Delivery)", "app.view-album"),
             ("Performance Meter", "app.view-performance"),
             ("Undo History", "app.view-history"),

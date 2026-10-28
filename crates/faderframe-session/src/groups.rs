@@ -138,6 +138,13 @@ impl Session {
                     .map(|t| Command::SetTrackPanMode { track: t.id, mode })
                     .collect()
             }
+            // The other selected tracks take the time base too.
+            Command::SetTrackTimeBase { track, base } => self
+                .followers(track, None, |t| t.kind != TrackKind::Folder)
+                .into_iter()
+                .filter(|t| t.time_base != base)
+                .map(|t| Command::SetTrackTimeBase { track: t.id, base })
+                .collect(),
             Command::SetTrackDualPan { track, pan } => {
                 // Each side moves by as much as this track's did.
                 let Some(old) = self.project.track(track).map(|t| t.dual_pan) else {

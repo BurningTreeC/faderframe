@@ -377,6 +377,12 @@ fn enclosure(stomp: Stomp) -> (u32, u32) {
             Pedal::BassDriver => (0x3b3f44, 0xe9e2c8),
             Pedal::OrangePhase => (0xf07e22, 0x1a1208),
             Pedal::BlueChorus => (0x3b7ccc, 0xf2f6ff),
+            // A red box with white script, and an orange plug-in module
+            // with black lettering.
+            Pedal::RedSqueeze => (0xd51f26, 0xf7f3ee),
+            Pedal::Juicer => (0xf6a03a, 0x16100a),
+            // A deep, bluish green, darker than the two 808s, cream letters.
+            Pedal::CarbonEcho => (0x1d473f, 0xeaeee4),
             Pedal::None => (0x333333, 0xffffff),
         },
         Stomp::Wah(faderframe_guitar::circuits::wah::Build::CryBaby) => (0x18181a, 0xe6e6e6),
@@ -875,6 +881,9 @@ struct Palette {
     piping: Color,
     accent: Option<Color>,
     brushed: bool,
+    /// A covering other than black tolex: lacquered tweed, its colour at the
+    /// top and the bottom, woven on the diagonal.
+    tweed: Option<(Color, Color)>,
 }
 
 fn palette(f: Finish) -> Palette {
@@ -886,6 +895,7 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xe9dcae),
             accent: None,
             brushed: true,
+            tweed: None,
         },
         Finish::Copper => Palette {
             plate_top: rgb(0xa8764a),
@@ -894,6 +904,7 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xd8c49a),
             accent: None,
             brushed: true,
+            tweed: None,
         },
         Finish::Blackface => Palette {
             plate_top: rgb(0x252528),
@@ -902,6 +913,7 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xc9c9c2),
             accent: Some(rgb(0xb9bdc1)),
             brushed: false,
+            tweed: None,
         },
         Finish::Silver => Palette {
             plate_top: rgb(0xdfe2e4),
@@ -910,6 +922,7 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xe8e8e2),
             accent: None,
             brushed: true,
+            tweed: None,
         },
         Finish::Modern => Palette {
             plate_top: rgb(0x202022),
@@ -918,6 +931,7 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xb8bcc0),
             accent: Some(rgb(0xd3392b)),
             brushed: false,
+            tweed: None,
         },
         Finish::Bass => Palette {
             plate_top: rgb(0x2a2d31),
@@ -926,8 +940,77 @@ fn palette(f: Finish) -> Palette {
             piping: rgb(0xc9ccd0),
             accent: Some(rgb(0x3c7bd0)),
             brushed: false,
+            tweed: None,
+        },
+        // The 5E3's chrome-plated control strip, its lettering dark, on
+        // lacquered tweed that has gone the colour of tea.
+        Finish::Tweed => Palette {
+            plate_top: rgb(0xe9e6df),
+            plate_bottom: rgb(0x9a968c),
+            ink: rgb(0x2a1d10),
+            piping: rgb(0x6b4a2a),
+            accent: None,
+            brushed: true,
+            tweed: Some((rgb(0xc9a76b), rgb(0x8a6a3a))),
+        },
+        // A polished chrome face, black lettering, a red jewel's line.
+        Finish::Chrome => Palette {
+            plate_top: rgb(0xf6f8fa),
+            plate_bottom: rgb(0x878d94),
+            ink: rgb(0x0e0f10),
+            piping: rgb(0xd7dade),
+            accent: Some(rgb(0xb81f1f)),
+            brushed: false,
+            tweed: None,
         },
     }
+}
+
+/// Lacquered tweed: a twill woven on the diagonal, two shades of thread, with
+/// the lacquer's sheen over it.
+fn tweed(p: &mut dyn Painter, r: Rect, top: Color, bottom: Color) {
+    p.fill_rounded(
+        r,
+        14.0,
+        &linear(r.x, r.y, r.x, r.bottom(), vec![(0.0, top), (1.0, bottom)]),
+    );
+    p.push_clip(r.inset(3.0));
+    let dark = bottom.mix(rgb(0x2a1a08), 0.55);
+    let light = top.mix(rgb(0xf1dfb0), 0.4);
+    let step = 5.0;
+    let mut x = r.x - r.h;
+    let mut k = 0;
+    while x < r.right() {
+        let (c, a) = if k % 2 == 0 {
+            (dark, 0.32)
+        } else {
+            (light, 0.18)
+        };
+        p.line(
+            Point::new(x, r.bottom()),
+            Point::new(x + r.h, r.y),
+            1.6,
+            c.with_alpha(a),
+        );
+        x += step;
+        k += 1;
+    }
+    p.pop_clip();
+    p.fill_rounded(
+        r,
+        14.0,
+        &linear(
+            r.x,
+            r.y,
+            r.x,
+            r.bottom(),
+            vec![
+                (0.0, rgba(0xfff3d0, 0.12)),
+                (0.5, rgba(0, 0.0)),
+                (1.0, rgba(0, 0.25)),
+            ],
+        ),
+    );
 }
 
 fn amp(p: &mut dyn Painter, sc: &Scene<'_>) {
@@ -946,28 +1029,32 @@ fn amp(p: &mut dyn Painter, sc: &Scene<'_>) {
     let pal = palette(layout::finish(a.amp));
     let r = layout::amp_rect();
     p.shadow(r, 14.0, rgba(0, 0.7), 0.0, 8.0, 18.0);
-    // Tolex, with its grain.
-    p.fill_rounded(
-        r,
-        14.0,
-        &linear(
-            r.x,
-            r.y,
-            r.x,
-            r.bottom(),
-            vec![(0.0, rgb(0x2a2826)), (1.0, rgb(0x0e0e0e))],
-        ),
-    );
-    let mut y = r.y + 3.0;
-    let mut k = 0;
-    while y < r.bottom() - 3.0 {
-        let alpha = if k % 3 == 0 { 0.035 } else { 0.015 };
-        p.fill(
-            Rect::new(r.x + 8.0, y, r.w - 16.0, 1.0),
-            rgba(0xffffff, alpha),
+    if let Some((top, bottom)) = pal.tweed {
+        tweed(p, r, top, bottom);
+    } else {
+        // Tolex, with its grain.
+        p.fill_rounded(
+            r,
+            14.0,
+            &linear(
+                r.x,
+                r.y,
+                r.x,
+                r.bottom(),
+                vec![(0.0, rgb(0x2a2826)), (1.0, rgb(0x0e0e0e))],
+            ),
         );
-        y += 2.5;
-        k += 1;
+        let mut y = r.y + 3.0;
+        let mut k = 0;
+        while y < r.bottom() - 3.0 {
+            let alpha = if k % 3 == 0 { 0.035 } else { 0.015 };
+            p.fill(
+                Rect::new(r.x + 8.0, y, r.w - 16.0, 1.0),
+                rgba(0xffffff, alpha),
+            );
+            y += 2.5;
+            k += 1;
+        }
     }
     p.stroke_rounded(r.inset(6.0), 10.0, 1.4, pal.piping.with_alpha(0.55));
     // Corner protectors.
@@ -1200,6 +1287,9 @@ fn amp_badge(p: &mut dyn Painter, sc: &Scene<'_>, a: &AmpLook, pal: &Palette) {
         .map(|m| match m {
             faderframe_guitar::voice::PowerModel::Jazz120SS => "transistor",
             faderframe_guitar::voice::PowerModel::AmericanSS800 => "transistor, 300 W",
+            // Stages no other preamplifier is offered, so named here.
+            faderframe_guitar::voice::PowerModel::TweedLux6V6 => "Tweed 6V6, 5Y3",
+            faderframe_guitar::voice::PowerModel::Seattle6L6 => "Seattle 6L6",
             _ => "",
         })
         .unwrap_or("");
@@ -1262,7 +1352,10 @@ fn power_for(m: faderframe_guitar::voice::PowerModel) -> faderframe_guitar::voic
         PowerModel::Brit45KT66 => PowerAmp::Brit45KT66,
         PowerModel::American7027A => PowerAmp::American7027A,
         PowerModel::AmericanV4b7027A => PowerAmp::AmericanV4b7027A,
-        PowerModel::Jazz120SS | PowerModel::British73Out => PowerAmp::Matched,
+        PowerModel::Jazz120SS
+        | PowerModel::British73Out
+        | PowerModel::TweedLux6V6
+        | PowerModel::Seattle6L6 => PowerAmp::Matched,
     }
 }
 

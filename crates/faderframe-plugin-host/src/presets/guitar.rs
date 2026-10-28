@@ -1,9 +1,11 @@
 //! Guitar Station rigs: an amplifier with its cabinet and microphones, and
 //! the pedals that go with it, each trimmed (Output) to play at about the
 //! level of the guitar going in (`preset_levels`). The menu lists the rigs,
-//! then "Amplifiers" (each amplifier's own presets) and "Sounds" (records'
-//! guitar sounds, named for the record: the names say which record a
-//! rig's research came from, not that anyone involved endorses it).
+//! then "Pedals" (rigs built round one of the newer pedals: the
+//! compressors, the bucket-brigade echo), "Amplifiers" (each amplifier's
+//! own presets) and "Sounds" (records' guitar sounds, named for the record:
+//! the names say which record a rig's research came from, not that anyone
+//! involved endorses it).
 
 use super::{FactoryPreset, preset};
 use crate::devices::guitar::id::{self, *};
@@ -32,6 +34,10 @@ const VT40: f64 = 16.0;
 const SVT: f64 = 17.0;
 const V4B: f64 = 18.0;
 const RB800: f64 = 19.0;
+const TWEED_LUX: f64 = 20.0;
+const TWEED_LUX_NORMAL: f64 = 21.0;
+const SEATTLE: f64 = 22.0;
+const SEATTLE_NORMAL: f64 = 23.0;
 
 // Power stages (`PowerAmp::ALL`): the amplifier's own is the default.
 const BYPASS: f64 = 1.0;
@@ -245,6 +251,138 @@ pub(super) fn guitar() -> Vec<FactoryPreset> {
                 (A_DISTANCE, 0.1),
             ],
         ),
+        // The OTA compressor in front of a blackface just warm: every pick
+        // even, the notes held, and the pedal's spike on each attack -- the
+        // country player's snap. That spike is why it sits half a decibel
+        // under the other rigs: it peaks within 1.5 dB of full scale.
+        preset(
+            "Country Squeeze",
+            &[
+                (OUTPUT, 8.9),
+                (at(0, STOMP), pedal(Pedal::RedSqueeze)),
+                (at(0, P_DRIVE), 0.45),
+                (at(0, P_LEVEL), 0.5),
+                (AMP, TWIN),
+                (DRIVE, 0.34),
+                (BASS, 0.5),
+                (MIDDLE, 0.4),
+                (TREBLE, 0.7),
+                (REVERB, 0.2),
+                (CABINET, AMERICAN_OPEN_212),
+                (MIC_A, DYNAMIC_57),
+                (A_DISTANCE, 0.03),
+                (MIC_B, RIBBON_121),
+                (B_POSITION, 0.4),
+                (B_DISTANCE, 0.3),
+                (BLEND, 0.3),
+            ],
+        )
+        .in_group("Pedals"),
+        // The JFET squeezer into a Deluxe on the edge: a slide held out
+        // long, the amplifier breaking up only where the note starts.
+        preset(
+            "Squeezed Slide",
+            &[
+                (OUTPUT, -13.8),
+                (at(0, STOMP), pedal(Pedal::Juicer)),
+                (at(0, P_DRIVE), 0.5),
+                (at(0, P_LEVEL), 0.6),
+                (AMP, DELUXE),
+                (DRIVE, 0.45),
+                (BASS, 0.5),
+                (TREBLE, 0.6),
+                (REVERB, 0.25),
+                (CABINET, AMERICAN_OPEN_112),
+                (MIC_A, RIBBON_121),
+                (A_DISTANCE, 0.05),
+            ],
+        )
+        .in_group("Pedals"),
+        // A tweed Deluxe turned up into its own open-backed 1x12 and alnico
+        // speaker, the normal channel's volume a little up to round it off;
+        // a ribbon a hand's width back.
+        preset(
+            "Tweed Breakup",
+            &[
+                (OUTPUT, 4.2),
+                (AMP, TWEED_LUX),
+                (DRIVE, 0.7),
+                (TREBLE, 0.6),
+                (SWEEP, 0.35),
+                (CABINET, AMERICAN_OPEN_112),
+                (SPEAKER, AMERICAN_ALNICO),
+                (MIC_A, DYNAMIC_57),
+                (A_POSITION, 0.35),
+                (A_DISTANCE, 0.03),
+                (MIC_B, RIBBON_121),
+                (B_DISTANCE, 0.15),
+                (BLEND, 0.45),
+            ],
+        ),
+        // The SLO's overdrive channel, mids forward, into a 4x12 of V30s.
+        preset(
+            "Seattle Lead",
+            &[
+                (OUTPUT, -1.4),
+                (AMP, SEATTLE),
+                (DRIVE, 0.55),
+                (BASS, 0.5),
+                (MIDDLE, 0.65),
+                (TREBLE, 0.6),
+                (PRESENCE, 0.55),
+                (SWEEP, 0.25),
+                (CABINET, BRIT_V30),
+                (MIC_A, DYNAMIC_57),
+                (A_POSITION, 0.25),
+                (MIC_B, RIBBON_121),
+                (B_DISTANCE, 0.08),
+                (BLEND, 0.4),
+            ],
+        ),
+        // A single dark repeat at about 90 ms, no modulation, into a clean
+        // Twin: rockabilly's slap, through a bucket brigade.
+        preset(
+            "Analog Slapback",
+            &[
+                (OUTPUT, -1.7),
+                (at(0, STOMP), pedal(Pedal::CarbonEcho)),
+                (at(0, P_DRIVE), 0.1),
+                (at(0, P_LEVEL), 0.6),
+                (at(0, TONE), 0.1),
+                (at(0, TONE + 1), 0.0),
+                (AMP, TWIN),
+                (DRIVE, 0.4),
+                (REVERB, 0.15),
+                (CABINET, AMERICAN_OPEN_212),
+                (MIC_A, DYNAMIC_57),
+                (A_DISTANCE, 0.03),
+            ],
+        )
+        .in_group("Pedals"),
+        // A Gold Drive into the echo at about 390 ms with its modulation on,
+        // repeats that darken as they go, into a Plexi on the edge.
+        preset(
+            "Carbon Lead",
+            &[
+                (OUTPUT, 0.2),
+                (at(0, STOMP), pedal(Pedal::GoldDrive)),
+                (at(0, P_DRIVE), 0.35),
+                (at(0, P_LEVEL), 0.6),
+                (at(1, STOMP), pedal(Pedal::CarbonEcho)),
+                (at(1, P_DRIVE), 0.55),
+                (at(1, P_LEVEL), 0.45),
+                (at(1, TONE), 0.4),
+                (at(1, TONE + 1), 1.0),
+                (AMP, PLEXI),
+                (DRIVE, 0.6),
+                (CABINET, BRIT_GREEN),
+                (MIC_A, DYNAMIC_57),
+                (MIC_B, RIBBON_121),
+                (B_DISTANCE, 0.08),
+                (BLEND, 0.4),
+            ],
+        )
+        .in_group("Pedals"),
         // Each amplifier's own presets, after GainStageFx's catalogue (its
         // PRESETS.md and docs/models hold the research behind them).
         preset(
@@ -841,6 +979,81 @@ pub(super) fn guitar() -> Vec<FactoryPreset> {
                 (CABINET, AMERICAN_810),
                 (MIC_A, DYNAMIC_57),
                 (A_DISTANCE, 0.05),
+            ],
+        )
+        .in_group("Amplifiers"),
+        // The tweed's normal channel clean: its volume low, the bright
+        // channel's half up loading it, the tone open.
+        preset(
+            "Tweed Lux Clean",
+            &[
+                (OUTPUT, 6.7),
+                (AMP, TWEED_LUX_NORMAL),
+                (DRIVE, 0.3),
+                (TREBLE, 0.75),
+                (SWEEP, 0.5),
+                (CABINET, AMERICAN_OPEN_112),
+                (SPEAKER, AMERICAN_ALNICO),
+                (MIC_A, DYNAMIC_57),
+                (A_DISTANCE, 0.04),
+            ],
+        )
+        .in_group("Amplifiers"),
+        // Jumpered: the guitar in the bright channel's jack 1, a cable from
+        // its jack 2 to the normal channel's, both volumes up.
+        preset(
+            "Tweed Lux Jumpered",
+            &[
+                (OUTPUT, -9.5),
+                (AMP, TWEED_LUX),
+                (DRIVE, 0.8),
+                (SWEEP, 0.6),
+                (TREBLE, 0.55),
+                (LOW_SWITCH, 2.0),
+                (CABINET, AMERICAN_OPEN_112),
+                (SPEAKER, AMERICAN_ALNICO),
+                (MIC_A, RIBBON_121),
+                (A_DISTANCE, 0.08),
+            ],
+        )
+        .in_group("Amplifiers"),
+        // The SLO's normal channel with its Crunch and Bright switches in.
+        preset(
+            "Seattle Crunch",
+            &[
+                (OUTPUT, -3.6),
+                (AMP, SEATTLE_NORMAL),
+                (DRIVE, 0.75),
+                (BRIGHT, 1.0),
+                (LOW_SWITCH, 1.0),
+                (BASS, 0.55),
+                (MIDDLE, 0.6),
+                (TREBLE, 0.55),
+                (PRESENCE, 0.5),
+                (CABINET, BRIT_1960),
+                (MIC_A, DYNAMIC_57),
+                (A_POSITION, 0.3),
+            ],
+        )
+        .in_group("Amplifiers"),
+        // The overdrive channel tight for rhythm: less preamp, the middle
+        // down, some depth.
+        preset(
+            "Seattle Rhythm",
+            &[
+                (OUTPUT, 1.2),
+                (AMP, SEATTLE),
+                (DRIVE, 0.4),
+                (BASS, 0.55),
+                (MIDDLE, 0.45),
+                (TREBLE, 0.6),
+                (PRESENCE, 0.6),
+                (SWEEP, 0.45),
+                (CABINET, BRIT_V30),
+                (MIC_A, DYNAMIC_57),
+                (MIC_B, DYNAMIC_906),
+                (B_POSITION, 0.5),
+                (BLEND, 0.35),
             ],
         )
         .in_group("Amplifiers"),

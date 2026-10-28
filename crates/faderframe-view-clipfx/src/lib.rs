@@ -3,8 +3,10 @@
 //! its parameters as bars — drag across one to set it (Shift: finely),
 //! double-click to reset it. "+ Add Effect" offers the audio effects the
 //! session knows (built-ins first); a card's header bypasses, moves or
-//! removes its device. The chain renders once it rests; the header says
-//! when it is rendering.
+//! removes its device, and "Open Window" under it shows the device's own
+//! window (its GUI; the generic one when it has none), whose changes the
+//! chain takes. The chain renders once it rests; the header says when it
+//! is rendering.
 
 #![forbid(unsafe_code)]
 
@@ -33,6 +35,8 @@ pub enum Hit {
     Left(usize),
     Right(usize),
     Remove(usize),
+    /// The card's "Open Window": the device's own window.
+    Window(usize),
     Parameter(usize, usize),
 }
 
@@ -162,11 +166,22 @@ impl ClipFxView {
         ]
     }
 
+    /// A card's "Open Window", above its parameters (it scrolls with them).
+    fn window_button(&self, card: usize, size: Size) -> Rect {
+        let c = self.card(card, size);
+        Rect::new(
+            c.x + 8.0,
+            c.y + TITLE_H + 6.0 - self.scroll_y,
+            c.w - 16.0,
+            ROW_H - 4.0,
+        )
+    }
+
     fn row(&self, card: usize, k: usize, size: Size) -> Rect {
         let c = self.card(card, size);
         Rect::new(
             c.x + 8.0,
-            c.y + TITLE_H + 6.0 + k as f32 * ROW_H - self.scroll_y,
+            c.y + TITLE_H + 6.0 + (k + 1) as f32 * ROW_H - self.scroll_y,
             c.w - 16.0,
             ROW_H - 4.0,
         )
@@ -193,11 +208,14 @@ impl ClipFxView {
             {
                 return Some(h);
             }
-            let infos = model.clip_fx_known_parameters(&slot.plugin)?;
             let body_top = self.card(i, size).y + TITLE_H;
             if pos.y < body_top {
                 return None;
             }
+            if self.window_button(i, size).contains(pos) {
+                return Some(Hit::Window(i));
+            }
+            let infos = model.clip_fx_known_parameters(&slot.plugin)?;
             for k in 0..infos.len() {
                 if self.row(i, k, size).contains(pos) {
                     return Some(Hit::Parameter(i, k));
@@ -219,6 +237,8 @@ impl ClipFxView {
                 .max()
                 .unwrap_or(0) as f32
                 * ROW_H
+                // "Open Window".
+                + ROW_H
                 + TITLE_H
                 + 2.0 * GAP
         })
@@ -323,16 +343,29 @@ impl ClipFxView {
                 &TextStyle::new(th.fonts.small, th.ui.text_dim).center(),
             );
         }
+        let body = Rect::new(c.x, c.y + TITLE_H, c.w, c.h - TITLE_H);
+        p.push_clip(body);
+        let w = self.window_button(i, size);
+        let bg = if self.hover == Some(Hit::Window(i)) {
+            th.piano.button_active
+        } else {
+            th.piano.button
+        };
+        p.fill_rounded(w, 3.0, &Paint::Solid(bg));
+        p.text(
+            "Open Window",
+            w,
+            &TextStyle::new(th.fonts.small, th.ui.text_dim).center(),
+        );
         let Some(infos) = model.clip_fx_known_parameters(&slot.plugin) else {
             p.text(
                 "…",
-                Rect::new(c.x, c.y + TITLE_H, c.w, ROW_H),
+                Rect::new(c.x, w.bottom() + 4.0, c.w, ROW_H),
                 &TextStyle::new(th.fonts.small, th.ui.text_faint).center(),
             );
+            p.pop_clip();
             return;
         };
-        let body = Rect::new(c.x, c.y + TITLE_H, c.w, c.h - TITLE_H);
-        p.push_clip(body);
         for (k, info) in infos.iter().enumerate() {
             let r = self.row(i, k, size);
             if r.bottom() < body.y || r.y > body.bottom() {
@@ -426,6 +459,11 @@ impl ClipFxView {
                 cx.emit(op(ClipFxOp::Move { from: i, to: i + 1 }))
             }
             Hit::Remove(i) => cx.emit(op(ClipFxOp::Remove(i))),
+            Hit::Window(index) => cx.emit(Action::OpenClipEffectEditor {
+                clip,
+                index,
+                generic: false,
+            }),
             Hit::Parameter(card, k) => {
                 let Some(info) = chain
                     .get(card)
@@ -602,6 +640,10 @@ impl CanvasView<Session, Action> for ClipFxView {
                 Hit::Bypass(_) => "Switch this device off or on",
                 Hit::Left(_) | Hit::Right(_) => "Move this device in the chain",
                 Hit::Remove(_) => "Remove this device",
+                Hit::Window(_) => {
+                    "The device's own window (its GUI; the parameter list when it has none). \
+                     What you change there is rendered into the clip"
+                }
                 Hit::Parameter(..) => "Drag across to set (Shift: finely) · double-click: default",
             }
             .into(),
@@ -775,6 +817,47 @@ mod tests {
             &mut s,
         );
         assert!(s.clip_fx_chain(clip).is_empty());
+    }
+
+    /// A card's "Open Window" asks the shell for the device's own window.
+    #[test]
+    fn a_device_opens_in_its_own_window() {
+        let (mut s, clip) = session();
+        let size = Size::new(900.0, 420.0);
+        let mut view = ClipFxView::new(Theme::default());
+        s.dispatch(Action::ClipEffects {
+            clip,
+            op: ClipFxOp::Add(PluginRef {
+                format: PluginFormat::Builtin,
+                id: faderframe_core::builtin::GAIN.into(),
+                name: "Utility".into(),
+            }),
+        })
+        .unwrap();
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        assert!(p.texts().contains(&"Open Window"));
+        let at = view.window_button(0, size).center();
+        assert_eq!(view.hit(at, size, &s), Some(Hit::Window(0)));
+        s.take_ui_requests();
+        send(
+            &mut view,
+            ViewEvent::PointerDown {
+                pos: at,
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+                clicks: 1,
+            },
+            size,
+            &mut s,
+        );
+        let id = s.clip_fx_chain(clip)[0].id;
+        assert!(s.take_ui_requests().into_iter().any(|r| matches!(
+            r,
+            faderframe_session::UiRequest::PluginEditor { plugin, .. } if plugin == id
+        )));
+        // The parameters sit under the button.
+        assert!(view.row(0, 0, size).y >= view.window_button(0, size).bottom());
     }
 
     #[test]

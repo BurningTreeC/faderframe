@@ -12,6 +12,7 @@ pub mod gain;
 pub mod id;
 pub mod pan;
 pub mod paths;
+pub mod role;
 pub mod surround;
 pub mod timecode;
 pub mod vbap;
@@ -20,8 +21,10 @@ pub use channel::ChannelLayout;
 pub use gain::{Decibels, FaderLaw, db_to_gain, gain_to_db};
 pub use id::{
     AdrCueId, AudioSourceId, AutomationLaneId, ClipId, ClipLinkId, CueId, GroupId, IdAllocator,
-    MarkerId, MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, SceneId,
-    ScratchPadId, SectionId, SendId, SongId, TrackId, VideoClipId, VideoSourceId, VideoTrackId,
+    MarkerId, MidiMappingId, ModulatorId, NoteId, ParameterId, PluginInstanceId, ReferenceId,
+    SceneId, ScratchPadId, SectionId, SendId, SongId, TrackId, VideoClipId, VideoSourceId,
+    VideoTrackId,
 };
 pub use pan::{DualPan, PanLaw, PanMode};
+pub use role::{RoleFamily, TrackRole};
 pub use surround::{SurroundFormat, SurroundPan, SurroundParam};

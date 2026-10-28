@@ -100,6 +100,15 @@ pub enum Taper {
         fractions: [f64; MAX_STEPS],
         count: usize,
     },
+    /// A measured law: the track's fraction at given knob positions,
+    /// straight between them (`(position, fraction)` pairs, positions
+    /// rising from 0 to 1, fractions rising too).
+    ///
+    /// For a control whose effect no track shape spreads over the travel --
+    /// the Juicer's bias, a trimmer whose whole squeeze lies within a fifth
+    /// of its turn -- the law is drawn over what the circuit was measured
+    /// to do, so that the knob moves its effect evenly.
+    Table(&'static [(f64, f64)]),
 }
 
 /// The most positions a `Taper::Steps` switch has: the V76's gain switch.
@@ -150,6 +159,7 @@ impl Taper {
                 let n = count.clamp(1, MAX_STEPS);
                 fractions[((p * n as f64) as usize).min(n - 1)]
             }
+            Taper::Table(points) => Self::table_law(p, points),
         }
     }
 
@@ -187,6 +197,28 @@ impl Taper {
     /// effect sweep evenly over a span of `k`. A span at or below one has no
     /// range to shape, so it falls back to a plain track rather than dividing
     /// by zero.
+    /// Straight between the table's points; flat beyond its ends (and the
+    /// position itself for an empty table).
+    fn table_law(p: f64, points: &[(f64, f64)]) -> f64 {
+        let Some(&(x0, y0)) = points.first() else {
+            return p;
+        };
+        if p <= x0 {
+            return y0;
+        }
+        for w in points.windows(2) {
+            let ((xa, ya), (xb, yb)) = (w[0], w[1]);
+            if p <= xb {
+                return if xb > xa {
+                    ya + (yb - ya) * (p - xa) / (xb - xa)
+                } else {
+                    yb
+                };
+            }
+        }
+        points.last().map_or(p, |&(_, y)| y)
+    }
+
     fn log_law(p: f64, span: f64) -> f64 {
         // Only a span of one -- or a nonsense one -- has no shape to give.
         if span.is_nan() || span <= 0.0 || (span - 1.0).abs() < 1e-6 {
@@ -397,6 +429,66 @@ impl BipolarSpec {
     };
 }
 
+/// An operational transconductance amplifier: a differential pair whose tail
+/// current is the current pushed into the amplifier-bias pin, mirrored to a
+/// push-pull current output. See `device::Ota` for what it does with these.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OtaSpec {
+    /// The junction the amplifier-bias pin drives into (a diode-connected
+    /// transistor to V-): its saturation current and emission coefficient.
+    /// Together they put the pin where the sheet's bias-voltage curve does.
+    pub bias_saturation: f64,
+    pub bias_emission: f64,
+    /// The input pair's current gain: each input draws its transistor's share
+    /// of the tail over this. It is what the sheet's input bias current and
+    /// input resistance both follow from.
+    pub input_beta: f64,
+    /// How close the output can come to V+ and to V- before the mirror driving
+    /// it saturates: the sheet's peak output voltage, as headroom from each
+    /// supply pin.
+    pub top_headroom: f64,
+    pub bottom_headroom: f64,
+    /// Over how many volts a saturating output mirror gives its current up.
+    pub knee: f64,
+}
+
+impl OtaSpec {
+    /// RCA's (later Harris's, then Intersil's) CA3080, from the Intersil data
+    /// sheet FN475.5 (April 2001), at 25 degrees C.
+    ///
+    /// - The bias pin: Figure 27 rises 60 mV a decade, 490 mV at 0.1 uA to
+    ///   730 mV at 1 mA, which is one junction at an emission of 1.0, and the
+    ///   table's 0.71 V typical at 500 uA puts its saturation current at
+    ///   `500 uA / exp(0.71 / VT)` = 5.9e-16 A. DOCUMENTED.
+    /// - The input pair: the table's input bias current, 2 uA typical at
+    ///   I_ABC = 500 uA, is each transistor's quarter-milliamp over a beta of
+    ///   125; the same beta gives the table's 26 kohm input resistance
+    ///   (`4 beta VT / I_ABC` = 26.4 k), which is the check. DERIVED.
+    /// - The output swing: Figure 18, on +-15 V with no load, reaches 14.1 V
+    ///   at 1 uA and 13.5 V at 1 mA on the positive side (13.5 V typical in
+    ///   the table at 500 uA) and -14.4 to -14.5 V on the negative. Headroom
+    ///   of 1.25 V from V+ is the middle of that across the 10-300 uA a pedal
+    ///   uses it at, 0.55 V from V-. APPROXIMATED as fixed.
+    /// - The knee over which a saturating mirror gives its current up: a
+    ///   tenth of a volt, the order of a transistor's soft entry into
+    ///   saturation. ESTIMATED; the sheet only gives the end points.
+    ///
+    /// Not modelled, and why: the input offset (0.4 mV typical, 5 mV maximum:
+    /// a part-to-part spread rather than a property, and the circuits here
+    /// that care trim it out); the output resistance (15 Mohm at 500 uA,
+    /// Figure 29: a thousandth of a pedal's 150 k load); the input and output
+    /// capacitances (3.6 and 5.6 pF); the common-mode range (within 1.4 V of
+    /// V+ and 0.4 V of V-, which no circuit here approaches).
+    pub const CA3080: OtaSpec = OtaSpec {
+        bias_saturation: 5.9e-16,
+        bias_emission: 1.0,
+        input_beta: 125.0,
+        top_headroom: 1.25,
+        bottom_headroom: 0.55,
+        knee: 0.1,
+    };
+}
+
 /// One part.
 #[derive(Clone, Debug)]
 pub enum Part {
@@ -577,6 +669,19 @@ pub enum Part {
         reference: usize,
         gm: f64,
         limit: f64,
+    },
+    /// An operational transconductance amplifier (a CA3080): inputs, current
+    /// output, the amplifier-bias pin whose current sets the transconductance,
+    /// and the two supply pins its output swing and its own consumption are
+    /// referred to. See `device::Ota`.
+    Ota {
+        plus: usize,
+        minus: usize,
+        out: usize,
+        bias: usize,
+        pos: usize,
+        neg: usize,
+        spec: OtaSpec,
     },
 }
 
@@ -1105,6 +1210,22 @@ impl Part {
                 map(out);
                 map(reference);
             }
+            Part::Ota {
+                plus,
+                minus,
+                out,
+                bias,
+                pos,
+                neg,
+                ..
+            } => {
+                map(plus);
+                map(minus);
+                map(out);
+                map(bias);
+                map(pos);
+                map(neg);
+            }
             Part::Bipolar { c, b, e, .. } => {
                 map(c);
                 map(b);
@@ -1144,6 +1265,15 @@ impl Part {
                 reference,
                 ..
             } => vec![plus, minus, out, reference],
+            Part::Ota {
+                plus,
+                minus,
+                out,
+                bias,
+                pos,
+                neg,
+                ..
+            } => vec![plus, minus, out, bias, pos, neg],
         }
     }
 
@@ -1176,6 +1306,7 @@ impl Part {
                 | Part::Core { .. }
                 | Part::Bipolar { .. }
                 | Part::Transconductor { .. }
+                | Part::Ota { .. }
                 | Part::Adjustable {
                     kind: Adjust::RealtimeResistor,
                     ..
@@ -1200,6 +1331,7 @@ impl Part {
             Part::Core { .. } => "core",
             Part::Bipolar { .. } => "transistor",
             Part::Transconductor { .. } => "transconductor",
+            Part::Ota { .. } => "OTA",
             Part::OpAmp { .. } => "op-amp",
             Part::LinearOpAmp { .. } => "linear op-amp",
             Part::Transformer { .. } => "transformer",
@@ -1361,13 +1493,22 @@ impl Netlist {
     /// amplifier remains one electrical circuit while the delayed tank pickup
     /// re-enters at the recovery-grid jack.
     pub fn aux_input(&mut self, node: &str, series: f64) -> usize {
+        self.aux_input_at(node, series, 0.0)
+    }
+
+    /// The same, from something standing at a direct voltage of its own:
+    /// what is set at runtime rides on `bias`, which the operating point is
+    /// solved with. For a source that is not at rest at zero -- a bucket
+    /// brigade's output stands at the brigade's own level -- so that nothing
+    /// steps when the circuit starts from its operating point.
+    pub fn aux_input_at(&mut self, node: &str, series: f64, bias: f64) -> usize {
         let node = self.pin(node);
         let slot = self.aux_inputs;
         self.aux_inputs += 1;
         self.parts.push(Part::Input {
             node,
             series,
-            bias: 0.0,
+            bias,
             source: slot + 1,
         });
         slot
@@ -1452,6 +1593,40 @@ impl Netlist {
             reference,
             gm,
             limit,
+        });
+        self
+    }
+
+    /// An operational transconductance amplifier: non-inverting and
+    /// inverting inputs, the current output, the amplifier-bias pin, and the
+    /// V+ and V- supply pins. See `Part::Ota`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ota(
+        &mut self,
+        plus: &str,
+        minus: &str,
+        out: &str,
+        bias: &str,
+        pos: &str,
+        neg: &str,
+        spec: OtaSpec,
+    ) -> &mut Self {
+        let (plus, minus, out, bias, pos, neg) = (
+            self.pin(plus),
+            self.pin(minus),
+            self.pin(out),
+            self.pin(bias),
+            self.pin(pos),
+            self.pin(neg),
+        );
+        self.parts.push(Part::Ota {
+            plus,
+            minus,
+            out,
+            bias,
+            pos,
+            neg,
+            spec,
         });
         self
     }
@@ -1702,6 +1877,14 @@ impl Netlist {
                 Part::OpAmp { rail, .. } => rail <= 0.0,
                 Part::LinearOpAmp { .. } => false,
                 Part::Transconductor { gm, limit, .. } => gm <= 0.0 || limit <= 0.0,
+                Part::Ota { spec, .. } => {
+                    spec.bias_saturation <= 0.0
+                        || spec.bias_emission <= 0.0
+                        || spec.input_beta <= 0.0
+                        || spec.top_headroom < 0.0
+                        || spec.bottom_headroom < 0.0
+                        || spec.knee <= 0.0
+                }
                 Part::Transformer { ratio, .. } => ratio <= 0.0,
             };
             if bad {
@@ -2046,4 +2229,23 @@ fn cuthill_mckee(parts: &[Part], nodes: usize) -> Vec<usize> {
         to[node] = position;
     }
     to
+}
+
+#[cfg(test)]
+mod taper_tests {
+    use super::Taper;
+
+    /// A table law is straight between its points and flat beyond them.
+    #[test]
+    fn a_table_law_runs_straight_between_its_points() {
+        const LAW: [(f64, f64); 3] = [(0.0, 0.3), (0.5, 0.4), (1.0, 1.0)];
+        let t = Taper::Table(&LAW);
+        assert_eq!(t.fraction(0.0), 0.3);
+        assert!((t.fraction(0.25) - 0.35).abs() < 1e-12);
+        assert_eq!(t.fraction(0.5), 0.4);
+        assert!((t.fraction(0.75) - 0.7).abs() < 1e-12);
+        assert_eq!(t.fraction(1.0), 1.0);
+        assert_eq!(t.fraction(-1.0), 0.3, "clamped");
+        assert_eq!(Taper::Table(&[]).fraction(0.6), 0.6);
+    }
 }

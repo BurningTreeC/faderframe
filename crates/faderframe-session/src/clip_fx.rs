@@ -9,11 +9,21 @@
 //! chain and all, in one "Clip Effects" step; a render that a newer edit
 //! has overtaken is dropped. Removing every effect gives the clip its
 //! audio back.
+//!
+//! A device can be shown in its own editor window
+//! ([`Session::open_clip_fx_editor`]): the engine hosts an instance of
+//! its slot outside the graph (as it does an album song's inserts), the
+//! session answers for the slot wherever a plugin's owner is asked
+//! ([`Session::clip_fx_slot`]), commands an editor window sends about it
+//! (values, bypass, state, presets) become edits of the chain
+//! ([`Session::clip_fx_commands`]), and what the plugin's own GUI changes
+//! is taken into the chain once it rests — its state and every value it
+//! moved — and rendered.
 
 use crate::render::{self, RenderChannels, RenderJob, RenderRange, RenderSettings};
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_audio_files::WavFormat;
-use faderframe_core::{ChannelLayout, ClipId, ParameterId, TrackId};
+use faderframe_core::{ChannelLayout, ClipId, ParameterId, PluginInstanceId, TrackId};
 use faderframe_project::clip_fx::{ClipEffects, OriginalAudio};
 use faderframe_project::{
     AudioClip, AudioSource, Clip, ClipContent, ClipFades, Command, PluginRef, PluginSlot, Project,
@@ -45,8 +55,29 @@ pub enum ClipFxOp {
         parameter: ParameterId,
         value: f64,
     },
+    /// Drop a parameter's explicit value: the device's own (its state's)
+    /// counts again.
+    ForgetParameter {
+        index: usize,
+        parameter: ParameterId,
+    },
+    /// A device's whole state and explicit values (a preset).
+    SetState {
+        index: usize,
+        state: Option<String>,
+        parameters: Vec<SavedParameter>,
+    },
     /// Every effect off: the clip's audio back.
     Clear,
+}
+
+/// A device shown in its own editor window: its clip, and when its GUI
+/// last changed something not yet taken into the chain.
+struct Editor {
+    clip: ClipId,
+    touched: Option<Instant>,
+    /// Its state was asked for (a sandboxed plugin answers later).
+    asked: bool,
 }
 
 struct Pending {
@@ -73,6 +104,10 @@ pub(crate) struct ClipFxState {
     infos: HashMap<String, Vec<faderframe_plugin_host::ParameterInfo>>,
     /// The clip the editor shows.
     pub(crate) shown: Option<ClipId>,
+    /// Devices in editor windows of their own, by slot.
+    editors: HashMap<PluginInstanceId, Editor>,
+    /// The session revision the editors' instances were last synced at.
+    synced: u64,
 }
 
 fn key(p: &PluginRef) -> String {
@@ -179,10 +214,9 @@ impl Session {
                 parameter,
                 value,
             } if index < chain.len() => {
+                // Explicit values are applied after the state: it stays
+                // (what the device's own editor set is kept).
                 let slot = &mut chain[index];
-                // A device's state would override the value: its
-                // parameters are what it is set by here.
-                slot.state = None;
                 match slot.parameters.iter_mut().find(|p| p.id == parameter) {
                     Some(p) => p.value = value,
                     None => slot.parameters.push(SavedParameter {
@@ -190,6 +224,17 @@ impl Session {
                         value,
                     }),
                 }
+            }
+            ClipFxOp::ForgetParameter { index, parameter } if index < chain.len() => {
+                chain[index].parameters.retain(|p| p.id != parameter);
+            }
+            ClipFxOp::SetState {
+                index,
+                state,
+                parameters,
+            } if index < chain.len() => {
+                chain[index].state = state;
+                chain[index].parameters = parameters;
             }
             ClipFxOp::Clear => chain.clear(),
             _ => return Ok(()),
@@ -220,6 +265,294 @@ impl Session {
         Ok(())
     }
 
+    /// Show device `index` of `clip`'s chain in its own editor window
+    /// (its GUI, or the generic one when `generic` or it has none).
+    pub(crate) fn open_clip_fx_editor(
+        &mut self,
+        clip: ClipId,
+        index: usize,
+        generic: bool,
+    ) -> Result<()> {
+        let Some(slot) = self.clip_fx_chain(clip).get(index).cloned() else {
+            return Err(SessionError::Other("no such clip effect".into()));
+        };
+        let track = self
+            .project
+            .clip(clip)
+            .map(|c| c.track)
+            .ok_or_else(|| SessionError::Other(format!("no clip {clip}")))?;
+        if !self.engine.host_plugin(&slot) {
+            return Err(SessionError::Other(format!(
+                "{} could not be loaded",
+                slot.plugin.name
+            )));
+        }
+        // Hosted before (its window closed since): what the chain says now.
+        self.engine.sync_plugin_slot(&slot);
+        self.clip_fx.editors.entry(slot.id).or_insert(Editor {
+            clip,
+            touched: None,
+            asked: false,
+        });
+        self.engine
+            .keep_plugins(self.clip_fx.editors.keys().copied().collect());
+        self.ui_requests.push(crate::UiRequest::PluginEditor {
+            track,
+            plugin: slot.id,
+            generic,
+        });
+        self.revision += 1;
+        Ok(())
+    }
+
+    /// A device in an editor window of its own: its clip, its place in the
+    /// chain and its slot (as being edited).
+    pub fn clip_fx_slot(&self, plugin: PluginInstanceId) -> Option<(ClipId, usize, &PluginSlot)> {
+        let clip = self.clip_fx.editors.get(&plugin)?.clip;
+        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&clip) {
+            Some(p) => &p.chain,
+            None => &self.project.clip(clip)?.as_audio()?.effects.as_ref()?.chain,
+        };
+        chain
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.id == plugin)
+            .map(|(i, s)| (clip, i, s))
+    }
+
+    /// A device's name as the views show it, for one in a clip's chain.
+    pub(crate) fn clip_fx_device_name(&self, plugin: PluginInstanceId) -> Option<String> {
+        let (clip, _, slot) = self.clip_fx_slot(plugin)?;
+        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&clip) {
+            Some(p) => &p.chain,
+            None => &self.project.clip(clip)?.as_audio()?.effects.as_ref()?.chain,
+        };
+        Some(faderframe_project::device_name(chain, slot))
+    }
+
+    /// The chain edits a command about devices in editor windows of their
+    /// own stands for (editor windows send track commands; device editors
+    /// batch several values). `None` when it names anything else.
+    pub(crate) fn clip_fx_commands(&self, cmd: &Command) -> Option<Vec<(ClipId, ClipFxOp)>> {
+        if self.clip_fx.editors.is_empty() {
+            return None;
+        }
+        match cmd {
+            Command::Batch { commands, .. } if !commands.is_empty() => commands
+                .iter()
+                .map(|c| self.clip_fx_commands(c))
+                .collect::<Option<Vec<_>>>()
+                .map(|v| v.into_iter().flatten().collect()),
+            _ => self.clip_fx_command(cmd).map(|e| vec![e]),
+        }
+    }
+
+    /// The chain edit one command about a device in an editor window of
+    /// its own stands for.
+    fn clip_fx_command(&self, cmd: &Command) -> Option<(ClipId, ClipFxOp)> {
+        let (plugin, op): (_, Box<dyn Fn(usize) -> ClipFxOp>) = match cmd {
+            Command::SetPluginParameter {
+                plugin,
+                parameter,
+                value,
+                ..
+            } => {
+                let (parameter, value) = (*parameter, *value);
+                (
+                    *plugin,
+                    Box::new(move |index| match value {
+                        Some(value) => ClipFxOp::SetParameter {
+                            index,
+                            parameter,
+                            value,
+                        },
+                        None => ClipFxOp::ForgetParameter { index, parameter },
+                    }),
+                )
+            }
+            Command::SetPluginBypass { plugin, bypass, .. } => {
+                let bypass = *bypass;
+                (
+                    *plugin,
+                    Box::new(move |index| ClipFxOp::Bypass(index, bypass)),
+                )
+            }
+            Command::SetPluginState {
+                plugin,
+                state,
+                parameters,
+                ..
+            } => {
+                let (state, parameters) = (state.clone(), parameters.clone());
+                (
+                    *plugin,
+                    Box::new(move |index| ClipFxOp::SetState {
+                        index,
+                        state: state.clone(),
+                        parameters: parameters.clone(),
+                    }),
+                )
+            }
+            _ => return None,
+        };
+        let (clip, index, _) = self.clip_fx_slot(plugin)?;
+        Some((clip, op(index)))
+    }
+
+    /// Moves made in a device's own GUI: those of devices in editor
+    /// windows of their own are noted (taken in once they rest), the
+    /// others are handed back.
+    pub(crate) fn clip_fx_editor_edits(
+        &mut self,
+        edits: Vec<(PluginInstanceId, faderframe_plugin_host::EditorEdit)>,
+    ) -> Vec<(PluginInstanceId, faderframe_plugin_host::EditorEdit)> {
+        if self.clip_fx.editors.is_empty() {
+            return edits;
+        }
+        edits
+            .into_iter()
+            .filter(|(plugin, _)| !self.note_clip_fx_touched(*plugin))
+            .collect()
+    }
+
+    /// A device in an editor window of its own changed (its GUI moved a
+    /// value, its state is dirty): true when it is one.
+    pub(crate) fn note_clip_fx_touched(&mut self, plugin: PluginInstanceId) -> bool {
+        match self.clip_fx.editors.get_mut(&plugin) {
+            Some(e) => {
+                e.touched = Some(Instant::now());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Per tick: instances of devices gone from their chains go; instances
+    /// follow their slots (undo, the view's bars); what a device's GUI
+    /// changed is taken into its chain once it rests.
+    fn tick_clip_fx_editors(&mut self) {
+        if self.clip_fx.editors.is_empty() {
+            return;
+        }
+        let gone: Vec<PluginInstanceId> = self
+            .clip_fx
+            .editors
+            .keys()
+            .filter(|id| self.clip_fx_slot(**id).is_none())
+            .copied()
+            .collect();
+        for id in &gone {
+            self.clip_fx.editors.remove(id);
+            self.engine.release_plugin(*id);
+        }
+        if !gone.is_empty() {
+            self.engine
+                .keep_plugins(self.clip_fx.editors.keys().copied().collect());
+        }
+        if self.clip_fx.synced != self.revision {
+            self.clip_fx.synced = self.revision;
+            let slots: Vec<PluginSlot> = self
+                .clip_fx
+                .editors
+                .keys()
+                .filter_map(|id| self.clip_fx_slot(*id).map(|(_, _, s)| s.clone()))
+                .collect();
+            for slot in &slots {
+                self.engine.sync_plugin_slot(slot);
+            }
+        }
+        let rested: Vec<PluginInstanceId> = self
+            .clip_fx
+            .editors
+            .iter()
+            .filter(|(_, e)| !e.asked && e.touched.is_some_and(|t| t.elapsed() >= SETTLE))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in rested {
+            if let Some(e) = self.clip_fx.editors.get_mut(&id) {
+                e.touched = None;
+            }
+            if self.engine.request_plugin_state(id) {
+                if let Some(e) = self.clip_fx.editors.get_mut(&id) {
+                    e.asked = true;
+                }
+            } else {
+                let state = self.engine.plugin_state(id);
+                self.take_clip_fx_state(id, state);
+            }
+        }
+        let asked: Vec<PluginInstanceId> = self
+            .clip_fx
+            .editors
+            .iter()
+            .filter(|(_, e)| e.asked)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in asked {
+            let answer = self.engine.take_plugin_state(id);
+            if answer.is_none() && !self.engine.plugin_failed(id) {
+                continue;
+            }
+            if let Some(e) = self.clip_fx.editors.get_mut(&id) {
+                e.asked = false;
+            }
+            if let Some(state) = answer {
+                self.take_clip_fx_state(id, state);
+            }
+        }
+    }
+
+    /// Put what a device's own GUI changed into its chain: its state, and
+    /// every value it moved (explicit values are applied after the state,
+    /// so they must follow; the view shows them), then render.
+    fn take_clip_fx_state(&mut self, plugin: PluginInstanceId, state: Option<String>) {
+        let Some((clip, index, _)) = self.clip_fx_slot(plugin) else {
+            return;
+        };
+        let mut chain = self.clip_fx_chain(clip);
+        let Some(slot) = chain.get_mut(index) else {
+            return;
+        };
+        let before = (slot.state.clone(), slot.parameters.clone());
+        if let Some(state) = &state {
+            slot.state = Some(state.clone());
+            self.engine.note_plugin_state(plugin, state);
+        }
+        let infos = self.clip_fx_parameters(&slot.plugin);
+        for info in infos {
+            let Some(v) = self.engine.plugin_parameter_value(plugin, info.id) else {
+                continue;
+            };
+            match slot.parameters.iter_mut().find(|p| p.id == info.id) {
+                Some(p) => p.value = v,
+                None if (v - info.default).abs() > 1e-9 => slot.parameters.push(SavedParameter {
+                    id: info.id,
+                    value: v,
+                }),
+                None => continue,
+            }
+            self.engine.note_plugin_parameter(plugin, info.id, v);
+        }
+        if (slot.state.clone(), slot.parameters.clone()) == before {
+            return;
+        }
+        self.clip_fx.generation += 1;
+        let generation = self.clip_fx.generation;
+        // It rested already: render at once.
+        let changed = Instant::now()
+            .checked_sub(SETTLE)
+            .unwrap_or_else(Instant::now);
+        self.clip_fx.pending.insert(
+            clip,
+            Pending {
+                chain,
+                changed,
+                generation,
+            },
+        );
+        self.revision += 1;
+    }
+
     /// Render a clip's chain again (its original audio changed).
     pub(crate) fn rerender_clip_fx(&mut self, clip: ClipId) {
         let chain = self.clip_fx_chain(clip);
@@ -241,6 +574,7 @@ impl Session {
     /// Start renders of chains that have rested; place the finished ones
     /// (from the session tick).
     pub(crate) fn poll_clip_fx(&mut self) {
+        self.tick_clip_fx_editors();
         let ready: Vec<ClipId> = self
             .clip_fx
             .pending
@@ -446,5 +780,70 @@ impl Session {
             },
         ];
         self.batch("Clip Effects", cmds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use faderframe_engine::EngineConfig;
+    use faderframe_project::PluginFormat;
+
+    /// What a device's own GUI changes reaches its chain once it rests —
+    /// the moved value made explicit, so the render and the view have it —
+    /// and the instance is not pushed back to the old value meanwhile.
+    #[test]
+    fn what_a_devices_own_gui_changes_reaches_the_chain() {
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let clip = s
+            .project()
+            .tracks
+            .iter()
+            .find(|t| t.name == "Pad")
+            .unwrap()
+            .clips[0];
+        let utility = PluginRef {
+            format: PluginFormat::Builtin,
+            id: faderframe_core::builtin::GAIN.into(),
+            name: "Utility".into(),
+        };
+        s.edit_clip_fx(clip, ClipFxOp::Add(utility)).unwrap();
+        s.open_clip_fx_editor(clip, 0, false).unwrap();
+        s.poll_clip_fx();
+        let mut slot = s.clip_fx_chain(clip)[0].clone();
+        assert!(slot.parameters.is_empty());
+        // The GUI turns the gain down (as an editor does: on the instance).
+        slot.parameters.push(SavedParameter {
+            id: ParameterId(0),
+            value: -3.0,
+        });
+        s.engine.sync_plugin_slot(&slot);
+        assert!(s.note_clip_fx_touched(slot.id));
+        s.poll_clip_fx();
+        assert!(
+            s.clip_fx_chain(clip)[0].parameters.is_empty(),
+            "not before it rests"
+        );
+        std::thread::sleep(SETTLE + Duration::from_millis(20));
+        s.poll_clip_fx();
+        let taken = &s.clip_fx_chain(clip)[0];
+        assert_eq!(
+            taken
+                .parameters
+                .iter()
+                .find(|p| p.id == ParameterId(0))
+                .map(|p| p.value),
+            Some(-3.0)
+        );
+        assert!(taken.state.is_some(), "its state too");
+        // Synced again: the instance keeps the value.
+        s.revision += 1;
+        s.poll_clip_fx();
+        assert_eq!(
+            s.engine.plugin_parameter_value(slot.id, ParameterId(0)),
+            Some(-3.0)
+        );
     }
 }

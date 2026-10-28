@@ -147,6 +147,10 @@ define_id!(
     /// A scratch pad: another arrangement of the project's tracks.
     ScratchPadId, "pad#"
 );
+define_id!(
+    /// A reference track (a finished record compared with the mix).
+    ReferenceId, "ref#"
+);
 
 /// Identifier of a parameter *within* a processor or plugin.
 ///

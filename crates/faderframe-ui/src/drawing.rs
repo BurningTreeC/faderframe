@@ -3,13 +3,16 @@
 //! CPU). GTK reads it once, from `GSK_RENDERER`, so it is chosen before GTK
 //! starts and applies from the next start.
 //!
-//! A graphics driver that crashes under GTK's renderer (GTK 4.22 with Mesa
-//! 26.1's `libgallium` copying past a buffer GTK uploads, #22) takes the
-//! program down while it draws. When the last run crashed inside the
-//! graphics stack and the renderer is GTK's choice, this run draws in
-//! software instead, kept as the preference, and the crash dialog says so.
+//! A graphics driver that crashes under GTK's renderer takes the program
+//! down while it draws. Mesa's crocus, the driver of Intel's graphics from
+//! the GMA X3000 to Haswell, does (#22: Mesa 26.1 growing its shader cache
+//! while GTK uploads a texture), so on those chips GTK's choice is software.
+//! When the last run crashed inside the graphics stack and the renderer is
+//! GTK's choice, this run draws in software instead, kept as the
+//! preference, and the crash dialog says so.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The renderers offered: preference id, label, `GSK_RENDERER` value.
@@ -30,6 +33,16 @@ pub fn switched_to_software() -> bool {
     SWITCHED.load(Ordering::Relaxed)
 }
 
+/// This start draws in software, the renderer being GTK's choice, because
+/// Mesa's crocus driver draws with the graphics chip: the chip's family.
+static CROCUS_CHIP: OnceLock<&'static str> = OnceLock::new();
+
+/// The family of the graphics chip this start draws in software for (see
+/// [`CROCUS`]), the renderer being GTK's choice.
+pub fn software_for_chip() -> Option<&'static str> {
+    CROCUS_CHIP.get().copied()
+}
+
 /// Whether GTK draws in software (no GPU textures reach it: frames go to
 /// it as pixels).
 pub fn software() -> bool {
@@ -37,9 +50,9 @@ pub fn software() -> bool {
 }
 
 /// Choose GTK's renderer: `GSK_RENDERER` when set, else the preference,
-/// else software after a crash in the graphics driver. Call it first in
-/// `main` (the program's own run, not a helper's), before any thread
-/// exists.
+/// else software after a crash in the graphics driver or on a chip Mesa's
+/// crocus driver draws with. Call it first in `main` (the program's own
+/// run, not a helper's), before any thread exists.
 pub fn prepare_renderer() {
     if std::env::var_os("GSK_RENDERER").is_some() {
         return;
@@ -52,7 +65,14 @@ pub fn prepare_renderer() {
         }
         SWITCHED.store(true, Ordering::Relaxed);
     }
-    let Some((_, _, value)) = RENDERERS.iter().find(|r| r.0 == prefs.renderer) else {
+    let mut chosen = prefs.renderer.as_str();
+    if chosen.is_empty()
+        && let Some(family) = crocus_family(&chips())
+    {
+        let _ = CROCUS_CHIP.set(family);
+        chosen = "software";
+    }
+    let Some((_, _, value)) = RENDERERS.iter().find(|r| r.0 == chosen) else {
         return;
     };
     if !value.is_empty() {
@@ -60,6 +80,152 @@ pub fn prepare_renderer() {
         // nothing reads the environment meanwhile.
         unsafe { std::env::set_var("GSK_RENDERER", value) };
     }
+}
+
+/// Intel's graphics chips Mesa draws with its crocus driver, by family
+/// (PCI device ids from Mesa's `include/pci_ids/crocus_pci_ids.h`, which
+/// Mesa's loader maps to crocus).
+const CROCUS: [(&str, &[u16]); 8] = [
+    (
+        "GMA X3000",
+        &[0x29a2, 0x2992, 0x2982, 0x2972, 0x2a02, 0x2a12],
+    ),
+    (
+        "GMA 4500",
+        &[0x2a42, 0x2e02, 0x2e12, 0x2e22, 0x2e32, 0x2e42, 0x2e92],
+    ),
+    ("Ironlake", &[0x0042, 0x0046]),
+    (
+        "Sandy Bridge",
+        &[0x0102, 0x0112, 0x0122, 0x0106, 0x0116, 0x0126, 0x010a],
+    ),
+    (
+        "Ivy Bridge",
+        &[0x0152, 0x0162, 0x0156, 0x0166, 0x015a, 0x016a],
+    ),
+    (
+        "Haswell",
+        &[
+            0x0402, 0x0412, 0x0422, 0x0406, 0x0416, 0x0426, 0x040a, 0x041a, 0x042a, 0x040b, 0x041b,
+            0x042b, 0x040e, 0x041e, 0x042e, 0x0c02, 0x0c12, 0x0c22, 0x0c06, 0x0c16, 0x0c26, 0x0c0a,
+            0x0c1a, 0x0c2a, 0x0c0b, 0x0c1b, 0x0c2b, 0x0c0e, 0x0c1e, 0x0c2e, 0x0a02, 0x0a12, 0x0a22,
+            0x0a06, 0x0a16, 0x0a26, 0x0a0a, 0x0a1a, 0x0a2a, 0x0a0b, 0x0a1b, 0x0a2b, 0x0a0e, 0x0a1e,
+            0x0a2e, 0x0d02, 0x0d12, 0x0d22, 0x0d06, 0x0d16, 0x0d26, 0x0d0a, 0x0d1a, 0x0d2a, 0x0d0b,
+            0x0d1b, 0x0d2b, 0x0d0e, 0x0d1e, 0x0d2e,
+        ],
+    ),
+    ("Bay Trail", &[0x0f31, 0x0f32, 0x0f33, 0x0157, 0x0155]),
+    ("Cherry View", &[0x22b0, 0x22b1, 0x22b2, 0x22b3]),
+];
+
+/// A graphics chip of the system (Linux: `/sys/class/drm/card<n>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Chip {
+    /// `card<n>`.
+    pub card: String,
+    pub vendor: u16,
+    pub device: u16,
+    /// The kernel's driver (`i915`, `amdgpu`, …), if it says.
+    pub driver: Option<String>,
+    /// A display is connected to it.
+    pub connected: bool,
+}
+
+impl Chip {
+    /// Its family, when Mesa's crocus driver draws with it.
+    pub fn crocus_family(&self) -> Option<&'static str> {
+        if self.vendor != 0x8086 {
+            return None;
+        }
+        CROCUS
+            .iter()
+            .find(|(_, ids)| ids.contains(&self.device))
+            .map(|(family, _)| *family)
+    }
+}
+
+/// The system's graphics chips (none known outside Linux).
+pub(crate) fn chips() -> Vec<Chip> {
+    if cfg!(target_os = "linux") {
+        chips_in(Path::new("/sys/class/drm"))
+    } else {
+        Vec::new()
+    }
+}
+
+/// The graphics chips in `drm` (a `/sys/class/drm`), by card.
+fn chips_in(drm: &Path) -> Vec<Chip> {
+    let Ok(entries) = std::fs::read_dir(drm) else {
+        return Vec::new();
+    };
+    let names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let id = |path: std::path::PathBuf| {
+        let text = std::fs::read_to_string(path).ok()?;
+        u16::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    };
+    let mut chips: Vec<Chip> = names
+        .iter()
+        .filter(|n| {
+            n.strip_prefix("card")
+                .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .filter_map(|card| {
+            let device = drm.join(card).join("device");
+            let connector = format!("{card}-");
+            Some(Chip {
+                vendor: id(device.join("vendor"))?,
+                device: id(device.join("device"))?,
+                driver: std::fs::read_link(device.join("driver"))
+                    .ok()
+                    .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())),
+                connected: names.iter().any(|n| {
+                    n.starts_with(&connector)
+                        && std::fs::read_to_string(drm.join(n).join("status"))
+                            .is_ok_and(|s| s.trim() == "connected")
+                }),
+                card: card.clone(),
+            })
+        })
+        .collect();
+    chips.sort_by(|a, b| a.card.cmp(&b.card));
+    chips
+}
+
+/// The family of the crocus chip GTK draws with, if it is one: among the
+/// chips with a display connected (all of them when none says so).
+fn crocus_family(chips: &[Chip]) -> Option<&'static str> {
+    let any_connected = chips.iter().any(|c| c.connected);
+    chips
+        .iter()
+        .filter(|c| c.connected || !any_connected)
+        .find_map(Chip::crocus_family)
+}
+
+/// The graphics chips for a crash report's header (`None`: none known).
+pub(crate) fn chips_line() -> Option<String> {
+    let chips = chips();
+    (!chips.is_empty()).then(|| {
+        chips
+            .iter()
+            .map(|c| {
+                let mut s = format!("{} {:04x}:{:04x}", c.card, c.vendor, c.device);
+                if let Some(d) = &c.driver {
+                    s.push_str(&format!(" {d}"));
+                }
+                if let Some(f) = c.crocus_family() {
+                    s.push_str(&format!(" (crocus, {f})"));
+                }
+                if c.connected {
+                    s.push_str(", display");
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
 }
 
 /// Whether a run that did not close left a crash report in `dir` whose
@@ -136,6 +302,63 @@ native backtrace (module(+offset) [address]):
         let ours = GALLIUM.replace("libgallium-26.1.6-1~bpo13+1.so", "libfoo.so");
         assert!(!in_the_graphics_driver(&ours));
         assert!(!in_the_graphics_driver("PANIC at libgallium"));
+    }
+
+    /// A fake `/sys/class/drm`: per card (vendor, device, driver,
+    /// connector statuses).
+    #[cfg(unix)]
+    fn drm(name: &str, cards: &[(u16, u16, &str, &[&str])]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ff-drm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (k, (vendor, device, driver, statuses)) in cards.iter().enumerate() {
+            let card = dir.join(format!("card{k}"));
+            let dev = card.join("device");
+            std::fs::create_dir_all(dev.join("drivers").join(driver)).unwrap();
+            std::fs::write(dev.join("vendor"), format!("0x{vendor:04x}\n")).unwrap();
+            std::fs::write(dev.join("device"), format!("0x{device:04x}\n")).unwrap();
+            std::os::unix::fs::symlink(dev.join("drivers").join(driver), dev.join("driver"))
+                .unwrap();
+            for (n, status) in statuses.iter().enumerate() {
+                let c = dir.join(format!("card{k}-HDMI-A-{n}"));
+                std::fs::create_dir_all(&c).unwrap();
+                std::fs::write(c.join("status"), format!("{status}\n")).unwrap();
+            }
+        }
+        std::fs::create_dir_all(dir.join("renderD128")).unwrap();
+        dir
+    }
+
+    /// Haswell graphics (#22's crocus) draw in software; another chip
+    /// driving the display, or a newer Intel one, do not.
+    #[test]
+    #[cfg(unix)]
+    fn crocus_chips_are_found_where_the_display_is() {
+        let haswell = drm("haswell", &[(0x8086, 0x0416, "i915", &["connected"])]);
+        let chips = chips_in(&haswell);
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].driver.as_deref(), Some("i915"));
+        assert_eq!(crocus_family(&chips), Some("Haswell"));
+        // A discrete card drives the display, the old chip idles.
+        let beside = drm(
+            "beside",
+            &[
+                (0x8086, 0x0162, "i915", &["disconnected"]),
+                (0x1002, 0x1638, "amdgpu", &["connected", "disconnected"]),
+            ],
+        );
+        let chips = chips_in(&beside);
+        assert_eq!(chips[0].crocus_family(), Some("Ivy Bridge"));
+        assert_eq!(crocus_family(&chips), None);
+        // No connector says: the chip is all there is to go by.
+        let headless = drm("headless", &[(0x8086, 0x0102, "i915", &[])]);
+        assert_eq!(crocus_family(&chips_in(&headless)), Some("Sandy Bridge"));
+        // Newer Intel graphics (iris), and no such folder.
+        let iris = drm("iris", &[(0x8086, 0x9a49, "i915", &["connected"])]);
+        assert_eq!(crocus_family(&chips_in(&iris)), None);
+        assert!(chips_in(&haswell.join("nothing")).is_empty());
+        for d in [haswell, beside, headless, iris] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     /// A run that did not close with such a report is found (the marker

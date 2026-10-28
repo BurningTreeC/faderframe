@@ -8,7 +8,9 @@
 //! Analytic slopes share intermediate values with the current equations, so
 //! Newton does not need repeated curve evaluations to estimate derivatives.
 
-use super::netlist::{BipolarSpec, CoreSpec, DiodeSpec, JfetSpec, PentodeSpec, TriodeSpec, GROUND};
+use super::netlist::{
+    BipolarSpec, CoreSpec, DiodeSpec, JfetSpec, OtaSpec, PentodeSpec, TriodeSpec, GROUND,
+};
 
 /// Thermal voltage at room temperature.
 const VT: f64 = 0.025_852;
@@ -2598,6 +2600,314 @@ impl Device for Transconductor {
     }
 }
 
+/// An operational transconductance amplifier: RCA's CA3080 and its family.
+///
+/// A long-tailed pair whose tail is not a resistor but a mirror of the current
+/// pushed into the amplifier-bias pin, `I_ABC`, and whose two collector
+/// currents are mirrored to one output: one sourced from V+, the other sunk to
+/// V-. What comes out is a current,
+///
+/// ```text
+/// Iout = I_ABC tanh((V+ - V-) / 2 VT)
+/// ```
+///
+/// so the transconductance at the origin is `I_ABC / 2 VT` -- 19.3 mS per mA
+/// at 25 degrees, the data sheet's 9600 uS at 500 uA -- and the most it
+/// can deliver is `I_ABC` either way. A gain set by a current is the whole
+/// point of the part: it is what every OTA compressor, filter and VCA is built
+/// round.
+///
+/// Every terminal carries what the part really draws, because the circuits
+/// round it notice:
+///
+/// - **The bias pin** is a diode-connected transistor to V-. `I_ABC` is its
+///   current, solved like any junction, so the pin sits one diode drop above
+///   V- -- 0.71 V at 500 uA -- and whatever drives it through a resistor
+///   loses that drop, which is how a real circuit sets the current. Its step
+///   is held by the same logarithmic junction limiter as a diode's.
+/// - **The inputs** each draw their transistor's share of the tail over the
+///   pair's beta: about I_ABC / 250 at rest. On the megohm divider of a pedal
+///   that is a volt that moves as the gain does, which is why such pedals
+///   carry a trimmer to balance the two inputs' bias.
+/// - **The output** saturates against the supply pins rather than an ideal
+///   rail: each half is the output transistor of a current mirror, and as the
+///   output nears the pin it is sourcing from, that transistor runs out of
+///   collector and gives its current up over `knee` volts. Pushed past it,
+///   the transistor conducts the other way, which holds the node there.
+/// - **The supply pins** carry the part's own consumption -- the mirrors run
+///   on twice `I_ABC`, the data sheet's amplifier supply current -- so a
+///   supply with any resistance in it moves with the gain, as a battery does.
+///
+/// Like `Transconductor`, the slope of the pair's `tanh` is taken as the
+/// chord through the origin once it is past its knee: the tangent of a
+/// saturated pair is flat, and inside a fast feedback loop a flat tangent
+/// throws Newton from one rail to the other.
+pub struct Ota {
+    plus: usize,
+    minus: usize,
+    out: usize,
+    bias: usize,
+    pos: usize,
+    neg: usize,
+    spec: OtaSpec,
+    scale: f64,
+    inv_scale: f64,
+    critical: f64,
+    inv_beta: f64,
+    /// The bias pin above V-, as last linearised: the junction limiter's
+    /// reference.
+    junction: f64,
+    /// The input difference and the output above V-, for `moved`.
+    difference: f64,
+    output: f64,
+    delta: f64,
+    /// Whether the junction limiter held the last step back.
+    clamped: bool,
+}
+
+/// The currents an OTA passes at one point and their slopes there, shared by
+/// the stamp and the tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OtaCurrents {
+    /// Into the bias pin, out of V-.
+    pub bias: f64,
+    /// Into each input, out of V-.
+    pub plus: f64,
+    pub minus: f64,
+    /// Out of V+ into V- inside the part: the mirrors' own current.
+    pub supply: f64,
+    /// Out of V+ into the output, and out of the output into V-.
+    pub source: f64,
+    pub sink: f64,
+}
+
+impl OtaCurrents {
+    /// What leaves through the output pin.
+    pub fn output(&self) -> f64 {
+        self.source - self.sink
+    }
+}
+
+/// How much of a mirror's current is left `room` volts from where its output
+/// transistor saturates: all of it well inside, none at the edge, and past
+/// it the transistor conducting backwards. `(fraction, slope)`; continuous
+/// with its slope at the edge.
+#[inline]
+fn compliance(room: f64, knee: f64) -> (f64, f64) {
+    if room > 0.0 {
+        let fall = (-room / knee).exp();
+        (1.0 - fall, fall / knee)
+    } else {
+        (room / knee, 1.0 / knee)
+    }
+}
+
+impl Ota {
+    pub fn new(
+        plus: usize,
+        minus: usize,
+        out: usize,
+        bias: usize,
+        pos: usize,
+        neg: usize,
+        spec: OtaSpec,
+    ) -> Self {
+        let scale = spec.bias_emission * VT;
+        Self {
+            plus,
+            minus,
+            out,
+            bias,
+            pos,
+            neg,
+            spec,
+            scale,
+            inv_scale: 1.0 / scale,
+            critical: scale * (scale / (std::f64::consts::SQRT_2 * spec.bias_saturation)).ln(),
+            inv_beta: 1.0 / spec.input_beta,
+            junction: 0.0,
+            difference: 0.0,
+            output: 0.0,
+            delta: 0.0,
+            clamped: false,
+        }
+    }
+
+    /// The bias pin's junction limiter: the diode's (`Diode::limit_junction`)
+    /// on the bias pin's own scale. `(voltage, held)`.
+    fn limit_junction(&self, wanted: f64) -> (f64, bool) {
+        let old = self.junction;
+        let scale = self.scale;
+        if wanted > self.critical && (wanted - old).abs() > 2.0 * scale {
+            let guess = if old > 0.0 {
+                let arg = 1.0 + (wanted - old) * self.inv_scale;
+                if arg > 0.0 {
+                    old + scale * arg.ln()
+                } else {
+                    self.critical
+                }
+            } else {
+                scale * (wanted * self.inv_scale).ln()
+            };
+            (guess, true)
+        } else {
+            (wanted, false)
+        }
+    }
+
+    /// The amplifier bias current for the bias pin `volts` above V-, and its
+    /// slope.
+    #[inline]
+    fn tail(&self, volts: f64) -> (f64, f64) {
+        let x = volts * self.inv_scale;
+        if x >= CLAMP {
+            (self.spec.bias_saturation * (CLAMP.exp() - 1.0), 0.0)
+        } else {
+            let e = x.exp();
+            (
+                self.spec.bias_saturation * (e - 1.0),
+                self.spec.bias_saturation * e * self.inv_scale,
+            )
+        }
+    }
+
+    /// Every current the part passes with its bias pin `bias` volts above V-,
+    /// `difference` volts between its inputs (non-inverting less inverting),
+    /// and its output `top` volts below V+ and `bottom` volts above V-.
+    pub fn currents(&self, bias: f64, difference: f64, top: f64, bottom: f64) -> OtaCurrents {
+        let (tail, _) = self.tail(bias);
+        let t = (difference / (2.0 * VT)).tanh();
+        let (up, down) = (0.5 * (1.0 + t), 0.5 * (1.0 - t));
+        let (high, _) = compliance(top - self.spec.top_headroom, self.spec.knee);
+        let (low, _) = compliance(bottom - self.spec.bottom_headroom, self.spec.knee);
+        OtaCurrents {
+            bias: tail + GMIN * bias,
+            plus: tail * up * self.inv_beta,
+            minus: tail * down * self.inv_beta,
+            supply: tail * (1.0 + down),
+            source: tail * up * high,
+            sink: tail * down * low,
+        }
+    }
+
+    /// The transconductance at the origin for an amplifier bias current.
+    pub fn transconductance(i_abc: f64) -> f64 {
+        i_abc / (2.0 * VT)
+    }
+}
+
+impl Device for Ota {
+    fn junction(&self) -> bool {
+        true
+    }
+
+    fn footprint(&self, m: &mut Mark) {
+        let (plus, minus, out) = (self.plus, self.minus, self.out);
+        let (bias, pos, neg) = (self.bias, self.pos, self.neg);
+        m.conductance(bias, neg);
+        for (a, b) in [(plus, neg), (minus, neg), (pos, neg), (pos, out), (out, neg)] {
+            m.transconductance(a, b, bias, neg);
+            m.transconductance(a, b, plus, minus);
+        }
+        m.transconductance(pos, out, pos, out);
+        m.transconductance(out, neg, out, neg);
+    }
+
+    fn linearisation(&self) -> Linearisation {
+        Linearisation {
+            at: [self.junction, self.difference, self.output, self.delta],
+            clamped: self.clamped,
+        }
+    }
+
+    fn relinearise(&mut self, saved: Linearisation) {
+        self.junction = saved.at[0];
+        self.difference = saved.at[1];
+        self.output = saved.at[2];
+        self.delta = saved.at[3];
+        self.clamped = saved.clamped;
+    }
+
+    fn stamp(&mut self, s: &mut Stamper, v: &[f64]) {
+        let (bias, held) = self.limit_junction(across(v, self.bias, self.neg));
+        s.junction_held |= held;
+        self.clamped = held;
+        let difference = across(v, self.plus, self.minus);
+        let top = across(v, self.pos, self.out);
+        let bottom = across(v, self.out, self.neg);
+        self.delta = (bias - self.junction)
+            .abs()
+            .max((difference - self.difference).abs())
+            .max((bottom - self.output).abs());
+        self.junction = bias;
+        self.difference = difference;
+        self.output = bottom;
+
+        let (tail, g_tail) = self.tail(bias);
+        let x = difference / (2.0 * VT);
+        let t = x.tanh();
+        // The slope of `(1 + t) / 2` with the input difference: the tangent
+        // on the pair's linear stretch, the chord through the origin beyond
+        // it (see the type's note).
+        let half_slope = if x.abs() < 1.0 {
+            0.25 * (1.0 - t * t) / VT
+        } else {
+            0.5 * t / difference
+        };
+        let (up, down) = (0.5 * (1.0 + t), 0.5 * (1.0 - t));
+        let (high, d_high) = compliance(top - self.spec.top_headroom, self.spec.knee);
+        let (low, d_low) = compliance(bottom - self.spec.bottom_headroom, self.spec.knee);
+        let inv_beta = self.inv_beta;
+
+        let (p, m, o) = (s.locate(self.plus), s.locate(self.minus), s.locate(self.out));
+        let (b, hi, lo) = (s.locate(self.bias), s.locate(self.pos), s.locate(self.neg));
+
+        // The bias pin: a junction, its `GMIN` linear.
+        s.conductance_at(b, lo, g_tail + GMIN);
+        s.current_at(b, lo, tail - g_tail * bias);
+
+        // A current of `tail * side * level` from `from` to `to`, by its
+        // slopes against the bias junction and the input difference: `side`
+        // is one of the pair's shares (or a sum of them), `sign` how it moves
+        // with the difference.
+        let pair = |s: &mut Stamper, from, to, level: f64, side: f64, sign: f64| {
+            let g_bias = g_tail * side * level;
+            let g_diff = sign * tail * half_slope * level;
+            s.transconductance_at(from, to, b, lo, g_bias);
+            s.transconductance_at(from, to, p, m, g_diff);
+            tail * side * level - g_bias * bias - g_diff * difference
+        };
+
+        // The inputs' base currents.
+        let rest = pair(s, p, lo, inv_beta, up, 1.0);
+        s.current_at(p, lo, rest);
+        let rest = pair(s, m, lo, inv_beta, down, -1.0);
+        s.current_at(m, lo, rest);
+        // The mirrors' own current, V+ to V-: the pair's collectors, and the
+        // sink half's feed.
+        let rest = pair(s, hi, lo, 1.0, 1.0 + down, -1.0);
+        s.current_at(hi, lo, rest);
+        // The output: sourced from V+ and sunk to V-, each against its own
+        // pin's compliance.
+        let g_top = tail * up * d_high;
+        s.transconductance_at(hi, o, hi, o, g_top);
+        let rest = pair(s, hi, o, high, up, 1.0) - g_top * top;
+        s.current_at(hi, o, rest);
+        let g_bottom = tail * down * d_low;
+        s.transconductance_at(o, lo, o, lo, g_bottom);
+        let rest = pair(s, o, lo, low, down, -1.0) - g_bottom * bottom;
+        s.current_at(o, lo, rest);
+    }
+
+    fn moved(&self) -> f64 {
+        self.delta
+    }
+
+    fn settled(&self, _tolerance: f64) -> bool {
+        !self.clamped
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Devices, stored inline
 // ---------------------------------------------------------------------------
@@ -2926,6 +3236,29 @@ impl TrialResidual for Transconductor {
     }
 }
 
+impl TrialResidual for Ota {
+    #[inline]
+    fn trial_residual(&mut self, r: &mut ResidualStamper<'_>, v: &[f64], _cache_eval: bool) {
+        let (bias, held) = self.limit_junction(across(v, self.bias, self.neg));
+        r.junction_held |= held;
+        if held {
+            return;
+        }
+        let c = self.currents(
+            bias,
+            across(v, self.plus, self.minus),
+            across(v, self.pos, self.out),
+            across(v, self.out, self.neg),
+        );
+        r.current(self.bias, self.neg, c.bias);
+        r.current(self.plus, self.neg, c.plus);
+        r.current(self.minus, self.neg, c.minus);
+        r.current(self.pos, self.neg, c.supply);
+        r.current(self.pos, self.out, c.source);
+        r.current(self.out, self.neg, c.sink);
+    }
+}
+
 impl TrialResidual for VariableResistor {
     #[inline]
     fn trial_residual(&mut self, r: &mut ResidualStamper<'_>, v: &[f64], _cache_eval: bool) {
@@ -2963,6 +3296,7 @@ pub enum AnyDevice {
     Core(Core),
     Transconductor(Transconductor),
     VariableResistor(VariableResistor),
+    Ota(Ota),
 }
 
 /// A rejected rescue must restore both limiter history and the evaluation
@@ -3042,6 +3376,7 @@ impl AnyDevice {
             (Self::Transconductor(dst), Self::Transconductor(src)) => {
                 dst.relinearise(src.linearisation())
             }
+            (Self::Ota(dst), Self::Ota(src)) => dst.relinearise(src.linearisation()),
             (Self::VariableResistor(dst), Self::VariableResistor(src)) => {
                 dst.ohms = src.ohms;
             }
@@ -3130,6 +3465,7 @@ impl AnyDevice {
             Self::Core(c) => c.trial_residual(r, v, cache_eval),
             Self::Transconductor(t) => t.trial_residual(r, v, cache_eval),
             Self::VariableResistor(vr) => vr.trial_residual(r, v, cache_eval),
+            Self::Ota(o) => o.trial_residual(r, v, cache_eval),
         }
     }
 
@@ -3236,6 +3572,19 @@ impl AnyDevice {
                 t.difference = difference;
             }
             Self::VariableResistor(_) => {}
+            Self::Ota(o) => {
+                let (bias, held) = o.limit_junction(across(v, o.bias, o.neg));
+                let difference = across(v, o.plus, o.minus);
+                let bottom = across(v, o.out, o.neg);
+                o.clamped = held;
+                o.delta = (bias - o.junction)
+                    .abs()
+                    .max((difference - o.difference).abs())
+                    .max((bottom - o.output).abs());
+                o.junction = bias;
+                o.difference = difference;
+                o.output = bottom;
+            }
         }
     }
 }
@@ -3254,6 +3603,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.stamp(s, v),
             AnyDevice::Transconductor(t) => t.stamp(s, v),
             AnyDevice::VariableResistor(r) => r.stamp(s, v),
+            AnyDevice::Ota(o) => o.stamp(s, v),
         }
     }
 
@@ -3270,6 +3620,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.footprint(m),
             AnyDevice::Transconductor(t) => t.footprint(m),
             AnyDevice::VariableResistor(r) => r.footprint(m),
+            AnyDevice::Ota(o) => o.footprint(m),
         }
     }
 
@@ -3286,6 +3637,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.moved(),
             AnyDevice::Transconductor(t) => t.moved(),
             AnyDevice::VariableResistor(r) => r.moved(),
+            AnyDevice::Ota(o) => o.moved(),
         }
     }
 
@@ -3302,6 +3654,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.settled(tolerance),
             AnyDevice::Transconductor(t) => t.settled(tolerance),
             AnyDevice::VariableResistor(r) => r.settled(tolerance),
+            AnyDevice::Ota(o) => o.settled(tolerance),
         }
     }
 
@@ -3318,6 +3671,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.linearisation(),
             AnyDevice::Transconductor(t) => t.linearisation(),
             AnyDevice::VariableResistor(r) => r.linearisation(),
+            AnyDevice::Ota(o) => o.linearisation(),
         }
     }
 
@@ -3334,6 +3688,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.relinearise(saved),
             AnyDevice::Transconductor(t) => t.relinearise(saved),
             AnyDevice::VariableResistor(r) => r.relinearise(saved),
+            AnyDevice::Ota(o) => o.relinearise(saved),
         }
     }
 
@@ -3350,6 +3705,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.advance(),
             AnyDevice::Transconductor(t) => t.advance(),
             AnyDevice::VariableResistor(r) => r.advance(),
+            AnyDevice::Ota(o) => o.advance(),
         }
     }
 
@@ -3372,6 +3728,7 @@ impl Device for AnyDevice {
             AnyDevice::Core(c) => c.switches(),
             AnyDevice::Transconductor(t) => t.switches(),
             AnyDevice::VariableResistor(r) => r.switches(),
+            AnyDevice::Ota(o) => o.switches(),
         }
     }
 
@@ -3388,6 +3745,7 @@ impl Device for AnyDevice {
         match self {
             AnyDevice::Diode(d) => d.junction(),
             AnyDevice::Bipolar(b) => b.junction(),
+            AnyDevice::Ota(o) => o.junction(),
             _ => false,
         }
     }

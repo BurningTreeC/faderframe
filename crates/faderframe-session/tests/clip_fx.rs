@@ -176,3 +176,106 @@ fn an_overtaken_render_is_dropped() {
     assert!((peak - want).abs() < 1e-3, "{peak} vs {want}");
     assert_eq!(s.history_steps().0.len(), 2, "import and one render");
 }
+
+/// A clip effect opens in its own editor window: the session hosts it,
+/// answers for it as a plugin's owner, and turns the commands an editor
+/// window sends about it (values, bypass) into edits of the clip's chain,
+/// rendered as any other; a removed effect leaves no window behind.
+#[test]
+fn a_clip_effect_opens_in_its_own_window_and_its_commands_edit_the_chain() {
+    let (mut s, clip, tone) = session();
+    let track = s.project().clip(clip).unwrap().track;
+    s.dispatch(Action::ClipEffects {
+        clip,
+        op: ClipFxOp::Add(utility()),
+    })
+    .unwrap();
+    settle(&mut s, clip);
+    let id = s.clip_fx_chain(clip)[0].id;
+    s.take_ui_requests();
+    s.dispatch(Action::OpenClipEffectEditor {
+        clip,
+        index: 0,
+        generic: false,
+    })
+    .unwrap();
+    let asked = s.take_ui_requests().into_iter().any(|r| {
+        matches!(r, faderframe_session::UiRequest::PluginEditor { track: t, plugin, generic: false }
+            if t == track && plugin == id)
+    });
+    assert!(asked, "the shell is asked for the window");
+    assert_eq!(
+        s.plugin_owner(id).map(|(t, slot)| (t, slot.id)),
+        Some((track, id))
+    );
+    assert_eq!(s.device_name(id).as_deref(), Some("Utility"));
+    // The window moves its gain: the chain takes it, not a track.
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track,
+        plugin: id,
+        parameter: ParameterId(0),
+        value: Some(-6.0206),
+    }))
+    .unwrap();
+    let chain = s.clip_fx_chain(clip);
+    assert_eq!(chain[0].parameters[0].value, -6.0206);
+    assert!(s.project().tracks.iter().all(|t| t.plugin(id).is_none()));
+    assert!(s.clip_fx_busy(clip), "it renders");
+    settle(&mut s, clip);
+    let out = played(&s, clip);
+    for (i, (x, y)) in out.iter().zip(&tone).enumerate().skip(4_800) {
+        assert!((x - y * 0.5).abs() < 1e-3, "{i}: {x} vs {}", y * 0.5);
+    }
+    // The hosted instance follows the chain.
+    let v = s.plugin_parameter_value(id, ParameterId(0)).unwrap();
+    assert!((v + 6.0206).abs() < 1e-6, "{v}");
+    // A device editor batches its values.
+    s.dispatch(Action::Edit(Command::Batch {
+        label: "Two values".into(),
+        commands: vec![
+            Command::SetPluginParameter {
+                track,
+                plugin: id,
+                parameter: ParameterId(0),
+                value: Some(-3.0),
+            },
+            Command::SetPluginParameter {
+                track,
+                plugin: id,
+                parameter: ParameterId(0),
+                value: Some(-6.0206),
+            },
+        ],
+    }))
+    .unwrap();
+    assert_eq!(s.clip_fx_chain(clip)[0].parameters[0].value, -6.0206);
+    // Its header's Bypass, and a value back to the device's own.
+    s.dispatch(Action::Edit(Command::SetPluginBypass {
+        track,
+        plugin: id,
+        bypass: true,
+    }))
+    .unwrap();
+    assert!(s.clip_fx_chain(clip)[0].bypass);
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track,
+        plugin: id,
+        parameter: ParameterId(0),
+        value: None,
+    }))
+    .unwrap();
+    assert!(s.clip_fx_chain(clip)[0].parameters.is_empty());
+    settle(&mut s, clip);
+    // Removed: nothing answers for it any more (its window closes).
+    s.dispatch(Action::ClipEffects {
+        clip,
+        op: ClipFxOp::Remove(0),
+    })
+    .unwrap();
+    s.tick(0.01);
+    assert!(s.plugin_owner(id).is_none());
+    assert!(
+        s.plugin_parameter_value(id, ParameterId(0)).is_none(),
+        "released"
+    );
+}

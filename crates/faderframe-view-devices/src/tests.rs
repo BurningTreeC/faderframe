@@ -296,6 +296,125 @@ mod guitar_station {
         assert!(p.texts().contains(&"REVERB"), "the Twin's own controls");
         assert!(!p.texts().contains(&"MASTER"), "an AB763 has no master");
     }
+
+    /// The compressors come from the menu's Dynamics group and wear their
+    /// boxes' knobs: two each, no tone row.
+    #[test]
+    fn the_compressors_are_on_the_line_with_their_knobs() {
+        let (mut s, plugin) = session(builtin::GUITAR_STATION, "Guitar Station");
+        let mut view = GuitarView::new(plugin, &Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        for (n, name) in ["Red Squeeze", "Juicer"].into_iter().enumerate() {
+            let r = crate::guitar::layout::pedal_rect(n);
+            let menu = click(&mut view, &mut s, at(r.center().x, r.center().y));
+            s.dispatch(pick(menu, name)).unwrap();
+        }
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::RedSqueeze).index() as f64
+        );
+        assert_eq!(
+            value(&s, plugin, id::slot(1, id::STOMP)),
+            Stomp::Pedal(Pedal::Juicer).index() as f64
+        );
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        assert!(p.balanced_clips());
+        let texts = p.texts();
+        for label in [
+            "RED SQUEEZE",
+            "SENSITIVITY",
+            "OUTPUT",
+            "JUICER",
+            "BIAS",
+            "VOLUME",
+        ] {
+            assert!(texts.contains(&label), "no {label}: {texts:?}");
+        }
+        assert_eq!(Stomp::Pedal(Pedal::RedSqueeze).family(), "Dynamics");
+        assert_eq!(Stomp::Pedal(Pedal::Juicer).family(), "Dynamics");
+        assert!(!Stomp::Pedal(Pedal::Juicer).knobs().tones[0].is_some());
+    }
+
+    /// The Carbon Echo comes off the stomp menu and wears its box's four
+    /// controls: DELAY on the drive knob, MIX on the level, REGEN and the MOD
+    /// switch on the tone row.
+    #[test]
+    fn the_carbon_echo_is_on_the_menu_with_its_four_controls() {
+        let (mut s, plugin) = session(builtin::GUITAR_STATION, "Guitar Station");
+        let mut view = GuitarView::new(plugin, &Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        let r = crate::guitar::layout::pedal_rect(0);
+        let menu = click(&mut view, &mut s, at(r.center().x, r.center().y));
+        s.dispatch(pick(menu, "Carbon Echo")).unwrap();
+        assert_eq!(
+            value(&s, plugin, id::slot(0, id::STOMP)),
+            Stomp::Pedal(Pedal::CarbonEcho).index() as f64
+        );
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        assert!(p.balanced_clips());
+        let texts = p.texts();
+        for label in ["DELAY", "MIX", "REGEN", "MOD"] {
+            assert!(
+                texts.iter().any(|t| t.eq_ignore_ascii_case(label)),
+                "no {label} among {texts:?}"
+            );
+        }
+    }
+
+    /// The Tweed Lux and the Seattle 100 show their own panels: the tweed's
+    /// one TONE, its other channel's volume and its jacks; the Seattle's
+    /// PREAMP, DEPTH, Crunch and Bright and its master.
+    #[test]
+    fn the_tweed_and_the_seattle_show_their_own_panels() {
+        let (mut s, plugin) = session(builtin::GUITAR_STATION, "Guitar Station");
+        let mut view = GuitarView::new(plugin, &Theme::default());
+        let name = crate::guitar::layout::amp_look_for_tests();
+        let menu = click(&mut view, &mut s, at(name.center().x, name.center().y));
+        s.dispatch(pick(menu, "Tweed Lux")).unwrap();
+        assert_eq!(value(&s, plugin, id::AMP), 20.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        assert!(p.balanced_clips());
+        let texts = p.texts();
+        for t in [
+            "TWEED LUX",
+            "VOLUME",
+            "TONE",
+            "NORMAL VOL",
+            "INPUT",
+            "Jack 1",
+        ] {
+            assert!(texts.contains(&t), "{t}: {texts:?}");
+        }
+        for t in ["MASTER", "PRESENCE", "BASS", "TREBLE"] {
+            assert!(!texts.contains(&t), "a 5E3 has no {t}");
+        }
+        let menu = click(&mut view, &mut s, at(name.center().x, name.center().y));
+        s.dispatch(pick(menu, "Seattle 100")).unwrap();
+        assert_eq!(value(&s, plugin, id::AMP), 22.0);
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, SIZE, &s, &Theme::default());
+        let texts = p.texts();
+        for t in [
+            "SEATTLE 100",
+            "PREAMP",
+            "BASS",
+            "MIDDLE",
+            "TREBLE",
+            "DEPTH",
+            "PRESENCE",
+            "MASTER",
+            "CRUNCH",
+            "Crunch",
+            "BRIGHT",
+        ] {
+            assert!(texts.contains(&t), "{t}: {texts:?}");
+        }
+    }
 }
 
 /// Every device control's menu learns a MIDI controller and, once one is
@@ -456,6 +575,197 @@ fn the_76_buttons_go_in_together_as_on_the_hardware() {
     assert!(value(&s, id::MIX) < 0.01);
 }
 
+/// The 2A's panel in every skin: the big knobs turn (and come back to
+/// their defaults on a double-click), the toggle flips between Compress and
+/// Limit, the selector takes a legend's click or steps round, the strip's
+/// switches, mix and R37 trim work, and every control's right-click menu
+/// offers its automation and MIDI learn.
+#[test]
+fn the_2a_panel_turns_its_knobs_and_switches() {
+    use crate::leveler::{GAIN_AT, LevelerView, PANEL_W, PEAK_AT, SELECTOR_AT, TOGGLE_AT, TOTAL_H};
+    use faderframe_plugin_host::devices::leveler::id;
+    let (mut s, plugin) = session(builtin::LEVELER_2A, "2A Leveler");
+    let size = Size::new(PANEL_W, TOTAL_H);
+    let mut view = LevelerView::new(plugin, &Theme::default());
+    for theme in Theme::builtin() {
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &theme);
+        assert!(p.balanced_clips(), "{}", theme.id);
+        for text in [
+            "LEVELER",
+            "GAIN",
+            "PEAK REDUCTION",
+            "COMPRESS",
+            "LIMIT",
+            "VU",
+        ] {
+            assert!(p.texts().contains(&text), "{}: {text}", theme.id);
+        }
+    }
+    let value =
+        |s: &Session, i: u32| f64::from(s.plugin_tap(plugin).unwrap().params.get(i as usize));
+    // At scale 1 the panel starts 44 below the top.
+    let at = |p: Point| Point::new(p.x, p.y + 44.0);
+    // Gain dragged up: more; a double-click: its default again.
+    let gain = value(&s, id::GAIN);
+    run(
+        &mut view,
+        &mut s,
+        down(at(GAIN_AT), PointerButton::Primary, 1),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        drag(at(GAIN_AT.offset(0.0, -60.0))),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        up(at(GAIN_AT.offset(0.0, -60.0)), PointerButton::Primary),
+        size,
+    );
+    assert!(value(&s, id::GAIN) > gain + 10.0, "{}", value(&s, id::GAIN));
+    run(
+        &mut view,
+        &mut s,
+        down(at(GAIN_AT), PointerButton::Primary, 2),
+        size,
+    );
+    assert_eq!(value(&s, id::GAIN), gain);
+    // Peak Reduction down half its travel.
+    let before = value(&s, id::PEAK_REDUCTION);
+    run(
+        &mut view,
+        &mut s,
+        down(at(PEAK_AT), PointerButton::Primary, 1),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        drag(at(PEAK_AT.offset(0.0, 130.0))),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        up(at(PEAK_AT.offset(0.0, 130.0)), PointerButton::Primary),
+        size,
+    );
+    let peak = value(&s, id::PEAK_REDUCTION);
+    assert!(
+        (peak - (before - 50.0)).abs() < 2.0,
+        "half the travel: {before} → {peak}"
+    );
+    // The toggle: Limit, then Compress again.
+    assert_eq!(value(&s, id::MODE), 0.0);
+    run(
+        &mut view,
+        &mut s,
+        down(at(TOGGLE_AT), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::MODE), 1.0);
+    run(
+        &mut view,
+        &mut s,
+        down(at(TOGGLE_AT), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::MODE), 0.0);
+    // The selector: +10's legend (up and to the right), then a step round
+    // on its knob back to Gain Reduction.
+    let ten = Point::new(SELECTOR_AT.x + 30.0, SELECTOR_AT.y - 17.5);
+    run(
+        &mut view,
+        &mut s,
+        down(at(ten), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::METER), 2.0);
+    run(
+        &mut view,
+        &mut s,
+        down(at(SELECTOR_AT), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::METER), 0.0);
+    // The strip: link off, the external sidechain off, mix at its left end
+    // (dry), the R37 trim turned up.
+    run(
+        &mut view,
+        &mut s,
+        down(Point::new(860.0, 22.0), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::LINK), 0.0);
+    run(
+        &mut view,
+        &mut s,
+        down(Point::new(1010.0, 22.0), PointerButton::Primary, 1),
+        size,
+    );
+    assert_eq!(value(&s, id::EXTERNAL), 0.0);
+    run(
+        &mut view,
+        &mut s,
+        down(Point::new(112.0, 22.0), PointerButton::Primary, 1),
+        size,
+    );
+    run(
+        &mut view,
+        &mut s,
+        up(Point::new(112.0, 22.0), PointerButton::Primary),
+        size,
+    );
+    assert!(value(&s, id::MIX) < 0.01);
+    let trim = Point::new(590.0, 22.0);
+    run(
+        &mut view,
+        &mut s,
+        down(trim, PointerButton::Primary, 1),
+        size,
+    );
+    run(&mut view, &mut s, drag(trim.offset(0.0, -100.0)), size);
+    run(
+        &mut view,
+        &mut s,
+        up(trim.offset(0.0, -100.0), PointerButton::Primary),
+        size,
+    );
+    assert!(value(&s, id::EMPHASIS) > 0.3, "{}", value(&s, id::EMPHASIS));
+    // A knob's menu: its default, its automation, MIDI learn.
+    let requests = run(
+        &mut view,
+        &mut s,
+        down(at(PEAK_AT), PointerButton::Secondary, 1),
+        size,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = requests.into_iter().next() else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.iter().any(|l| l.starts_with("Default")),
+        "{labels:?}"
+    );
+    assert!(labels.contains(&"Show Automation"), "{labels:?}");
+    assert!(labels.contains(&"MIDI Learn…"), "{labels:?}");
+    // The toggle's too (switches are learnable).
+    let requests = run(
+        &mut view,
+        &mut s,
+        down(at(TOGGLE_AT), PointerButton::Secondary, 1),
+        size,
+    );
+    assert!(matches!(
+        requests.first(),
+        Some(HostRequest::ContextMenu { .. })
+    ));
+}
+
 /// A stock device's panel for screen readers: its sections as groups, its
 /// knobs as sliders the arrows move, its switches as toggles.
 #[test]
@@ -579,4 +889,135 @@ fn the_dynamics_decks_hold_every_control_inside_their_sections() {
         face.min_size(),
         &[],
     );
+}
+
+/// The Tape Machine's face: its deck holds every parameter's control inside
+/// its sections without overlap, at its editor size and its smallest; it
+/// paints in every theme (clips balanced, its readouts there); the VU
+/// needles settle on the published tape level with a VU's ballistics; a
+/// knob's right-click offers its automation and MIDI learn; a drag moves
+/// the bias.
+#[test]
+fn the_tape_machine_face_paints_in_every_theme_and_learns() {
+    use crate::kit::{Ctx, Face};
+    use faderframe_plugin_host::devices::tape::{id, parameters, value};
+    let (mut s, plugin) = session(builtin::TAPE_MACHINE, "Tape Machine");
+    let (w, h) = crate::editor_size(builtin::TAPE_MACHINE).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let theme = Theme::default();
+    let face = crate::tape::TapeFace::new(&theme);
+    for at in [size, face.min_size()] {
+        let panel = face.panel(at);
+        for c in &panel.controls {
+            let r = c.rect;
+            assert!(
+                panel.sections.iter().any(|s| r.x >= s.rect.x - 0.5
+                    && r.right() <= s.rect.right() + 0.5
+                    && r.y >= s.rect.y
+                    && r.bottom() <= s.rect.bottom() + 0.5),
+                "{} ({r:?}) outside every section at {at:?}",
+                c.label
+            );
+            assert!(
+                r.y >= panel.display.unwrap().bottom(),
+                "{} over the display",
+                c.label
+            );
+        }
+        for (i, a) in panel.controls.iter().enumerate() {
+            for b in &panel.controls[i + 1..] {
+                let (p, q) = (a.rect, b.rect);
+                let apart =
+                    p.right() <= q.x || q.right() <= p.x || p.bottom() <= q.y || q.bottom() <= p.y;
+                assert!(apart, "{} and {} overlap at {at:?}", a.label, b.label);
+            }
+        }
+        for p in parameters() {
+            assert!(
+                panel.controls.iter().any(|c| c.id == p.id),
+                "no control for {}",
+                p.name
+            );
+        }
+    }
+    // Every theme.
+    for th in Theme::all() {
+        let mut view = crate::editor_for(builtin::TAPE_MACHINE, plugin, &th).unwrap();
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &th);
+        assert!(p.balanced_clips(), "{}", th.name);
+        let texts = p.texts();
+        for want in ["RESPONSE", "TAPE  M–H", "BIAS", "WOW & FLUTTER", "VU"] {
+            assert!(texts.contains(&want), "{}: no {want}", th.name);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("15 ips") && t.contains("NAB 50 µs") && t.contains("0.04 %")),
+            "{}: the machine's line",
+            th.name
+        );
+    }
+    // The needles: the tape at its operating level reads 0 VU.
+    let tap = s.plugin_tap(plugin).unwrap();
+    tap.set_value(value::VU_L, 1.0);
+    tap.set_value(value::VU_R, 0.0);
+    let mut face = crate::tape::TapeFace::new(&theme);
+    let display = face.panel(size).display.unwrap();
+    for _ in 0..60 {
+        let cx = Ctx {
+            model: &s,
+            tap: &tap,
+            theme: &theme,
+            accent: face.accent(),
+            dt: 1.0 / 60.0,
+            drop: None,
+            loading: false,
+        };
+        face.paint_display(&mut RecordingPainter::new(), display, &cx);
+    }
+    let zero = faderframe_ui_canvas::controls::vu_deflection(0.0);
+    assert!(
+        (face.needles[0].pos - zero).abs() < 0.02,
+        "{}",
+        face.needles[0].pos
+    );
+    assert!(face.needles[1].pos < 0.05, "{}", face.needles[1].pos);
+    // A knob's menu: its automation and MIDI learn.
+    let mut view = crate::editor_for(builtin::TAPE_MACHINE, plugin, &theme).unwrap();
+    let bias = face
+        .panel(size)
+        .controls
+        .iter()
+        .find(|c| c.id == ParameterId(id::BIAS))
+        .unwrap()
+        .rect;
+    let requests = run(
+        view.as_mut(),
+        &mut s,
+        down(bias.center(), PointerButton::Secondary, 1),
+        size,
+    );
+    let Some(items) = requests.into_iter().find_map(|r| match r {
+        HostRequest::ContextMenu { items, .. } => Some(items),
+        _ => None,
+    }) else {
+        panic!("a menu");
+    };
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Show Automation"), "{labels:?}");
+    assert!(labels.contains(&"MIDI Learn…"), "{labels:?}");
+    // Drag the bias up.
+    let before = f64::from(tap.params.get(id::BIAS as usize));
+    run(
+        view.as_mut(),
+        &mut s,
+        down(bias.center(), PointerButton::Primary, 1),
+        size,
+    );
+    let to = Point::new(bias.center().x, bias.center().y - 60.0);
+    run(view.as_mut(), &mut s, drag(to), size);
+    run(view.as_mut(), &mut s, up(to, PointerButton::Primary), size);
+    let after = f64::from(tap.params.get(id::BIAS as usize));
+    assert!(after > before + 1.0, "{before} → {after}");
 }

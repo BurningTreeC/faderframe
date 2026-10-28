@@ -79,9 +79,14 @@ pub(crate) mod key {
     pub const DISPLAY: &str = "eq.display.range";
     pub const PIANO: &str = "eq.display.piano";
     pub const SKETCH: &str = "eq.sketch";
-    /// −1: the sidechain; −2: the input, recorded earlier; otherwise
-    /// another EQ's instance id.
-    pub const MATCH_REFERENCE: &str = "eq.match.reference";
+    /// −1: the sidechain; −2: the input, recorded earlier; −3: a
+    /// reference track (its id in [`MATCH_TRACK`]); otherwise another EQ's
+    /// instance id.
+    pub const MATCH_REFERENCE: &str = faderframe_session::references::MATCH_REFERENCE_KEY;
+    /// The reference track EQ Match matches to.
+    pub const MATCH_TRACK: &str = faderframe_session::references::MATCH_TRACK_KEY;
+    /// Above 0: open EQ Match (a reference was sent to it).
+    pub const MATCH_OPEN: &str = faderframe_session::references::MATCH_OPEN_KEY;
 }
 
 /// Where the external spectrum comes from.
@@ -351,6 +356,24 @@ impl EqView {
             plugin: self.device.plugin,
             values: values.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
         }
+    }
+
+    /// Close EQ Match (whether it was open), and the session's request to
+    /// open it with it.
+    pub(crate) fn close_matching(
+        &mut self,
+        model: &Session,
+        cx: &mut faderframe_ui_canvas::EventCx<'_, Action>,
+    ) -> bool {
+        let was = self.matching.take().is_some();
+        if model
+            .device_view(self.device.plugin, key::MATCH_OPEN)
+            .unwrap_or(0.0)
+            > 0.0
+        {
+            cx.emit(self.view_action(key::MATCH_OPEN, 0.0));
+        }
+        was
     }
 
     pub(crate) fn rate(model: &Session) -> f64 {

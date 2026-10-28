@@ -446,6 +446,11 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-mix",
+            A::Workspace(W::ShowView(ViewId::mix_intelligence())),
+        ),
+        dispatch(
+            app,
             "show-album",
             A::Workspace(W::ShowView(ViewId::album())),
         ),
@@ -502,6 +507,8 @@ pub fn install(app: &Rc<AppState>) {
     }
     app.app.add_action_entries(entries);
     crate::toggles::install(app);
+    // A/B listening: the Reference view, the flip, its development aids.
+    crate::compare::install(app);
     // Development aid: insert a plugin (by id) on the selected or first
     // audio track, e.g. FADERFRAME_STARTUP_ACTIONS="insert-plugin:com.vendor.plugin".
     let weak = Rc::downgrade(app);
@@ -804,6 +811,35 @@ pub fn install(app: &Rc<AppState>) {
                     excluded: on != "off",
                 })),
                 None => tracing::warn!("ripple-exclude-track: no track '{name}'"),
+            }
+        }),
+        // `time-lock:<track>=<on|off>`: a track placed in time (tempo
+        // changes keep its clips and automation on their samples) or with
+        // the music again.
+        named("time-lock", |a, arg| {
+            let Some((name, on)) = arg.split_once('=') else {
+                return tracing::warn!("time-lock: '{arg}' is not <track>=<on|off>");
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match track {
+                Some(track) => a.dispatch(Action::Edit(
+                    faderframe_project::Command::SetTrackTimeBase {
+                        track,
+                        base: if on == "off" {
+                            faderframe_project::TimeBase::Musical
+                        } else {
+                            faderframe_project::TimeBase::TimeLocked
+                        },
+                    },
+                )),
+                None => tracing::warn!("time-lock: no track '{name}'"),
             }
         }),
         named("ripple-offset", |a, arg| {
@@ -1989,6 +2025,24 @@ pub fn install(app: &Rc<AppState>) {
                 });
             }
         }),
+        // `clip-fx-open:<n>[/generic]`: effect n of the shown clip in its
+        // own window (its "Open Window").
+        named("clip-fx-open", |a, arg| {
+            let Some(clip) = a.session.borrow().clip_fx_clip() else {
+                return;
+            };
+            let (n, generic) = match arg.split_once('/') {
+                Some((n, how)) => (n, how == "generic"),
+                None => (arg, false),
+            };
+            if let Ok(index) = n.parse() {
+                a.dispatch(Action::OpenClipEffectEditor {
+                    clip,
+                    index,
+                    generic,
+                });
+            }
+        }),
         // Development aids: `transcribe:<track>` (its first clip's words to
         // the lyrics), `export-lyrics:<path>` (.srt, else LRC).
         named("transcribe", |a, arg| {
@@ -2153,6 +2207,18 @@ pub fn install(app: &Rc<AppState>) {
         named("export-lead-sheet", |a, arg| {
             a.dispatch(Action::ExportLeadSheet(std::path::PathBuf::from(arg)));
         }),
+        // Development aids for Mix Intelligence (`crate::mix_actions`).
+        named("mix-analyse", crate::mix_actions::analyse),
+        named("mix-cancel", crate::mix_actions::cancel),
+        named("mix-finding", crate::mix_actions::finding),
+        named("mix-audition", crate::mix_actions::audition),
+        named("mix-compare", crate::mix_actions::compare),
+        named("mix-match", crate::mix_actions::matching),
+        named("mix-apply", crate::mix_actions::apply),
+        named("mix-reject", crate::mix_actions::reject),
+        named("mix-dismiss", crate::mix_actions::dismiss),
+        named("track-role", crate::mix_actions::track_role),
+        named("mix-log", crate::mix_actions::log),
         // Development aid: `song-structure:<track>[|<track>…]` (their
         // first clips).
         named("song-structure", |a, arg| {
@@ -2169,6 +2235,56 @@ pub fn install(app: &Rc<AppState>) {
                     .collect()
             };
             a.dispatch(Action::SongStructure { clips });
+        }),
+        // Development aid: `auto-align:<track>|<track>…[@<reference>]`
+        // opens Auto-Align for those tracks and analyses them (empty: the
+        // selected tracks), `auto-align-apply:x` applies what it found
+        // (once found), `track-delay:<track>=<ms>` sets a track's delay.
+        named("auto-align", |a, arg| {
+            use faderframe_session::align::AlignOp;
+            let (list, reference) = match arg.rsplit_once('@') {
+                Some((l, r)) => (l, Some(r)),
+                None => (arg, None),
+            };
+            let (tracks, reference) = {
+                let s = a.session.borrow();
+                let id = |name: &str| {
+                    s.project()
+                        .tracks
+                        .iter()
+                        .find(|t| t.name == name)
+                        .map(|t| t.id)
+                };
+                let tracks: Vec<_> = list
+                    .split('|')
+                    .filter(|n| !n.is_empty())
+                    .filter_map(id)
+                    .collect();
+                (tracks, reference.and_then(id))
+            };
+            a.dispatch(Action::AutoAlign(AlignOp::Open { tracks, reference }));
+        }),
+        named("auto-align-apply", |a, _| {
+            a.dispatch(Action::AutoAlign(faderframe_session::align::AlignOp::Apply));
+        }),
+        named("track-delay", |a, arg| {
+            let Some((name, ms)) = arg.rsplit_once('=') else {
+                return;
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            if let (Some(track), Ok(ms)) = (track, ms.trim().parse::<f64>()) {
+                a.dispatch(Action::Edit(faderframe_project::Command::SetTrackDelay {
+                    track,
+                    ms,
+                }));
+            }
         }),
         // Development aid: `from-clip:<tempo|warp|key>=<track>` (its first
         // clip).

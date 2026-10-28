@@ -253,7 +253,9 @@ fn drop_host(plugin: PluginInstanceId, host: Host) {
 }
 
 /// The track a plugin's commands name and the window title. An album
-/// song's insert names the master (the commands find the song's slot).
+/// song's insert names the master (the commands find the song's slot), a
+/// clip effect its clip's track (the session makes its commands edits of
+/// the clip's chain).
 fn title_of(app: &AppState, plugin: PluginInstanceId) -> Option<(TrackId, String)> {
     let s = app.session.try_borrow().ok()?;
     if let Some((song, slot)) = s.song_insert(plugin) {
@@ -266,6 +268,11 @@ fn title_of(app: &AppState, plugin: PluginInstanceId) -> Option<(TrackId, String
                 song.title
             ),
         ));
+    }
+    if let Some((clip, _, _)) = s.clip_fx_slot(plugin) {
+        let c = s.project().clip(clip)?;
+        let name = s.device_name(plugin)?;
+        return Some((c.track, format!("{name} — {} (clip effect)", c.name)));
     }
     let (t, slot) = s.plugin_slot(plugin)?;
     Some((t.id, format!("{} — {}", t.name_of(slot), t.name)))
@@ -1079,10 +1086,7 @@ pub fn tick(app: &Rc<AppState>) {
         e.generic
             .borrow()
             .keys()
-            .filter(|p| {
-                s.as_ref()
-                    .is_ok_and(|s| s.plugin_slot(**p).is_none() && s.song_insert(**p).is_none())
-            })
+            .filter(|p| s.as_ref().is_ok_and(|s| s.plugin_owner(**p).is_none()))
             .copied()
             .collect()
     });

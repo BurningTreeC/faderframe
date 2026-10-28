@@ -246,6 +246,24 @@ impl TempoMap {
         self.seconds_to_musical(samples as f64 / sample_rate)
     }
 
+    /// The musical position that lands on sample `samples` exactly (as
+    /// [`Self::musical_to_samples`] rounds it): the nearest tick to the
+    /// sample's time, or a neighbour of it where rounding in the
+    /// conversions would miss the sample. Time-locked material is kept on
+    /// its sample through tempo changes with it, so a round trip is exact.
+    /// Ticks are finer than samples down to ~20 BPM at 192 kHz; below that
+    /// a sample may have no tick of its own and the nearest one is given.
+    pub fn musical_at_sample(&self, samples: i64, sample_rate: f64) -> MusicalTime {
+        let t = self.samples_to_musical(samples, sample_rate);
+        if self.musical_to_samples(t, sample_rate) == samples {
+            return t;
+        }
+        (1..=8)
+            .flat_map(|d| [t + MusicalTime(d), t - MusicalTime(d)])
+            .find(|c| self.musical_to_samples(*c, sample_rate) == samples)
+            .unwrap_or(t)
+    }
+
     /// Fractional quarter-note position of a sample index (used per block by
     /// the transport; allocation-free).
     pub fn samples_to_quarters(&self, samples: i64, sample_rate: f64) -> f64 {
@@ -313,6 +331,28 @@ mod tests {
             let secs = map.musical_to_seconds(pos);
             assert_eq!(map.seconds_to_musical(secs), pos);
         }
+    }
+
+    #[test]
+    fn a_sample_has_a_tick_that_lands_on_it() {
+        let mut map = TempoMap::new(97.3);
+        map.points[0].curve = TempoCurve::Linear;
+        map.set_point(TempoPoint {
+            position: MusicalTime::from_quarters_i(16),
+            bpm: 143.0,
+            curve: TempoCurve::Constant,
+        });
+        for rate in [44_100.0, 48_000.0, 96_000.0, 192_000.0] {
+            for s in [0, 1, 7, 12_345, 480_001, 1_234_567, 9_876_543] {
+                let t = map.musical_at_sample(s, rate);
+                assert_eq!(map.musical_to_samples(t, rate), s, "{s} at {rate}");
+            }
+        }
+        // Negative samples (before the start) too.
+        assert_eq!(
+            map.musical_to_samples(map.musical_at_sample(-4_801, SR), SR),
+            -4_801
+        );
     }
 
     #[test]

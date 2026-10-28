@@ -19,6 +19,7 @@ pub mod gate;
 pub mod guitar;
 pub mod hardware_insert;
 pub mod keep_length;
+pub mod leveler;
 pub mod limiter;
 pub(crate) mod midi_fx;
 pub mod modulation;
@@ -33,6 +34,7 @@ pub mod saturator;
 pub mod scale;
 pub mod sfz;
 pub mod synth;
+pub mod tape;
 pub mod tuner;
 pub mod utility;
 
@@ -50,6 +52,7 @@ pub fn reduction_value(id: &str) -> Option<usize> {
         b::LIMITER => Some(limiter::value::REDUCTION),
         b::DEESSER => Some(deesser::value::REDUCTION),
         b::CHANNEL_STRIP => Some(channel_strip::value::COMP_GR),
+        b::LEVELER_2A => Some(leveler::value::GR),
         _ => None,
     }
 }

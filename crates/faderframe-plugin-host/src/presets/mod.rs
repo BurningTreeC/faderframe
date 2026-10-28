@@ -18,6 +18,7 @@ mod equalisers;
 mod guitar;
 mod midi;
 mod synth;
+mod tape;
 #[cfg(test)]
 mod tests;
 
@@ -100,6 +101,8 @@ pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
         builtin::SCALE => midi::scale(),
         builtin::NOTE_ECHO => midi::note_echo(),
         builtin::GUITAR_STATION => guitar::guitar(),
+        builtin::TAPE_MACHINE => tape::tape_machine(),
+        builtin::LEVELER_2A => dynamics::leveler_2a(),
         _ => Vec::new(),
     }
 }
@@ -127,6 +130,8 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
         builtin::SCALE => scale::parameters(),
         builtin::NOTE_ECHO => note_echo::parameters(),
         builtin::GUITAR_STATION => guitar::parameters(),
+        builtin::TAPE_MACHINE => crate::devices::tape::parameters(),
+        builtin::LEVELER_2A => leveler::parameters(),
         _ => Vec::new(),
     }
 }

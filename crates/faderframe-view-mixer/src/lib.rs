@@ -2500,6 +2500,9 @@ impl MixerView {
             .separated(),
         );
         items.extend(model.group_menu(t.id).into_iter().map(menu_item));
+        // The microphones of one source in time and polarity; the
+        // track's own delay back to none.
+        items.extend(model.auto_align_menu(t.id).into_iter().map(menu_item));
         let formats: Vec<MenuItem<Action>> = model
             .format_choices(t.id)
             .into_iter()
@@ -2531,6 +2534,15 @@ impl MixerView {
         }
         if let Some(c) = model.object_choice(t.id) {
             items.push(MenuItem::new(c.label, c.action).checked(c.checked));
+        }
+        // Placed with the music or in time (see the arranger's menu).
+        let bases: Vec<MenuItem<Action>> = model
+            .time_base_choices(t.id)
+            .into_iter()
+            .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+            .collect();
+        if !bases.is_empty() {
+            items.push(MenuItem::submenu("Time Base", bases));
         }
         let choices = |list: Vec<faderframe_session::InputChoice>| -> Vec<MenuItem<Action>> {
             list.into_iter()

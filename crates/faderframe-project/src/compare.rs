@@ -209,6 +209,9 @@ fn track_differences(a: &Track, b: &Track, now: &Project, out: &mut Vec<String>)
             faderframe_core::pan::format_dual(b.dual_pan)
         ));
     }
+    if a.delay_ms != b.delay_ms {
+        push(format!("delay {:+.3} → {:+.3} ms", a.delay_ms, b.delay_ms));
+    }
     for (was, is, what) in [
         (a.mute, b.mute, "muted"),
         (a.solo, b.solo, "soloed"),
@@ -230,6 +233,13 @@ fn track_differences(a: &Track, b: &Track, now: &Project, out: &mut Vec<String>)
             crate::OutputRouting::None => "nothing".into(),
         };
         push(format!("now goes to {to}"));
+    }
+    if a.time_base != b.time_base {
+        push(format!(
+            "time base {} → {}",
+            a.time_base.label(),
+            b.time_base.label()
+        ));
     }
     if a.color != b.color {
         push("colour changed".into());
@@ -328,6 +338,7 @@ mod tests {
         let bass = now.tracks.iter().position(|t| t.name == "Bass").unwrap();
         now.tracks[bass].volume_db = -6.0;
         now.tracks[bass].name = "Low End".into();
+        now.tracks[bass].time_base = crate::TimeBase::TimeLocked;
         let drums = now.tracks.iter().find(|t| t.name == "Drums").unwrap().id;
         now.tracks.retain(|t| t.id != drums);
         now.clips.retain(|_, c| c.track != drums);
@@ -346,6 +357,7 @@ mod tests {
             "Track ‘Drums’ removed",
             "‘Low End’: renamed from ‘Bass’",
             "‘Low End’: volume -3.0 → -6.0 dB",
+            "‘Low End’: time base Musical → Time-locked",
             "‘Lead Synth’: clips 1 moved",
         ] {
             assert!(

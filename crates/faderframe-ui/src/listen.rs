@@ -194,6 +194,16 @@ pub fn menu() -> gio::Menu {
     mono.append(Some("Mono Check"), Some("app.mono-check"));
     mono.append(Some("Bass Management"), Some("app.bass-management"));
     m.append_section(None, &mono);
+    // A/B: what the mix is compared with (an audition of the undo
+    // history, a reference track), heard instead of it.
+    let ab = gio::Menu::new();
+    ab.append(
+        Some("Flip A/B (Mix ⇄ Then or Reference)"),
+        Some("app.compare-flip"),
+    );
+    ab.append(Some("Stop Comparing"), Some("app.compare-off"));
+    ab.append(Some("Reference Tracks…"), Some("app.show-reference"));
+    m.append_section(None, &ab);
     let heads = gio::Menu::new();
     let dummies = gio::Menu::new();
     let people = gio::Menu::new();

@@ -30,8 +30,8 @@ mod power_hard;
 mod ss800_collapse;
 
 use super::device::{
-    AnyDevice, Bipolar, Core, Device, Diode, Jfet, Linearisation, Mark, OpAmp, Pentode, Rectifier,
-    ResidualStamper, Stamper, Transconductor, Triode, VariableResistor,
+    AnyDevice, Bipolar, Core, Device, Diode, Jfet, Linearisation, Mark, OpAmp, Ota, Pentode,
+    Rectifier, ResidualStamper, Stamper, Transconductor, Triode, VariableResistor,
 };
 use super::netlist::{Adjust, Circuit, Part, GROUND};
 #[cfg(any())]
@@ -2803,6 +2803,7 @@ impl Simulation {
                 | Part::Jfet { .. }
                 | Part::Bipolar { .. }
                 | Part::Transconductor { .. }
+                | Part::Ota { .. }
                 | Part::Core { .. }
                 | Part::OpAmp { .. }
                 | Part::Adjustable {
@@ -4211,6 +4212,9 @@ impl Simulation {
                             } else {
                                 let slot = which - 1;
                                 aux_source[slot * n + node] += g;
+                                // So may an auxiliary one (`aux_input_at`); every
+                                // `aux_input` is at zero, so this adds nothing there.
+                                bias[node] += g * at;
                             }
                         }
                     }
@@ -4368,6 +4372,21 @@ impl Simulation {
                                 .push(AnyDevice::Transconductor(Transconductor::new(
                                     plus, minus, out, reference, gm, limit,
                                 )));
+                        }
+                    }
+                    Part::Ota {
+                        plus,
+                        minus,
+                        out,
+                        bias,
+                        pos,
+                        neg,
+                        spec,
+                    } => {
+                        if !keep_devices {
+                            self.devices.push(AnyDevice::Ota(Ota::new(
+                                plus, minus, out, bias, pos, neg, spec,
+                            )));
                         }
                     }
                     Part::Core {

@@ -839,3 +839,53 @@ fn version_comparison_names_pan_changes() {
     );
     assert!(lines.iter().any(|l| l.starts_with("Pan law")));
 }
+
+#[test]
+fn a_track_delay_is_clamped_undone_and_saved() {
+    let mut p = demo_project(48_000);
+    let mut h = History::default();
+    let before = p.clone();
+    let id = p
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    let set = |ms: f64| Command::SetTrackDelay { track: id, ms };
+    assert_eq!(set(1.0).impact(), Impact::Params);
+    // A drag of the delay is one step.
+    h.begin("Delay");
+    for ms in [0.5, -2.25, -3.137_5] {
+        h.apply(&mut p, set(ms)).unwrap();
+    }
+    h.end();
+    assert_eq!(p.track(id).unwrap().delay_ms, -3.137_5);
+    assert_eq!(h.undo_labels().len(), 1);
+    // A file keeps it to the last bit; a track without one writes none.
+    let text = file::to_string(&p, None).unwrap();
+    assert_eq!(text.matches("\"delay_ms\"").count(), 1);
+    let back = file::from_str(&text).unwrap().project;
+    assert_eq!(back.track(id).unwrap().delay_ms, -3.137_5);
+    h.undo(&mut p).unwrap();
+    assert_same(&p, &before);
+    // Clamped, and NaN is none.
+    h.apply(&mut p, set(1e9)).unwrap();
+    assert_eq!(
+        p.track(id).unwrap().delay_ms,
+        faderframe_project::MAX_TRACK_DELAY_MS
+    );
+    h.apply(&mut p, set(f64::NAN)).unwrap();
+    assert_eq!(p.track(id).unwrap().delay_ms, 0.0);
+    // The master has none (it would only move everything).
+    let master = p.master_id().unwrap();
+    assert!(matches!(
+        h.apply(
+            &mut p,
+            Command::SetTrackDelay {
+                track: master,
+                ms: 1.0
+            }
+        ),
+        Err(EditError::Invalid(_))
+    ));
+}

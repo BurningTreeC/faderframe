@@ -190,6 +190,13 @@ pub struct Project {
     /// The show's songs in order (show mode).
     #[serde(default, skip_serializing_if = "crate::setlist::Setlist::is_empty")]
     pub setlist: crate::setlist::Setlist,
+    /// Reference tracks: records the mix is compared with (never part of
+    /// it).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::reference::References::is_empty"
+    )]
+    pub references: crate::reference::References,
     /// The clip launcher's scenes and slots.
     #[serde(default, skip_serializing_if = "crate::launcher::Launcher::is_empty")]
     pub launcher: crate::launcher::Launcher,
@@ -252,6 +259,7 @@ impl Project {
             lyrics: Vec::new(),
             adr: Default::default(),
             setlist: Default::default(),
+            references: Default::default(),
             launcher: crate::launcher::Launcher::default(),
             scratch_pads: crate::scratch::ScratchPads::default(),
             clip_links: BTreeMap::new(),
@@ -492,6 +500,8 @@ impl Project {
                 out.insert(f.source);
             }
         }
+        // Reference tracks play from the media too.
+        out.extend(self.references.tracks.iter().map(|r| r.source));
         out
     }
 
@@ -896,6 +906,14 @@ impl Project {
                     .max()
                     .unwrap_or(0),
             );
+        max_id = max_id.max(
+            self.references
+                .tracks
+                .iter()
+                .map(|r| r.id.raw())
+                .max()
+                .unwrap_or(0),
+        );
         self.ids.reserve_through(max_id);
         // Scratch pads: consistent with the tracks, their ids reserved.
         notes.extend(self.repair_scratch_pads());

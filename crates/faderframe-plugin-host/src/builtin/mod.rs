@@ -47,10 +47,14 @@ enum Kind {
     HardwareInsert,
     /// The 76 Compressor (a FET limiting amplifier).
     Fet76,
+    /// The Tape Machine.
+    Tape,
+    /// The 2A Leveler (an optical leveling amplifier).
+    Leveler,
 }
 
 impl Kind {
-    const ALL: [Kind; 37] = [
+    const ALL: [Kind; 39] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -88,6 +92,8 @@ impl Kind {
         Kind::Container,
         Kind::HardwareInsert,
         Kind::LatencyProbe,
+        Kind::Tape,
+        Kind::Leveler,
     ];
 
     /// Are its processors built for where they run — on the audio thread
@@ -141,6 +147,8 @@ impl Kind {
             builtin::CONTAINER => Kind::Container,
             builtin::HARDWARE_INSERT => Kind::HardwareInsert,
             builtin::COMPRESSOR_76 => Kind::Fet76,
+            builtin::TAPE_MACHINE => Kind::Tape,
+            builtin::LEVELER_2A => Kind::Leveler,
             _ => return None,
         })
     }
@@ -344,6 +352,20 @@ impl Kind {
                 vec![stereo],
                 0,
             ),
+            Kind::Tape => (
+                builtin::TAPE_MACHINE,
+                "Tape Machine",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Leveler => (
+                builtin::LEVELER_2A,
+                "2A Leveler",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                0,
+            ),
         };
         PluginDescriptor {
             format: PluginFormat::Builtin,
@@ -419,6 +441,8 @@ impl Kind {
             Kind::Container => Vec::new(),
             Kind::HardwareInsert => crate::devices::hardware_insert::parameters(),
             Kind::Fet76 => crate::devices::fet76::parameters(),
+            Kind::Tape => crate::devices::tape::parameters(),
+            Kind::Leveler => crate::devices::leveler::parameters(),
         }
     }
 
@@ -468,6 +492,8 @@ impl Kind {
             // A tap for its live parameters (the engine's send reads them).
             Kind::HardwareInsert => Some(0),
             Kind::Fet76 => Some(crate::devices::fet76::TAP_VALUES),
+            Kind::Tape => Some(crate::devices::tape::TAP_VALUES),
+            Kind::Leveler => Some(crate::devices::leveler::TAP_VALUES),
             _ => None,
         }
     }
@@ -725,6 +751,8 @@ impl PluginInstance for BuiltinInstance {
             Kind::Gate => crate::devices::gate::format(id, value),
             Kind::ChannelStrip => crate::devices::channel_strip::format(id, value),
             Kind::Guitar => crate::devices::guitar::format(id, value),
+            Kind::Tape => crate::devices::tape::format(id, value),
+            Kind::Leveler => crate::devices::leveler::format(id, value),
             _ => None,
         }
     }
@@ -855,6 +883,8 @@ impl PluginInstance for BuiltinInstance {
             Kind::Deesser => crate::devices::deesser::latency(&self.params, self.rate),
             Kind::Gate => crate::devices::gate::latency(&self.params, self.rate),
             Kind::Fet76 => crate::devices::fet76::latency(&self.params, self.rate),
+            Kind::Tape => crate::devices::tape::latency(&self.params, self.rate),
+            Kind::Leveler => crate::devices::leveler::latency(&self.params, self.rate),
             _ => 0,
         }
     }
@@ -887,6 +917,10 @@ impl PluginInstance for BuiltinInstance {
             | Kind::HardwareInsert => TailLength::None,
             // The longest release (1.1 s) to come back.
             Kind::Fet76 => TailLength::Samples(96_000),
+            // The head bump's ring at 3.75 ips and the transport's delay.
+            Kind::Tape => TailLength::Samples(24_000),
+            // The cell's slowest release (its deepest traps emptying).
+            Kind::Leveler => TailLength::Samples(48_000 * 15),
             // Notes still due: a held arpeggio's last steps, strums, echoes.
             Kind::Arpeggiator | Kind::Chord | Kind::Scale => TailLength::Samples(48_000 * 2),
             Kind::NoteEcho => TailLength::Samples(48_000 * 40),
@@ -980,6 +1014,11 @@ impl BuiltinInstance {
                 config,
             )),
             Kind::Fet76 => Box::new(crate::devices::fet76::Fet76Processor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Tape => Box::new(crate::devices::tape::TapeProcessor::new(
                 params,
                 tap()?,
                 config,
@@ -1125,6 +1164,11 @@ impl BuiltinInstance {
                     params, tap, config,
                 ))
             }
+            Kind::Leveler => Box::new(crate::devices::leveler::LevelerProcessor::new(
+                params,
+                tap()?,
+                config,
+            )?),
         };
         Ok(Box::new(Modulated {
             params: self.params.clone(),

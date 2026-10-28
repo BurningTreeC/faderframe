@@ -5,7 +5,8 @@
 //! tempo map, the hit markers moved onto their beats (where they sound
 //! stays), the other markers kept where they sound, and — when asked —
 //! audio clips kept where they sound too (MIDI follows the new tempo; the
-//! picture is placed in time already).
+//! picture is placed in time already). Time-locked tracks always keep
+//! their material where it sounds (see `crate::time_lock`).
 
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_project::{ClipContent, Command, Marker};
@@ -148,7 +149,9 @@ impl Session {
             }
         }
         if req.keep_audio {
-            for t in &p.tracks {
+            // Time-locked tracks keep theirs on their samples whatever
+            // `keep_audio` says (`Session::edit` moves them exactly).
+            for t in p.tracks.iter().filter(|t| !t.is_time_locked()) {
                 for c in p.clips_of(t.id) {
                     if matches!(c.content, ClipContent::Audio(_) | ClipContent::Takes(_)) {
                         let start = keep(c.start);

@@ -1353,13 +1353,16 @@ pub fn build_graph(
             continue;
         }
 
+        // Heard live with low-latency monitoring: without its delay (as
+        // without its latent effects).
+        let (sub, processor, _) = track_input(t, slots, config, layout, early.contains(&t.id))?;
         let input = b.add_node(
             NodeSpec::new(format!("{} · Input", t.name))
-                .key(node_key(t.id, Role::Input, 0, &[layout]))
+                .key(node_key(t.id, Role::Input, sub, &[layout]))
                 .group(gi)
                 .audio_in(layout)
                 .audio_out(layout),
-            Box::new(Passthrough),
+            processor,
         );
         tn.input = Some(own(&mut owners, input, t.id, None, NodeWork::Input));
         // The modulators, between the input and the devices (a follower of
@@ -1753,6 +1756,7 @@ pub fn build_graph(
                             config.sample_rate as u32,
                             config.max_block_size,
                             mono,
+                            slots.monitor_trim()?,
                             slots.bass_management()?,
                             slots.mix()?,
                         )),
@@ -2600,7 +2604,8 @@ fn is_diffuse(project: &Project, t: &Track) -> bool {
 }
 
 /// What a parameter edit can change of the graph's shape (a change
-/// rebuilds it): the diffuse spreads (their decorrelation filters), where
+/// rebuilds it): tracks' own delays (their nodes and latency), the
+/// diffuse spreads (their decorrelation filters), where
 /// folder buses take their tracks' default outputs (moving a track into or
 /// out of one, see `Project::output_target`), and the post-fader sends
 /// that place their source themselves ([`places_itself`]).
@@ -2609,6 +2614,9 @@ pub struct ParamShape {
     pub diffuse: Vec<TrackId>,
     pub folder_routes: Vec<(TrackId, TrackId)>,
     pub placing_sends: Vec<faderframe_core::SendId>,
+    /// Tracks' own delays by what they need of the graph (none, later, a
+    /// whole millisecond more or less ahead: `nodes::DelayShape`).
+    pub delays: Vec<(TrackId, crate::nodes::DelayShape)>,
 }
 
 pub fn param_shape(project: &Project) -> ParamShape {
@@ -2636,10 +2644,17 @@ pub fn param_shape(project: &Project) -> ParamShape {
                 .map(|s| s.id)
         })
         .collect();
+    let delays = project
+        .tracks
+        .iter()
+        .filter(|t| t.takes_delay())
+        .filter_map(|t| crate::nodes::DelayShape::of(t.delay_ms).map(|s| (t.id, s)))
+        .collect();
     ParamShape {
         diffuse: diffuse_tracks(project),
         folder_routes,
         placing_sends,
+        delays,
     }
 }
 
@@ -3230,6 +3245,39 @@ fn note_effects(
     Ok(out)
 }
 
+/// A track's input node: its key's part, the processor and its latency.
+type InputNode = (
+    u64,
+    Box<dyn faderframe_audio_graph::Processor<EngineContext>>,
+    u32,
+);
+
+/// A track's input node (where its sources sum): with a delay of its own
+/// ([`Track::delay_ms`]) the delay node, else a pass-through (`live`:
+/// heard live with low-latency monitoring, without the delay).
+fn track_input(
+    t: &Track,
+    slots: &mut SlotRegistry,
+    config: &PrepareConfig,
+    layout: ChannelLayout,
+    live: bool,
+) -> Result<InputNode, EngineError> {
+    let shape = crate::nodes::DelayShape::of(t.delay_ms).filter(|_| t.takes_delay() && !live);
+    let Some(shape) = shape else {
+        return Ok((0, Box::new(Passthrough), 0));
+    };
+    let node = crate::nodes::TrackDelay::new(
+        slots.track_delay(t.id)?,
+        shape,
+        t.delay_ms,
+        config.sample_rate,
+        config.max_block_size,
+        layout.channel_count(),
+    );
+    let latency = faderframe_audio_graph::Processor::latency(&node);
+    Ok((0xDE1A_0000 | shape.code(), Box::new(node), latency))
+}
+
 /// Track indices for building with buses rendered ahead: every other
 /// track first (in project order), then those buses, each after the buses
 /// that reach it.
@@ -3285,13 +3333,13 @@ fn build_ahead_chain(
     } else {
         t.layout
     };
-    let mut latency = 0u32;
+    let (sub, processor, mut latency) = track_input(t, slots, config, layout, false)?;
     let input = ab.add_node(
         NodeSpec::new(format!("{} · Input", t.name))
-            .key(node_key(t.id, Role::Input, 0, &[layout]))
+            .key(node_key(t.id, Role::Input, sub, &[layout]))
             .audio_in(layout)
             .audio_out(layout),
-        Box::new(Passthrough),
+        processor,
     );
     let mut midi = None;
     let frozen = t.freeze.as_ref();

@@ -81,6 +81,13 @@ fn the_guitar_station_does_not_allocate_live() {
         Stomp::Wah(faderframe_guitar::circuits::wah::Build::CryBaby).index() as f64,
     );
     set(id::slot(2, id::AUTO), 1.0);
+    // The Carbon Echo: its clock board, compander rectifiers and BBDs,
+    // its DELAY (the clock board's pump rebuilt), REGEN and MOD moved below.
+    set(
+        id::slot(3, id::STOMP),
+        Stomp::Pedal(Pedal::CarbonEcho).index() as f64,
+    );
+    set(id::slot(3, id::P_LEVEL), 0.7);
     set(id::MIC_B, 6.0);
     set(id::B_PAN, 0.6);
     let tap = Arc::new(AnalysisTap::new(params.clone(), guitar::TAP_VALUES));
@@ -124,6 +131,21 @@ fn the_guitar_station_does_not_allocate_live() {
                 ParameterEvent {
                     sample_offset: 90,
                     parameter: ParameterId(id::slot(1, id::ON)),
+                    value: (k % 2) as f32,
+                },
+                ParameterEvent {
+                    sample_offset: 30,
+                    parameter: ParameterId(id::slot(3, id::P_DRIVE)),
+                    value: 0.1 + 0.25 * k as f32,
+                },
+                ParameterEvent {
+                    sample_offset: 50,
+                    parameter: ParameterId(id::slot(3, id::TONE)),
+                    value: 0.2 + 0.2 * k as f32,
+                },
+                ParameterEvent {
+                    sample_offset: 110,
+                    parameter: ParameterId(id::slot(3, id::TONE + 1)),
                     value: (k % 2) as f32,
                 },
             ]
@@ -203,6 +225,26 @@ fn the_guitar_station_does_not_allocate_live() {
     set(id::REVERB, 0.4);
     set(id::INTENSITY, 0.5);
     run(&mut p, 400, true, &events[3]);
+    // The compressors in place 2: the OTA's stamp, and the JFET shunt.
+    set(
+        id::slot(1, id::STOMP),
+        Stomp::Pedal(Pedal::RedSqueeze).index() as f64,
+    );
+    run(&mut p, 200, true, &events[0]);
+    set(
+        id::slot(1, id::STOMP),
+        Stomp::Pedal(Pedal::Juicer).index() as f64,
+    );
+    run(&mut p, 200, true, &events[1]);
+    // The Tweed Lux jumpered (six contacts move), then the Seattle 100 with
+    // its depth turned on the power stage and its Crunch switch thrown.
+    set(id::AMP, 20.0);
+    set(id::LOW_SWITCH, 2.0);
+    run(&mut p, 150, true, &events[0]);
+    set(id::AMP, 22.0);
+    set(id::SWEEP, 0.7);
+    set(id::LOW_SWITCH, 0.0);
+    run(&mut p, 150, true, &events[1]);
     // Late frames from here on only.
     p.take_underruns();
     p.reset();

@@ -29,11 +29,14 @@ use crate::acoustics::stage::MicSlot;
 use crate::circuits::{
     ac30, american312, american_800rb, american_ss800, american_svt, american_v4b, american_vt40,
     bass_driver, bigmuff, blue_chorus, brit2205, brit800, brit_drive, british_47, brum100, cabinet,
-    clean_boost, clipper, console_e, deluxe, distortion_plus, dr103, evh5150, german_76,
-    gold_drive, heavy_metal, iron, jazz120, jc120_power, jtm45, markiic, metal_zone, modern_33,
-    modern_purple, neve, orange_dist, orange_phase, oregon_t, plexi, plexi_bass, power, preamp,
-    rectifier, rodent, round_fuzz, studio, tone, treble_boost, ts808, tube610, twin, wah,
+    carbon_echo, clean_boost, clipper, console_e, deluxe, distortion_plus, dr103, evh5150,
+    german_76, gold_drive, heavy_metal, iron, jazz120, jc120_power, jtm45, juicer, markiic,
+    metal_zone, modern_33, modern_purple, neve, orange_dist, orange_phase, oregon_t, plexi,
+    plexi_bass, power, preamp, rectifier, red_squeeze, rodent, round_fuzz, studio, tone,
+    treble_boost, ts808, tube610, twin, wah,
 };
+// The amplifiers added after the extraction (2026-10-28).
+use crate::circuits::{seattle100, tweed_lux};
 use crate::dsp::ac;
 use crate::dsp::netlist::{Circuit as Netlist, DiodeSpec, Fault};
 use crate::dsp::oversample::Oversampler;
@@ -221,12 +224,27 @@ pub enum Gain {
     /// The Ampeg V-4B of 1971, the VT-40's bass sibling, from Ampeg's own
     /// drawing (`circuits::american_v4b`), into its four 7027As.
     AmericanV4b,
+    /// The Fender Deluxe 5E3 (1955-60), its bright channel, from Fender's own
+    /// schematic and layout (`circuits::tweed_lux`): two volumes that load
+    /// each other, one tone control, a cathodyne and two cathode-biased 6V6s
+    /// behind a 5Y3 (`power::PowerSpec::TWEED_6V6`).
+    TweedLux,
+    /// The same amplifier played through its normal channel, the bright one's
+    /// volume on the panel's fourth knob.
+    TweedLuxNormal,
+    /// The Soldano SLO-100, its overdrive channel, from the 1996 drawings
+    /// (`circuits::seattle100`), into four 6L6s with 39 k of feedback
+    /// (`power::PowerSpec::SEATTLE_6L6`).
+    Seattle100,
+    /// The same amplifier's normal channel, with its Crunch and Bright
+    /// switches.
+    Seattle100Normal,
 }
 
 impl Gain {
     // Appended: the calibration table and every chain's circuit slots are laid
     // out in this order.
-    pub const ALL: [Gain; 51] = [
+    pub const ALL: [Gain; 55] = [
         Gain::Clean,
         Gain::Crunch,
         Gain::HighGain,
@@ -278,6 +296,10 @@ impl Gain {
         Gain::Brit45,
         Gain::AmericanVt40,
         Gain::AmericanV4b,
+        Gain::TweedLux,
+        Gain::TweedLuxNormal,
+        Gain::Seattle100,
+        Gain::Seattle100Normal,
     ];
 
     pub fn name(self) -> &'static str {
@@ -333,6 +355,10 @@ impl Gain {
             Gain::Brit45 => "JTM45",
             Gain::AmericanVt40 => "Ampeg VT-40",
             Gain::AmericanV4b => "Ampeg V-4B",
+            Gain::TweedLux => "Deluxe 5E3",
+            Gain::TweedLuxNormal => "Deluxe 5E3, Normal",
+            Gain::Seattle100 => "SLO-100",
+            Gain::Seattle100Normal => "SLO-100, Normal",
         }
     }
 
@@ -391,6 +417,10 @@ impl Gain {
             Gain::Brit45 => jtm45::VOLUME,
             Gain::AmericanVt40 => american_vt40::VOLUME,
             Gain::AmericanV4b => american_v4b::VOLUME,
+            // The played channel's volume, the other on the fourth knob.
+            Gain::TweedLux | Gain::TweedLuxNormal => tweed_lux::VOLUME,
+            Gain::Seattle100 => seattle100::OD_VOLUME,
+            Gain::Seattle100Normal => seattle100::NORMAL_VOLUME,
             _ => clipper::GAIN,
         }
     }
@@ -437,7 +467,11 @@ impl Gain {
             | Gain::AmericanSvt
             | Gain::AmericanVt40
             | Gain::AmericanV4b
-            | Gain::American800RB => "VOLUME",
+            | Gain::American800RB
+            | Gain::TweedLux
+            | Gain::TweedLuxNormal => "VOLUME",
+            // The SLO prints its channels' gains as PREAMP.
+            Gain::Seattle100 | Gain::Seattle100Normal => "PREAMP",
             // The Laney prints its volumes as gains: this channel's is GAIN TWO.
             Gain::Brum100 => "GAIN",
             Gain::Recto | Gain::Brit2205 => "GAIN",
@@ -532,6 +566,11 @@ impl Gain {
             Gain::ModernPurple => Some(Level::Circuit(modern_purple::VOLUME)),
             Gain::BassDriver => Some(Level::Circuit(bass_driver::LEVEL)),
             Gain::American800RB => Some(Level::Circuit(american_800rb::BOOST)),
+            // Each channel's own master, P6 or P7, after the shared stack and
+            // ahead of the photo-resistors that pick between them. The Tweed
+            // Lux has none, like the 1959.
+            Gain::Seattle100 => Some(Level::Circuit(seattle100::OD_MASTER)),
+            Gain::Seattle100Normal => Some(Level::Circuit(seattle100::NORMAL_MASTER)),
             // The MicroAmp's one knob is its gain, already the Drive knob.
             _ => None,
         }
@@ -607,8 +646,31 @@ impl Gain {
                 american_800rb::LO_MID,
                 american_800rb::TREBLE,
             )),
+            // One control, TONE, on the Treble knob (`tone_label`); see
+            // `circuits::tweed_lux`.
+            Gain::TweedLux | Gain::TweedLuxNormal => {
+                Some((usize::MAX, usize::MAX, tweed_lux::TONE))
+            }
+            // The JCM800's stack but for its 47 k slope resistor, shared by
+            // both channels.
+            Gain::Seattle100 | Gain::Seattle100Normal => {
+                Some((seattle100::BASS, seattle100::MIDDLE, seattle100::TREBLE))
+            }
             Gain::Neve => None,
             _ => None,
+        }
+    }
+
+    /// What the panel prints under each of the three tone knobs (bass, middle,
+    /// treble) on this circuit. The Tweed Lux's one control is not a treble
+    /// control but a cut with a bright cap on its other end, and its panel
+    /// says TONE.
+    pub fn tone_label(self, knob: usize) -> &'static str {
+        match (self, knob) {
+            (Gain::TweedLux | Gain::TweedLuxNormal, 2) => "TONE",
+            (_, 0) => "BASS",
+            (_, 1) => "MIDDLE",
+            _ => "TREBLE",
         }
     }
 
@@ -637,6 +699,23 @@ impl Gain {
             // Not a tone control but the box's toggle beyond its stack: off,
             // Blue and Red in thirds of the knob.
             Gain::ModernPurple => Some((modern_purple::AGGRESSION, "AGGRESSION")),
+            // The other channel's volume, which loads the one played: see
+            // `circuits::tweed_lux`.
+            Gain::TweedLux => Some((tweed_lux::OTHER_VOLUME, "NORMAL VOL")),
+            Gain::TweedLuxNormal => Some((tweed_lux::OTHER_VOLUME, "BRIGHT VOL")),
+            _ => None,
+        }
+    }
+
+    /// A control of this amplifier's own power stage that the panel's fourth
+    /// knob turns, where its circuit has none of its own (`own_sweep`), and
+    /// what the panel calls it: the Seattle 100's DEPTH, a rheostat in its
+    /// feedback loop (`power::DepthNetwork`). It reaches whatever power stage
+    /// is behind the preamplifier, on that stage's `power::RESONANCE`; a stage
+    /// without one ignores it, and every other amplifier rests the control.
+    pub fn power_sweep(self) -> Option<(usize, &'static str)> {
+        match self {
+            Gain::Seattle100 | Gain::Seattle100Normal => Some((power::RESONANCE, "DEPTH")),
             _ => None,
         }
     }
@@ -746,6 +825,8 @@ impl Gain {
             Gain::Brum100 => Some(&power::PowerSpec::BRUM_EL34),
             Gain::OregonT => Some(&power::PowerSpec::OREGON_6550),
             Gain::AmericanSvt => Some(&power::PowerSpec::SVT_6550),
+            Gain::TweedLux | Gain::TweedLuxNormal => Some(&power::PowerSpec::TWEED_6V6),
+            Gain::Seattle100 | Gain::Seattle100Normal => Some(&power::PowerSpec::SEATTLE_6L6),
             _ => None,
         }
     }
@@ -800,6 +881,10 @@ impl Gain {
                 | Gain::ModernPurple
                 | Gain::AmericanVt40
                 | Gain::AmericanV4b
+                | Gain::TweedLux
+                | Gain::TweedLuxNormal
+                | Gain::Seattle100
+                | Gain::Seattle100Normal
         )
     }
 
@@ -953,6 +1038,17 @@ impl Gain {
     }
 
     pub fn bright_switch(self) -> Option<BrightSwitch> {
+        if matches!(self, Gain::Seattle100 | Gain::Seattle100Normal) {
+            // S2, Bright/(Norm): C5 across R10 in the normal channel's
+            // divider. In overdrive mode the normal channel still reaches the
+            // mix, so the switch is there on both. See `circuits::seattle100`.
+            return Some(BrightSwitch {
+                slot: seattle100::BRIGHT_SLOT,
+                on: seattle100::BRIGHT_FARADS,
+                off: seattle100::BRIGHT_OFF_FARADS,
+                on_label: "On (470 pF)",
+            });
+        }
         if self == Gain::American800RB {
             // HI BOOST: shorts R23 so C26 and R28 bridge the volume.
             return Some(BrightSwitch {
@@ -1053,7 +1149,36 @@ impl Gain {
                 ],
                 labels: &["80 Hz", "Flat", "300 Hz", "80+300"],
             }),
+            // The three ways into a tweed's jacks, jack 1 second: see
+            // `tweed_lux::INPUT`. The Tweed Lux's jacks are this switch rather
+            // than `input_jacks`, because jumpering moves six contacts, not
+            // three.
+            Gain::TweedLux | Gain::TweedLuxNormal => Some(CircuitSwitch {
+                slots: &tweed_lux::INPUT_SLOTS,
+                values: &[
+                    &tweed_lux::INPUT[0],
+                    &tweed_lux::INPUT[1],
+                    &tweed_lux::INPUT[2],
+                ],
+                labels: &["Jack 2", "Jack 1", "Jumpered"],
+            }),
+            // S1, Crunch/(Clean), Crunch second. In overdrive mode it still
+            // sets what the normal channel adds to the mix.
+            Gain::Seattle100 | Gain::Seattle100Normal => Some(CircuitSwitch {
+                slots: &seattle100::CRUNCH_SLOTS,
+                values: &[&seattle100::CRUNCH[0], &seattle100::CRUNCH[1]],
+                labels: &["Clean", "Crunch"],
+            }),
             _ => None,
+        }
+    }
+
+    /// What the panel calls the low switch (`low_switch`) on this circuit.
+    pub fn low_switch_caption(self) -> &'static str {
+        match self {
+            Gain::TweedLux | Gain::TweedLuxNormal => "INPUT",
+            Gain::Seattle100 | Gain::Seattle100Normal => "CRUNCH",
+            _ => "LOW",
         }
     }
 
@@ -1650,10 +1775,15 @@ pub enum PowerModel {
     American7027A,
     /// The V-4B's four 7027As. See `power::PowerSpec::V4B_7027A`.
     AmericanV4b7027A,
+    /// The tweed Deluxe's cathodyne and two cathode-biased 6V6GTs behind a
+    /// 5Y3. See `power::PowerSpec::TWEED_6V6`.
+    TweedLux6V6,
+    /// The SLO-100's four 6L6GCs. See `power::PowerSpec::SEATTLE_6L6`.
+    Seattle6L6,
 }
 
 impl PowerModel {
-    pub const ALL: [PowerModel; 22] = [
+    pub const ALL: [PowerModel; 24] = [
         PowerModel::Cali6L6,
         PowerModel::American6L6Clean,
         PowerModel::American6L6HighGain,
@@ -1676,6 +1806,8 @@ impl PowerModel {
         PowerModel::Brit45KT66,
         PowerModel::American7027A,
         PowerModel::AmericanV4b7027A,
+        PowerModel::TweedLux6V6,
+        PowerModel::Seattle6L6,
     ];
 
     /// The valve stage this model is, where it is one.
@@ -1707,6 +1839,8 @@ impl PowerModel {
             Self::Brit45KT66 => &power::PowerSpec::JTM45_KT66,
             Self::American7027A => &power::PowerSpec::VT40_7027A,
             Self::AmericanV4b7027A => &power::PowerSpec::V4B_7027A,
+            Self::TweedLux6V6 => &power::PowerSpec::TWEED_6V6,
+            Self::Seattle6L6 => &power::PowerSpec::SEATTLE_6L6,
             Self::Jazz120SS | Self::British73Out | Self::AmericanSS800 => return None,
         })
     }
@@ -1715,6 +1849,15 @@ impl PowerModel {
     /// See `power::PowerSpec::presence_name`.
     pub fn presence_name(self) -> Option<&'static str> {
         self.spec().and_then(power::PowerSpec::presence_name)
+    }
+
+    /// Whether this stage has a control on `power::RESONANCE` for a voice's
+    /// `Gain::power_sweep` to turn: a depth (`power::DepthNetwork`) or the
+    /// 5150's resonance (`power::FeedbackNetwork`).
+    pub fn has_resonance(self) -> bool {
+        self.spec().is_some_and(|s| {
+            s.feedback > 0.0 && (s.depth.is_some() || s.feedback_network.is_some())
+        })
     }
 
     /// The speaker-loaded circuit for this stage, whatever kind it is. One
@@ -1782,6 +1925,8 @@ impl PowerModel {
             Self::Brit45KT66 => 19,
             Self::American7027A => 20,
             Self::AmericanV4b7027A => 21,
+            Self::TweedLux6V6 => 22,
+            Self::Seattle6L6 => 23,
         }
     }
 
@@ -1822,6 +1967,8 @@ impl PowerModel {
             Self::AmericanV4b7027A => {
                 voice_index(Gain::AmericanV4b, Diode::Silicon, Amplifier::Valve)
             }
+            Self::TweedLux6V6 => voice_index(Gain::TweedLux, Diode::Silicon, Amplifier::Valve),
+            Self::Seattle6L6 => voice_index(Gain::Seattle100, Diode::Silicon, Amplifier::Valve),
         }
     }
 }
@@ -1901,6 +2048,8 @@ impl PowerAmp {
                 Gain::Brit45 => Some(PowerModel::Brit45KT66),
                 Gain::AmericanVt40 => Some(PowerModel::American7027A),
                 Gain::AmericanV4b => Some(PowerModel::AmericanV4b7027A),
+                Gain::TweedLux | Gain::TweedLuxNormal => Some(PowerModel::TweedLux6V6),
+                Gain::Seattle100 | Gain::Seattle100Normal => Some(PowerModel::Seattle6L6),
                 _ => None,
             },
             Self::Bypass => None,
@@ -1985,6 +2134,17 @@ pub enum Pedal {
     /// The Revv G3 (`circuits::modern_purple`). Gain, bass, mid, treble, the
     /// Aggression toggle as a fourth tone knob in thirds, and volume.
     ModernPurple,
+    /// The MXR Dyna Comp, CA3080 version (`circuits::red_squeeze`).
+    /// Sensitivity on the slot's drive, Output on its level.
+    RedSqueeze,
+    /// The Dan Armstrong Orange Squeezer (`circuits::juicer`). Its bias
+    /// trimmer on the slot's drive, its volume trimmer on its level.
+    Juicer,
+    /// The MXR M169 Carbon Copy (`circuits::carbon_echo`): Delay on the
+    /// slot's drive, Mix on its level, Regen and the Mod switch on its tone
+    /// knobs. Its bucket brigades, compander rectifiers and clock board are
+    /// `carbon_echo::Echo`, beside its netlist.
+    CarbonEcho,
 }
 
 /// What a guitar puts out for a nominal digital signal: the level every circuit
@@ -2070,6 +2230,10 @@ impl Pedal {
             Pedal::BlueChorus => ("rate", "level"),
             Pedal::Modern33 => ("drive", "level"),
             Pedal::ModernPurple => ("gain", "volume"),
+            Pedal::RedSqueeze => ("sensitivity", "output"),
+            // The trimmers inside the box, as GGG's replica brings them out.
+            Pedal::Juicer => ("bias", "volume"),
+            Pedal::CarbonEcho => ("delay", "mix"),
         }
     }
 
@@ -2095,10 +2259,17 @@ impl Pedal {
             Pedal::BlueChorus => Some(Gain::BlueChorus),
             Pedal::Modern33 => Some(Gain::Modern33),
             Pedal::ModernPurple => Some(Gain::ModernPurple),
+            // Only on the line: the compressors are not circuits of the
+            // catalogue's own.
+            Pedal::RedSqueeze | Pedal::Juicer => None,
+            // Not a catalogue voice: a delay is nobody's amplifier, and a
+            // voice needs a measured calibration row. The pedal line is the
+            // only place it plays.
+            Pedal::CarbonEcho => None,
         }
     }
 
-    pub const ALL: [Pedal; 19] = [
+    pub const ALL: [Pedal; 22] = [
         Pedal::None,
         Pedal::Green808,
         Pedal::BigMuff,
@@ -2118,10 +2289,13 @@ impl Pedal {
         Pedal::BlueChorus,
         Pedal::Modern33,
         Pedal::ModernPurple,
+        Pedal::RedSqueeze,
+        Pedal::Juicer,
+        Pedal::CarbonEcho,
     ];
     /// How many pedal circuits a chain holds.
     #[allow(dead_code)]
-    pub(crate) const SLOTS: usize = 18;
+    pub(crate) const SLOTS: usize = 21;
 
     pub(crate) fn slot(self) -> Option<usize> {
         match self {
@@ -2144,6 +2318,9 @@ impl Pedal {
             Pedal::BlueChorus => Some(15),
             Pedal::Modern33 => Some(16),
             Pedal::ModernPurple => Some(17),
+            Pedal::RedSqueeze => Some(18),
+            Pedal::Juicer => Some(19),
+            Pedal::CarbonEcho => Some(20),
         }
     }
 
@@ -2184,10 +2361,25 @@ impl Pedal {
     /// circuit (the Metal Zone 4.56). With its kernels compiled, 23.9 % alone
     /// and 47.1 % in front of the Cali IIC+ at 1x, against the Metal Zone's
     /// 20.2 and 45.0 measured beside it; before them it took 109.6 % at 2x.
+    ///
+    /// The compressors (2026-10-28) are not. Measured alone with
+    /// `pedal::tests::compressor_stage_cost`, on a machine other builds were
+    /// loading, beside the Green 808 for scale (4.1 % at 1x and 8.3 % at 2x in
+    /// the same run): the Red Squeeze 5.9 and 12.0 % -- five transistors, two
+    /// diodes and the CA3080 -- and the Juicer 4.1 and 8.5 %; both 2.0
+    /// Newton passes a sample at every Drive, none unsettled.
+    ///
+    /// The Carbon Echo (2026-10-28) too: its audio board is four rail-aware
+    /// op-amps, five transistors and the compander's two gain cells on
+    /// Newton's boundary, two passes a sample, and with its clock board and
+    /// BBDs about 37 % of a core alone at 1x (`carbon_echo::tests::
+    /// cost_by_part`), the Blue Chorus 29-33 % beside it -- some 75 % at 2x.
+    /// And oversampling buys a delay nothing: its wet path is band-limited
+    /// to about 4 kHz by its own filters, its dry path is op-amps.
     pub fn is_expensive(self) -> bool {
         matches!(
             self,
-            Pedal::HeavyMetal | Pedal::MetalZone | Pedal::ModernPurple
+            Pedal::HeavyMetal | Pedal::MetalZone | Pedal::ModernPurple | Pedal::CarbonEcho
         )
     }
 
@@ -2243,6 +2435,9 @@ impl Pedal {
             15 => blue_chorus::build(10_000.0, 470_000.0),
             16 => modern_33::build(10_000.0, 470_000.0),
             17 => modern_purple::build(10_000.0, 470_000.0),
+            18 => red_squeeze::build(10_000.0, 470_000.0),
+            19 => juicer::build(10_000.0, 470_000.0),
+            20 => carbon_echo::build(10_000.0, 470_000.0),
             _ => clean_boost::build(10_000.0, 470_000.0),
         }
     }
@@ -2447,6 +2642,42 @@ impl Pedal {
                     None,
                 ],
                 level: Some(modern_purple::VOLUME),
+            },
+            // SENSITIVITY and OUTPUT.
+            18 => PedalControls {
+                drive: Some(red_squeeze::SENSITIVITY),
+                tones: NO_TONES,
+                level: Some(red_squeeze::OUTPUT),
+            },
+            // The bias and volume trimmers.
+            19 => PedalControls {
+                drive: Some(juicer::BIAS),
+                tones: NO_TONES,
+                level: Some(juicer::VOLUME),
+            },
+            // DELAY, MIX, REGEN and the MOD switch, as the box has them.
+            // DELAY is in the clock's timing network rather than either
+            // netlist: the stage hands it to `carbon_echo::Echo`, which also
+            // takes MOD to the clock board. MIX rests at its middle, so the
+            // level knob is the pot itself.
+            20 => PedalControls {
+                drive: Some(carbon_echo::DELAY),
+                tones: [
+                    Some(ToneKnob {
+                        control: carbon_echo::REGEN,
+                        label: "regen",
+                        inverted: false,
+                    }),
+                    Some(ToneKnob {
+                        control: carbon_echo::MOD,
+                        label: "mod",
+                        inverted: false,
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                level: Some(carbon_echo::MIX),
             },
             // One knob, GAIN on the box: the drive, and no level.
             _ => PedalControls {
@@ -2764,8 +2995,32 @@ pub fn build_voice(gain: Gain, diode: Diode, amplifier: Amplifier) -> Result<Net
         Gain::Brit45 => jtm45::build(10_000.0, 1_000_000.0),
         Gain::AmericanVt40 => american_vt40::build(10_000.0, 1_000_000.0),
         Gain::AmericanV4b => american_v4b::build(10_000.0, 1_000_000.0),
+        // Loaded by the cathodyne's grid: its 1 M leak bootstrapped by the
+        // cathode to some megohms. See `circuits::tweed_lux`.
+        Gain::TweedLux => {
+            tweed_lux::build_channel(tweed_lux::Channel::Bright, 10_000.0, TWEED_LOAD)
+        }
+        Gain::TweedLuxNormal => {
+            tweed_lux::build_channel(tweed_lux::Channel::Normal, 10_000.0, TWEED_LOAD)
+        }
+        // Loaded by the inverter's R31, bootstrapped by its tail.
+        Gain::Seattle100 => {
+            seattle100::build_channel(seattle100::Channel::Overdrive, 10_000.0, SEATTLE_LOAD)
+        }
+        Gain::Seattle100Normal => {
+            seattle100::build_channel(seattle100::Channel::Normal, 10_000.0, SEATTLE_LOAD)
+        }
     }
 }
+
+/// What the cathodyne's grid presents to V2A's plate: its 1 M leak returned
+/// to a junction that follows the cathode at about nine tenths of the grid's
+/// swing, so ten megohms. APPROXIMATED.
+const TWEED_LOAD: f64 = 10_000_000.0;
+/// What the SLO's inverter presents through C17: R31's 1 M returned to the
+/// leak junction, which moves with the cathodes at about half the grid's
+/// swing, so two megohms. APPROXIMATED.
+const SEATTLE_LOAD: f64 = 2_000_000.0;
 
 /// The output transformer, which is a control rather than a property of a
 /// circuit: iron belongs after a distortion pedal exactly as much as after a

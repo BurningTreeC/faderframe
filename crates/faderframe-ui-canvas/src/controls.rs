@@ -19,6 +19,26 @@ pub const PLANE_RADIUS: f32 = 7.0;
 const KNOB_START: f32 = PI * 0.75;
 const KNOB_SWEEP: f32 = PI * 1.5;
 
+/// A padlock filling `r` (body below, shackle above) in `color`: the mark
+/// of material locked in time (time-locked tracks and their clips).
+pub fn lock_glyph(p: &mut dyn Painter, r: Rect, color: Color) {
+    let w = r.w.min(r.h * 0.85);
+    let x = r.x + (r.w - w) / 2.0;
+    let body_h = r.h * 0.55;
+    let body = Rect::new(x, r.bottom() - body_h, w, body_h);
+    let radius = (w * 0.3).max(1.0);
+    let line = (w * 0.16).clamp(1.0, 1.6);
+    let cx = x + w / 2.0;
+    let top = r.y + radius + line / 2.0;
+    let mut shackle = Path::new();
+    shackle.move_to(Point::new(cx - radius, body.y + 0.5));
+    shackle.line_to(Point::new(cx - radius, top));
+    shackle.arc(Point::new(cx, top), radius, PI, 2.0 * PI, true);
+    shackle.line_to(Point::new(cx + radius, body.y + 0.5));
+    p.stroke_path(&shackle, line, color);
+    p.fill_rounded(body, 1.2, &Paint::Solid(color));
+}
+
 /// Normalised value change for a vertical drag of `dy` pixels.
 /// Moving up increases the value; `fine` gives 5× more resolution.
 pub fn drag_delta(dy: f32, fine: bool) -> f32 {

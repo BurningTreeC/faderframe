@@ -137,6 +137,7 @@ pub static COLORS: [ColorKey; 56] = [
         |t, c| {
             t.ui.selection = c;
             t.arranger.snap_guide = c;
+            t.arranger.time_lock = c;
             t.piano.lane_curve = c;
             t.piano.rubber_band = c.with_alpha(t.piano.rubber_band.a);
             t.console.selected_glow = c.with_alpha(t.console.selected_glow.a);

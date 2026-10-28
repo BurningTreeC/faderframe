@@ -2850,6 +2850,41 @@ fn the_stock_devices_do_not_allocate() {
             0,
             (430.0, 450.0),
         ),
+        // The Tape Machine under-biased (its hysteresis path), hissing,
+        // fluttering, the azimuth off, at 4× and driven; its bias automated
+        // across the alignment (the pinned population coming and going).
+        (
+            builtin::TAPE_MACHINE,
+            vec![
+                set(8, -3.0),
+                set(11, 1.0),
+                set(10, 2.0),
+                set(12, 5.0),
+                set(13, 1.0),
+                set(0, 6.0),
+            ],
+            false,
+            8,
+            (-4.0, 2.0),
+        ),
+        // The 2A: Limit, Peak Reduction up, half mix, unlinked; R37
+        // automated (the sidechain's circuit rebuilt as the trim moves).
+        (
+            builtin::LEVELER_2A,
+            vec![set(1, 75.0), set(2, 1.0), set(5, 0.5), set(6, 0.0)],
+            false,
+            4,
+            (0.0, 1.0),
+        ),
+        // Keyed by the sidechain, Compress/Limit automated (SW3: the input
+        // circuit rebuilt at each throw).
+        (
+            builtin::LEVELER_2A,
+            vec![set(1, 70.0), set(7, 1.0), set(4, 0.4)],
+            true,
+            2,
+            (0.0, 1.0),
+        ),
     ];
     let mut ids = Vec::new();
     for (i, (plugin, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate() {
@@ -3583,6 +3618,17 @@ fn the_guitar_station_does_not_allocate() {
                 id::slot(2, id::STOMP),
                 Stomp::Pedal(Pedal::MetalZone).index() as f64,
             ),
+            // The OTA compressor: the CA3080's stamp on the audio path.
+            set(
+                id::slot(3, id::STOMP),
+                Stomp::Pedal(Pedal::RedSqueeze).index() as f64,
+            ),
+            // The bucket-brigade echo, its delay short.
+            set(
+                id::slot(4, id::STOMP),
+                Stomp::Pedal(Pedal::CarbonEcho).index() as f64,
+            ),
+            set(id::slot(4, id::P_DRIVE), 0.2),
             set(id::AMP, 8.0),
             set(id::REVERB, 0.3),
             set(id::INTENSITY, 0.4),
@@ -3859,6 +3905,8 @@ fn surround_strips_do_not_allocate() {
         .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
         .unwrap();
     r.controller.set_mono_check(true).unwrap();
+    // A loudness-matched comparison's monitor trim.
+    r.controller.set_monitor_trim(-2.5).unwrap();
     r.play_from(0).unwrap();
     let mut bufs = OwnedBuffers::new(2, 6, 256);
     for _ in 0..4 {
@@ -4343,4 +4391,150 @@ fn blocks_an_instrument_misses_do_not_allocate() {
     assert_eq!(n, 0, "allocations with missed blocks");
     let ended = ENDED.load(Ordering::Relaxed);
     assert!(ended >= 64, "every note ended: {ended}");
+}
+
+/// Tracks' own delays (later by whole samples, by a fraction, earlier
+/// through the delay compensation) play, crossfade to new values while
+/// playing, and forget what they hold on a panic: nothing allocates.
+#[test]
+fn track_delays_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::ChannelLayout;
+    use faderframe_project::{Impact, TrackKind};
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let mut tracks = Vec::new();
+    for (name, ms, layout) in [
+        ("Kick In", 2.0, ChannelLayout::Mono),
+        ("Snare", 1.010_416, ChannelLayout::Mono),
+        ("Overheads", -3.25, ChannelLayout::Stereo),
+        ("Room", 0.3, ChannelLayout::Stereo),
+    ] {
+        let t = tp.track(TrackKind::Audio, name, layout);
+        let src = tp.dc(layout.channel_count(), 0.25, 200_000);
+        tp.clip(t, src, faderframe_timeline::MusicalTime::ZERO, 200_000);
+        tp.project.track_mut(t).unwrap().delay_ms = ms;
+        tracks.push(t);
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    assert!(r.controller.graph_stats().output_latency > 0);
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+        r.controller.collect_garbage();
+    }
+    let mut history = History::default();
+    for (i, ms) in [(0, 7.5), (1, 9.000_7), (2, -3.9), (3, 0.71)] {
+        history
+            .apply(
+                &mut tp.project,
+                Command::SetTrackDelay {
+                    track: tracks[i],
+                    ms,
+                },
+            )
+            .unwrap();
+    }
+    // The same shapes: parameters only, no rebuild (the latency stays).
+    let latency = r.controller.graph_stats().output_latency;
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Params)
+        .unwrap();
+    assert_eq!(r.controller.graph_stats().output_latency, latency);
+    r.controller.reset_processors().unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations with track delays");
+}
+
+#[test]
+fn the_compare_source_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_files::{PAGE_FRAMES, StreamSource, WavFormat, write_wav};
+    use faderframe_engine::nodes::{CompareSettings, CompareSource, CompareSync};
+    use faderframe_realtime::{Epoch, Reclaimer};
+    const SR: u32 = 48_000;
+    let n = PAGE_FRAMES * 4;
+    let x: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+    let dir = std::env::temp_dir().join(format!("ff-alloc-compare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("then.wav");
+    write_wav(&path, &[x.clone(), x], SR, WavFormat::Float32, false).unwrap();
+    let src = StreamSource::open(&path).unwrap();
+    src.ensure(
+        src.page_range(0, n as i64),
+        &Epoch::new(),
+        &mut Reclaimer::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    let link = std::sync::Arc::clone(r.controller.listening().link.compare());
+    let shared = std::sync::Arc::clone(link.shared());
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    link.set(Some(CompareSource {
+        source: src.clone(),
+        settings: CompareSettings::follow(0, n as i64),
+    }));
+    let (_, allocs) = armed(|| {
+        for i in 0..200 {
+            match i {
+                10 => shared.hear(true),
+                40 => shared.set_gain(0.5),
+                60 => {
+                    let _ = r
+                        .controller
+                        .transport(TransportCommand::Locate(PAGE_FRAMES as i64 - 10));
+                }
+                90 => shared.hear(false),
+                120 => shared.hear(true),
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while comparing");
+    // Another source (looping its region) crossfaded in, then none.
+    link.set(Some(CompareSource {
+        source: src.clone(),
+        settings: CompareSettings {
+            sync: CompareSync::Loop,
+            from: 1000,
+            to: 5000,
+        },
+    }));
+    let (_, allocs) = armed(|| {
+        for _ in 0..50 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "switching sources allocates nothing");
+    link.set(None);
+    let (_, allocs) = armed(|| {
+        for _ in 0..50 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "taking the source away allocates nothing");
+    link.collect();
+    let _ = std::fs::remove_dir_all(&dir);
 }

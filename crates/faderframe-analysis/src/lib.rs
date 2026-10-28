@@ -9,11 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod align;
 pub mod chroma;
 pub mod delivery;
 mod dynamics;
 pub mod levels;
 mod loudness;
+pub mod ltas;
 pub mod melody;
 pub mod pitch;
 pub mod polyvoice;

@@ -1155,3 +1155,101 @@ fn the_character_menu_offers_console_tape_oversampling_and_drive() {
         p.texts()
     );
 }
+
+#[test]
+fn a_reference_track_sent_to_eq_match_is_its_reference() {
+    use faderframe_session::references::{MATCH_OPEN_KEY, ReferenceOp};
+    let dir = std::env::temp_dir().join(format!("ff-eq-reference-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Record.wav");
+    let mut seed = 5u32;
+    let mut last = 0.0f32;
+    // A bright record: noise with its highs lifted.
+    let bright: Vec<f32> = (0..48_000 * 4)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = ((seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 0.3;
+            let y = v + 1.5 * (v - last);
+            last = v;
+            y
+        })
+        .collect();
+    faderframe_audio_files::write_wav(
+        &file,
+        &[bright.clone(), bright],
+        48_000,
+        faderframe_audio_files::WavFormat::Float32,
+        false,
+    )
+    .unwrap();
+    let mut s = Session::new(
+        faderframe_project::Project::new("Match", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::Reference(ReferenceOp::Add(vec![file])))
+        .unwrap();
+    assert!(s.wait_for_compare(std::time::Duration::from_secs(120)));
+    let reference = s.references().tracks[0].id;
+    s.dispatch(Action::Reference(ReferenceOp::SendToEqMatch {
+        reference,
+        track: None,
+    }))
+    .unwrap();
+    let master = s.project().master_id().unwrap();
+    let plugin = s.project().track(master).unwrap().inserts[0].id;
+    assert_eq!(Reference::of(&s, plugin), Reference::Track(reference));
+    // The editor opens EQ Match on it.
+    let mut view = EqView::new(plugin, &Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(view.matching.is_some());
+    assert!(p.texts().contains(&"Ref: ‘Record’ ▾"), "{:?}", p.texts());
+    // The input (plain noise) listened to: ready to match, treble added.
+    let tap = s.plugin_tap(plugin).unwrap();
+    let mut noise = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((seed >> 9) as f32 / (1u32 << 23) as f32 - 0.5) * 0.3
+    };
+    for _ in 0..40 {
+        let x: Vec<f32> = (0..4_096).map(|_| noise()).collect();
+        tap.input.push(&x, &x);
+        view.matching.as_mut().unwrap().update(&s, &tap, plugin);
+    }
+    let m = view.matching.as_mut().unwrap();
+    assert!(
+        m.ready(),
+        "{} {}",
+        m.input.averaged_seconds(),
+        m.reference_seconds()
+    );
+    m.compute(24);
+    let bands = m.result.clone().unwrap();
+    let at = |f: f64| -> f64 {
+        bands
+            .iter()
+            .map(|b| faderframe_plugin_host::eq::design::analog_db(b, f))
+            .sum()
+    };
+    assert!(
+        at(10_000.0) > at(200.0) + 4.0,
+        "{} {}",
+        at(10_000.0),
+        at(200.0)
+    );
+    // Cancelled: the request is answered, the panel stays shut.
+    run(
+        &mut view,
+        &mut s,
+        ViewEvent::Key {
+            key: Key::Escape,
+            modifiers: Modifiers::NONE,
+        },
+    );
+    assert!(view.matching.is_none());
+    assert_eq!(s.device_view(plugin, MATCH_OPEN_KEY), Some(0.0));
+    paint(&mut view, &s);
+    assert!(view.matching.is_none());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}

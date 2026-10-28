@@ -20,7 +20,7 @@ const MIDI_EFFECTS: [&str; 4] = [
 ];
 
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 19] = [
+const WITH_PRESETS: [&str; 21] = [
     builtin::COMPRESSOR_76,
     builtin::CHANNEL_STRIP,
     builtin::ARPEGGIATOR,
@@ -40,6 +40,8 @@ const WITH_PRESETS: [&str; 19] = [
     builtin::PROGRAM_EQ,
     builtin::SYNTH,
     builtin::GUITAR_STATION,
+    builtin::TAPE_MACHINE,
+    builtin::LEVELER_2A,
 ];
 
 #[test]

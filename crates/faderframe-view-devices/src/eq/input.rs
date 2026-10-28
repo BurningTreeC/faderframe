@@ -1157,7 +1157,7 @@ impl EqView {
                 self.remove(model, cx, &sel);
             }
             Key::Escape => {
-                if self.instances.take().is_none() && self.matching.take().is_none() {
+                if self.instances.take().is_none() && !self.close_matching(model, cx) {
                     if self.output_open {
                         self.output_open = false;
                     } else if self.selected.is_empty() {
@@ -1266,10 +1266,9 @@ impl EqView {
                 cx.emit(self.view_action(key::SKETCH, if on { 0.0 } else { 1.0 }));
             }
             TopItem::Match => {
-                self.matching = match self.matching.take() {
-                    Some(_) => None,
-                    None => Some(Match::new(model.sample_rate())),
-                };
+                if !self.close_matching(model, cx) {
+                    self.matching = Some(Match::new(model.sample_rate()));
+                }
                 self.instances = None;
             }
             TopItem::Sidechain => {
@@ -1887,7 +1886,7 @@ impl EqView {
                 }
             }
             instances::Hit::Match(id) => {
-                cx.emit(self.view_action(key::MATCH_REFERENCE, Reference::Instance(id).value()));
+                cx.emit(self.view_actions(&Reference::Instance(id).values()));
                 self.matching = Some(Match::new(model.sample_rate()));
                 self.instances = None;
             }
@@ -1932,14 +1931,20 @@ impl EqView {
                         items.push(
                             MenuItem::new(
                                 label,
-                                self.view_action(
-                                    key::MATCH_REFERENCE,
-                                    Reference::Instance(id).value(),
-                                ),
+                                self.view_actions(&Reference::Instance(id).values()),
                             )
                             .checked(now == Reference::Instance(id)),
                         );
                     }
+                }
+                // The project's reference tracks (their measured spectra).
+                for (i, r) in model.references().tracks.iter().enumerate() {
+                    let item = MenuItem::new(
+                        format!("Reference Track ‘{}’", r.name),
+                        self.view_actions(&Reference::Track(r.id).values()),
+                    )
+                    .checked(now == Reference::Track(r.id));
+                    items.push(if i == 0 { item.separated() } else { item });
                 }
                 cx.request(HostRequest::ContextMenu {
                     at: Point::new(r.x + 14.0, r.y + 52.0),
@@ -1951,6 +1956,14 @@ impl EqView {
                     m.input.reset_average();
                 }
                 m.input.averaging = !m.input.averaging;
+            }
+            matching::Hit::RecordReference
+                if matches!(
+                    Reference::of(model, self.device.plugin),
+                    Reference::Track(_)
+                ) =>
+            {
+                // A reference track's spectrum is measured, not recorded.
             }
             matching::Hit::RecordReference => {
                 if !m.reference.averaging {
@@ -1982,14 +1995,16 @@ impl EqView {
             }
             matching::Hit::Apply => {
                 if let Some(bands) = m.result.clone() {
-                    self.matching = None;
+                    self.close_matching(model, cx);
                     let slots = self.add_bands(model, cx, "EQ Match", &bands);
                     self.selected = slots;
                     self.focus = self.selected.last().copied();
                 }
             }
             matching::Hit::Back => m.result = None,
-            matching::Hit::Cancel => self.matching = None,
+            matching::Hit::Cancel => {
+                self.close_matching(model, cx);
+            }
             matching::Hit::Body => {}
         }
     }

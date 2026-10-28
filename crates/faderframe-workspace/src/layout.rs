@@ -48,10 +48,15 @@ pub enum ViewKind {
     /// The selected track's processing chain from input to output, a card
     /// per device.
     ChannelOverview,
+    /// Reference tracks: a loudness-matched A/B with the mix, spectra
+    /// compared.
+    Reference,
+    /// Mix Intelligence: the mix analysed, its findings and experiments.
+    MixIntelligence,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 22] = [
+    pub const ALL: [ViewKind; 24] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -74,11 +79,13 @@ impl ViewKind {
         ViewKind::Setlist,
         ViewKind::Inspector,
         ViewKind::ChannelOverview,
+        ViewKind::Reference,
+        ViewKind::MixIntelligence,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 22] = [
+    pub const TAB_ORDER: [ViewKind; 24] = [
         ViewKind::Arranger,
         ViewKind::Inspector,
         ViewKind::Mixer,
@@ -87,6 +94,8 @@ impl ViewKind {
         ViewKind::Events,
         ViewKind::Automation,
         ViewKind::Tools,
+        ViewKind::Reference,
+        ViewKind::MixIntelligence,
         ViewKind::Album,
         ViewKind::Performance,
         ViewKind::History,
@@ -141,6 +150,8 @@ impl ViewKind {
             ViewKind::Setlist => "Setlist",
             ViewKind::Inspector => "Inspector",
             ViewKind::ChannelOverview => "Channel Overview",
+            ViewKind::Reference => "Reference",
+            ViewKind::MixIntelligence => "Mix Intelligence",
         }
     }
 
@@ -178,6 +189,8 @@ impl ViewKind {
             ViewKind::Setlist => ViewId::setlist(),
             ViewKind::Inspector => ViewId::inspector(),
             ViewKind::ChannelOverview => ViewId::channel_overview(),
+            ViewKind::Reference => ViewId::reference(),
+            ViewKind::MixIntelligence => ViewId::mix_intelligence(),
         }
     }
 }

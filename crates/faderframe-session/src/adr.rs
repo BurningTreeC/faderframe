@@ -217,10 +217,23 @@ impl Session {
             .iter()
             .find(|t| t.name == BEEPS_TRACK && t.kind == TrackKind::Audio)
             .map(|t| (t.id, t.clips.clone()));
+        // The beeps belong to the cues, which belong to the picture: their
+        // track is time-locked (a tempo change leaves them on their cues).
+        let locked = faderframe_project::TimeBase::TimeLocked;
         let track = match existing {
             Some((id, clips)) => {
                 for c in clips {
                     commands.push(Command::RemoveClip { clip: c });
+                }
+                if self
+                    .project
+                    .track(id)
+                    .is_some_and(|t| t.time_base != locked)
+                {
+                    commands.push(Command::SetTrackTimeBase {
+                        track: id,
+                        base: locked,
+                    });
                 }
                 id
             }
@@ -228,6 +241,7 @@ impl Session {
                 let id: TrackId = self.project.ids.allocate();
                 let mut t = Track::new(id, TrackKind::Audio, BEEPS_TRACK, TrackColor::palette(5));
                 t.layout = faderframe_core::ChannelLayout::Mono;
+                t.time_base = locked;
                 let index = self
                     .project
                     .tracks

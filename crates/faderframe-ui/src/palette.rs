@@ -84,6 +84,8 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.edit-tool::smart", &["<Alt>s"]),
     // Ripple editing on and off (Alt+R repeats in the arranger).
     ("app.ripple", &["<Control><Alt>r"]),
+    // A/B: the mix ⇄ "Then" or the reference.
+    ("app.compare-flip", &["<Control><Alt>a"]),
 ];
 
 /// Whether a command is on now (the check or radio dot its menu item

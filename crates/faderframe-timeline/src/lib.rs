@@ -56,6 +56,13 @@ impl Timeline {
         self.tempo.samples_to_musical(samples, sample_rate)
     }
 
+    /// The musical position on sample `samples` exactly (see
+    /// [`TempoMap::musical_at_sample`]).
+    #[inline]
+    pub fn at_sample(&self, samples: i64, sample_rate: f64) -> MusicalTime {
+        self.tempo.musical_at_sample(samples, sample_rate)
+    }
+
     /// Musical end position of something that starts at `start` and lasts
     /// `frames` samples (e.g. an un-stretched audio clip).
     pub fn end_of_sample_span(

@@ -277,7 +277,136 @@ pub struct PowerSpec {
     /// it the `pi_*` fields are unused and `feedback` lands on the gain stage's
     /// cathode. `None` everywhere but the VT-40's. See `ParaphaseFront`.
     pub paraphase_front: Option<&'static ParaphaseFront>,
+    /// A front end of the tweed kind in place of the long-tailed pair: one
+    /// triode with equal loads in its plate and its cathode, the plate the
+    /// inverted output and the cathode the other, each capacitor coupled to
+    /// its side's grids as everywhere else. With it the `pi_*` fields are
+    /// unused. `None` everywhere but the Tweed Lux's. See `CathodyneFront`.
+    pub cathodyne_front: Option<&'static CathodyneFront>,
+    /// A depth control in series with a plain loop (`feedback` straight to
+    /// the tail, the presence shunted off the tail), on control `RESONANCE`.
+    /// `None` everywhere but the Seattle 100's. See `DepthNetwork`.
+    pub depth: Option<&'static DepthNetwork>,
 }
+
+/// The tweed Deluxe's phase inverter: V2B, a split-load (cathodyne) stage,
+/// from Fender's drawing "Fender 'Deluxe' Schematic, Model 5E3" (F-EE) and its
+/// layout. See `circuits::tweed_lux`, which has the rest of the amplifier and
+/// the sources.
+///
+/// ```text
+/// V2A plate -- .02 (600 V) -- V2B grid -- 1 M -- J
+/// V2B plate -- 56 k -- B+3        (the inverted output)
+/// V2B cathode -- 1500 -- J -- 56 k -- ground   (the other, at the cathode)
+/// B+2 -- 22 k -- B+3, 16 uF / 450 V
+/// ```
+///
+/// **A cathodyne has no gain and no balance problem, and it has a temper.**
+/// Equal loads above and below make the two outputs equal and opposite, each a
+/// little under the input; the grid leak returns to J, above the 56 k, so the
+/// grid sits at the cathode's forty-odd volts and the leak is bootstrapped to
+/// tens of megohms. Driven hard, the grid passes the cathode and conducts: the
+/// .02 charges, the stage biases itself off, and the plate side clips before
+/// the cathode side does. That lopsided, sputtering edge -- the inverter
+/// blocking and recovering over the .02 and the leak -- is a large part of
+/// what a tweed Deluxe turned up sounds like, which is why the .02 is built
+/// here, on the grid it charges, and not in the preamplifier.
+///
+/// **The inverter's rail is the preamplifier's.** B+3 hangs off the screens'
+/// node through the drawing's 22 k, so a hard chord takes the screens down
+/// and the inverter with them; the rest of the preamplifier's standing current
+/// on that node (V1 and V2A, from the chart below) is a resistor here.
+#[derive(Clone, Copy, Debug)]
+pub struct CathodyneFront {
+    pub tube: TriodeSpec,
+    /// What the driving plate looks like from the coupling capacitor, less
+    /// the module's own source resistance (`build`'s `source`): the plate it
+    /// hands over from is behind its load and the valve's own resistance.
+    pub drive_source: f64,
+    /// The coupling into the grid, and the grid leak back to the junction.
+    pub couple: f64,
+    pub leak: f64,
+    /// The plate load, the bias resistor, and the cathode load below it.
+    pub plate: f64,
+    pub bias: f64,
+    pub load: f64,
+    /// The inverter's rail: a dropper off the screens' node (`scr`), its
+    /// reservoir, and what the preamplifier draws from it, as a resistance.
+    pub rail_dropper: f64,
+    pub rail_reservoir: f64,
+    pub rail_draw: f64,
+}
+
+impl CathodyneFront {
+    /// The 5E3's, value for value off the drawing.
+    pub const TWEED_5E3: CathodyneFront = CathodyneFront {
+        tube: TriodeSpec::ECC83, // V2, a 12AX7
+        // APPROXIMATED. V2A's 100 k plate load in parallel with the valve's
+        // plate resistance at the chart's 0.83 mA (about 65 k on this model's
+        // ECC83) is 40 k; the module is driven through 10 k already.
+        drive_source: 30_000.0,
+        couple: 0.02e-6,   // the .02-600
+        leak: 1_000_000.0, // 1 MEG, to the junction
+        plate: 56_000.0,   // 56 K
+        bias: 1_500.0,     // 1500
+        load: 56_000.0,    // 56 K
+        rail_dropper: 22_000.0, // 22 K, B+2 to B+3
+        rail_reservoir: 16e-6,  // 16-450
+        // DERIVED: V1A and V1B at 1.1 mA each and V2A at 0.83 mA (the chart
+        // `circuits::tweed_lux` cites), 3.03 mA, off B+3's 247 V.
+        rail_draw: 78_000.0,
+    };
+}
+
+/// A depth control: a rheostat in series with the loop, a capacitor round it,
+/// and a capacitor in series with both, from the output tap to the feedback
+/// resistor. Turned up, the rheostat takes the bottom of the band out of the
+/// loop while the capacitor round it keeps the top in; less feedback where the
+/// cabinet resonates is more of the resonance, which is what "depth" (and
+/// "resonance") does on every amplifier that has one.
+///
+/// The Seattle 100's (Soldano SLO-100). The 1996 drawings have none -- the
+/// loop is R35 39 k straight to the tail -- and the control began as the most
+/// common modification to the amplifier; Soldano now fits it as standard
+/// ("The Depth control in now standard on the SLO-100", soldano.com's SLO-100
+/// page, 2026) without publishing its values. These are SECONDARY: Rob
+/// Robinette's annotated SLO-100 drawing (v1.6h), "(Optional) Depth": 1 M
+/// audio, 0.0047 uF across it, 0.1 uF in series.
+#[derive(Clone, Copy, Debug)]
+pub struct DepthNetwork {
+    /// The rheostat, its track, and where it rests: at its stop, where it
+    /// is out of circuit.
+    pub pot: f64,
+    pub taper: Taper,
+    pub rest: f64,
+    /// Across the rheostat.
+    pub bypass: f64,
+    /// In series with the loop.
+    pub series_cap: f64,
+}
+
+impl DepthNetwork {
+    pub const SEATTLE: DepthNetwork = DepthNetwork {
+        pot: 1_000_000.0,
+        // A rheostat on a reverse track: turned up is more resistance, on the
+        // audio law in the knob's own position. See `Taper::ReverseAudio`.
+        taper: Taper::ReverseAudio,
+        rest: 0.0,
+        bypass: 0.0047e-6,
+        series_cap: 0.1e-6,
+    };
+}
+
+/// The 5Y3GT, the tweed Deluxe's rectifier: about 60 V of drop at its rated
+/// 125 mA. SECONDARY: General Electric's "Essential Characteristics" figure as
+/// tabulated by 300guitars.com's rectifier chart (5Y3-G/GA 60 V, 5U4-G 44 V,
+/// 5AR4 10 V); RCA's sheet gives the 125 mA rating but no drop. The softest
+/// valve in the catalogue -- twice the GZ34's drop at half its current -- and
+/// the reason a tweed Deluxe sags as it does.
+pub const T5Y3GT: RectifierSpec = RectifierSpec {
+    drop_volts: 60.0,
+    at_amps: 0.125,
+};
 
 /// The Mark IIC+'s inverter and loop as both redraws have them (RP10 and
 /// FINAL, which agree part for part; no factory sheet exists). See
@@ -826,6 +955,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The 1959 Super Lead's, as Unicord drew it in July 1970 (70-6-11 issue B):
@@ -914,6 +1045,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The JCM800 2205's, from Marshall's "2205 STD Output Stage & PSU", issue 2
@@ -1013,6 +1146,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The AC30/6 Top Boost's, from the 1974 Dallas drawing Sc/V/1313, checked
@@ -1107,6 +1242,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The DR103's, from Hiwatt's own output-stage (Issue 1, 1994) and power
@@ -1197,6 +1334,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The DR103's power stage as another preamplifier meets it: the Hiwatt's
@@ -1299,6 +1438,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The same amplifier with its rectifier switch on VALVE rather than SILICON
@@ -1388,6 +1529,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The Peavey EVH 5150's, read off page 5 of Peavey's drawing at 200 dpi.
@@ -1458,6 +1601,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The Mesa Boogie Mark IIC+'s.
@@ -1551,6 +1696,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The Fender Twin Reverb AB763's, off the manufacturer's schematic.
@@ -1699,6 +1846,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     pub const TWIN: PowerSpec = PowerSpec {
@@ -1789,6 +1938,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The 1992 Super Bass's, as Unicord drew it in July 1970 (70-13-11): the
@@ -1912,6 +2063,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The Laney Supergroup 100 Mk I's, from the traced drawing of a 1969 build
@@ -2009,6 +2162,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
 
     /// The Sunn Model T's, from Sunn's own drawing D-1029 revision A, ECN 441,
@@ -2120,6 +2275,8 @@ impl PowerSpec {
         plate_resistor: 23.5,
         follower_front: None,
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
     /// The Ampeg SVT's, from Ampeg's "SVT POWER AMP SCHEMATIC" D 591720
     /// revision H (1975): the matched power stage of the American SVT
@@ -2218,6 +2375,8 @@ impl PowerSpec {
         plate_resistor: 5.1 / 3.0,
         follower_front: Some(&FollowerFront::SVT),
         paraphase_front: None,
+        cathodyne_front: None,
+        depth: None,
     };
     /// The Ampeg VT-40's, from its schematic DWG 06500 revision B (4-71) and
     /// the service section's transformer data: the matched power stage of the
@@ -2309,6 +2468,8 @@ impl PowerSpec {
         plate_resistor: 0.0,
         follower_front: None,
         paraphase_front: Some(&ParaphaseFront::VT40),
+        cathodyne_front: None,
+        depth: None,
     };
     /// The Ampeg V-4B's, from its schematic DWG 06700 revision A (5-71): the
     /// matched power stage of the American V-4B (`circuits::american_v4b`).
@@ -2351,9 +2512,225 @@ impl PowerSpec {
         saturation_volts: 40.0,
         saturation_hz: 40.0,
         paraphase_front: Some(&ParaphaseFront::V4B),
+        cathodyne_front: None,
+        depth: None,
         ..Self::VT40_7027A
     };
+
+    /// The tweed Deluxe's, model 5E3: the matched power stage of the Tweed Lux
+    /// (`circuits::tweed_lux`), from Fender's drawing and layout (F-EE), which
+    /// agree part for part. See that module for the sources and the chart.
+    ///
+    /// The simplest power stage in the catalogue, and none of it is
+    /// incidental:
+    ///
+    /// - **A cathodyne** (`CathodyneFront::TWEED_5E3`), .1 uF to each side's
+    ///   220 k leak and 1500 ohm stopper.
+    /// - **Two 6V6GTs, cathode biased** on one shared 250 ohm 5 W with 25 uF
+    ///   across it. Driven hard the pair's current rises, the cathode climbs,
+    ///   the bias goes with it: the compression a tweed is played for.
+    /// - **No screen resistors**: the screens are wired to B+2.
+    /// - **A 5Y3GT** (`T5Y3GT`) into 16 uF at B+1, the plates' node; 5000 ohm
+    ///   to B+2, the screens', 16 uF; 22 k to B+3 (in the cathodyne front).
+    /// - **No feedback loop and no presence**: the transformer and the valves
+    ///   reach the speaker as they are.
+    ///
+    /// The chart is a kit maker's (SECONDARY, see `circuits::tweed_lux`):
+    /// 370 V at B+1, 318 V at B+2, 362 V on the plates (the primary's copper),
+    /// 317 V on the screens and 20 V on the cathodes.
+    pub const TWEED_6V6: PowerSpec = PowerSpec {
+        name: "Tweed Lux 6V6 (5E3)",
+        // No master: V2A's plate drives the inverter's .02 directly.
+        master: 0.0,
+        master_rest: 1.0,
+        // Unused: the cathodyne front has its own coupling.
+        pi_couple: 0.0,
+        driver_volts: 0.0,
+        pi_stopper: 0.0,
+        pi_leak_upper: 0.0,
+        pi_leak_lower: 0.0,
+        pi_cathode: 0.0,
+        pi_tail: 0.0,
+        pi_tail_lower: 0.0,
+        pi_cross: 0.0,
+        pi_plate_driven: 0.0,
+        pi_plate_other: 0.0,
+        pi_supply: 0.0,
+        pi_tube: TriodeSpec::ECC83,
+        pi_plate_cap: 0.0,
+        couple: 0.1e-6,       // .1-400 (plate side), .1-200 (cathode side)
+        grid_leak: 220_000.0, // 220 K, both
+        stopper: 1_500.0,     // 1500, both
+        // None: the screens are wired to B+2. The builder needs a resistor;
+        // ten ohms is the wire and the pin.
+        screen_resistor: 10.0,
+        tubes_per_side: 1.0,
+        tube: PentodeSpec::T6V6GT,
+        bias: 0.0,
+        cathode_bias: 250.0,   // 250 - 5W, shared
+        cathode_bypass: 25e-6, // 25-25
+        plate_supply: TWEED_RAW_OPEN,
+        screen_supply: TWEED_RAW_OPEN,
+        supply_resistance: TWEED_RAW_SOURCE,
+        rectifier: Some(T5Y3GT),
+        reservoir: 16e-6,          // 16-450 at B+1
+        screen_resistance: 5_000.0, // 5000, B+1 to B+2
+        screen_reservoir: 16e-6,    // 16-450 at B+2
+        // 8 k plate to plate into 8 ohm: SECONDARY (the transformer is not
+        // specified on the drawing; 8 k : 8 ohm is Rob Robinette's 5E3 page
+        // and the kit makers' replacement for the original).
+        ratio: 31.622_776_601_683_793,
+        // ESTIMATED: a small transformer's copper, inductance and leakage.
+        // 20 H against the 8 k puts the bottom corner near 64 Hz with valves
+        // that have no loop to stiffen them, where a tweed Deluxe's bass
+        // gives out.
+        primary_resistance: 220.0,
+        primary_inductance: 20.0,
+        leakage: 60e-6,
+        // ESTIMATED: about 15 W into 8 ohm, 15.5 V peak, held at the open low
+        // E and no lower. A tweed Deluxe's transformer runs out of iron on the
+        // bottom string at full volume; that soft, smeared low end is the
+        // amplifier rather than a defect.
+        saturation_volts: 15.5,
+        saturation_hz: 82.0,
+        core_sharpness: 6.0,
+        speaker: 8.0,
+        feedback: 0.0,
+        presence_pot: 0.0,
+        presence_cap: 0.0,
+        presence_taper: Taper::Audio,
+        presence_on_tail: false,
+        cut_pot: 0.0,
+        cut_cap: 0.0,
+        cut_rest: 0.0,
+        driver: None,
+        feedback_network: None,
+        series_loop: None,
+        screen_tap: 0.0,
+        plate_resistor: 0.0,
+        follower_front: None,
+        paraphase_front: None,
+        cathodyne_front: Some(&CathodyneFront::TWEED_5E3),
+        depth: None,
+    };
+
+    /// The Soldano SLO-100's: the matched power stage of the Seattle 100
+    /// (`circuits::seattle100`), from the 1996 drawings' sheet 2 ("Soldano
+    /// Super Lead Overdrive 100W", rev A, 15 March 1996), whose values and
+    /// reference numbers these are. See that module for the sources.
+    ///
+    /// A Marshall-shaped stage built for headroom: the long-tailed pair of the
+    /// 5150 and the JCM800 (82 k / 100 k plates, 47 pF across them, 1 M legs,
+    /// 470 ohm and 10 k in the tail, 4.7 k below it with the loop landing
+    /// there), four 6L6GCs on 497 V from a solid-state bridge, and **39 k of
+    /// feedback from the 4 ohm tap** -- a good deal more loop than a Marshall
+    /// (the JCM800's 100 k from 16 ohm), which is what keeps a hundred watts
+    /// tight under a preamplifier that never stops clipping. The presence is
+    /// the Marshall kind, C19 .1 uF and P8 25 k linear as a rheostat off the
+    /// tail. The depth control (`DepthNetwork::SEATTLE`) is later than the
+    /// drawings; it rests out of circuit.
+    pub const SEATTLE_6L6: PowerSpec = PowerSpec {
+        name: "Seattle 100 6L6 (SLO-100, 1996)",
+        // The masters are the preamplifier's (P6, P7), ahead of C17.
+        master: 0.0,
+        master_rest: 1.0,
+        pi_couple: 0.02e-6,          // C17
+        driver_volts: 0.0,
+        pi_stopper: 0.0,
+        pi_leak_upper: 1_000_000.0,  // R31
+        pi_leak_lower: 1_000_000.0,  // R34
+        pi_cathode: 470.0,           // R33
+        pi_tail: 10_000.0,           // R32
+        pi_tail_lower: 4_700.0,      // R44
+        pi_cross: 0.1e-6,            // C18
+        pi_plate_driven: 82_000.0,   // R36 (V5B, the driven unit)
+        pi_plate_other: 100_000.0,   // R37
+        // B2, 378 V on sheet 1, the preamplifier's top node; it sags with the
+        // screens behind R60 there, and is a stiff supply here.
+        pi_supply: 378.0,
+        pi_tube: TriodeSpec::ECC83,  // V5
+        pi_plate_cap: 47e-12,        // C20
+        couple: 0.047e-6,            // C21, C22
+        grid_leak: 220_000.0,        // R38, R39
+        // R40 / R41, 2.2 k per pair as drawn ("V6 & 7"), a stopper a valve.
+        stopper: 2_200.0 / 2.0,
+        // R42 / R43, 475 ohm 1 W, a valve.
+        screen_resistor: 475.0 / 2.0,
+        tubes_per_side: 2.0,        // V6 & 7, V8 & 9
+        tube: PentodeSpec::T6L6GC,
+        bias: SEATTLE_BIAS,
+        cathode_bias: 0.0,
+        cathode_bypass: 0.0,
+        plate_supply: SEATTLE_PLATE_OPEN,
+        screen_supply: SEATTLE_SCREEN_OPEN,
+        // ESTIMATED: a hundred-watt transformer's winding and the bridge into a
+        // capacitor input, as the 5150's (the same class of amplifier).
+        supply_resistance: 150.0,
+        rectifier: None, // D1-D4, a bridge
+        // C30-C33, 200 uF / 300 V: two in parallel, in series with two more.
+        reservoir: 200e-6,
+        // T3, the choke (ESTIMATED copper), to the screens' node.
+        screen_resistance: 100.0,
+        // C34, C35, 200 uF / 300 V in series.
+        screen_reservoir: 100e-6,
+        // 2.2 k plate to plate into the 4 ohm tap, where the loop is taken.
+        // SECONDARY: the drawing prints only "Output taps at 4, 8 & 16 Ohms";
+        // 2.2 k is Rob Robinette's annotated SLO-100 drawing.
+        ratio: 23.452_078_799_117_15,
+        // ESTIMATED from the 5150's hundred-watt 6L6 transformer.
+        primary_resistance: 30.0,
+        primary_inductance: 30.0,
+        leakage: 15e-6,
+        // A hundred watts into 4 ohm is 20 V rms, 28.3 V peak.
+        saturation_volts: 28.284_271_247_461_9,
+        saturation_hz: 75.0,
+        core_sharpness: 7.0,
+        speaker: 4.0,
+        feedback: 39_000.0,         // R35, from the 4 ohm tap
+        presence_pot: 25_000.0,     // P8, 25K-L
+        presence_cap: 0.1e-6,       // C19
+        presence_taper: Taper::Linear,
+        presence_on_tail: false,
+        cut_pot: 0.0,
+        cut_cap: 0.0,
+        cut_rest: 0.0,
+        driver: None,
+        feedback_network: None,
+        series_loop: None,
+        screen_tap: 0.0,
+        plate_resistor: 0.0,
+        follower_front: None,
+        paraphase_front: None,
+        cathodyne_front: None,
+        depth: Some(&DepthNetwork::SEATTLE),
+    };
 }
+
+/// The tweed's high-tension winding, as the open-circuit voltage behind a
+/// resistance that the 5Y3GT turns into B+1, the voltage fitted so that B+1
+/// idles at the chart's 370 V with this model's valves (`tests/tweed_lux.rs`).
+///
+/// The resistance is ESTIMATED, and larger than a winding's on purpose. The
+/// model's supply is direct current: a valve rectifier into a capacitor-input
+/// filter charges the reservoir in short peaks, and its output falls with
+/// load faster than the valve's own Child-law drop says -- in the order of
+/// 0.8 V a milliamp for a 5Y3 into a small reservoir, where Child's law gives
+/// about 0.37 V a milliamp at this stage's idle. The difference, with the
+/// winding's copper, is these 400 ohm. The ripple the 16 uF really carries is
+/// folded into the voltage.
+pub const TWEED_RAW_OPEN: f64 = 449.9;
+pub const TWEED_RAW_SOURCE: f64 = 400.0;
+
+/// The Seattle 100's rails, as open-circuit voltages fitted so that the
+/// plates' node idles at sheet 1's 497 V and the screens' at 495 V with this
+/// model's valves (`tests/seattle_100.rs`).
+pub const SEATTLE_PLATE_OPEN: f64 = 519.0;
+pub const SEATTLE_SCREEN_OPEN: f64 = 496.4;
+/// The bias: no voltage is printed. ESTIMATED to idle each 6L6GC at 37 mA on
+/// 497 V (18.6 W, about 60 % of its 30 W), where a hundred-watt amplifier of
+/// this kind is usually set; the drawing's network (R70 56 k, P10 25 k, R71
+/// 15 k from the bias tap, C40 / C41 10 uF) covers it.
+pub const SEATTLE_BIAS: f64 = -45.0;
 
 /// The power amplifier as a netlist, taking volts at its input and giving
 /// volts across the speaker.
@@ -2629,6 +3006,28 @@ fn paraphase_front(
     "f_fb"
 }
 
+/// The tweed Deluxe's cathodyne: its plate left as `pi_p1` and its cathode as
+/// `pi_p2` for the output valves' coupling, its rail hung off the screens'
+/// node. There is no loop, so the node returned is ground. See
+/// `CathodyneFront`.
+fn cathodyne_front(
+    net: &mut Netlist,
+    f: &CathodyneFront,
+    master_node: &'static str,
+) -> &'static str {
+    net.resistor(master_node, "c_drive", f.drive_source)
+        .capacitor("c_drive", "pi_a", f.couple) // .02
+        .resistor("pi_a", "c_j", f.leak) // 1 M, to the junction
+        .resistor("scr", "pi_c", f.rail_dropper) // 22 k, B+2 to B+3
+        .capacitor("pi_c", "gnd", f.rail_reservoir) // 16 uF
+        .resistor("pi_c", "gnd", f.rail_draw) // the preamplifier's current
+        .resistor("pi_c", "pi_p1", f.plate) // 56 k
+        .triode("pi_p1", "pi_a", "pi_p2", f.tube) // V2B
+        .resistor("pi_p2", "c_j", f.bias) // 1500
+        .resistor("c_j", "gnd", f.load); // 56 k
+    "gnd"
+}
+
 pub fn build(spec: &PowerSpec, source: f64) -> Result<Circuit, Fault> {
     tap(spec, source, "spk")
 }
@@ -2728,7 +3127,10 @@ fn assemble(
     // the Twin adds both a nonexistent divider and a parallel load at the exact
     // hand-off we are trying to model. For the Twin the channel-mix source goes
     // straight to the stock 0.001 µF phase-inverter coupling capacitor.
-    let master_node = if twin_supply {
+    // The Tweed Lux and the Seattle 100 have none in this stage either: the
+    // tweed has no master at all, and the Seattle's two are in its
+    // preamplifier, ahead of the channel switching. `master` of zero says so.
+    let master_node = if twin_supply || spec.master <= 0.0 {
         "in"
     } else {
         net.rest(MASTER, spec.master_rest).pot(
@@ -2753,10 +3155,16 @@ fn assemble(
     // front end stands in its place and in place of the output grids'
     // coupling; the VT-40's in its place alone. Either way `tail` is where the
     // loop comes back.
-    let tail = match (spec.follower_front, spec.paraphase_front) {
-        (Some(front), _) => follower_front(&mut net, front, master_node),
-        (None, Some(front)) => paraphase_front(&mut net, front, master_node),
-        (None, None) => long_tailed_pair(&mut net, spec, master_node, twin_supply),
+    // The tweed's cathodyne likewise, and it has no loop.
+    let tail = match (
+        spec.follower_front,
+        spec.paraphase_front,
+        spec.cathodyne_front,
+    ) {
+        (Some(front), _, _) => follower_front(&mut net, front, master_node),
+        (None, Some(front), _) => paraphase_front(&mut net, front, master_node),
+        (None, None, Some(front)) => cathodyne_front(&mut net, front, master_node),
+        (None, None, None) => long_tailed_pair(&mut net, spec, master_node, twin_supply),
     };
 
     // --- the supplies ------------------------------------------------------
@@ -3078,7 +3486,22 @@ fn assemble(
         .resistor("fb_r", tail, spec.feedback) // R61
         .capacitor("fb_r", tail, l.shelf_cap); // C61
     } else if spec.feedback > 0.0 {
-        net.resistor("spk", tail, spec.feedback);
+        match spec.depth {
+            // The Seattle's: the depth rheostat with its capacitor round it,
+            // then the series capacitor, then R35 into the tail.
+            // `pot(a, wiper, b)` with the wiper tied to `b` leaves
+            // `R (1 - f(p))` in circuit; see `DepthNetwork`.
+            Some(d) => {
+                net.rest(RESONANCE, d.rest)
+                    .pot("spk", "fb_d", "fb_d", d.pot, d.taper, RESONANCE)
+                    .capacitor("spk", "fb_d", d.bypass)
+                    .capacitor("fb_d", "fb_c", d.series_cap)
+                    .resistor("fb_c", tail, spec.feedback);
+            }
+            None => {
+                net.resistor("spk", tail, spec.feedback);
+            }
+        }
         // The SVT's C7 across R46, the VT-40's C13 across R48.
         if let Some(f) = spec.follower_front {
             net.capacitor("spk", tail, f.feedback_cap);

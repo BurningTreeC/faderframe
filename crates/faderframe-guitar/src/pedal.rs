@@ -16,7 +16,7 @@
 //! A stage's circuit is built off the audio thread ([`StompCircuit::build`])
 //! and handed in whole ([`PedalStage::swap`]); nothing here allocates.
 
-use crate::circuits::wah;
+use crate::circuits::{carbon_echo, wah};
 use crate::dsp::bbd::Brigade;
 use crate::dsp::netlist::{Circuit as Netlist, Fault};
 use crate::dsp::oversample::Oversampler;
@@ -46,7 +46,7 @@ pub enum Stomp {
 impl Stomp {
     /// Everything the line offers, in the order of the stable parameter
     /// values: append, never reorder.
-    pub const ALL: [Stomp; 21] = [
+    pub const ALL: [Stomp; 24] = [
         Stomp::Empty,
         Stomp::Pedal(Pedal::Green808),
         Stomp::Pedal(Pedal::Green9),
@@ -68,6 +68,9 @@ impl Stomp {
         Stomp::Pedal(Pedal::BlueChorus),
         Stomp::Wah(wah::Build::CryBaby),
         Stomp::Wah(wah::Build::V847),
+        Stomp::Pedal(Pedal::RedSqueeze),
+        Stomp::Pedal(Pedal::Juicer),
+        Stomp::Pedal(Pedal::CarbonEcho),
     ];
 
     pub fn index(self) -> usize {
@@ -104,6 +107,9 @@ impl Stomp {
                 Pedal::BlueChorus => "Blue Chorus",
                 Pedal::Modern33 => "Modern 33",
                 Pedal::ModernPurple => "Modern Purple",
+                Pedal::RedSqueeze => "Red Squeeze",
+                Pedal::Juicer => "Juicer",
+                Pedal::CarbonEcho => "Carbon Echo",
             },
         }
     }
@@ -130,6 +136,8 @@ impl Stomp {
                 Pedal::BigMuff | Pedal::RoundFuzz => "Fuzz",
                 Pedal::BassDriver => "Preamp",
                 Pedal::OrangePhase | Pedal::BlueChorus => "Modulation",
+                Pedal::RedSqueeze | Pedal::Juicer => "Dynamics",
+                Pedal::CarbonEcho => "Delay",
                 Pedal::None => "",
             },
         }
@@ -231,10 +239,23 @@ impl BrigadeNodes {
     }
 }
 
-/// The longest delay a pedal's bucket brigade is given, and the highest rate
-/// it can run at, which size its line (upstream's `BRIGADE_*`).
+/// The longest delay the Blue Chorus's bucket brigade is given, and the
+/// highest rate it can run at, which size its line (upstream's `BRIGADE_*`).
+/// Only the chorus's: the Carbon Echo's clocked line is sized by its stage
+/// count, whatever its clock (`dsp::bbd::Clocked`), so no chorus carries a
+/// line for six hundred milliseconds.
 const BRIGADE_LONGEST: f64 = crate::circuits::blue_chorus::LONGEST;
 const BRIGADE_MAX_RATE: f64 = 192_000.0 * MODELLED_MAX_OVERSAMPLING as f64;
+
+/// What a stomp's netlist works with beside it, sample by sample.
+enum Outboard {
+    /// A delay line between a send and a return, its length off a control
+    /// node: the Blue Chorus.
+    Chorus(Brigade, BrigadeNodes),
+    /// The Carbon Echo's bucket brigades, clock board and compander
+    /// rectifiers.
+    Echo(Box<carbon_echo::Echo>),
+}
 
 /// One channel's circuit for a stomp, built and sized off the audio thread.
 pub struct StompCircuit {
@@ -244,7 +265,7 @@ pub struct StompCircuit {
     factor: usize,
     /// Volts at its input per unit of the line's signal.
     into: f64,
-    brigade: Option<(Brigade, BrigadeNodes)>,
+    outboard: Option<Outboard>,
 }
 
 impl StompCircuit {
@@ -276,18 +297,58 @@ impl StompCircuit {
                 )
             }
         };
-        let brigade = brigade.and_then(|b| {
-            BrigadeNodes::resolve(&netlist, b)
-                .map(|nodes| (Brigade::new(BRIGADE_LONGEST, BRIGADE_MAX_RATE), nodes))
-        });
+        let outboard = if stomp == Stomp::Pedal(Pedal::CarbonEcho) {
+            Some(Outboard::Echo(Box::new(carbon_echo::Echo::new(
+                &netlist, inner,
+            )?)))
+        } else {
+            brigade.and_then(|b| {
+                BrigadeNodes::resolve(&netlist, b).map(|nodes| {
+                    Outboard::Chorus(Brigade::new(BRIGADE_LONGEST, BRIGADE_MAX_RATE), nodes)
+                })
+            })
+        };
         let sim = Simulation::new(netlist, inner);
-        Ok(Some(Self {
+        let mut circuit = Self {
             stomp,
             sim,
             factor,
             into,
-            brigade,
-        }))
+            outboard,
+        };
+        circuit.reset_outboard();
+        Ok(Some(circuit))
+    }
+
+    /// The outboard back to rest, after the netlist's `reset_deferred`.
+    fn reset_outboard(&mut self) {
+        match &mut self.outboard {
+            Some(Outboard::Chorus(line, _)) => line.reset(),
+            Some(Outboard::Echo(echo)) => echo.reset(&mut self.sim),
+            None => {}
+        }
+    }
+
+    /// A knob's position, to the netlist and to whatever beside it takes it.
+    fn set_control(&mut self, which: usize, position: f64) {
+        self.sim.set_control(which, position);
+        if let Some(Outboard::Echo(echo)) = &mut self.outboard {
+            echo.set_control(which, position);
+        }
+    }
+
+    /// The netlist's simulation (for measuring it).
+    #[cfg(test)]
+    pub(crate) fn simulation(&self) -> &Simulation {
+        &self.sim
+    }
+
+    /// The Carbon Echo's outboard, where this is one (for measuring it).
+    pub fn echo(&self) -> Option<&carbon_echo::Echo> {
+        match &self.outboard {
+            Some(Outboard::Echo(echo)) => Some(echo),
+            _ => None,
+        }
     }
 
     pub fn stomp(&self) -> Stomp {
@@ -366,8 +427,9 @@ impl PedalStage {
         if let Some(c) = &mut self.circuit {
             c.sim.reset_deferred();
             c.sim.set_realtime_deadline(self.deadline);
-            if let Some((line, _)) = &mut c.brigade {
-                line.reset();
+            c.reset_outboard();
+            if let Some(Outboard::Echo(echo)) = &mut c.outboard {
+                echo.set_realtime_deadline(self.deadline);
             }
             self.over.set_factor(c.factor);
             self.pad
@@ -393,9 +455,7 @@ impl PedalStage {
             // charge it had, so it starts again from its operating point.
             if let Some(c) = &mut self.circuit {
                 c.sim.reset_deferred();
-                if let Some((line, _)) = &mut c.brigade {
-                    line.reset();
-                }
+                c.reset_outboard();
             }
             self.over.reset();
             self.pad.reset();
@@ -425,19 +485,19 @@ impl PedalStage {
                 let Some(slot) = p.slot() else { return };
                 let controls = Pedal::controls(slot);
                 if let Some(drive) = controls.drive {
-                    c.sim.set_control(drive, s.drive.clamp(0.0, 1.0));
+                    c.set_control(drive, s.drive.clamp(0.0, 1.0));
                 }
                 for (knob, &value) in controls.tones.iter().zip(s.tone.iter()) {
                     let Some(knob) = knob else { continue };
                     let value = value.clamp(0.0, 1.0);
-                    c.sim.set_control(
+                    c.set_control(
                         knob.control,
                         if knob.inverted { 1.0 - value } else { value },
                     );
                 }
                 if let Some(level) = controls.level {
                     let rest = c.sim.resting_position(level).unwrap_or(DEFAULT_MASTER_REST);
-                    c.sim.set_control(level, master_position(rest, s.level));
+                    c.set_control(level, master_position(rest, s.level));
                 }
             }
             // A wah's pot follows the treadle sample by sample (`process`).
@@ -498,7 +558,7 @@ impl PedalStage {
                 let position = &mut self.position;
                 let returned = &mut self.brigade_return;
                 let sim = &mut c.sim;
-                let brigade = &mut c.brigade;
+                let outboard = &mut c.outboard;
                 let out = self.over.process(x * into, &mut |v| {
                     if let Some(target) = target {
                         let before = *position;
@@ -509,13 +569,19 @@ impl PedalStage {
                             sim.set_realtime_value(wah::TREADLE_BOTTOM, bottom);
                         }
                     }
-                    if let Some((_, nodes)) = brigade.as_ref() {
-                        sim.set_aux_input(nodes.ret, *returned);
+                    match outboard {
+                        Some(Outboard::Chorus(_, nodes)) => sim.set_aux_input(nodes.ret, *returned),
+                        Some(Outboard::Echo(echo)) => echo.before(sim),
+                        None => {}
                     }
                     let out = sim.process(v);
-                    if let Some((line, nodes)) = brigade.as_mut() {
-                        let delay = (nodes.delay)(sim.voltage_at(nodes.control)) * inner;
-                        *returned = line.process(sim.voltage_at(nodes.send), delay, inner);
+                    match outboard {
+                        Some(Outboard::Chorus(line, nodes)) => {
+                            let delay = (nodes.delay)(sim.voltage_at(nodes.control)) * inner;
+                            *returned = line.process(sim.voltage_at(nodes.send), delay, inner);
+                        }
+                        Some(Outboard::Echo(echo)) => echo.after(sim),
+                        None => {}
                     }
                     out
                 });
@@ -535,9 +601,7 @@ impl PedalStage {
     pub fn reset(&mut self) {
         if let Some(c) = &mut self.circuit {
             c.sim.reset_deferred();
-            if let Some((line, _)) = &mut c.brigade {
-                line.reset();
-            }
+            c.reset_outboard();
         }
         self.over.reset();
         self.pad.reset();
@@ -555,11 +619,25 @@ impl PedalStage {
         self.deadline = deadline;
         if let Some(c) = &mut self.circuit {
             c.sim.set_realtime_deadline(deadline);
+            if let Some(Outboard::Echo(echo)) = &mut c.outboard {
+                echo.set_realtime_deadline(deadline);
+            }
         }
     }
 
     pub fn deadline_aborts(&self) -> u64 {
-        self.circuit.as_ref().map_or(0, |c| c.sim.deadline_aborts())
+        self.circuit.as_ref().map_or(0, |c| {
+            c.sim.deadline_aborts()
+                + match &c.outboard {
+                    Some(Outboard::Echo(echo)) => echo.deadline_aborts(),
+                    _ => 0,
+                }
+        })
+    }
+
+    /// The installed circuit, while there is one (for measuring it).
+    pub fn circuit(&self) -> Option<&StompCircuit> {
+        self.circuit.as_ref()
     }
 
     pub fn needs_operating_point(&self) -> bool {
@@ -598,8 +676,14 @@ impl PedalStage {
         if let (Some(dst), Some(src)) = (&mut self.circuit, &source.circuit) {
             if dst.stomp == src.stomp {
                 dst.sim.copy_runtime_state_from(&src.sim);
-                if let (Some((a, _)), Some((b, _))) = (&mut dst.brigade, &src.brigade) {
-                    a.copy_runtime_state_from(b);
+                match (&mut dst.outboard, &src.outboard) {
+                    (Some(Outboard::Chorus(a, _)), Some(Outboard::Chorus(b, _))) => {
+                        a.copy_runtime_state_from(b)
+                    }
+                    (Some(Outboard::Echo(a)), Some(Outboard::Echo(b))) => {
+                        a.copy_runtime_state_from(b)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -616,5 +700,59 @@ impl PedalStage {
         self.brigade_return = source.brigade_return;
         self.fade_remaining = source.fade_remaining;
         self.prev_output = source.prev_output;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a stage costs one channel against the 48 kHz budget, at the
+    /// line's 1x and 2x qualities: the compressors, with the Green 808 beside
+    /// them for scale (`Pedal::is_expensive`'s table has it at 11.6 % alone).
+    /// Three seconds of the plucked note at each Drive. Run in release with
+    /// `--ignored --nocapture`, nothing else running.
+    #[test]
+    #[ignore]
+    fn compressor_stage_cost() {
+        use crate::circuits::dynamics::{pluck, SR};
+        let n = 3 * SR as usize;
+        let nominal = 10f64.powf(NOMINAL_DBFS / 20.0);
+        let input: Vec<f64> = (0..n).map(|k| pluck(k) * nominal / GUITAR_VOLTS).collect();
+        for stomp in [
+            Stomp::Pedal(Pedal::Green808),
+            Stomp::Pedal(Pedal::RedSqueeze),
+            Stomp::Pedal(Pedal::Juicer),
+        ] {
+            for quality in [1, 2] {
+                for drive in [0.0, 0.5, 1.0] {
+                    let mut stage = PedalStage::new(SR, quality);
+                    let mut circuit = StompCircuit::build(stomp, SR, quality).unwrap();
+                    stage.swap(&mut circuit);
+                    stage.apply(&StompSettings {
+                        stomp,
+                        drive,
+                        ..StompSettings::default()
+                    });
+                    stage.reset();
+                    stage.find_operating_point();
+                    let t = Instant::now();
+                    for &x in &input {
+                        std::hint::black_box(stage.process(x));
+                    }
+                    let share = 100.0 * t.elapsed().as_secs_f64() / (n as f64 / SR);
+                    let (solves, passes, unsettled, _) = stage
+                        .circuit
+                        .as_ref()
+                        .map_or((1, 0, 0, 0), |c| c.sim.statistics());
+                    eprintln!(
+                        "{:<12} {quality}x drive {drive:.1}: {share:>5.1} % of a core, \
+                         {:.2} passes a solve, {unsettled} unsettled",
+                        stomp.name(),
+                        passes as f64 / solves.max(1) as f64
+                    );
+                }
+            }
+        }
     }
 }

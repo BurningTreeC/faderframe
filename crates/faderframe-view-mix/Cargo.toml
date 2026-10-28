@@ -1,0 +1,23 @@
+[package]
+name = "faderframe-view-mix"
+description = "Mix Intelligence view: analysis controls, ranked findings with their evidence, experiments to audition and apply"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+faderframe-mix-intelligence.workspace = true
+faderframe-core.workspace = true
+faderframe-project.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true
+faderframe-timeline.workspace = true
+faderframe-audio-files.workspace = true

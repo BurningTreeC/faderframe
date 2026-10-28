@@ -19,6 +19,7 @@ pub mod guitar;
 mod hardware_insert;
 mod keys;
 mod kit;
+pub mod leveler;
 mod limiter;
 mod modulation;
 mod note_echo;
@@ -28,6 +29,7 @@ mod sampler;
 mod saturator;
 mod scale;
 mod synth;
+mod tape;
 mod tuner;
 mod utility;
 mod values;
@@ -143,6 +145,12 @@ pub fn editor_for(
         builtin::COMPRESSOR_76 => Some(Box::new(fet76::Fet76View::new(plugin, theme))),
         builtin::GUITAR_STATION => Some(Box::new(guitar::GuitarView::new(plugin, theme))),
         builtin::CONTAINER => Some(Box::new(container::ContainerView::new(plugin, theme))),
+        builtin::TAPE_MACHINE => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            tape::TapeFace::new(theme),
+        ))),
+        builtin::LEVELER_2A => Some(Box::new(leveler::LevelerView::new(plugin, theme))),
         _ => None,
     }
 }
@@ -185,6 +193,12 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
         builtin::GUITAR_STATION => Some((
             (guitar::PANEL_W * 0.92) as i32,
             (guitar::TOTAL_H * 0.92) as i32 + HEADER_BAR,
+        )),
+        builtin::TAPE_MACHINE => Some((1080, 540 + HEADER_BAR)),
+        // The panel at its size.
+        builtin::LEVELER_2A => Some((
+            leveler::PANEL_W as i32,
+            leveler::TOTAL_H as i32 + HEADER_BAR,
         )),
         _ => None,
     }

@@ -12,3 +12,4 @@ pub mod british_47;
 pub mod german_76;
 #[rustfmt::skip]
 pub mod console_bus;
+pub mod leveler;

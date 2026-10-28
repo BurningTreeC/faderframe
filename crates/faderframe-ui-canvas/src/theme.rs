@@ -292,6 +292,9 @@ pub struct ArrangerTheme {
     pub fine_line: Color,
     /// The line at the object a drag snapped to (Snap to Objects).
     pub snap_guide: Color,
+    /// The mark of a time-locked track and its clips (placed in time,
+    /// not with the music).
+    pub time_lock: Color,
     pub loop_on: Color,
     pub loop_off: Color,
     pub playhead: Color,
@@ -648,6 +651,7 @@ impl Theme {
                 sub_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[2]),
                 fine_line: Color::rgba(1.0, 1.0, 1.0, GRID_ALPHAS[3]),
                 snap_guide: Color::hex(0x6fc3ff),
+                time_lock: Color::hex(0x6fc3ff),
                 loop_on: accent.with_alpha(0.22),
                 loop_off: Color::rgba(1.0, 1.0, 1.0, 0.07),
                 playhead: accent,

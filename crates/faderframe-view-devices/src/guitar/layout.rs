@@ -41,7 +41,8 @@ pub fn amp_plate() -> Rect {
 /// Where a new group starts in the amplifier menu.
 pub fn amp_group_starts(i: usize) -> bool {
     // Brit | American (Fender, Roland) | Cali, 5150, Oregon | bass amplifiers
-    matches!(i, 8 | 12 | 16)
+    // | the tweed and the Seattle (appended: `AMPS` is the parameter order)
+    matches!(i, 8 | 12 | 16 | 20)
 }
 
 /// What an amplifier's panel looks like.
@@ -59,6 +60,10 @@ pub enum Finish {
     Modern,
     /// Black and silver with a blue line.
     Bass,
+    /// A chrome control strip, dark lettering, on lacquered tweed.
+    Tweed,
+    /// Polished chrome, black lettering, on black.
+    Chrome,
 }
 
 pub fn finish(amp: Gain) -> Finish {
@@ -74,6 +79,8 @@ pub fn finish(amp: Gain) -> Finish {
         Gain::Twin | Gain::Deluxe | Gain::DeluxeNormal => Finish::Blackface,
         Gain::Jazz120 | Gain::OregonT => Finish::Silver,
         Gain::Boogie | Gain::Recto | Gain::Peavey => Finish::Modern,
+        Gain::TweedLux | Gain::TweedLuxNormal => Finish::Tweed,
+        Gain::Seattle100 | Gain::Seattle100Normal => Finish::Chrome,
         _ => Finish::Bass,
     }
 }
@@ -334,19 +341,24 @@ fn amp_look(amp: Gain, power: PowerAmp) -> AmpLook {
     let plate = amp_plate();
     let mut knobs: Vec<(u32, &'static str, bool)> = vec![(id::DRIVE, amp.drive_name(), false)];
     let tone = amp.own_tone_knobs();
-    for (on, (id, label)) in tone.iter().zip([
-        (id::BASS, "BASS"),
-        (id::MIDDLE, "MIDDLE"),
-        (id::TREBLE, "TREBLE"),
-    ]) {
+    for (k, (on, id)) in tone
+        .iter()
+        .zip([id::BASS, id::MIDDLE, id::TREBLE])
+        .enumerate()
+    {
         if *on {
-            knobs.push((id, label, false));
+            knobs.push((id, amp.tone_label(k), false));
         }
     }
-    if let Some((_, name)) = amp.own_sweep() {
+    let resolved = power.resolved(amp);
+    // The fourth knob: the circuit's own, or its power stage's where the
+    // stage behind it has one to turn.
+    let power_sweep = amp
+        .power_sweep()
+        .filter(|_| resolved.is_some_and(|m| m.has_resonance()));
+    if let Some((_, name)) = amp.own_sweep().or(power_sweep) {
         knobs.push((id::SWEEP, name, false));
     }
-    let resolved = power.resolved(amp);
     if amp.own_presence().is_some() {
         knobs.push((id::PRESENCE, "PRESENCE", false));
     } else if let Some(name) = resolved.and_then(|m| m.presence_name()) {
@@ -418,7 +430,7 @@ fn amp_look(amp: Gain, power: PowerAmp) -> AmpLook {
         ));
     }
     for (id, caption, sw) in [
-        (id::LOW_SWITCH, "LOW", amp.low_switch()),
+        (id::LOW_SWITCH, amp.low_switch_caption(), amp.low_switch()),
         (id::MID_SWITCH, "MID", amp.mid_switch()),
     ] {
         if let Some(sw) = sw {

@@ -264,6 +264,33 @@ impl History {
         Ok(opposite)
     }
 
+    /// The project as it is with `done` steps done (as [`Self::undo_labels`]
+    /// counts them; fewer than now: as it was, more: as the steps to redo
+    /// make it) — made on a copy of `project`: neither it nor the history
+    /// changes. An unfinished gesture belongs to the present (undone first,
+    /// as [`Self::undo`] would).
+    pub fn project_at(&self, project: &Project, done: usize) -> Result<Project, EditError> {
+        let mut p = project.clone();
+        let replay = |p: &mut Project, tx: &Transaction| -> Result<(), EditError> {
+            for inv in tx.inverses.iter().rev() {
+                inv.clone().apply(p)?;
+            }
+            Ok(())
+        };
+        let now = self.undo.len();
+        if done <= now {
+            let open = self.open.iter().filter(|t| !t.inverses.is_empty());
+            for tx in open.chain(self.undo.iter().rev().take(now - done)) {
+                replay(&mut p, tx)?;
+            }
+        } else {
+            for tx in self.redo.iter().rev().take(done - now) {
+                replay(&mut p, tx)?;
+            }
+        }
+        Ok(p)
+    }
+
     fn impact_of(tx: &Transaction) -> Impact {
         tx.inverses
             .iter()
@@ -306,6 +333,39 @@ impl History {
         self.redo.clear();
         self.open = None;
         self.depth = 0;
+    }
+}
+
+#[cfg(test)]
+mod project_at_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn a_step_long_ago_is_made_on_a_copy_as_undoing_would_make_it() {
+        let mut p = Project::new("A", 48_000);
+        let start = p.timeline.tempo.points()[0].bpm;
+        let mut h = History::default();
+        for bpm in [100.0, 110.0, 120.0, 130.0] {
+            h.apply(&mut p, Command::SetTempo { bpm }).unwrap();
+        }
+        h.undo(&mut p).unwrap();
+        let bpm = |p: &Project| p.timeline.tempo.points()[0].bpm;
+        // Back to the start, two steps back, and forward to the step
+        // undone.
+        assert_eq!(bpm(&h.project_at(&p, 0).unwrap()), start);
+        let then = h.project_at(&p, 1).unwrap();
+        assert_eq!(bpm(&then), 100.0);
+        assert_eq!(bpm(&h.project_at(&p, 3).unwrap()), 120.0);
+        assert_eq!(bpm(&h.project_at(&p, 4).unwrap()), 130.0);
+        // Nothing moved.
+        assert_eq!(bpm(&p), 120.0);
+        assert_eq!((h.undo_labels().len(), h.redo_labels().len()), (3, 1));
+        // As undoing really makes it.
+        h.undo(&mut p).unwrap();
+        h.undo(&mut p).unwrap();
+        assert_eq!(then, p);
     }
 }
 

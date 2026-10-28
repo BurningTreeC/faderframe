@@ -170,6 +170,18 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             true,
             false,
         ),
+        ViewKind::Reference => ViewHost::new(
+            app,
+            Box::new(faderframe_view_reference::ReferenceView::new(theme)),
+            false,
+            false,
+        ),
+        ViewKind::MixIntelligence => ViewHost::new(
+            app,
+            Box::new(faderframe_view_mix::MixView::new(theme)),
+            false,
+            true,
+        ),
     };
     app.register_canvas(&host.canvas);
     host
@@ -614,7 +626,7 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 21] = [
+pub(crate) const DOCK_VIEWS: [DockView; 23] = [
     ("inspector", ViewId::inspector),
     ("mixer", ViewId::mixer),
     ("channel-overview", ViewId::channel_overview),
@@ -622,6 +634,8 @@ pub(crate) const DOCK_VIEWS: [DockView; 21] = [
     ("events", ViewId::events),
     ("automation", ViewId::automation),
     ("tools", ViewId::tools),
+    ("reference", ViewId::reference),
+    ("mix", ViewId::mix_intelligence),
     ("album", ViewId::album),
     ("performance", ViewId::performance),
     ("history", ViewId::history),

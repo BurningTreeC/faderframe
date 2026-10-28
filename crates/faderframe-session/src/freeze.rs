@@ -69,8 +69,15 @@ impl Session {
         // shown (its clip goes there).
         let project = self.absolute_copy();
         let project = if freeze { project.into_song() } else { project };
-        let (copy, start, end) = render::track_render_project(&project, track)
+        let (mut copy, start, end) = render::track_render_project(&project, track)
             .ok_or_else(|| SessionError::Other(format!("'{name}' has no clips to render")))?;
+        // A frozen track still plays through its own delay (its input
+        // stage) and its polarity (its strip): not in the file as well.
+        // A bounce's new track has neither: they are in its file.
+        if freeze && let Some(t) = copy.track_mut(track) {
+            t.delay_ms = 0.0;
+            t.phase_invert = false;
+        }
         std::fs::create_dir_all(&self.media_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.media_dir.display())))?;
         let stem = format!("{name} {}", if freeze { "Freeze" } else { "Bounce" });

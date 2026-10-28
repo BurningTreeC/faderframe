@@ -450,6 +450,44 @@ pub(crate) fn render_one(
     )>,
     keep_latency: bool,
 ) -> Result<Vec<Vec<f32>>, RenderError> {
+    let mut out = vec![Vec::with_capacity(frames); outputs.max(1)];
+    render_each(
+        project,
+        sample_rate,
+        sources,
+        (start, frames),
+        progress,
+        outputs,
+        binaural,
+        keep_latency,
+        &mut |piece| {
+            for (o, c) in out.iter_mut().zip(piece) {
+                o.extend_from_slice(c);
+            }
+        },
+    )?;
+    Ok(out)
+}
+
+/// [`render_one`] handing each rendered piece (every output channel, at
+/// most 16 384 frames) to `each` as it comes, instead of collecting it:
+/// what analyses a long range uses (Mix Intelligence), holding no more
+/// than a piece.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_each(
+    project: &Project,
+    sample_rate: u32,
+    sources: &faderframe_engine::SourceMap,
+    (start, frames): (i64, usize),
+    progress: &RenderProgress,
+    outputs: usize,
+    binaural: Option<(
+        faderframe_binaural::Room,
+        Option<&faderframe_binaural::Head>,
+    )>,
+    keep_latency: bool,
+    each: &mut dyn FnMut(&[&[f32]]),
+) -> Result<(), RenderError> {
     let config = EngineConfig {
         sample_rate,
         max_block_size: 1024,
@@ -484,23 +522,25 @@ pub(crate) fn render_one(
         )));
     }
     r.play_from(start)?;
-    let mut out = vec![Vec::with_capacity(frames); outputs.max(1)];
-    while out[0].len() < frames {
+    let mut done = 0;
+    while done < frames {
         if progress.cancel.load(Ordering::Relaxed) {
             return Err(RenderError::Cancelled);
         }
-        let n = (frames - out[0].len() + skip).min(16_384);
+        let n = (frames - done + skip).min(16_384);
         let chunk = r.render(n);
         let from = skip.min(n);
         skip -= from;
-        for (o, c) in out.iter_mut().zip(chunk) {
-            o.extend_from_slice(&c[from..]);
+        if n > from {
+            let piece: Vec<&[f32]> = chunk.iter().map(|c| &c[from..]).collect();
+            each(&piece);
         }
+        done += n - from;
         progress
             .done
             .fetch_add((n - from) as u64, Ordering::Relaxed);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Run stereo `audio` through a chain of plugins (an album song's inserts;

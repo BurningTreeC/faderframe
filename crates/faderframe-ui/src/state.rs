@@ -540,6 +540,7 @@ impl AppState {
                         .map(|w| w.upcast::<gtk::Window>());
                     crate::render_report::show(self, win.as_ref(), &what, &files);
                 }
+                faderframe_session::UiRequest::AutoAlign => crate::auto_align::open(self),
             }
         }
         let report = self

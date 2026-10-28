@@ -344,6 +344,360 @@ impl Brigade {
     }
 }
 
+// --- a bucket brigade at its own clock -------------------------------------------
+
+/// What a clocked line is made of: its stages, its chips and what each chip
+/// does to the charge it carries. See [`Clocked`].
+#[derive(Clone, Copy, Debug)]
+pub struct ClockedSpec {
+    /// Stages in the whole line, every chip in series. A sample is taken once
+    /// a clock period and comes out `stages / 2` periods later.
+    pub stages: usize,
+    /// How many chips the stages are in. Each brings its own insertion gain
+    /// and its own transfer curve; between them the signal is re-biased.
+    pub chips: usize,
+    /// One chip's insertion gain.
+    pub gain: f64,
+    /// One chip's transfer curve about its bias: `x + second x^2 - third x^3`,
+    /// its buckets full at `saturation` volts either way.
+    pub second: f64,
+    pub third: f64,
+    pub saturation: f64,
+    /// The whole line's charge-transfer inefficiency, N times the fraction of
+    /// a packet each transfer leaves behind for the one after it. Its
+    /// response is `exp(-inefficiency (1 - cos(2 pi f / f_clock)))`: a
+    /// low-pass that follows the clock down.
+    pub inefficiency: f64,
+    /// Noise on each sample the line carries, in volts RMS: a white part, and
+    /// a part from the charge each bucket gathers while it waits, which grows
+    /// with the holding time and is `leakage_noise` at `noise_reference_hz`.
+    pub noise: f64,
+    pub leakage_noise: f64,
+    pub noise_reference_hz: f64,
+    /// The clock the output stages leave in the signal after their two
+    /// outputs are balanced against each other: a square at the clock, this
+    /// many volts either way.
+    pub clock_leak: f64,
+}
+
+/// How many samples of the circuit's rate either side of a step the
+/// band-limited step spreads over.
+const STEP_HALF: usize = 8;
+const STEP_SPAN: usize = 2 * STEP_HALF;
+/// Fractional positions per sample in the step table.
+const STEP_PHASES: usize = 64;
+/// The band the steps are limited to, as a fraction of the circuit's rate.
+const STEP_CUTOFF: f64 = 0.45;
+/// Taps of the charge-transfer smear: enough for an inefficiency of two.
+const SMEAR_TAPS: usize = 8;
+
+/// A bucket brigade run at its own clock, between two halves of a solved
+/// circuit (FaderFrame: the Carbon Echo's four BL3208As).
+///
+/// Where [`Brigade`] is a delay whose length a clock sets, this is the clock
+/// itself. A sample of the input is taken at every clock period -- whenever
+/// in the circuit's own samples that falls -- and held in a bucket; the
+/// bucket `stages / 2` periods back comes out and is held at the output for
+/// one period, as a BBD's two summed outputs hold it. So:
+///
+/// - **a slow clock aliases.** Anything above half the clock that the
+///   input filter lets through folds back down, as it does in the chip;
+/// - **its output is a staircase**, with images of the signal about every
+///   multiple of the clock, for the output filter to take out -- and below
+///   about 14 kHz of clock the first image is in the audio band;
+/// - **turning the clock moves the pitch.** The buckets hold samples, not
+///   time: what was put in at one clock comes out at another, faster or
+///   slower, which is the swoop of a BBD's delay knob;
+/// - **the clock is in the output**: a square at the clock, what is left of
+///   it once the two outputs are balanced; and the buckets are noisy, more
+///   so the longer each waits.
+///
+/// The steps are placed between the circuit's samples band-limited (each
+/// step is the integral of a windowed sinc, tabulated), so nothing above the
+/// circuit's own Nyquist frequency folds into it: the aliasing is the chip's
+/// and none of it this model's. That and the four-point interpolation of the
+/// input cost `STEP_HALF + 1` samples of the circuit's rate in latency --
+/// under 0.2 ms at 48 kHz.
+///
+/// Allocates once, in `new`, off the audio thread; the line's size is the
+/// stage count, not a time, so no clock or rate ever resizes it.
+pub struct Clocked {
+    spec: ClockedSpec,
+    buckets: Vec<f64>,
+    mask: usize,
+    write: usize,
+    periods: usize,
+    smear: [f64; SMEAR_TAPS],
+    /// Half periods into the present one, 0..1.
+    phase: f64,
+    /// Whether the next clock edge ends the first half of a period.
+    first_half: bool,
+    /// The packet at the output, and what the output holds (it and the
+    /// clock).
+    packet: f64,
+    held: f64,
+    /// The input at the last four samples, oldest first.
+    input: [f64; 4],
+    /// What the steps still owe the next `STEP_SPAN` outputs, and what the
+    /// held output was `STEP_HALF` samples ago.
+    owed: [f64; STEP_SPAN],
+    naive: [f64; STEP_SPAN],
+    at: usize,
+    seed: u64,
+    rng: u64,
+    steps: Vec<f64>,
+}
+
+impl Clocked {
+    pub fn new(spec: ClockedSpec, seed: u64) -> Self {
+        let periods = (spec.stages / 2).max(1);
+        let size = (periods + SMEAR_TAPS + 1).next_power_of_two();
+        let mut smear = [0.0; SMEAR_TAPS];
+        // The fraction left behind at each of N transfers, compounded: a
+        // packet arrives with `e^-l l^k / k!` of the one `k` periods ahead of
+        // it (Poisson, for a small fraction over many transfers).
+        let l = spec.inefficiency.max(0.0);
+        let mut term = (-l).exp();
+        for (k, tap) in smear.iter_mut().enumerate() {
+            *tap = term;
+            term *= l / (k + 1) as f64;
+        }
+        let total: f64 = smear.iter().sum();
+        smear.iter_mut().for_each(|t| *t /= total);
+        let seed = seed | 1;
+        Self {
+            spec,
+            buckets: vec![0.0; size],
+            mask: size - 1,
+            write: 0,
+            periods,
+            smear,
+            phase: 0.0,
+            first_half: false,
+            packet: 0.0,
+            held: 0.0,
+            input: [0.0; 4],
+            owed: [0.0; STEP_SPAN],
+            naive: [0.0; STEP_SPAN],
+            at: 0,
+            seed,
+            rng: seed,
+            steps: step_table(),
+        }
+    }
+
+    pub fn spec(&self) -> &ClockedSpec {
+        &self.spec
+    }
+
+    /// The delay a clock gives, in seconds: `stages / (2 f)`.
+    pub fn delay_at(&self, clock_hz: f64) -> f64 {
+        self.periods as f64 / clock_hz.max(1.0)
+    }
+
+    pub fn reset(&mut self) {
+        self.buckets.fill(0.0);
+        self.write = 0;
+        self.phase = 0.0;
+        self.first_half = false;
+        self.packet = 0.0;
+        self.held = 0.0;
+        self.input = [0.0; 4];
+        self.owed = [0.0; STEP_SPAN];
+        self.naive = [0.0; STEP_SPAN];
+        self.at = 0;
+        self.rng = self.seed;
+    }
+
+    /// Take another line's exact state (FaderFrame: a dormant channel waking
+    /// from the one that ran). Copies into existing storage only.
+    pub fn copy_runtime_state_from(&mut self, source: &Self) {
+        if self.buckets.len() == source.buckets.len() {
+            self.buckets.copy_from_slice(&source.buckets);
+        }
+        self.write = source.write;
+        self.phase = source.phase;
+        self.first_half = source.first_half;
+        self.packet = source.packet;
+        self.held = source.held;
+        self.input = source.input;
+        self.owed = source.owed;
+        self.naive = source.naive;
+        self.at = source.at;
+        self.rng = source.rng;
+    }
+
+    /// One sample of the circuit in (volts about the input's bias), the
+    /// clock over that sample, and the output for the circuit's next sample
+    /// (volts about the output's own level).
+    pub fn process(&mut self, x: f64, clock_hz: f64, rate: f64) -> f64 {
+        let x = if x.is_finite() { x } else { 0.0 };
+        self.input = [self.input[1], self.input[2], self.input[3], x];
+        // Half periods in one sample of the circuit.
+        let step = 2.0 * clock_hz.clamp(1.0, rate * 16.0) / rate;
+        let mut at = 0.0;
+        let mut phase = self.phase;
+        loop {
+            let need = (1.0 - phase) / step;
+            if at + need > 1.0 {
+                phase += (1.0 - at) * step;
+                break;
+            }
+            at += need;
+            phase = 0.0;
+            self.edge(at, clock_hz);
+        }
+        self.phase = phase.min(1.0);
+
+        let now = self.at & (STEP_SPAN - 1);
+        self.naive[now] = self.held;
+        let then = self.at.wrapping_sub(STEP_HALF) & (STEP_SPAN - 1);
+        let out = self.naive[then] + self.owed[now];
+        self.owed[now] = 0.0;
+        self.at = self.at.wrapping_add(1);
+        out
+    }
+
+    /// A clock edge `at` of the way through the present sample.
+    fn edge(&mut self, at: f64, clock_hz: f64) {
+        self.first_half = !self.first_half;
+        let leak = self.spec.clock_leak;
+        let next = if self.first_half {
+            // A new period: the input sampled into the first bucket, the
+            // last bucket's packet out.
+            let sampled = self.through_chips(self.sampled(at));
+            self.buckets[self.write] = sampled;
+            let read = self.write.wrapping_sub(self.periods);
+            let mut packet = 0.0;
+            for (k, tap) in self.smear.iter().enumerate() {
+                packet += tap * self.buckets[read.wrapping_sub(k) & self.mask];
+            }
+            self.write = (self.write + 1) & self.mask;
+            self.packet = packet + self.noise(clock_hz);
+            self.packet + leak
+        } else {
+            self.packet - leak
+        };
+        let delta = next - self.held;
+        self.held = next;
+        if delta != 0.0 {
+            self.place_step(delta, 1.0 - at);
+        }
+    }
+
+    /// The input `at` of the way between the circuit's last-but-one sample
+    /// and its last: four-point Hermite.
+    fn sampled(&self, at: f64) -> f64 {
+        let [y0, y1, y2, y3] = self.input;
+        let c1 = 0.5 * (y2 - y0);
+        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+        ((c3 * at + c2) * at + c1) * at + y1
+    }
+
+    /// Through every chip's transfer curve, each re-biased at its input.
+    fn through_chips(&self, mut x: f64) -> f64 {
+        let s = &self.spec;
+        let limit = s.saturation.max(1e-3);
+        for _ in 0..s.chips {
+            let curved = x + s.second * x * x - s.third * x * x * x;
+            // Full buckets: a knee of the sixth order, under 1e-4 below a
+            // quarter of the way (where it is left out).
+            let r = (curved / limit).abs();
+            x = s.gain
+                * if r < 0.25 {
+                    curved
+                } else {
+                    let r3 = r * r * r;
+                    curved / (1.0 + r3 * r3).powf(1.0 / 6.0)
+                };
+        }
+        x
+    }
+
+    /// One packet's noise at this clock.
+    fn noise(&mut self, clock_hz: f64) -> f64 {
+        let s = &self.spec;
+        let leakage = s.leakage_noise * s.leakage_noise * s.noise_reference_hz / clock_hz.max(1.0);
+        let sigma = (s.noise * s.noise + leakage).sqrt();
+        if sigma == 0.0 {
+            return 0.0;
+        }
+        // Four uniforms: near enough a normal for noise, and cheap.
+        let mut sum = 0.0;
+        for _ in 0..4 {
+            self.rng ^= self.rng >> 12;
+            self.rng ^= self.rng << 25;
+            self.rng ^= self.rng >> 27;
+            let bits = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+            sum += bits as f64 * (1.0 / (1u64 << 53) as f64);
+        }
+        sigma * (sum - 2.0) * 3f64.sqrt()
+    }
+
+    /// A step of `delta` `before` of a sample ahead of the present sample's
+    /// end, band-limited into the outputs it reaches.
+    fn place_step(&mut self, delta: f64, before: f64) {
+        let pos = before.clamp(0.0, 1.0) * STEP_PHASES as f64;
+        let p = (pos as usize).min(STEP_PHASES - 1);
+        let w = pos - p as f64;
+        for j in 0..STEP_SPAN {
+            let row = &self.steps[j * (STEP_PHASES + 1)..];
+            let r = row[p] + (row[p + 1] - row[p]) * w;
+            self.owed[(self.at + j) & (STEP_SPAN - 1)] += delta * r;
+        }
+    }
+}
+
+/// What a band-limited step differs from a sharp one by, `j - STEP_HALF +
+/// p / STEP_PHASES` samples after it, for `j` in `0..STEP_SPAN` and `p` in
+/// `0..=STEP_PHASES`: the running integral of a Blackman-windowed sinc at
+/// `STEP_CUTOFF`, less the unit step.
+fn step_table() -> Vec<f64> {
+    let half = STEP_HALF as f64;
+    let fine = 512usize;
+    let impulse = |s: f64| -> f64 {
+        if s.abs() >= half {
+            return 0.0;
+        }
+        let x = s / half;
+        let window = 0.42 + 0.5 * (std::f64::consts::PI * x).cos()
+            + 0.08 * (std::f64::consts::TAU * x).cos();
+        let arg = std::f64::consts::TAU * STEP_CUTOFF * s;
+        let sinc = if arg.abs() < 1e-12 {
+            2.0 * STEP_CUTOFF
+        } else {
+            (arg).sin() / (std::f64::consts::PI * s)
+        };
+        sinc * window
+    };
+    // The running integral on a fine grid (midpoint rule), normalised so the
+    // step ends at exactly one.
+    let n = STEP_SPAN * fine;
+    let mut running = vec![0.0; n + 1];
+    let ds = 1.0 / fine as f64;
+    for k in 0..n {
+        let s = -half + (k as f64 + 0.5) * ds;
+        running[k + 1] = running[k] + impulse(s) * ds;
+    }
+    let total = running[n];
+    let integral = |d: f64| -> f64 {
+        let pos = ((d + half) * fine as f64).clamp(0.0, n as f64);
+        let k = (pos as usize).min(n - 1);
+        let w = pos - k as f64;
+        (running[k] + (running[k + 1] - running[k]) * w) / total
+    };
+    let mut table = vec![0.0; STEP_SPAN * (STEP_PHASES + 1)];
+    for j in 0..STEP_SPAN {
+        for p in 0..=STEP_PHASES {
+            let d = j as f64 - half + p as f64 / STEP_PHASES as f64;
+            let sharp = if d >= 0.0 { 1.0 } else { 0.0 };
+            table[j * (STEP_PHASES + 1) + p] = integral(d) - sharp;
+        }
+    }
+    table
+}
+
 /// A one-pole coefficient for a corner in hertz.
 fn one_pole(hz: f64, rate: f64) -> f64 {
     let x = (-std::f64::consts::TAU * hz / rate).exp();
@@ -493,6 +847,157 @@ mod tests {
                 "at {rate} Hz the impulse came back at {seconds:.5} s, and the \
                  shortest delay is {SHORTEST:.5} s"
             );
+        }
+    }
+
+    // --- the clocked line --------------------------------------------------------------
+
+    /// A clean line: no curve, no loss, no noise, no leak.
+    fn ideal(stages: usize) -> ClockedSpec {
+        ClockedSpec {
+            stages,
+            chips: 1,
+            gain: 1.0,
+            second: 0.0,
+            third: 0.0,
+            saturation: 1e3,
+            inefficiency: 0.0,
+            noise: 0.0,
+            leakage_noise: 0.0,
+            noise_reference_hz: 10_000.0,
+            clock_leak: 0.0,
+        }
+    }
+
+    fn sine_power(x: &[f64], hz: f64, rate: f64) -> f64 {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (k, &v) in x.iter().enumerate() {
+            let w = 0.5 - 0.5 * (std::f64::consts::TAU * k as f64 / x.len() as f64).cos();
+            let a = std::f64::consts::TAU * hz * k as f64 / rate;
+            re += v * w * a.cos();
+            im += v * w * a.sin();
+        }
+        (re * re + im * im) / (x.len() as f64).powi(2)
+    }
+
+    /// An impulse comes out `stages / (2 f)` later, plus the step's and the
+    /// interpolation's few samples.
+    #[test]
+    fn a_clocked_line_delays_by_its_stages_over_twice_its_clock() {
+        let rate = 48_000.0;
+        for clock in [6_800.0, 40_000.0, 200_000.0] {
+            let mut line = Clocked::new(ideal(8192), 1);
+            let (mut moment, mut area) = (0.0, 0.0);
+            for k in 0..(rate * 0.8) as usize {
+                // A short pulse, wide enough for the slowest clock to see.
+                let x = if k < 8 { 1.0 } else { 0.0 };
+                let y = line.process(x, clock, rate);
+                moment += k as f64 * y;
+                area += y;
+            }
+            // Where the pulse's weight comes out: the stages, the step's half
+            // span and the interpolation's sample, and the pulse's own
+            // middle; within half a clock period (where its samples fell)
+            // and a sample of the circuit's.
+            let want = line.delay_at(clock) + (STEP_HALF as f64 + 1.0 + 3.5) / rate;
+            let got = moment / area / rate;
+            assert!(
+                (got - want).abs() < 1.0 / clock + 1.0 / rate,
+                "at {clock} Hz: {got:.5} s, {want:.5} s by the stages"
+            );
+        }
+    }
+
+    /// The buckets hold samples, not time: what went in at one clock comes
+    /// out at another an octave up when the clock doubles.
+    #[test]
+    fn doubling_the_clock_plays_the_buckets_an_octave_up() {
+        let rate = 48_000.0;
+        let mut line = Clocked::new(ideal(2048), 1);
+        let fill = (rate * 0.2) as usize;
+        for k in 0..fill {
+            let x = (std::f64::consts::TAU * 300.0 * k as f64 / rate).sin();
+            line.process(x, 20_000.0, rate);
+        }
+        // 1024 periods of 20 kHz is 51 ms of 300 Hz in the buckets; read it
+        // back at 40 kHz, 25.6 ms of it, with nothing new behind it.
+        let out: Vec<f64> = (0..(rate * 0.024) as usize)
+            .map(|_| line.process(0.0, 40_000.0, rate))
+            .collect();
+        let octave = sine_power(&out, 600.0, rate);
+        let unison = sine_power(&out, 300.0, rate);
+        assert!(octave > 30.0 * unison, "600 Hz {octave:e}, 300 Hz {unison:e}");
+    }
+
+    /// A slow clock aliases: a tone above half of it comes out folded down,
+    /// and the band-limited steps put nothing above the circuit's own
+    /// Nyquist frequency back into the band.
+    #[test]
+    fn a_slow_clock_folds_what_is_above_half_of_it() {
+        let rate = 48_000.0;
+        let clock = 8_000.0;
+        let mut line = Clocked::new(ideal(256), 1);
+        let n = (rate * 0.5) as usize;
+        let out: Vec<f64> = (0..n)
+            .map(|k| {
+                let x = (std::f64::consts::TAU * 5_000.0 * k as f64 / rate).sin();
+                line.process(x, clock, rate)
+            })
+            .collect();
+        let tail = &out[n / 2..];
+        let folded = sine_power(tail, 3_000.0, rate);
+        let straight = sine_power(tail, 5_000.0, rate);
+        assert!(folded > 0.5 * straight, "3 kHz {folded:e}, 5 kHz {straight:e}");
+        // A clean step's images fall where the clock's multiples put them,
+        // and nowhere the circuit's sampling would have folded them to: the
+        // 15 kHz image (8 + 7) stays; nothing at 48 - 21 = 27 -> 21 kHz's
+        // mirror, 48 - 23 = 25 -> 23 kHz's, beyond what the sinc lets by.
+        let image = sine_power(tail, 11_000.0, rate);
+        assert!(image < straight, "image {image:e}");
+    }
+
+    /// The clock in the output is a square at the clock, there with nothing
+    /// in the line.
+    #[test]
+    fn the_clock_leaks_into_the_output_at_the_clock() {
+        let rate = 48_000.0;
+        let clock = 6_000.0;
+        let mut spec = ideal(512);
+        spec.clock_leak = 0.01;
+        let mut line = Clocked::new(spec, 1);
+        let n = (rate * 0.25) as usize;
+        let out: Vec<f64> = (0..n).map(|_| line.process(0.0, clock, rate)).collect();
+        let at = sine_power(&out, clock, rate).sqrt();
+        let off = sine_power(&out, 4_000.0, rate).sqrt();
+        // A square of 10 mV either way has a fundamental of 12.7 mV peak; the
+        // window's mean halves what the sum reads.
+        assert!((at * 2.0 * 2.0 - 0.0127).abs() < 0.003, "{at}");
+        assert!(off < at / 100.0, "{off} away from the clock");
+    }
+
+    /// Noise and resets are deterministic, and a copy carries on exactly.
+    #[test]
+    fn a_reset_line_repeats_itself_and_a_copy_carries_on() {
+        let rate = 48_000.0;
+        let mut spec = ideal(1024);
+        spec.noise = 1e-3;
+        spec.leakage_noise = 1e-3;
+        spec.chips = 4;
+        spec.second = 0.01;
+        spec.third = 0.03;
+        spec.inefficiency = 1.0;
+        spec.clock_leak = 0.003;
+        let mut a = Clocked::new(spec, 9);
+        let input = |k: usize| 0.5 * (std::f64::consts::TAU * 440.0 * k as f64 / rate).sin();
+        let first: Vec<f64> = (0..4_000).map(|k| a.process(input(k), 30_000.0, rate)).collect();
+        a.reset();
+        let again: Vec<f64> = (0..4_000).map(|k| a.process(input(k), 30_000.0, rate)).collect();
+        assert_eq!(first, again);
+        let mut b = Clocked::new(spec, 9);
+        b.copy_runtime_state_from(&a);
+        for k in 4_000..6_000 {
+            let x = input(k);
+            assert_eq!(a.process(x, 25_000.0, rate), b.process(x, 25_000.0, rate));
         }
     }
 }

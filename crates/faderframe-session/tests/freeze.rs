@@ -210,3 +210,38 @@ fn renders_take_the_latency_off_the_front() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A track with a delay of its own (earlier: through the delay
+/// compensation) and its polarity inverted sounds the same frozen: the
+/// file has neither, the frozen track plays it through both.
+#[test]
+fn a_frozen_track_keeps_its_delay_and_polarity_once() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let bass = track(&s, "Bass");
+    for cmd in [
+        Command::SetTrackDelay {
+            track: bass,
+            ms: -1.234,
+        },
+        Command::SetTrackPhaseInvert {
+            track: bass,
+            on: true,
+        },
+    ] {
+        s.dispatch(Action::Edit(cmd)).unwrap();
+    }
+    let before = master(s.project(), "delayed-before");
+    s.dispatch(Action::FreezeTrack(bass)).unwrap();
+    wait(&mut s);
+    assert!(s.is_frozen(bass));
+    let after = master(s.project(), "delayed-after");
+    let diff = before
+        .iter()
+        .zip(&after)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        diff < 1e-3,
+        "frozen audio sounds the same (max diff {diff})"
+    );
+}

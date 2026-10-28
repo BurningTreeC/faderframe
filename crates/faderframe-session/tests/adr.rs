@@ -189,3 +189,45 @@ fn takes_are_rated() {
     assert_eq!(takes[1].3, 4);
     assert_eq!(takes[0].3, 0);
 }
+
+/// Cues and their beeps belong to the picture: a tempo change leaves the
+/// cues on their samples and the beeps on their cues, in one undo step.
+#[test]
+fn cues_and_beeps_stay_with_the_picture_through_a_tempo_change() {
+    let (mut s, t) = setup();
+    s.dispatch(Action::Adr(AdrOp::FromTranscript { track: Some(t) }))
+        .unwrap();
+    s.dispatch(Action::Adr(AdrOp::MakeBeeps)).unwrap();
+    let samples = |s: &Session| -> (Vec<(i64, i64)>, Vec<i64>) {
+        let p = s.project();
+        let to = |m| p.timeline.to_samples(m, SR as f64);
+        let beeps = p.tracks.iter().find(|t| t.name == BEEPS_TRACK).unwrap();
+        let mut b: Vec<i64> = beeps.clips.iter().map(|c| to(p.clips[c].start)).collect();
+        b.sort();
+        (
+            s.adr()
+                .cues
+                .iter()
+                .map(|c| (to(c.start), to(c.end)))
+                .collect(),
+            b,
+        )
+    };
+    let beeps = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == BEEPS_TRACK)
+        .unwrap()
+        .id;
+    assert!(s.is_time_locked(beeps), "the beeps' track is time-locked");
+    let before = samples(&s);
+    let steps = s.history_steps().0.len();
+    s.dispatch(Action::Edit(Command::SetTempo { bpm: 93.0 }))
+        .unwrap();
+    assert_eq!(samples(&s), before, "cues and beeps stay where they were");
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one undo step");
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(samples(&s), before);
+    assert_eq!(s.project().timeline.tempo.bpm_at(MusicalTime::ZERO), 120.0);
+}

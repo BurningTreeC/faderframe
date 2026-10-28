@@ -65,7 +65,9 @@ impl Session {
             }
         }
         for id in self.engine.take_dirty_plugins() {
-            if self.engine.plugin_sandboxed(id) {
+            if self.note_clip_fx_touched(id) {
+                // A clip effect's: its chain takes it (`clip_fx`).
+            } else if self.engine.plugin_sandboxed(id) {
                 self.plugin_care.dirty.insert(id);
             }
         }

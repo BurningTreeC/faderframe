@@ -9,7 +9,8 @@ const BLACK_KEY_W: f32 = 0.62;
 use super::geometry::{
     Layout, NODE_R, analyser_y, freq_of, is_black, note_label, note_name, note_of, sweep,
 };
-use super::{Drag, EqView, Hit, NodeButton, Settings, Source, ValueField};
+use super::matching::Match;
+use super::{Drag, EqView, Hit, NodeButton, Settings, Source, ValueField, key};
 use faderframe_plugin_host::eq::design::{
     self, AnalogBand, BandShape, BandType, Coefs, MAX_SECTIONS,
 };
@@ -269,6 +270,16 @@ impl EqView {
             let frozen = s.freeze || self.grab.is_some();
             a.post.set_hold(s.peak_hold);
             a.update(&tap, external.as_ref(), s.external, fall, frozen);
+        }
+        // A reference sent to EQ Match from the Reference view: open it.
+        if self.matching.is_none()
+            && model
+                .device_view(self.device.plugin, key::MATCH_OPEN)
+                .unwrap_or(0.0)
+                > 0.0
+        {
+            self.matching = Some(Match::new(model.sample_rate()));
+            self.instances = None;
         }
         if let Some(m) = self.matching.as_mut() {
             m.update(model, &tap, self.device.plugin);

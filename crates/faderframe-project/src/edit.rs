@@ -79,6 +79,7 @@ pub enum CoalesceKey {
     TrackPan(TrackId),
     TrackDualPan(TrackId),
     TrackSurround(TrackId),
+    TrackDelay(TrackId),
     SendLevel(TrackId, SendId),
     SendPan(TrackId, SendId),
     CueLevel(CueId),
@@ -188,6 +189,13 @@ pub enum Command {
     SetTrackPhaseInvert {
         track: TrackId,
         on: bool,
+    },
+    /// The track's own delay in milliseconds ([`Track::delay_ms`]; NaN is
+    /// none), within ±[`crate::MAX_TRACK_DELAY_MS`]; tracks with audio,
+    /// not the master.
+    SetTrackDelay {
+        track: TrackId,
+        ms: f64,
     },
     RenameTrack {
         track: TrackId,
@@ -415,6 +423,19 @@ pub enum Command {
         track: TrackId,
         excluded: bool,
     },
+    /// Place a track's material with the music or in time
+    /// ([`crate::TimeBase`]). Nothing moves: from now on tempo changes
+    /// keep a time-locked track's clips and automation on their samples
+    /// (see [`crate::time_lock`]).
+    SetTrackTimeBase {
+        track: TrackId,
+        base: crate::TimeBase,
+    },
+    /// What a track plays in the mix ([`Track::role`]; `None`: not said).
+    SetTrackRole {
+        track: TrackId,
+        role: Option<faderframe_core::TrackRole>,
+    },
     /// Freeze (`Some`) or unfreeze a track.
     SetTrackFreeze {
         track: TrackId,
@@ -572,6 +593,11 @@ pub enum Command {
     /// Replace the setlist.
     SetSetlist {
         setlist: Box<crate::setlist::Setlist>,
+    },
+    /// Replace the reference tracks (normalised: see
+    /// [`crate::reference::References::tidy`]).
+    SetReferences {
+        references: Box<crate::reference::References>,
     },
     /// Replace the ADR cue list and its settings.
     SetAdr {
@@ -888,6 +914,7 @@ impl Command {
             SetTrackMidiOutput { .. } => "Change MIDI Output".into(),
             SetTrackMpe { .. } => "Change MPE".into(),
             SetTrackPhaseInvert { .. } => "Toggle Phase Invert".into(),
+            SetTrackDelay { .. } => "Track Delay".into(),
             RenameTrack { .. } => "Rename Track".into(),
             SetTrackColor { .. } => "Change Track Colour".into(),
             SetTrackOutput { .. } => "Change Output".into(),
@@ -938,6 +965,8 @@ impl Command {
             SetTrackRippleExcluded {
                 excluded: false, ..
             } => "Include in Ripple".into(),
+            SetTrackTimeBase { base, .. } => format!("Time Base: {}", base.label()),
+            SetTrackRole { .. } => "Set Track Role".into(),
             SetTrackFreeze {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
@@ -978,6 +1007,7 @@ impl Command {
             SetChords { .. } => "Edit Chords".into(),
             SetLyrics { .. } => "Edit Lyrics".into(),
             SetSetlist { .. } => "Edit Setlist".into(),
+            SetReferences { .. } => "Edit References".into(),
             SetAdr { .. } => "Edit ADR Cues".into(),
             SetVideo { .. } => "Edit Video".into(),
             SetTimecode { .. } => "Change Timecode".into(),
@@ -1020,6 +1050,7 @@ impl Command {
             SetTrackPan { track, .. } => CoalesceKey::TrackPan(*track),
             SetTrackDualPan { track, .. } => CoalesceKey::TrackDualPan(*track),
             SetTrackSurround { track, .. } => CoalesceKey::TrackSurround(*track),
+            SetTrackDelay { track, .. } => CoalesceKey::TrackDelay(*track),
             SetSendLevel { track, send, .. } => CoalesceKey::SendLevel(*track, *send),
             SetSendPan { track, send, .. } => CoalesceKey::SendPan(*track, *send),
             SetCueLevel { cue, .. } => CoalesceKey::CueLevel(*cue),
@@ -1061,6 +1092,10 @@ impl Command {
             | SetTrackMute { .. }
             | SetTrackSolo { .. }
             | SetTrackPhaseInvert { .. }
+            // A slot the delay node reads; the engine rebuilds when the
+            // delay needs another node (none, later, or a whole
+            // millisecond more or less ahead: `build::param_shape`).
+            | SetTrackDelay { .. }
             | SetSendLevel { .. }
             | SetSendPan { .. }
             | SetCueLevel { .. }
@@ -1097,10 +1132,15 @@ impl Command {
             | SetTrackGroup { .. }
             | SetFolderGroup { .. }
             | SetTrackRippleExcluded { .. }
+            // Moves nothing: tempo changes from now on keep its place.
+            | SetTrackTimeBase { .. }
+            | SetTrackRole { .. }
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
             | SetSetlist { .. }
+            // Monitoring only: the session hands them to the listening.
+            | SetReferences { .. }
             | SetAdr { .. }
             | SetVideo { .. }
             | SetTimecode { .. }
@@ -1279,6 +1319,20 @@ impl Command {
             SetTrackPhaseInvert { track, on } => {
                 let old = std::mem::replace(&mut track_mut(p, track)?.phase_invert, on);
                 SetTrackPhaseInvert { track, on: old }
+            }
+            SetTrackDelay { track, ms } => {
+                let t = track_mut(p, track)?;
+                let ms = if ms.is_nan() { 0.0 } else { ms };
+                let ms = ms.clamp(-crate::MAX_TRACK_DELAY_MS, crate::MAX_TRACK_DELAY_MS);
+                if ms != 0.0 && !t.takes_delay() {
+                    return Err(EditError::Invalid(format!(
+                        "{} track '{}' has no delay of its own",
+                        t.kind_label(),
+                        t.name
+                    )));
+                }
+                let old = std::mem::replace(&mut t.delay_ms, ms);
+                SetTrackDelay { track, ms: old }
             }
             RenameTrack { track, name } => {
                 let name = name.trim().to_string();
@@ -1824,6 +1878,16 @@ impl Command {
                     excluded: old,
                 }
             }
+            SetTrackTimeBase { track, base } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.time_base, base);
+                SetTrackTimeBase { track, base: old }
+            }
+            SetTrackRole { track, role } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.role, role);
+                SetTrackRole { track, role: old }
+            }
             SetTrackFreeze { track, freeze } => {
                 let t = track_mut(p, track)?;
                 let old = std::mem::replace(&mut t.freeze, freeze);
@@ -2299,6 +2363,12 @@ impl Command {
                 setlist.tidy();
                 SetSetlist {
                     setlist: Box::new(std::mem::replace(&mut p.setlist, *setlist)),
+                }
+            }
+            SetReferences { mut references } => {
+                references.tidy();
+                SetReferences {
+                    references: Box::new(std::mem::replace(&mut p.references, *references)),
                 }
             }
             SetAdr { mut adr } => {

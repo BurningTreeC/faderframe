@@ -1727,6 +1727,26 @@ impl EngineController {
         self.plugins.instance(slot).is_ok()
     }
 
+    /// Keep these instances hosted whatever the project holds: slots
+    /// outside it (a clip effect shown in its own editor window).
+    pub fn keep_plugins(
+        &mut self,
+        plugins: std::collections::HashSet<faderframe_core::PluginInstanceId>,
+    ) {
+        self.plugins.set_kept(plugins);
+    }
+
+    /// Push a slot outside the project to its hosted instance (state,
+    /// explicit values), as syncing does for the project's slots.
+    pub fn sync_plugin_slot(&mut self, slot: &faderframe_project::PluginSlot) {
+        self.plugins.sync_slot(slot);
+    }
+
+    /// Drop the instance of a slot outside the project now.
+    pub fn release_plugin(&mut self, plugin: faderframe_core::PluginInstanceId) {
+        self.plugins.release(plugin);
+    }
+
     /// Latency of a hosted plugin instance (samples).
     pub fn plugin_latency(&self, plugin: faderframe_core::PluginInstanceId) -> Option<u32> {
         self.plugins.latency(plugin)
@@ -2890,6 +2910,22 @@ impl EngineController {
     pub fn set_mono_check(&mut self, on: bool) -> Result<(), EngineError> {
         let slot = self.slots.monitor_mono()?;
         self.params.set(slot, if on { 1.0 } else { 0.0 });
+        Ok(())
+    }
+
+    /// A gain (dB) on what the device plays of the master, for listening
+    /// only: immediate (ramped over a block), no rebuild, never part of a
+    /// render. Mix Intelligence plays a candidate loudness-matched with it.
+    pub fn set_monitor_trim(&mut self, db: f32) -> Result<(), EngineError> {
+        let slot = self.slots.monitor_trim()?;
+        self.params.set(
+            slot,
+            if db.is_finite() {
+                db.clamp(-24.0, 24.0)
+            } else {
+                0.0
+            },
+        );
         Ok(())
     }
 

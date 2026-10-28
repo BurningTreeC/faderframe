@@ -31,6 +31,7 @@ faderframe-workspace = { path = "crates/faderframe-workspace" }
 faderframe-project = { path = "crates/faderframe-project" }
 faderframe-audio = { path = "crates/faderframe-audio" }
 faderframe-analysis = { path = "crates/faderframe-analysis" }
+faderframe-mix-intelligence = { path = "crates/faderframe-mix-intelligence" }
 faderframe-audio-cpal = { path = "crates/faderframe-audio-cpal" }
 faderframe-audio-jack = { path = "crates/faderframe-audio-jack" }
 faderframe-audio-pipewire = { path = "crates/faderframe-audio-pipewire" }
@@ -66,6 +67,7 @@ faderframe-view-automation = { path = "crates/faderframe-view-automation" }
 faderframe-view-album = { path = "crates/faderframe-view-album" }
 faderframe-view-performance = { path = "crates/faderframe-view-performance" }
 faderframe-view-history = { path = "crates/faderframe-view-history" }
+faderframe-view-reference = { path = "crates/faderframe-view-reference" }
 faderframe-view-leadsheet = { path = "crates/faderframe-view-leadsheet" }
 faderframe-view-events = { path = "crates/faderframe-view-events" }
 faderframe-view-spectral = { path = "crates/faderframe-view-spectral" }
@@ -75,6 +77,7 @@ faderframe-view-modulators = { path = "crates/faderframe-view-modulators" }
 faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }
 faderframe-view-clipfx = { path = "crates/faderframe-view-clipfx" }
 faderframe-view-inspector = { path = "crates/faderframe-view-inspector" }
+faderframe-view-mix = { path = "crates/faderframe-view-mix" }
 faderframe-transcribe = { path = "crates/faderframe-transcribe" }
 faderframe-speech = { path = "crates/faderframe-speech" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }

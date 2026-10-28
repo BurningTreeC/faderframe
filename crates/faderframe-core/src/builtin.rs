@@ -69,6 +69,11 @@ pub const CONTAINER: &str = "faderframe.container";
 pub const HARDWARE_INSERT: &str = "faderframe.hardware-insert";
 /// A FET limiting amplifier in the classic 1176's manner.
 pub const COMPRESSOR_76: &str = "faderframe.76-compressor";
+/// An analog tape machine: record and reproduce on modelled tape (effect).
+pub const TAPE_MACHINE: &str = "faderframe.tape-machine";
+/// An optical leveling amplifier in the classic LA-2A's manner (its T4
+/// cell, valve make-up amplifier and transformers).
+pub const LEVELER_2A: &str = "faderframe.2a-leveler";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
@@ -97,6 +102,8 @@ pub fn has_editor(id: &str) -> bool {
             | NOTE_ECHO
             | HARDWARE_INSERT
             | COMPRESSOR_76
+            | TAPE_MACHINE
+            | LEVELER_2A
     )
 }
 
