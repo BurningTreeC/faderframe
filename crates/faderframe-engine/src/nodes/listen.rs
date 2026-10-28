@@ -123,10 +123,6 @@ pub struct ListenOut {
     retired: Option<Box<Listening>>,
     stages: Stages,
     mono: ParamSlot,
-    /// The monitor trim (dB) and the gain it was at the end of the last
-    /// block (ramped from there).
-    trim: ParamSlot,
-    trim_gain: f32,
     /// Bass management's settings ([`BassManagement::values`]).
     bass_slots: [ParamSlot; 4],
     shared: MixSlots,
@@ -168,7 +164,6 @@ impl ListenOut {
         rate: u32,
         block: usize,
         mono: ParamSlot,
-        trim: ParamSlot,
         bass_slots: [ParamSlot; 4],
         shared: MixSlots,
     ) -> Self {
@@ -206,28 +201,11 @@ impl ListenOut {
                 scratch: vec![vec![0.0; block]; 2],
             },
             mono,
-            trim,
-            trim_gain: 1.0,
             bass_slots,
             shared,
             alt,
             compare: Compare::new(&listen.link.compare, input, rate, block),
         }
-    }
-
-    /// The monitor trim, ramped over the block from where it was.
-    fn apply_trim(&mut self, target: f32, out: &mut AudioBuffer, n: usize) {
-        let from = self.trim_gain;
-        if from == 1.0 && target == 1.0 {
-            return;
-        }
-        let step = (target - from) / n.max(1) as f32;
-        for c in 0..out.num_channels() {
-            for (i, v) in out.channel_mut(c)[..n].iter_mut().enumerate() {
-                *v *= from + step * (i + 1) as f32;
-            }
-        }
-        self.trim_gain = target;
     }
 
     /// `input` heard by `listening` into `out` (cleared first): rendered
@@ -382,7 +360,8 @@ impl Processor<EngineContext> for ListenOut {
             mono: params.get(self.mono) >= 0.5,
             bass: BassManagement::from_values(&self.bass_slots.map(|s| params.get(s))),
         };
-        // The mix, or what is compared with it (A/B), heard alike.
+        // The mix, or what is compared with it (A/B), heard alike, each at
+        // its listening gain (the only gain of the monitor path).
         let input = self.compare.process(cx, input, n);
         Self::hear(&mut self.now, &mut self.stages, block, input, out, n);
         if let Some(next) = self.next.as_mut() {
@@ -406,7 +385,5 @@ impl Processor<EngineContext> for ListenOut {
                 self.give_back();
             }
         }
-        let trim = faderframe_core::db_to_gain(params.get(self.trim));
-        self.apply_trim(trim, out, n);
     }
 }

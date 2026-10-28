@@ -160,6 +160,12 @@ impl FileMeter {
         self.frames += frames as u64;
     }
 
+    /// The loudness meter (`None` when the loudness is not measured): its
+    /// short-term and momentary values over time.
+    pub fn loudness_meter(&self) -> Option<&WeightedLoudness> {
+        self.loudness.as_ref()
+    }
+
     /// The levels of everything fed.
     pub fn finish(mut self) -> FileLevels {
         let frames = self.frames.max(1) as f64;

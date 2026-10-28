@@ -111,6 +111,19 @@ pub fn conflicts(
     rule: &MaskingRule,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<ConflictRange>, MaskingError> {
+    conflicts_except(target, masker, rule, &[], cancel)
+}
+
+/// [`conflicts`] with the frames marked in `skip` left out (the target does
+/// not count there): where the two carry the same audio
+/// ([`crate::same`]), masking is not judged.
+pub fn conflicts_except(
+    target: &TrackProfile,
+    masker: &TrackProfile,
+    rule: &MaskingRule,
+    skip: &[bool],
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<ConflictRange>, MaskingError> {
     if !compatible(target, masker) {
         return Err(MaskingError::Mismatch);
     }
@@ -126,6 +139,9 @@ pub fn conflicts(
     for t in 0..frames {
         if t % 256 == 0 && cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(MaskingError::Cancelled);
+        }
+        if skip.get(t) == Some(&true) {
+            continue;
         }
         let top = (0..bands)
             .map(|b| target.frames.level(t, b))

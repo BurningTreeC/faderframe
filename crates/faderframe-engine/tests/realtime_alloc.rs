@@ -3905,8 +3905,8 @@ fn surround_strips_do_not_allocate() {
         .sync(&tp.project, &tp.sources, faderframe_project::Impact::Graph)
         .unwrap();
     r.controller.set_mono_check(true).unwrap();
-    // A loudness-matched comparison's monitor trim.
-    r.controller.set_monitor_trim(-2.5).unwrap();
+    // A loudness-matched comparison's listening gain on the mix.
+    r.controller.set_listening_gain(-2.5, 0.0);
     r.play_from(0).unwrap();
     let mut bufs = OwnedBuffers::new(2, 6, 256);
     for _ in 0..4 {
@@ -4500,6 +4500,7 @@ fn the_compare_source_does_not_allocate() {
             match i {
                 10 => shared.hear(true),
                 40 => shared.set_gain(0.5),
+                50 => shared.set_mix_gain(0.7),
                 60 => {
                     let _ = r
                         .controller
@@ -4537,4 +4538,57 @@ fn the_compare_source_does_not_allocate() {
     assert_eq!(allocs, 0, "taking the source away allocates nothing");
     link.collect();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn capturing_for_an_analysis_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_engine::capture::CapturePlan;
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        measure_nodes: true,
+        ..EngineConfig::default()
+    };
+    // Every track tapped, every device probed, timed per node.
+    let plan = CapturePlan {
+        tracks: project.tracks.iter().map(|t| t.id).collect(),
+        devices: true,
+        block: BLOCK,
+    };
+    let mut r =
+        OfflineRenderer::with_capture(&project, &sources, config, BLOCK, 2, Some(plan)).unwrap();
+    r.controller.set_node_timing(true);
+    let capture = std::sync::Arc::clone(r.controller.capture().unwrap());
+    let taps = capture.taps();
+    assert!(taps.len() > 3, "{}", taps.len());
+    assert!(!capture.probes().is_empty());
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.play_from(0).unwrap();
+    let mut heard = 0.0f32;
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+        for t in &taps {
+            t.take(|_| {});
+        }
+    }
+    let (_, n) = armed(|| {
+        for _ in 0..300 {
+            r.processor.process_device(&mut bufs);
+            for t in &taps {
+                t.take(|c| {
+                    for ch in c {
+                        heard = ch.iter().fold(heard, |m, v| m.max(v.abs()));
+                    }
+                });
+            }
+        }
+    });
+    assert_eq!(n, 0, "allocations while capturing and taking the taps");
+    assert!(heard > 1e-3, "the taps hear the music");
+    assert!(taps.iter().all(|t| t.missed() == 0));
+    assert!(capture.probes().iter().any(|p| p.stats().out_energy > 0.0));
 }

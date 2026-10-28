@@ -945,6 +945,7 @@ name = "faderframe-mix-intelligence"
 version = "0.34.0"
 dependencies = [
  "faderframe-analysis",
+ "faderframe-audio-files",
  "faderframe-core",
  "thiserror 2.0.21",
 ]

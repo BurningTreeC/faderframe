@@ -9,9 +9,16 @@
 //!   `mix-compare:<a|b>`, `mix-match:<on|off>`, `mix-apply:x` (the one
 //!   auditioned, else the first that can be applied), `mix-reject:x`,
 //!   `mix-dismiss:x`;
+//! * `mix-open:<n>` — the selected finding's n-th experiment that hands
+//!   over (a reference heard A/B, EQ Match with it; 1 = the first such);
 //! * `track-role:<track>=<role|none>` (a role by its name: `kick`,
 //!   `lead-vocal`, `rhythm guitar` …);
-//! * `mix-log:x` — log the findings (scripted checks).
+//! * `mix-log:x` — log the findings (scripted checks);
+//! * `mix-pairs:x` — log the pairs compared for phase and timing (delay,
+//!   polarity, confidence, the sum against the energies, onsets) and those
+//!   left out;
+//! * `mix-dynamics:x` — log every subject's dynamics indicators and width
+//!   by region.
 
 use crate::state::AppState;
 use faderframe_core::TrackRole;
@@ -105,6 +112,31 @@ pub(crate) fn apply(a: &Rc<AppState>, _: &str) {
     }
 }
 
+pub(crate) fn open(a: &Rc<AppState>, arg: &str) {
+    let target = {
+        let s = a.session.borrow();
+        let n = arg.parse::<usize>().unwrap_or(1).max(1);
+        s.mix_selected().and_then(|f| {
+            f.recommendations
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.experiment.hand_off().is_some())
+                .nth(n - 1)
+                .map(|(i, _)| (f.id, i))
+        })
+    };
+    match target {
+        Some((finding, recommendation)) => op(
+            a,
+            MixOp::Open {
+                finding,
+                recommendation,
+            },
+        ),
+        None => tracing::warn!("mix-open: the selected finding hands nothing over"),
+    }
+}
+
 pub(crate) fn reject(a: &Rc<AppState>, _: &str) {
     op(a, MixOp::Reject);
 }
@@ -166,20 +198,118 @@ pub(crate) fn log(a: &Rc<AppState>, _: &str) {
         return;
     };
     let name = |t| s.mix_track_name(t);
+    let device = |d| s.mix_device_name(d);
     tracing::info!(
-        "mix: {} findings, {} · stale: {:?}",
+        "mix: {} findings, {} · {} render(s), {:.1} s · stale: {:?}",
         r.report.findings.len(),
         r.signal.label(),
+        r.renders,
+        r.elapsed,
         s.mix_stale()
     );
     for (i, f) in s.mix_findings().iter().enumerate() {
         tracing::info!(
-            "mix: {} {} — severity {:.2}, confidence {:.2}, {} experiments",
+            "mix: {} [{}] {} — severity {:.2}, confidence {:.2}, {} experiments{}",
             i + 1,
-            f.title(&name),
+            f.category().label(),
+            f.title_named(&name, &device),
             f.severity,
             f.confidence,
-            f.recommendations.len()
+            f.recommendations.len(),
+            if s.mix_finding_stale(f.id) {
+                " (stale)"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some(c) = s.mix_reference() {
+        tracing::info!(
+            "mix: reference played at {:+.1} dB to match the mix's loudness",
+            c.match_db
+        );
+    }
+}
+
+pub(crate) fn pairs(a: &Rc<AppState>, _: &str) {
+    let s = a.session.borrow();
+    let Some(r) = s.mix_results() else {
+        tracing::info!("mix: no results ({:?})", s.mix_status());
+        return;
+    };
+    let name = |t| s.mix_track_name(t);
+    let db = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{v:+.1} dB"));
+    tracing::info!(
+        "mix: {} pairs compared ({} measured, {} reused, {} left out)",
+        r.report.details.pairs.len(),
+        r.extra.pairs_measured,
+        r.extra.pairs_reused,
+        r.extra.pairs_skipped
+    );
+    for p in &r.report.details.pairs {
+        let lag = p.lag.map_or("none".to_string(), |l| {
+            format!(
+                "{:+.3} ms{} (confidence {:.2}, clarity {:.2}{})",
+                l.ms,
+                if l.inverted { " inverted" } else { "" },
+                l.confidence,
+                l.clarity,
+                if l.related { "" } else { ", unrelated" }
+            )
+        });
+        tracing::info!(
+            "mix: pair {} × {} — lag {lag}; sum {} now, {} corrected, {} mono; onsets {} \
+             paired, median {:?} ms, spread {:?} ms",
+            name(p.a),
+            name(p.b),
+            db(p.sum_db),
+            db(p.corrected_db),
+            db(p.mono_db),
+            p.onsets_paired,
+            p.onset_median_ms,
+            p.onset_spread_ms
+        );
+    }
+    for (x, y, why) in &r.report.details.skipped_pairs {
+        tracing::info!("mix: pair {} × {} left out: {why}", name(*x), name(*y));
+    }
+}
+
+pub(crate) fn dynamics(a: &Rc<AppState>, _: &str) {
+    use faderframe_mix_intelligence::Subject;
+    let s = a.session.borrow();
+    let Some(r) = s.mix_results() else {
+        tracing::info!("mix: no results ({:?})", s.mix_status());
+        return;
+    };
+    let label = |x: Subject| match x {
+        Subject::Track(t) | Subject::Pair { target: t, .. } | Subject::Tracks { a: t, .. } => {
+            s.mix_track_name(t)
+        }
+        Subject::Master(_) => "the master".to_string(),
+    };
+    for d in &r.report.details.dynamics {
+        let x = &d.dynamics;
+        tracing::info!(
+            "mix: dynamics {} — crest {:?} dB, PLR {:?}, LRA {:?} LU, short-term {:?} LUFS, TSR \
+             {:?} dB over {} events, source TSR {:?}, flattening {:?}",
+            label(d.subject),
+            x.crest_db,
+            x.plr_db,
+            x.lra_lu,
+            x.short_term,
+            x.tsr_db,
+            x.events,
+            d.source.as_ref().and_then(|s| s.tsr_db),
+            d.flattening.map(|f| f.tsr_change_db)
+        );
+    }
+    for w in &r.report.details.width {
+        tracing::info!(
+            "mix: width {} — side − mid by region {:?} dB, mono change {:?} dB",
+            label(w.subject),
+            w.broad_width_db,
+            w.broad_mono_db
         );
     }
 }

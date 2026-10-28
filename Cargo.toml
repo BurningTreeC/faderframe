@@ -173,6 +173,14 @@ opt-level = 3
 [profile.dev.package.faderframe-guitar]
 opt-level = 3
 
+# Mix Intelligence and Auto-Align measure whole mixes: FFTs, true peaks,
+# loudness over every tapped signal.
+[profile.dev.package.faderframe-analysis]
+opt-level = 3
+
+[profile.dev.package.faderframe-mix-intelligence]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"

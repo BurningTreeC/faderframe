@@ -232,12 +232,370 @@ impl Default for StereoRule {
     }
 }
 
+/// Thresholds of the health check ([`crate::health`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HealthRule {
+    /// A channel whose mean is at least this (dBFS) has a DC offset worth
+    /// reporting (heuristic: −50 dBFS is 0.3 % of full scale — a level
+    /// that costs headroom through a sum of tracks and thumps at edits and
+    /// mutes; well-behaved converters and devices stay far below).
+    pub dc_dbfs: f64,
+    /// … over at least this much audio (seconds): the mean of a shorter
+    /// stretch is swayed by low frequencies.
+    pub dc_min_seconds: f64,
+    /// A device "changes nothing" when what it adds or takes away is this
+    /// many dB under its input (heuristic: 90 dB is far below anything
+    /// heard, above the rounding noise of floating-point processing).
+    pub no_change_db: f64,
+    /// A device's input counts as signal from this RMS (dBFS): quieter
+    /// and nothing can be said about what it does.
+    pub signal_dbfs: f64,
+    /// Its output counts as silent under this RMS (dBFS).
+    pub silent_dbfs: f64,
+    /// A device flattens peaks when its output has at least this many runs
+    /// of equal-magnitude samples …
+    pub min_flat_runs: u64,
+    /// … and this many times as many as its input (so material that has
+    /// them already — a constant, a square wave — does not count).
+    pub flat_ratio: f64,
+    /// A device's processing time (share of real time) at which a device
+    /// that changes nothing counts fully in the severity (heuristic: 2 %
+    /// of one core).
+    pub cost_share: f64,
+    /// The deepest trim an experiment puts before a device (dB).
+    pub max_trim_db: f64,
+}
+
+impl Default for HealthRule {
+    fn default() -> Self {
+        Self {
+            dc_dbfs: -50.0,
+            dc_min_seconds: 2.0,
+            no_change_db: 90.0,
+            signal_dbfs: -80.0,
+            silent_dbfs: -120.0,
+            min_flat_runs: 10,
+            flat_ratio: 4.0,
+            cost_share: 0.02,
+            max_trim_db: 12.0,
+        }
+    }
+}
+
+/// Which pairs of tracks are compared for phase and timing
+/// ([`crate::phase`]), on what, and the thresholds of the phase rules.
+/// Levels are band levels as in [`MaskingRule`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhaseRule {
+    /// At most this many pairs are measured per analysis (each needs both
+    /// tracks rendered over an excerpt and compared): the cost stays
+    /// bounded whatever the number of tracks.
+    pub max_pairs: usize,
+    /// How long an excerpt is (seconds): about what the delay estimator
+    /// compares at most (160 frames of 0.17 s at half overlap).
+    pub excerpt_seconds: f64,
+    /// Pairs playing together for less than this (seconds) in their best
+    /// excerpt are not compared.
+    pub min_together_seconds: f64,
+    /// The furthest delay searched either way (ms): Auto-Align's default,
+    /// about ten metres of air.
+    pub max_lag_ms: f64,
+    /// The delay estimator's confidence (0 to 1) from which a delay or a
+    /// polarity is taken as measured (its own floor, 0.25, only says
+    /// "some common signal"; heuristic).
+    pub min_confidence: f64,
+    /// How far the correlation's peak has to stand over the next one
+    /// (from 0 to 1) before a delay or polarity is suggested: low clarity
+    /// means two sources heard by both (bleed), or periodic material
+    /// (heuristic).
+    pub min_clarity: f64,
+    /// Delays under this (ms) count as none: the first cancellation would
+    /// lie above 10 kHz (heuristic).
+    pub min_offset_ms: f64,
+    /// Delays over this (ms) are heard as an echo, a doubling or a timing
+    /// feel rather than as a colouring comb filter: no delay is suggested
+    /// for them from the correlation (heuristic; comb filtering is
+    /// usually discussed up to 10–20 ms).
+    pub max_comb_ms: f64,
+    /// A band counts as cancelling when the two tracks' sum holds this
+    /// many dB less than the sum of their energies (heuristic; 3 dB is
+    /// half the energy gone).
+    pub cancel_db: f64,
+    /// A correction (delay, polarity) is suggested only when it would
+    /// bring back at least this much (dB, over the bands both tracks are
+    /// relevant in; heuristic).
+    pub min_gain_db: f64,
+    /// Bands where the magnitude-squared coherence (0 to 1, debiased) is
+    /// at least this are taken as sharing a signal (heuristic).
+    pub min_coherence: f64,
+    /// A band is relevant to the pair when both tracks are within this
+    /// many dB of their loudest band and above `floor_db`.
+    pub relevance_db: f64,
+    pub floor_db: f64,
+    /// Pairs whose band levels rise and fall together over time at least
+    /// this much (a correlation, 0 to 1) are compared even without roles
+    /// or a masking finding: a screening for "may share a source"
+    /// (heuristic; the coherence measured afterwards decides).
+    pub covary: f64,
+}
+
+impl Default for PhaseRule {
+    fn default() -> Self {
+        Self {
+            max_pairs: 12,
+            excerpt_seconds: 12.0,
+            min_together_seconds: 2.0,
+            max_lag_ms: 30.0,
+            min_confidence: 0.5,
+            min_clarity: 0.3,
+            min_offset_ms: 0.05,
+            max_comb_ms: 15.0,
+            cancel_db: 3.0,
+            min_gain_db: 1.0,
+            min_coherence: 0.5,
+            relevance_db: 30.0,
+            floor_db: -60.0,
+            covary: 0.8,
+        }
+    }
+}
+
+/// Thresholds of the onset timing rule ([`crate::phase::OnsetTiming`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimingRule {
+    /// Onsets of the two tracks this close (ms) are taken as one played
+    /// together (heuristic; wider takes in neighbouring notes).
+    pub match_ms: f64,
+    /// Matched onsets needed at least.
+    pub min_onsets: usize,
+    /// …and the share of the sparser track's onsets they make.
+    pub min_share: f64,
+    /// A median offset from this (ms) is reported (heuristic: tighter
+    /// than this is heard as together; the onset detector itself is good
+    /// to about a millisecond).
+    pub flam_ms: f64,
+    /// An offset is consistent when the spread (median absolute
+    /// deviation) is under `consistent_ms` plus this share of the offset.
+    pub consistent_ms: f64,
+    pub consistent_share: f64,
+    /// A spread from this (ms) between doubled parts is reported as loose
+    /// timing (heuristic).
+    pub loose_ms: f64,
+    /// Offsets beyond this (ms) are not offered as a delay experiment
+    /// (larger moves change the part, not its alignment).
+    pub max_shift_ms: f64,
+}
+
+impl Default for TimingRule {
+    fn default() -> Self {
+        Self {
+            match_ms: 50.0,
+            min_onsets: 6,
+            min_share: 0.5,
+            flam_ms: 5.0,
+            consistent_ms: 1.5,
+            consistent_share: 0.35,
+            loose_ms: 10.0,
+            max_shift_ms: 30.0,
+        }
+    }
+}
+
+/// Thresholds of the width rules ([`crate::width`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WidthRule {
+    /// Under this frequency (Hz) a wide band is reported (the low end many
+    /// systems play in mono: subwoofers, clubs, cutting lathes).
+    pub low_end_hz: f64,
+    /// A low band is wide when its side signal comes within this many dB
+    /// of its mid signal (heuristic: −6 dB is a correlation of about 0.6
+    /// between equal channels, or a source panned well off centre).
+    pub wide_db: f64,
+    /// …for at least this long (seconds).
+    pub min_seconds: f64,
+    /// Bands within this many dB of the loudest band (and above −60 dB)
+    /// are judged.
+    pub relevance_db: f64,
+    /// The master's balance in mono: a band range whose mono fold-down
+    /// changes by this many dB more than the whole (heuristic: panning
+    /// and decorrelation alone move a band by at most 3 dB against a
+    /// centred one, so more takes cancellation).
+    pub mono_shift_db: f64,
+}
+
+impl Default for WidthRule {
+    fn default() -> Self {
+        Self {
+            low_end_hz: 150.0,
+            wide_db: -6.0,
+            min_seconds: 1.0,
+            relevance_db: 30.0,
+            mono_shift_db: 4.0,
+        }
+    }
+}
+
+/// Thresholds of the dynamics rules ([`crate::dynamics`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DynamicsRule {
+    /// An envelope event: the 5 ms RMS rising this many dB over its lowest
+    /// in the 50 ms before (heuristic; a soft swell does not count)…
+    pub event_rise_db: f64,
+    /// …with a peak above this (dBFS)…
+    pub event_floor_db: f64,
+    /// …at least this long after the previous one (seconds).
+    pub event_gap_seconds: f64,
+    /// Events needed for a transient-to-sustain figure.
+    pub min_events: usize,
+    /// Possible transient flattening: the source's attacks stand at least
+    /// this far over their sustain (dB; there were transients to lose)…
+    pub min_source_tsr_db: f64,
+    /// …and the processed signal's stand this much less far (dB;
+    /// heuristic).
+    pub flatten_db: f64,
+    /// A track's loudness range is reported from this (LU; heuristic:
+    /// mixed tracks commonly measure 3–12 LU)…
+    pub track_lra_lu: f64,
+    /// …when it is also this much wider than the mix's (LU)…
+    pub lra_margin_lu: f64,
+    /// …over at least this much active time (seconds: the LRA is a
+    /// programme measure and inflates on short, sparse material).
+    pub min_active_seconds: f64,
+    /// A step: the momentary loudness 2 s after a moment this many LU
+    /// from the 2 s before, both playing (heuristic).
+    pub step_lu: f64,
+    /// A step the mix makes too (by at least this share of the track's)
+    /// is the arrangement's, not the track's: left out.
+    pub mirrored_share: f64,
+}
+
+impl Default for DynamicsRule {
+    fn default() -> Self {
+        Self {
+            event_rise_db: 9.0,
+            event_floor_db: -50.0,
+            event_gap_seconds: 0.05,
+            min_events: 8,
+            min_source_tsr_db: 8.0,
+            flatten_db: 4.0,
+            track_lra_lu: 15.0,
+            lra_margin_lu: 6.0,
+            min_active_seconds: 20.0,
+            step_lu: 10.0,
+            mirrored_share: 0.5,
+        }
+    }
+}
+
+/// Thresholds of the comparisons with a reference track
+/// ([`crate::reference`]). Every level difference is taken after matching
+/// the loudness; a reference is a comparison target, never a standard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceRule {
+    /// A frequency range is reported where the mix and the (loudness-
+    /// matched) reference differ by at least this much (dB, smoothed over
+    /// neighbouring bands) …
+    pub spectrum_db: f64,
+    /// … over at least this many adjacent bands (third octaves: 3 = one
+    /// octave; a narrower difference is more likely the arrangement — a
+    /// note, an instrument — than the balance).
+    pub min_bands: usize,
+    /// Only bands within this many dB of the louder signal's loudest band
+    /// are compared (the noise floor of either says nothing).
+    pub relevance_db: f64,
+    /// At most this many ranges are reported.
+    pub max_ranges: usize,
+    /// A section is reported when a broad region's balance there differs
+    /// from the reference's by this much (dB) and by half this from the
+    /// sections' typical difference (a difference the whole song has is the
+    /// spectrum rule's).
+    pub section_db: f64,
+    /// Sections shorter than this (seconds) are left out.
+    pub min_section_seconds: f64,
+    /// Loudness differences reported from (LU): integrated, and the
+    /// loudness range.
+    pub loudness_lu: f64,
+    pub range_lu: f64,
+    /// A broad region is reported when the mix loses this much more in a
+    /// mono fold-down than the reference (dB) …
+    pub fold_db: f64,
+    /// … or is this much wider or narrower (side against mid, dB).
+    pub width_db: f64,
+}
+
+impl Default for ReferenceRule {
+    fn default() -> Self {
+        Self {
+            spectrum_db: 4.0,
+            min_bands: 3,
+            relevance_db: 40.0,
+            max_ranges: 3,
+            section_db: 4.0,
+            min_section_seconds: 4.0,
+            loudness_lu: 2.0,
+            range_lu: 4.0,
+            fold_db: 3.0,
+            width_db: 6.0,
+        }
+    }
+}
+
+/// When two tracks carry the same audio ([`crate::same`]): masking is not
+/// judged there, and a finding says so.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SameRule {
+    /// The windows coherence is judged over (seconds, sliding by half):
+    /// the time resolution of "the same in this section, not in that".
+    pub window_seconds: f64,
+    /// Same audio from this coherence (0 to 1; both its power-weighted and
+    /// its plain mean over the bands that matter). Heuristic: independent
+    /// sounds stay near 0, copies through gain, pan, EQ or a small delay
+    /// near 1; time-varying processing (compression) a little under.
+    pub coherence: f64,
+    /// At least this many bands must matter (one steady tone could keep
+    /// step with another at the frame rate by chance).
+    pub min_bands: usize,
+    /// Delays allowed for between copies (ms; band sums lose coherence
+    /// beyond, see the module docs).
+    pub max_lag_ms: f64,
+    /// Frames both play in needed to judge a window.
+    pub min_frames: usize,
+    /// A band matters when both tracks are within this many dB of their
+    /// loudest band in the window and above `floor_db`.
+    pub relevance_db: f64,
+    pub floor_db: f64,
+    /// The same audio is reported from this long in all (seconds).
+    pub min_seconds: f64,
+}
+
+impl Default for SameRule {
+    fn default() -> Self {
+        Self {
+            window_seconds: 4.0,
+            coherence: 0.85,
+            min_bands: 2,
+            max_lag_ms: 1.0,
+            min_frames: 8,
+            relevance_db: 30.0,
+            floor_db: -60.0,
+            min_seconds: 2.0,
+        }
+    }
+}
+
 /// Every rule's thresholds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Rules {
     pub masking: MaskingRule,
     pub levels: LevelRule,
     pub stereo: StereoRule,
+    pub health: HealthRule,
+    pub reference: ReferenceRule,
+    pub phase: PhaseRule,
+    pub timing: TimingRule,
+    pub width: WidthRule,
+    pub dynamics: DynamicsRule,
+    pub same: SameRule,
 }
 
 #[cfg(test)]

@@ -13,20 +13,54 @@ Audio Units on macOS), an analogue-console-style mixer with modelled
 preamps, console summing and cue mixes for the performers' headphones, a
 full set of stock devices (circuit-modelled ones among them: an optical
 leveller, a FET compressor, a tape machine, a guitar rig), mastering meters,
-Mix Intelligence (masking between tracks, levels and mono compatibility,
-measured and explained, with experiments to audition), A/B listening
+Mix Intelligence (masking, phase, width, dynamics, levels and a health
+check across the whole mix, measured and explained, with experiments to
+audition), A/B listening
 against reference tracks or earlier steps of the undo history, surround,
 object-based (ADM BWF) and IAMF masters with binaural monitoring, album
 delivery down to CD and vinyl masters, video for working to picture with
 time-locked tracks, lead sheets, scratch pads, project templates, and
 dockable, detachable editors.
 
-> **Status: in active development** (version 0.34.0). Most of a working
+> **Status: in active development** (version 0.35.0). Most of a working
 > DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
 > comes next.
 
-## What's new in 0.34
+## What's new in 0.35
+
+* **Mix Intelligence, complete**: everything the first milestone left
+  open.
+  * **Much faster**: the mix is rendered once, with every track, bus and
+    return captured where it reaches its destination, instead of one
+    render per track; the analysis runs on several threads, and after an
+    edit only what it affects is measured again. The demo analyses in 2.6 s
+    instead of 20 s, a four times larger project in 3.6 s instead of 54 s,
+    and an unchanged project again in a tenth of a second. Bus and master
+    compressors now react to the whole mix, and buses and returns can be
+    named in findings.
+  * **Copies are not masking**: two tracks carrying the same audio — a
+    copy panned or set apart, through an EQ, slightly later, a stereo
+    recording split in two, one source processed two ways — are reported
+    as the same audio (with what the copy adds, +6 dB in mono for equal
+    copies), not as masking each other, judged section by section and
+    channel by channel. Separately recorded takes are still checked.
+  * **Phase and timing**: polarity flips, comb filtering from small
+    offsets, cancellation that changes with frequency, flams and loose
+    doubles — with the track's delay and polarity as experiments to
+    audition and apply. Longer offsets are treated as musical.
+  * **Stereo width per band** and mono collapse, **dynamics** (crest
+    factor, PLR, loudness range, transient-to-sustain, possible transient
+    flattening, level jumps), a **health check** (DC offset, overs and
+    flattened peaks between devices, devices that silence or do nothing
+    with their CPU cost, bypassed devices) and **comparisons with a
+    reference track** (loudness-matched; spectrum, sections, stereo and
+    mono; handed to A/B listening and EQ Match).
+  * Mix Intelligence and A/B listening share one listening gain; the real
+    level change of an experiment and the gain used only to compare
+    fairly are shown apart.
+
+### 0.34
 
 * **Mix Intelligence** (View → Mix Intelligence; first milestone):
   deterministic mix analysis with no AI, model or network. Each track is
@@ -708,13 +742,21 @@ cyan-to-violet accent:
   mix's, and Send to EQ Match. Ctrl+Alt+A flips; meters always show the
   mix.
 * Mix Intelligence (View → Mix Intelligence): analyses the project, the
-  edit range or the selected tracks — processed (as mixed) or the source —
-  without AI, models or network, and lists potential masking conflicts
-  between tracks, level problems and mono losses, ranked, each with its
+  edit range or the selected tracks — processed (as mixed, from one
+  render that captures every track, bus and return where it reaches its
+  destination) or the source — without AI, models or network, and lists,
+  ranked: potential masking between tracks (copies of the same audio are
+  recognised and not counted), phase and timing problems between related
+  tracks, stereo width and mono collapse per band, dynamics, level
+  problems, a health check of the devices (DC offset, overs between
+  devices, devices doing nothing at a CPU cost, bypassed ones) and
+  comparisons with a reference track. Each finding comes with its
   measurements, severity and confidence and how they were reached, the
-  rule's limitations, and experiments to audition (A/B,
+  rule's limitations, and experiments — EQ cuts, levels, a track's delay
+  and polarity, gain staging, bypassing — to audition (A/B,
   loudness-matched) and apply as one undo step. Clicking a finding selects
-  its tracks and shows its time. Track roles help it weigh pairs.
+  its tracks and shows its time. Track roles help it weigh pairs; after an
+  edit only what it affects is measured again.
 * Meters: each strip's meter shows sample peaks, peaks with the RMS, a
   VU (0 VU at −18 dBFS or another reference), the EBU PPM or a K-System
   meter (K-20, K-14, K-12) — chosen from its right-click menu, per strip

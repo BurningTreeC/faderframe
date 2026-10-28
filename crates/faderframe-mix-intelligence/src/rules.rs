@@ -14,6 +14,9 @@
 //! Reads two tracks' profiles ([`crate::masking::conflicts`]), both
 //! directions where the roles allow (see [`pair_weight`]); per unordered
 //! pair and overlapping range only the stronger direction is kept.
+//! Stretches where the two carry the same audio ([`crate::same`]: copies,
+//! one source processed two ways) are left out, window by window, and
+//! reported instead ([`crate::rules_same`], [`RuleId::SameAudio`]).
 //!
 //! * severity = role weight × √persistence × depth × importance, where
 //!   persistence is the share of the target's time in the range it is
@@ -51,7 +54,7 @@ use crate::finding::{
     Category, Evidence, Experiment, Finding, FrequencyRange, Pattern, Recommendation, RuleId,
     SignalPoint, SpectrumEvidence, Subject, Term, TimeSpan, Unit, labels,
 };
-use crate::masking::{ConflictRange, MaskingError, conflicts};
+use crate::masking::{ConflictRange, MaskingError};
 use crate::profile::{TrackProfile, power_db};
 use crate::stereo;
 use faderframe_core::{RoleFamily, TrackId, TrackRole};
@@ -80,6 +83,9 @@ pub struct DiagnoseInput<'a> {
     pub sections: Vec<(String, TimeSpan)>,
     pub rules: &'a Rules,
     pub cancel: Option<&'a AtomicBool>,
+    /// Pairs never compared for masking (either order): a track and a bus
+    /// or return its signal reaches (that one carries it).
+    pub related: Vec<(TrackId, TrackId)>,
 }
 
 /// One subject's levels and stereo picture (facts, no judgement).
@@ -108,6 +114,50 @@ pub struct Summary {
 pub struct Report {
     pub findings: Vec<Finding>,
     pub summaries: Vec<Summary>,
+    /// Dynamics, width, pairs compared and charts ([`crate::details`]).
+    pub details: crate::details::Details,
+}
+
+impl Report {
+    /// Add findings (made by other rules over the same analysis) and rank
+    /// everything again (most relevant first, ties by id); a finding whose
+    /// id is already there is left out.
+    pub fn add(&mut self, findings: Vec<Finding>) {
+        for f in findings {
+            if f.severity.is_finite()
+                && f.confidence.is_finite()
+                && !self.findings.iter().any(|x| x.id == f.id)
+            {
+                self.findings.push(f);
+            }
+        }
+        self.findings.sort_by(|a, b| {
+            b.relevance()
+                .total_cmp(&a.relevance())
+                .then(a.id.cmp(&b.id))
+        });
+    }
+}
+
+impl Report {
+    /// Findings of other rules (the health check, a reference) ranked in
+    /// with these.
+    pub fn merge(&mut self, more: Vec<Finding>) {
+        self.findings.extend(
+            more.into_iter()
+                .filter(|f| f.severity.is_finite() && f.confidence.is_finite()),
+        );
+        rank(&mut self.findings);
+    }
+}
+
+/// Most relevant first (ties by id: the same order every time).
+pub fn rank(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        b.relevance()
+            .total_cmp(&a.relevance())
+            .then(a.id.cmp(&b.id))
+    });
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -440,48 +490,123 @@ fn overlaps(a: &Finding, b: &Finding) -> bool {
     }
 }
 
-fn masking(input: &DiagnoseInput<'_>, out: &mut Vec<Finding>) -> Result<(), Cancelled> {
+/// A pair's findings and the charts they show.
+type PairFound = (Vec<Finding>, Vec<(u64, crate::details::Chart)>);
+
+/// One pair's masking findings — both directions where the roles allow,
+/// per overlapping range only the more severe direction, frames where the
+/// two carry the same audio left out — and the same-audio finding (with
+/// its chart).
+fn pair_masking(
+    input: &DiagnoseInput<'_>,
+    a: &TrackInput<'_>,
+    b: &TrackInput<'_>,
+    (sa, sb): (&crate::same::BandSums, &crate::same::BandSums),
+) -> Result<PairFound, Cancelled> {
     let rule = &input.rules.masking;
+    // Where the two carry the same audio, masking is not judged.
+    let same = crate::same::same_audio(a.profile, sa, b.profile, sb, &input.rules.same);
+    let mut pair: Vec<Finding> = Vec::new();
+    for (target, masker) in [(a, b), (b, a)] {
+        let Some(weight) = pair_weight(target.role, masker.role) else {
+            continue;
+        };
+        for r in crate::masking::conflicts_except(
+            target.profile,
+            masker.profile,
+            rule,
+            &same.frames,
+            input.cancel,
+        )? {
+            let f = masking_finding(input, target, masker, weight, r);
+            if f.severity >= rule.min_severity {
+                pair.push(f);
+            }
+        }
+    }
+    // One direction per overlapping range: the more severe.
+    pair.sort_by(|x, y| y.severity.total_cmp(&x.severity).then(x.id.cmp(&y.id)));
+    let mut kept: Vec<Finding> = Vec::new();
+    for f in pair {
+        if let Some(k) = kept.iter_mut().find(|k| overlaps(k, &f)) {
+            if k.subject != f.subject {
+                k.caveats.push(format!(
+                    "The other way round was found too (severity {:.2}): the two \
+                     tracks cover each other there.",
+                    f.severity
+                ));
+            }
+            continue;
+        }
+        kept.push(f);
+    }
+    if same.any() {
+        for k in &mut kept {
+            k.caveats.push(format!(
+                "For {:.0} s the two carry the same audio (coherence {:.2}): masking is \
+                 not judged there.",
+                same.seconds, same.coherence
+            ));
+        }
+    }
+    let mut charts = Vec::new();
+    if let Some(f) = crate::rules_same::finding(input, a, b, &same, &mut charts) {
+        kept.push(f);
+    }
+    Ok((kept, charts))
+}
+
+/// Every pair compared (in focus, not related, roles allowing), on a few
+/// threads ([`crate::map_parallel`]): each profile's band sums decoded once
+/// for all its pairs, then the pairs; findings and charts in the pairs'
+/// order whatever the threads did.
+fn masking(
+    input: &DiagnoseInput<'_>,
+    out: &mut Vec<Finding>,
+    charts: &mut Vec<(u64, crate::details::Chart)>,
+) -> Result<(), Cancelled> {
     let tracks: Vec<&TrackInput<'_>> = input.tracks.iter().filter(|t| t.compare).collect();
+    let mut pairs = Vec::new();
     for i in 0..tracks.len() {
         for j in i + 1..tracks.len() {
-            if input.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-                return Err(Cancelled);
-            }
             let (a, b) = (tracks[i], tracks[j]);
             if !(a.focus || b.focus) {
                 continue;
             }
-            let mut pair: Vec<Finding> = Vec::new();
-            for (target, masker) in [(a, b), (b, a)] {
-                let Some(weight) = pair_weight(target.role, masker.role) else {
-                    continue;
-                };
-                for r in conflicts(target.profile, masker.profile, rule, input.cancel)? {
-                    let f = masking_finding(input, target, masker, weight, r);
-                    if f.severity >= rule.min_severity {
-                        pair.push(f);
-                    }
-                }
+            if input
+                .related
+                .iter()
+                .any(|&(x, y)| (x, y) == (a.track, b.track) || (y, x) == (a.track, b.track))
+            {
+                continue;
             }
-            // One direction per overlapping range: the more severe.
-            pair.sort_by(|x, y| y.severity.total_cmp(&x.severity).then(x.id.cmp(&y.id)));
-            let mut kept: Vec<Finding> = Vec::new();
-            for f in pair {
-                if let Some(k) = kept.iter_mut().find(|k| overlaps(k, &f)) {
-                    if k.subject != f.subject {
-                        k.caveats.push(format!(
-                            "The other way round was found too (severity {:.2}): the two \
-                             tracks cover each other there.",
-                            f.severity
-                        ));
-                    }
-                    continue;
-                }
-                kept.push(f);
+            if pair_weight(a.role, b.role).is_none() && pair_weight(b.role, a.role).is_none() {
+                continue;
             }
-            out.extend(kept);
+            pairs.push((i, j));
         }
+    }
+    let mut needed: Vec<usize> = pairs.iter().flat_map(|&(i, j)| [i, j]).collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let decoded = crate::map_parallel(&needed, |&k| crate::same::BandSums::of(tracks[k].profile));
+    let mut sums: Vec<Option<crate::same::BandSums>> = vec![None; tracks.len()];
+    for (k, d) in needed.into_iter().zip(decoded) {
+        sums[k] = Some(d);
+    }
+    let found = crate::map_parallel(&pairs, |&(i, j)| {
+        if input.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Cancelled);
+        }
+        match (&sums[i], &sums[j]) {
+            (Some(x), Some(y)) => pair_masking(input, tracks[i], tracks[j], (x, y)),
+            _ => Ok((Vec::new(), Vec::new())),
+        }
+    });
+    for f in found {
+        let (findings, made) = f?;
+        out.extend(findings);
+        charts.extend(made);
     }
     Ok(())
 }
@@ -507,6 +632,7 @@ fn level_finding(
         Subject::Track(t) | Subject::Master(Some(t)) => t.0,
         Subject::Master(None) => u64::MAX,
         Subject::Pair { target, .. } => target.0,
+        Subject::Tracks { a, .. } => a.0,
     };
     let tracks = match subject {
         Subject::Track(t) | Subject::Master(Some(t)) => vec![t],
@@ -960,18 +1086,17 @@ fn summary(subject: Subject, p: &TrackProfile, sections: &[(String, TimeSpan)]) 
 /// (ties by id), and a summary per subject.
 pub fn diagnose(input: &DiagnoseInput<'_>) -> Result<Report, Cancelled> {
     let mut findings = Vec::new();
-    masking(input, &mut findings)?;
+    let mut details = crate::details::Details::default();
+    masking(input, &mut findings, &mut details.charts)?;
     if input.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(Cancelled);
     }
     levels(input, &mut findings);
     stereo_rules(input, &mut findings);
+    crate::rules_width::run(input, &mut findings, &mut details);
+    crate::rules_dynamics::run(input, &mut findings, &mut details);
     findings.retain(|f| f.severity.is_finite() && f.confidence.is_finite());
-    findings.sort_by(|a, b| {
-        b.relevance()
-            .total_cmp(&a.relevance())
-            .then(a.id.cmp(&b.id))
-    });
+    rank(&mut findings);
     let mut summaries: Vec<Summary> = input
         .tracks
         .iter()
@@ -983,6 +1108,7 @@ pub fn diagnose(input: &DiagnoseInput<'_>) -> Result<Report, Cancelled> {
     Ok(Report {
         findings,
         summaries,
+        details,
     })
 }
 

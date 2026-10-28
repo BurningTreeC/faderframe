@@ -407,6 +407,10 @@ enum Role {
     Talkback = 26,
     /// A cue mix after its level: its strip plus the talkback.
     CueOut = 27,
+    /// An analysis render's tap on a strip ([`crate::capture`]).
+    Capture = 28,
+    /// An analysis render's probe after a device.
+    Probe = 29,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -973,6 +977,7 @@ pub fn build_graph(
     listen: &Listen,
     monitoring: &Monitoring,
     talkback: &crate::slots::Talkback,
+    capture: Option<&crate::capture::Capture>,
 ) -> Result<BuiltGraph, EngineError> {
     let early = &monitoring.tracks;
     let midi_ports = &routing.inputs;
@@ -1519,9 +1524,54 @@ pub fn build_graph(
         let mut events = sources;
         let mut raw = true;
         let mut layout = layout;
+        // The audio devices in order (MIDI effects pass no audio): where an
+        // analysis render's probes sit.
+        let devices: Vec<&PluginSlot> = chain
+            .iter()
+            .copied()
+            .filter(|s| !fx.iter().any(|(id, _)| *id == s.id))
+            .collect();
+        let probe = |b: &mut GraphBuilder<EngineContext>,
+                     slot: &PluginSlot,
+                     (before, in_layout): (NodeId, ChannelLayout),
+                     (after, out_layout): (NodeId, ChannelLayout)|
+         -> Result<(), EngineError> {
+            let Some(c) = capture else {
+                return Ok(());
+            };
+            let position = devices.iter().position(|s| s.id == slot.id).unwrap_or(0);
+            let Some(p) = c.probe_for(crate::capture::ProbeInfo {
+                track: t.id,
+                plugin: slot.id,
+                position,
+                next: devices.get(position + 1).map(|s| s.id),
+                bypassed: slot.bypass,
+                in_channels: in_layout.channel_count(),
+                out_channels: out_layout.channel_count(),
+            }) else {
+                return Ok(());
+            };
+            let node = b.add_node(
+                NodeSpec::new(format!("{} · Probe {}", t.name, position + 1))
+                    .key(node_key(
+                        t.id,
+                        Role::Probe,
+                        slot.id.raw(),
+                        &[in_layout, out_layout],
+                    ))
+                    .group(gi)
+                    .audio_in(in_layout)
+                    .audio_in(out_layout),
+                Box::new(crate::capture::ProbeNode::new(p)),
+            );
+            b.connect_audio(before, 0, node, 0)?;
+            b.connect_audio(after, 0, node, 1)?;
+            Ok(())
+        };
         for slot in chain {
             // A container: its chains side by side.
             if slot.plugin.is_container() {
+                let before = (prev, layout);
                 let mut links = ChainLinks {
                     project,
                     notes: t.kind == TrackKind::Instrument,
@@ -1542,6 +1592,7 @@ pub fn build_graph(
                     0,
                     &mut links,
                 )?;
+                probe(&mut b, slot, before, (prev, layout))?;
                 continue;
             }
             // A MIDI effect (built above): what follows gets its notes.
@@ -1564,6 +1615,7 @@ pub fn build_graph(
             let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
             // A device that widens a mono track takes it as stereo (the
             // graph duplicates it) and everything after it is stereo.
+            let before = (prev, layout);
             layout = slot.plugin.output_layout(layout);
             let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                 .group(gi)
@@ -1596,6 +1648,7 @@ pub fn build_graph(
                 tn.preamp = Some(node);
             }
             b.connect_audio(prev, 0, node, 0)?;
+            probe(&mut b, slot, before, (node, layout))?;
             if notes {
                 for e in &events {
                     b.connect_events(*e, 0, node, 0)?;
@@ -1714,6 +1767,23 @@ pub fn build_graph(
                 renderer = Some(node);
             }
         }
+        // An analysis render's tap: the signal as it reaches its
+        // destination (heard with the outputs: aligned with the master).
+        if !ahead_strip
+            && let Some(tap) = capture
+                .and_then(|c| c.tap_for(t.id, destination_layout(project, t).channel_count()))
+        {
+            let layout = destination_layout(project, t);
+            let node = g.add_node(
+                NodeSpec::new(format!("{} · Capture", t.name))
+                    .key(node_key(t.id, Role::Capture, 0, &[layout]))
+                    .role(NodeRole::Heard)
+                    .group(gi)
+                    .audio_in(layout),
+                Box::new(crate::capture::TapNode::new(tap)),
+            );
+            g.connect_audio(out, 0, node, 0)?;
+        }
         // The node's graph is `g`'s.
         let reachable = |n: &TrackNodes| n.input.filter(|_| n.input_ahead == ahead_strip);
         match t.output {
@@ -1756,7 +1826,6 @@ pub fn build_graph(
                             config.sample_rate as u32,
                             config.max_block_size,
                             mono,
-                            slots.monitor_trim()?,
                             slots.bass_management()?,
                             slots.mix()?,
                         )),

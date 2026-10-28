@@ -478,6 +478,63 @@ pub(crate) fn render_each(
     project: &Project,
     sample_rate: u32,
     sources: &faderframe_engine::SourceMap,
+    range: (i64, usize),
+    progress: &RenderProgress,
+    outputs: usize,
+    binaural: Option<(
+        faderframe_binaural::Room,
+        Option<&faderframe_binaural::Head>,
+    )>,
+    keep_latency: bool,
+    each: &mut dyn FnMut(&[&[f32]]),
+) -> Result<(), RenderError> {
+    render_each_with(
+        project,
+        sample_rate,
+        sources,
+        range,
+        progress,
+        outputs,
+        binaural,
+        keep_latency,
+        faderframe_realtime::default_worker_count(),
+        each,
+    )
+}
+
+/// [`render_each`] (no binaural listening, the latency off the front) with
+/// `workers` DSP threads beside the calling one (0: the calling thread
+/// alone — for renders run side by side, each on a thread of its own).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_each_on(
+    project: &Project,
+    sample_rate: u32,
+    sources: &faderframe_engine::SourceMap,
+    range: (i64, usize),
+    progress: &RenderProgress,
+    outputs: usize,
+    workers: usize,
+    each: &mut dyn FnMut(&[&[f32]]),
+) -> Result<(), RenderError> {
+    render_each_with(
+        project,
+        sample_rate,
+        sources,
+        range,
+        progress,
+        outputs,
+        None,
+        false,
+        workers,
+        each,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_each_with(
+    project: &Project,
+    sample_rate: u32,
+    sources: &faderframe_engine::SourceMap,
     (start, frames): (i64, usize),
     progress: &RenderProgress,
     outputs: usize,
@@ -486,6 +543,7 @@ pub(crate) fn render_each(
         Option<&faderframe_binaural::Head>,
     )>,
     keep_latency: bool,
+    workers: usize,
     each: &mut dyn FnMut(&[&[f32]]),
 ) -> Result<(), RenderError> {
     let config = EngineConfig {
@@ -514,8 +572,7 @@ pub(crate) fn render_each(
     } else {
         latency as usize
     };
-    // Faster than realtime on every core.
-    let workers = faderframe_realtime::default_worker_count();
+    // Faster than realtime on every core (or alone, beside others).
     if workers > 0 {
         r.processor.set_worker_pool(Some(std::sync::Arc::new(
             faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(workers)),
@@ -541,6 +598,148 @@ pub(crate) fn render_each(
             .fetch_add((n - from) as u64, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Where a capture render's pieces go: `None` the master, else a tap's
+/// track; every channel of the piece.
+pub(crate) type CapturedPiece<'a> = dyn FnMut(Option<TrackId>, &[&[f32]]) + 'a;
+
+/// What a capture render ([`render_captured`]) measured besides its
+/// pieces.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CaptureReport {
+    /// What each device's probe measured (every device of every track).
+    pub probes: Vec<(
+        faderframe_engine::capture::ProbeInfo,
+        faderframe_engine::capture::ProbeStats,
+    )>,
+    /// Per device: its processing time over the audio time rendered (a
+    /// share of real time; the engine's node timing).
+    pub costs: std::collections::HashMap<faderframe_core::PluginInstanceId, f64>,
+    /// The devices that are instruments (sound from notes).
+    pub instruments: std::collections::HashSet<faderframe_core::PluginInstanceId>,
+    /// Frames a tap could not keep (none when read after every callback).
+    pub missed: u64,
+    /// The graph's latency taken off the front.
+    pub latency: u32,
+}
+
+/// One offline render of `project` from `start` capturing `plan` (see
+/// `faderframe_engine::capture`): `each` is handed every piece of the
+/// device output (`None`: the master, `outputs` channels) and of each
+/// tap (`Some(track)`) as it comes, all of them aligned — the graph's
+/// latency taken off the front of every one alike, so their frame `k` is
+/// the range's frame `k`. With `plan.devices` the devices are probed and
+/// timed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_captured(
+    project: &Project,
+    sample_rate: u32,
+    sources: &faderframe_engine::SourceMap,
+    (start, frames): (i64, usize),
+    progress: &RenderProgress,
+    outputs: usize,
+    plan: faderframe_engine::capture::CapturePlan,
+    each: &mut CapturedPiece<'_>,
+) -> Result<CaptureReport, RenderError> {
+    const BLOCK: usize = 1024;
+    let timed = plan.devices;
+    let config = EngineConfig {
+        sample_rate,
+        max_block_size: BLOCK,
+        measure_nodes: timed,
+        ..EngineConfig::default()
+    };
+    let outputs = outputs.max(1);
+    let mut r =
+        OfflineRenderer::with_capture(project, sources, config, BLOCK, outputs, Some(plan))?;
+    r.controller.set_node_timing(timed);
+    let latency = r.controller.graph_stats().output_latency;
+    let capture = r
+        .controller
+        .capture()
+        .cloned()
+        .ok_or_else(|| RenderError::NoTrack("nothing to capture".into()))?;
+    let taps = capture.taps();
+    let workers = faderframe_realtime::default_worker_count();
+    if workers > 0 {
+        r.processor.set_worker_pool(Some(std::sync::Arc::new(
+            faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(workers)),
+        )));
+    }
+    r.play_from(start)?;
+    let mut skip = latency as usize;
+    let mut done = 0;
+    let mut padded: Vec<Vec<f32>> = Vec::new();
+    let mut rendered = 0usize;
+    while done < frames {
+        if progress.cancel.load(Ordering::Relaxed) {
+            return Err(RenderError::Cancelled);
+        }
+        let out = r.step();
+        let n = out.output_ref(0).len();
+        rendered += n;
+        let from = skip.min(n);
+        skip -= from;
+        let take = (n - from).min(frames - done);
+        if take > 0 {
+            let piece: Vec<&[f32]> = (0..outputs)
+                .map(|c| &out.output_ref(c)[from..from + take])
+                .collect();
+            each(None, &piece);
+        }
+        for tap in &taps {
+            tap.take(|chs| {
+                if take == 0 {
+                    return;
+                }
+                if chs.iter().all(|c| c.len() >= from + take) {
+                    let piece: Vec<&[f32]> = chs.iter().map(|c| &c[from..from + take]).collect();
+                    each(Some(tap.track()), &piece);
+                } else {
+                    // Frames the tap missed: silence in their place.
+                    padded.resize(chs.len(), Vec::new());
+                    for (p, c) in padded.iter_mut().zip(chs) {
+                        p.clear();
+                        p.extend((from..from + take).map(|i| c.get(i).copied().unwrap_or(0.0)));
+                    }
+                    let piece: Vec<&[f32]> = padded.iter().map(Vec::as_slice).collect();
+                    each(Some(tap.track()), &piece);
+                }
+            });
+        }
+        done += take;
+        progress.done.fetch_add(take as u64, Ordering::Relaxed);
+    }
+    let mut report = CaptureReport {
+        missed: taps.iter().map(|t| t.missed()).sum(),
+        latency,
+        ..CaptureReport::default()
+    };
+    for p in capture.probes() {
+        report.probes.push((p.info.clone(), p.stats()));
+        if r.controller.plugin_is_instrument(p.info.plugin) {
+            report.instruments.insert(p.info.plugin);
+        }
+    }
+    if timed && let Some(profile) = r.controller.graph_profile() {
+        let seconds = rendered as f64 / f64::from(sample_rate.max(1));
+        for (i, owner) in profile.owners.iter().enumerate() {
+            let Some(owner) = owner else { continue };
+            let (
+                Some(plugin),
+                faderframe_engine::NodeWork::Insert | faderframe_engine::NodeWork::Instrument,
+            ) = (owner.plugin, owner.work)
+            else {
+                continue;
+            };
+            if seconds > 0.0 {
+                *report.costs.entry(plugin).or_insert(0.0) +=
+                    profile.timings.total_ns(i) as f64 / 1e9 / seconds;
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Run stereo `audio` through a chain of plugins (an album song's inserts;

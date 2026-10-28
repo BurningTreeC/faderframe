@@ -83,6 +83,7 @@ fn input<'a>(
         sections: Vec::new(),
         rules,
         cancel: None,
+        related: Vec::new(),
     }
 }
 
@@ -192,8 +193,10 @@ fn a_lead_vocal_is_the_one_masked_by_its_accompaniment() {
 
 #[test]
 fn rhythm_guitar_against_bass_and_two_related_instruments() {
-    // A "guitar" whose lowest notes reach the bass's range.
-    let g = profile(&[&bass(98.0, 0.3)]);
+    // A "guitar" whose lowest notes reach the bass's range: the same bands
+    // and levels, tuned 0.4 Hz apart (two sounds, not one audio twice —
+    // their phases drift apart).
+    let g = profile(&[&bass(98.4, 0.3)]);
     let b = profile(&[&bass(98.0, 0.3)]);
     let r = run(&[
         (1, Some(TrackRole::RhythmGuitar), &g),
@@ -209,9 +212,26 @@ fn rhythm_guitar_against_bass_and_two_related_instruments() {
             masker: TrackId(1)
         }
     );
-    // Two accompanying instruments (keys and keys) overlap too.
+    // Two accompanying instruments (keys and pads) overlap too: the same
+    // chord, the pad tuned a little apart (independent sounds).
     let a = profile(&[&keys(0.2)]);
-    let c = profile(&[&keys(0.18)]);
+    let detuned: Vec<f32> = {
+        let mut parts = Vec::new();
+        for root in [261.6, 329.6, 392.0] {
+            for h in 1..=6 {
+                parts.push(tone(
+                    root * 1.006 * h as f64,
+                    0.18 * 0.6f64.powi(h - 1),
+                    0.0,
+                    LEN,
+                    LEN,
+                ));
+            }
+        }
+        let refs: Vec<&[f32]> = parts.iter().map(Vec::as_slice).collect();
+        mix(&refs)
+    };
+    let c = profile(&[&detuned]);
     let r = run(&[
         (1, Some(TrackRole::Keys), &a),
         (2, Some(TrackRole::Pads), &c),
@@ -461,4 +481,68 @@ fn cancelling_stops_the_diagnosis() {
     let mut i = input(&tracks, None, &rules);
     i.cancel = Some(&stop);
     assert!(diagnose(&i).is_err());
+}
+
+#[test]
+fn a_bus_is_never_compared_with_the_tracks_it_carries() {
+    let k = profile(&[&kick(0.8)]);
+    let b = profile(&[&bass(62.0, 0.35)]);
+    // A bus carrying the bass: the same sound, so it "covers" it fully.
+    let rules = Rules::default();
+    let tracks = [
+        (1, Some(TrackRole::Kick), &k),
+        (2, Some(TrackRole::Bass), &b),
+        (3, None, &b),
+    ];
+    let pair = |f: &&crate::Finding| match f.subject {
+        Subject::Pair { target, masker } => matches!((target.0, masker.0), (2, 3) | (3, 2)),
+        _ => false,
+    };
+    let mut related = input(&tracks, None, &rules);
+    related.related = vec![(TrackId(2), TrackId(3))];
+    let r = diagnose(&related).unwrap_or_default();
+    assert!(
+        !masking(&r).iter().any(pair),
+        "a track against what carries it"
+    );
+    let same = |r: &Report| {
+        r.findings.iter().any(|f| {
+            f.rule == RuleId::SameAudio
+                && f.tracks.contains(&TrackId(2))
+                && f.tracks.contains(&TrackId(3))
+        })
+    };
+    assert!(!same(&r), "not compared at all");
+    // The kick is still compared with both.
+    assert!(!masking(&r).is_empty());
+    // Unrelated, the two are compared: the same audio, said as such (not
+    // masking).
+    let r = diagnose(&input(&tracks, None, &rules)).unwrap_or_default();
+    assert!(same(&r));
+    assert!(!masking(&r).iter().any(pair));
+}
+
+#[test]
+fn pairs_compared_on_several_threads_give_the_same_report_every_time() {
+    let v: Vec<u64> = (0..1000).collect();
+    assert_eq!(
+        crate::map_parallel(&v, |x| x * 3),
+        v.iter().map(|x| x * 3).collect::<Vec<_>>()
+    );
+    assert!(crate::map_parallel(&[] as &[u64], |x| *x).is_empty());
+    // Many overlapping tracks: the same findings in the same order, run
+    // after run.
+    let profiles: Vec<TrackProfile> = (0..8)
+        .map(|i| profile(&[&bass(55.0 + 3.0 * f64::from(i), 0.3)]))
+        .collect();
+    let tracks: Vec<(u64, Option<TrackRole>, &TrackProfile)> = profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as u64 + 1, None, p))
+        .collect();
+    let first = run(&tracks);
+    assert!(masking(&first).len() > 4);
+    for _ in 0..3 {
+        assert_eq!(run(&tracks), first);
+    }
 }

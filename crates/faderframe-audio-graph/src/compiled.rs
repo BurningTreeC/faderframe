@@ -104,8 +104,9 @@ pub struct GraphStats {
     /// Largest number of nodes sharing a level (upper bound on parallelism).
     pub max_width: usize,
     /// The latency arriving at the device outputs: every output the
-    /// listener hears (audio and MIDI outputs, not a hardware insert's
-    /// send) is aligned to the latest of them.
+    /// listener hears (audio and MIDI outputs, [`crate::NodeRole::Heard`]
+    /// taps, not a hardware insert's send) is aligned to the latest of
+    /// them.
     pub output_latency: u32,
     pub compensated_edges: usize,
     pub max_compensation: u32,
@@ -614,8 +615,8 @@ pub(crate) fn compile<C>(
     }
 
     // Every output the listener hears at the same time: device outputs
-    // (and MIDI outputs, for outboard instruments) wait for the latest
-    // one. Outputs are sinks, so delaying them moves nothing else — except
+    // (and MIDI outputs, for outboard instruments; analysis taps, heard
+    // as the master is) wait for the latest one. Outputs are sinks, so delaying them moves nothing else — except
     // a hardware insert's send, which its return follows (`after`) and
     // times itself from: it keeps its own timing.
     let mut followed = vec![false; compiled.len()];
@@ -628,7 +629,7 @@ pub(crate) fn compile<C>(
         !followed[i]
             && matches!(
                 b.info.role,
-                NodeRole::DeviceOutput { .. } | NodeRole::EventOutput { .. }
+                NodeRole::DeviceOutput { .. } | NodeRole::EventOutput { .. } | NodeRole::Heard
             )
     };
     let out_max = compiled

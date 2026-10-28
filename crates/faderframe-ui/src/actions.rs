@@ -2215,10 +2215,13 @@ pub fn install(app: &Rc<AppState>) {
         named("mix-compare", crate::mix_actions::compare),
         named("mix-match", crate::mix_actions::matching),
         named("mix-apply", crate::mix_actions::apply),
+        named("mix-open", crate::mix_actions::open),
         named("mix-reject", crate::mix_actions::reject),
         named("mix-dismiss", crate::mix_actions::dismiss),
         named("track-role", crate::mix_actions::track_role),
         named("mix-log", crate::mix_actions::log),
+        named("mix-pairs", crate::mix_actions::pairs),
+        named("mix-dynamics", crate::mix_actions::dynamics),
         // Development aid: `song-structure:<track>[|<track>…]` (their
         // first clips).
         named("song-structure", |a, arg| {
@@ -2490,6 +2493,23 @@ pub fn install(app: &Rc<AppState>) {
                 a.dispatch(Action::SetFolderGroup {
                     folder,
                     on: on != "off",
+                });
+            }
+        }),
+        // `duplicate-track:<track>`: the track and its clips again, after it.
+        named("duplicate-track", |a, arg| {
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .map(|t| t.id);
+            if let Some(track) = track {
+                a.dispatch(Action::DuplicateTracks {
+                    tracks: vec![track],
+                    content: true,
                 });
             }
         }),

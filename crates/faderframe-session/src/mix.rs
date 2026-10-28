@@ -4,50 +4,69 @@
 //!
 //! **What is measured.** An analysis renders, on a thread of its own
 //! (never the audio thread, never the live engine: renders build their
-//! own, as exports do), the audio of each track over the range:
+//! own, as exports do), over the range:
 //!
-//! * *Processed* (the default): each track as it reaches the master
-//!   output alone — solo in place over a copy of the project, so its
-//!   devices, automation, sidechains (keyed from tracks that stay muted),
-//!   fader, pan, sends, buses, returns and master chain all play as in the
-//!   mix — and the master itself (the whole mix, stereo; a surround master
-//!   folded down as the device would). The engine's delay compensation
-//!   places everything; renders take the graph's latency off the front, so
-//!   every signal starts on the range's first sample: one time reference,
-//!   no second compensation.
+//! * *Processed* (the default): **one** render of the whole mix
+//!   ([`capture`], `faderframe_engine::capture`) with a tap on every track,
+//!   bus and return analysed — its signal as it reaches its destination:
+//!   after its devices, automation, sidechains, fader and pan, before it is
+//!   summed there — the master as the render's output (stereo; a surround
+//!   master folded down as the device would), and a probe after every
+//!   device (the health check: overs, flattened peaks, invalid samples,
+//!   silence, no change, each device's processing time from the engine's
+//!   node timing). Bus compressors and the master chain react to the whole
+//!   mix, as they do when it plays. The taps are aligned with the master by
+//!   the graph's own delay compensation and the render takes the graph's
+//!   latency off the front of all of them alike: one time reference, no
+//!   second compensation. With a reference track the master is compared
+//!   with it ([`faderframe_mix_intelligence::reference`], loudness-matched).
 //! * *Source*: each track's clips as they play (clip gain, fades, warp,
 //!   an instrument's notes through its MIDI effects and instrument) with
 //!   no audio device after them, no fader, pan, sends, modulators or
-//!   console: what the material is, not what the mix makes of it.
+//!   console: what the material is, not what the mix makes of it — a
+//!   render per track ([`render_each`]).
 //!
 //! Renders stream into [`faderframe_mix_intelligence::profile::ProfileBuilder`]
 //! (a frame of audio held at a time, whatever the range's length); the
-//! profiles go through the rules ([`faderframe_mix_intelligence::rules`]).
-//! The live project is never touched to analyse it.
+//! profiles go through the rules ([`faderframe_mix_intelligence::rules`],
+//! `health`, `reference`). The live project is never touched to analyse it.
+//! A second stage ([`extra`]) measures what needs more than one profile per
+//! track: the sources of processed tracks (their attacks compared; rendered
+//! side by side on a few threads) and pairs of tracks over excerpts for
+//! phase and timing (processed: every track of an excerpt tapped in one
+//! render of it).
 //!
 //! **Caching and staleness.** Profiles are kept (up to [`CACHE_BYTES`],
 //! least recently used out) under a key of the track, the signal, the
-//! range, the rate, the analysis settings and a fingerprint of everything
-//! in the project that can change the audio (its JSON without names,
-//! colours, markers, sections, roles, solo, ids …: [`fingerprint`]).
-//! Processed renders depend on the whole mix, so their fingerprint is the
-//! project's; a source render's is its own one-track project's (changing
-//! one track's devices re-renders only the processed profiles). Results
-//! say which project serial, history revision and fingerprint they came
-//! from: a job for a project that was replaced, or superseded by a newer
-//! job (generation), is dropped; results whose project has changed since
-//! are shown as stale, and their experiments refused until analysed again.
+//! range, the rate, the analysis settings and a fingerprint of what the
+//! signal depends on ([`fingerprint`]): a processed track's is its
+//! upstream closure's (itself and everything reaching it) plus the global
+//! settings — nothing downstream changes a tap — the master's the whole
+//! project's (without names, colours, markers, sections, roles, solo, ids,
+//! references …); a source render's is its own one-track project's. So a
+//! change re-measures only the tracks it reaches (the render itself runs
+//! again whenever anything is missing: the master needs the whole mix),
+//! and the health check is kept for the project fingerprint it was made
+//! with. Results say which project serial, history revision and
+//! fingerprints they came from: a job for a project that was replaced, or
+//! superseded by a newer job (generation), is dropped; a finding whose
+//! tracks' fingerprints changed since is stale ([`Session::mix_finding_stale`])
+//! and its experiments are refused until analysed again — findings on
+//! tracks the change did not reach stay valid.
 //!
 //! **Auditioning.** An experiment is applied to the live project *without*
 //! an undo step (its inverse kept here), so the engine plays it for real:
 //! a new built-in EQ at the end of the track's devices, or the fader. A/B
 //! switches the EQ's band between on and bypassed, or the fader between
-//! its two values — parameter changes, instant, no rebuild. Meanwhile the
-//! loudness of the master with and without it is measured offline (BS.1770
+//! its two values — parameter changes, instant, no rebuild (gain staging:
+//! both trims; a device's bypass: a rebuild). Meanwhile the loudness of
+//! the master with and without it is measured offline (BS.1770
 //! integrated, over the finding's time, up to [`MEASURE_SECONDS`]); with
 //! matching on, the candidate is played that much louder or quieter on the
-//! monitor only (`EngineController::set_monitor_trim`), the difference
-//! shown, the project never changed by it. Anything else that edits the
+//! monitor only — the mix side of the one listening gain the A/B
+//! comparisons use too ([`crate::compare`], [`Session::listening_gain`]) —
+//! the real level change shown beside the fairness gain, the project never
+//! changed by it. Anything else that edits the
 //! project, undoes, saves or renders ends the audition first (the
 //! candidate taken out again), so no undo step or file ever holds it;
 //! edits of the candidate's own EQ stay part of the candidate. Apply takes
@@ -66,9 +85,10 @@ use faderframe_mix_intelligence::{
     AnalysisConfig, Experiment, Finding, Fnv, Report, Rules, SignalPoint, TimeSpan, TrackProfile,
 };
 use faderframe_plugin_host::eq::{Field, band_id};
+use faderframe_project::reference::ReferenceSync;
 use faderframe_project::{
     Command, Impact, InputRouting, OutputRouting, PluginRef, PluginSlot, Project, SavedParameter,
-    Track, TrackKind,
+    SourceSpec, Track, TrackKind,
 };
 use faderframe_timeline::MusicalTime;
 use std::collections::BTreeSet;
@@ -76,7 +96,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 
+mod capture;
+mod fingerprint;
+mod measure;
+
 pub use faderframe_mix_intelligence as intelligence;
+use faderframe_mix_intelligence::health::DeviceRecord;
+use faderframe_mix_intelligence::reference::ReferenceComparison;
+pub use fingerprint::{Fingerprints, fingerprints};
+
+mod extra;
+pub use extra::{ExtraCounts, MAX_EXCERPT_BYTES};
 
 /// The longest range analysed at once (seconds): longer ones are asked to
 /// be analysed by selection.
@@ -89,6 +119,8 @@ pub const MEASURE_SECONDS: f64 = 30.0;
 const MEASURE_MIN_SECONDS: f64 = 4.0;
 /// The built-in EQ's name as a slot names it.
 const EQ_NAME: &str = "EQ";
+/// The built-in Utility's.
+const UTILITY_NAME: &str = "Utility";
 
 /// What to analyse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +175,12 @@ pub enum MixOp {
         finding: u64,
         recommendation: usize,
     },
+    /// Do what a hand-off experiment says (`Experiment::hand_off`): hear
+    /// the reference A/B, open EQ Match with it.
+    Open {
+        finding: u64,
+        recommendation: usize,
+    },
     /// End the audition; the project as it was.
     Reject,
     /// Hide a finding (for this project; shown again with
@@ -187,6 +225,33 @@ pub struct MixResults {
     pub serial: u64,
     pub history_revision: u64,
     pub fingerprint: Option<u64>,
+    /// What each analysed signal depended on (a finding is stale when one
+    /// of its tracks' changed).
+    pub fingerprints: Option<Fingerprints>,
+    /// What the probes measured of every device (processed analyses).
+    pub devices: Arc<Vec<DeviceRecord>>,
+    /// The master against the reference (processed, with a reference).
+    pub reference: Option<ReferenceComparison>,
+    /// Offline renders it took (one for a processed analysis, one per
+    /// track for sources; none when everything was reused) and how long
+    /// the analysis took (seconds).
+    pub renders: usize,
+    pub elapsed: f64,
+    /// The graph's latency the render took off the front of the master and
+    /// every tap alike (frames; `None`: nothing rendered).
+    pub latency: Option<u32>,
+    /// Seconds each stage took ("render and measure", "reference",
+    /// "rules" …).
+    pub phases: Vec<(&'static str, f64)>,
+    /// What could not be measured (a reference that is not there …).
+    pub notes: Vec<String>,
+    /// `false` while the second stage (sources beside the processed
+    /// signals, phase and timing between pairs) still runs: the findings of
+    /// the first are shown meanwhile.
+    pub complete: bool,
+    /// Sources measured beside the processed signals, pairs compared
+    /// (rendered now or reused).
+    pub extra: ExtraCounts,
 }
 
 impl MixResults {
@@ -296,11 +361,12 @@ impl Cache {
     }
 }
 
-/// What a planned render plays.
+/// What a planned signal is.
 #[derive(Clone, Copy, Debug)]
 enum Plays {
-    /// The track solo in place through the mix.
-    Solo,
+    /// The track (bus, return) where it reaches its destination, tapped in
+    /// the one render of the whole mix.
+    Tapped,
     /// The track's source through its first `keep` devices.
     Source { keep: usize },
     /// The whole mix.
@@ -315,6 +381,9 @@ struct Planned {
     name: String,
     role: Option<TrackRole>,
     focus: bool,
+    /// Compared with the others for masking (tracks and returns: a bus
+    /// summing tracks is not — its tracks are).
+    compare: bool,
     spans: Vec<(usize, usize)>,
 }
 
@@ -330,13 +399,98 @@ struct Shared {
     /// The cache as it was when the job started (profiles found there are
     /// not rendered again).
     cache: Vec<(CacheKey, Arc<TrackProfile>)>,
+    /// The reference the master is compared with.
+    reference: Option<capture::ReferencePlan>,
+    /// The last health check and its key (reused for the same project).
+    health: Option<(u64, Arc<Vec<DeviceRecord>>)>,
+    /// Sources beside processed signals, pairs ([`extra`]).
+    extra: extra::ExtraPlan,
+}
+
+impl Shared {
+    /// What the extra stage reads ([`extra`]).
+    fn stage<'a>(
+        &'a self,
+        planned: &'a [Planned],
+        base: &'a Project,
+        fps: Option<&'a Fingerprints>,
+        sources: &'a faderframe_engine::SourceMap,
+        progress: &'a Progress,
+    ) -> extra::Stage<'a> {
+        extra::Stage {
+            planned,
+            base,
+            fps,
+            sources,
+            start: self.start,
+            frames: self.frames,
+            rate: self.rate,
+            signal: self.signal,
+            config: &self.config,
+            rules: &self.rules,
+            cache: &self.cache,
+            plan: &self.extra,
+            render: &progress.render,
+            progress: &progress.extra,
+            threads: &progress.threads,
+        }
+    }
+
+    /// The cache key of a signal of `track` (`u64::MAX`: the master) whose
+    /// fingerprint is `project`.
+    fn key(&self, track: u64, project: u64, spans: &[(usize, usize)]) -> CacheKey {
+        let mut h = Fnv::new();
+        for (x, y) in spans {
+            h.write_u64(*x as u64);
+            h.write_u64(*y as u64);
+        }
+        CacheKey {
+            track,
+            signal: self.signal as u8,
+            project,
+            start: self.start,
+            frames: self.frames,
+            rate: self.rate,
+            config: self.config.fingerprint(),
+            spans: h.finish(),
+        }
+    }
 }
 
 struct Progress {
     render: RenderProgress,
     track: AtomicU32,
     diagnosing: AtomicBool,
+    /// What the job does now ([`STAGE_RENDER`] …).
+    stage: AtomicU32,
+    /// Signals measured now (not reused), the threads measuring them;
+    /// sources rendered so far.
+    measuring: AtomicU32,
+    threads: AtomicU32,
+    done: AtomicU32,
+    /// The first stage's findings, handed over once.
+    first: std::sync::Mutex<Option<Partial>>,
+    extra: extra::ExtraProgress,
 }
+
+/// What a processed job found before its second stage, shown while that
+/// runs ([`Session::mix_results`] with `complete: false`).
+struct Partial {
+    report: Report,
+    rendered: usize,
+    reused: usize,
+    fingerprint: Option<u64>,
+    fingerprints: Option<Fingerprints>,
+    devices: Arc<Vec<DeviceRecord>>,
+    reference: Option<ReferenceComparison>,
+    renders: usize,
+    latency: Option<u32>,
+}
+
+/// A job's stages (what its progress says).
+const STAGE_RENDER: u32 = 0;
+const STAGE_REFERENCE: u32 = 1;
+const STAGE_RULES: u32 = 2;
 
 struct Output {
     report: Report,
@@ -344,8 +498,20 @@ struct Output {
     profiles: Vec<(CacheKey, Arc<TrackProfile>)>,
     reused: Vec<CacheKey>,
     rendered: usize,
-    /// The analysed project's fingerprint ([`fingerprint`]).
+    /// The analysed project's fingerprint ([`fingerprint`]) and its
+    /// tracks'.
     fingerprint: Option<u64>,
+    fingerprints: Option<Fingerprints>,
+    devices: Arc<Vec<DeviceRecord>>,
+    /// The key the health check was made for (kept for the next job).
+    health_key: Option<u64>,
+    reference: Option<ReferenceComparison>,
+    renders: usize,
+    latency: Option<u32>,
+    notes: Vec<String>,
+    /// Seconds each stage took.
+    phases: Vec<(&'static str, f64)>,
+    extra: extra::ExtraOutcome,
 }
 
 struct Job {
@@ -365,10 +531,11 @@ struct Job {
     names: Vec<String>,
     progress: Arc<Progress>,
     handle: JoinHandle<std::result::Result<Output, String>>,
+    started: std::time::Instant,
 }
 
 /// How A/B switches a candidate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Toggle {
     Band {
         track: TrackId,
@@ -379,6 +546,25 @@ enum Toggle {
         track: TrackId,
         original: f32,
         candidate: f32,
+    },
+    /// Parameters of the candidate's own devices: (device, parameter,
+    /// original, candidate) — gain staging's two trims, a DC filter's
+    /// switch.
+    Params {
+        track: TrackId,
+        params: Vec<(PluginInstanceId, ParameterId, f64, f64)>,
+    },
+    /// A device bypassed (the candidate) or playing (the original): the
+    /// graph rebuilds each time.
+    Bypass {
+        track: TrackId,
+        plugin: PluginInstanceId,
+    },
+    /// The track's delay (ms) and polarity, as they were and as tried.
+    Alignment {
+        track: TrackId,
+        original: (f64, bool),
+        candidate: (f64, bool),
     },
 }
 
@@ -402,10 +588,12 @@ struct Audition {
 }
 
 impl Audition {
-    fn plugin(&self) -> Option<PluginInstanceId> {
-        match self.toggle {
-            Toggle::Band { plugin, .. } => Some(plugin),
-            Toggle::Volume { .. } => None,
+    /// The candidate's own devices (edits of them stay part of it).
+    fn plugins(&self) -> Vec<PluginInstanceId> {
+        match &self.toggle {
+            Toggle::Band { plugin, .. } => vec![*plugin],
+            Toggle::Params { params, .. } => params.iter().map(|p| p.0).collect(),
+            Toggle::Volume { .. } | Toggle::Bypass { .. } | Toggle::Alignment { .. } => Vec::new(),
         }
     }
 }
@@ -430,6 +618,12 @@ pub(crate) struct MixState {
     serial: u64,
     config: Option<AnalysisConfig>,
     rules: Rules,
+    /// The last health check and the key it was made for.
+    health: Option<(u64, Arc<Vec<DeviceRecord>>)>,
+    /// Findings no longer describing the project (their tracks changed).
+    stale_findings: BTreeSet<u64>,
+    /// Pair measurements kept for reuse ([`extra`]).
+    pairs: extra::PairCache,
 }
 
 impl Default for MixState {
@@ -451,6 +645,9 @@ impl Default for MixState {
             serial: 0,
             config: None,
             rules: Rules::default(),
+            health: None,
+            stale_findings: BTreeSet::new(),
+            pairs: extra::PairCache::default(),
         }
     }
 }
@@ -461,67 +658,20 @@ impl MixState {
     }
 }
 
-/// Top-level project fields that do not change what any track sounds like.
-const PRESENTATION: [&str; 19] = [
-    "name",
-    "markers",
-    "loop_range",
-    "loop_enabled",
-    "punch_range",
-    "punch_enabled",
-    "play_start",
-    "midi_mappings",
-    "sections",
-    "groups",
-    "album",
-    "lyrics",
-    "adr",
-    "setlist",
-    "scratch_pads",
-    "clip_links",
-    "video",
-    "timecode",
-    "ids",
-];
-/// Track fields that do not change what it sounds like in a render.
-const TRACK_PRESENTATION: [&str; 7] = [
-    "name",
-    "color",
-    "solo",
-    "role",
-    "record_arm",
-    "monitor",
-    "group",
-];
-
 /// What an analysis of `project` depends on, as a number: its JSON with
 /// the presentation left out (names, colours, markers, sections, roles,
-/// solo, ids …). `None` when it cannot be serialised (nothing is cached
-/// then).
+/// solo, ids, references …). `None` when it cannot be serialised (nothing
+/// is cached then). Each track's is in [`fingerprints`].
 pub fn fingerprint(project: &Project) -> Option<u64> {
-    let mut v = serde_json::to_value(project).ok()?;
-    if let Some(o) = v.as_object_mut() {
-        for k in PRESENTATION {
-            o.remove(k);
-        }
-        if let Some(tracks) = o.get_mut("tracks").and_then(|t| t.as_array_mut()) {
-            for t in tracks.iter_mut().filter_map(|t| t.as_object_mut()) {
-                for k in TRACK_PRESENTATION {
-                    t.remove(k);
-                }
-            }
-        }
-        if let Some(clips) = o.get_mut("clips").and_then(|c| c.as_object_mut()) {
-            for c in clips.values_mut().filter_map(|c| c.as_object_mut()) {
-                c.remove("name");
-                c.remove("color");
-            }
-        }
-    }
-    let bytes = serde_json::to_vec(&v).ok()?;
-    let mut h = Fnv::new();
-    h.write(&bytes);
-    Some(h.finish())
+    fingerprints(project).map(|f| f.project)
+}
+
+/// Kinds of track Mix Intelligence analyses: tracks, buses and returns.
+fn analysable(kind: TrackKind) -> bool {
+    matches!(
+        kind,
+        TrackKind::Audio | TrackKind::Instrument | TrackKind::Bus | TrackKind::Aux
+    )
 }
 
 /// Something of `track` sounds between `a` and `b`: a clip, a freeze, a
@@ -614,6 +764,24 @@ fn source_project(base: &Project, track: TrackId, keep: usize) -> Option<(Projec
     Some((p, outputs))
 }
 
+/// The built-in Utility with `params` set, as a new slot.
+fn utility_slot(project: &mut Project, params: &[(u32, f64)]) -> PluginSlot {
+    PluginSlot {
+        id: project.ids.allocate(),
+        plugin: PluginRef::builtin(builtin::GAIN, UTILITY_NAME),
+        bypass: false,
+        parameters: params
+            .iter()
+            .map(|&(id, value)| SavedParameter {
+                id: ParameterId(id),
+                value,
+            })
+            .collect(),
+        state: None,
+        sidechain: None,
+    }
+}
+
 /// The built-in EQ with `params` set, as a new slot.
 fn eq_slot(
     project: &mut Project,
@@ -639,83 +807,59 @@ fn job_worker(
     shared: Shared,
     progress: Arc<Progress>,
 ) -> std::result::Result<Output, String> {
-    let Shared {
-        start,
-        frames,
-        rate,
-        signal,
-        config,
-        rules,
-        sections,
-        cache,
-    } = shared;
-    let mut sources = faderframe_engine::render_generated_sources(&base, rate);
+    let mut sources = faderframe_engine::render_generated_sources(&base, shared.rate);
     for (_, path, e) in crate::media::open_file_sources(&base, None, &mut sources) {
         tracing::warn!("mix analysis: {}: {e}", path.display());
     }
-    let base_fp = fingerprint(&base);
-    let key = |track: u64, project: Option<u64>, spans: &[(usize, usize)]| {
-        let mut h = Fnv::new();
-        for (x, y) in spans {
-            h.write_u64(*x as u64);
-            h.write_u64(*y as u64);
-        }
-        project.map(|project| CacheKey {
-            track,
-            signal: signal as u8,
-            project,
-            start,
-            frames,
-            rate,
-            config: config.fingerprint(),
-            spans: h.finish(),
-        })
-    };
-    let mut profiles: Vec<Arc<TrackProfile>> = Vec::with_capacity(planned.len());
-    let (mut made, mut reused) = (Vec::new(), Vec::new());
-    let mut rendered = 0;
-    for (i, p) in planned.iter().enumerate() {
-        progress.track.store(i as u32, Ordering::Relaxed);
-        if progress.render.cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
-        }
-        // What it plays, and the fingerprint of that.
-        let (project, outputs, fp, id) = match p.plays {
-            Plays::Solo => {
-                let mut x = base.clone();
-                for t in &mut x.tracks {
-                    t.solo = t.id == p.track;
-                }
-                (Some(x), 2, base_fp, p.track.0)
-            }
-            Plays::Master => (None, 2, base_fp, u64::MAX),
-            Plays::Source { keep } => match source_project(&base, p.track, keep) {
-                Some((x, outputs)) => {
-                    let fp = fingerprint(&x);
-                    (Some(x), outputs, fp, p.track.0)
-                }
-                None => return Err(format!("{}: no master to render through", p.name)),
-            },
+    match shared.signal {
+        SignalPoint::Processed => capture::processed(&planned, &base, shared, &progress, &sources),
+        SignalPoint::Source => source_worker(&planned, &base, shared, &progress, &sources),
+    }
+}
+
+/// The source analysis: each track's clips through what makes their
+/// sound (an instrument), a render per track.
+fn source_worker(
+    planned: &[Planned],
+    base: &Project,
+    shared: Shared,
+    progress: &Progress,
+    sources: &faderframe_engine::SourceMap,
+) -> std::result::Result<Output, String> {
+    // The sources side by side on a few threads, each render on its own
+    // (a track and a plain master: little in a graph that small to share
+    // between cores), its profile built on the same thread.
+    let t0 = std::time::Instant::now();
+    let n = planned.len();
+    let threads = measure::threads(n);
+    progress.threads.store(threads as u32, Ordering::Relaxed);
+    progress.measuring.store(n as u32, Ordering::Relaxed);
+    type Done = std::result::Result<(Arc<TrackProfile>, Option<CacheKey>, bool), String>;
+    let results: std::sync::Mutex<Vec<Option<Done>>> =
+        std::sync::Mutex::new((0..n).map(|_| None).collect());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let one = |p: &Planned| -> Done {
+        let Plays::Source { keep } = p.plays else {
+            return Err(format!("{}: not a source", p.name));
         };
-        let k = key(id, fp, &p.spans);
-        if let Some(found) = k.and_then(|k| cache.iter().find(|e| e.0 == k)) {
-            reused.push(found.0);
-            profiles.push(Arc::clone(&found.1));
-            continue;
+        let Some((project, outputs)) = source_project(base, p.track, keep) else {
+            return Err(format!("{}: no master to render through", p.name));
+        };
+        let k = fingerprint(&project).map(|fp| shared.key(p.track.0, fp, &p.spans));
+        if let Some(found) = k.and_then(|k| shared.cache.iter().find(|e| e.0 == k)) {
+            return Ok((Arc::clone(&found.1), Some(found.0), false));
         }
-        let project = project.as_ref().unwrap_or(&base);
-        let mut builder =
-            ProfileBuilder::new(rate, outputs, &config, &p.spans).map_err(|e| e.to_string())?;
+        let mut builder = ProfileBuilder::new(shared.rate, outputs, &shared.config, &p.spans)
+            .map_err(|e| e.to_string())?;
         let mut failed = None;
-        render_each(
-            project,
-            rate,
-            &sources,
-            (start, frames),
+        crate::render::render_each_on(
+            &project,
+            shared.rate,
+            sources,
+            (shared.start, shared.frames),
             &progress.render,
             outputs,
-            None,
-            false,
+            0,
             &mut |piece| {
                 if failed.is_none()
                     && let Err(e) = builder.push(piece)
@@ -728,43 +872,131 @@ fn job_worker(
         if let Some(e) = failed {
             return Err(e.to_string());
         }
-        let profile = Arc::new(builder.finish());
-        if let Some(k) = k {
-            made.push((k, Arc::clone(&profile)));
+        Ok((Arc::new(builder.finish()), k, true))
+    };
+    std::thread::scope(|scope| {
+        for w in 0..threads {
+            let (next, results, one) = (&next, &results, &one);
+            let spawned = std::thread::Builder::new()
+                .name(format!("faderframe-mix-source-{w}"))
+                .spawn_scoped(scope, move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n || progress.render.cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let r = one(&planned[i]);
+                        progress.done.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut v) = results.lock() {
+                            v[i] = Some(r);
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("mix analysis: {e}");
+            }
+        }
+    });
+    if progress.render.cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+    let results = results
+        .into_inner()
+        .map_err(|_| "a source render failed".to_string())?;
+    let mut profiles: Vec<Arc<TrackProfile>> = Vec::with_capacity(n);
+    let (mut made, mut reused) = (Vec::new(), Vec::new());
+    let mut rendered = 0;
+    let mut renders = 0;
+    for (p, r) in planned.iter().zip(results) {
+        let (profile, key, fresh) =
+            r.unwrap_or_else(|| Err(format!("{}: not rendered", p.name)))?;
+        match (fresh, key) {
+            (true, k) => {
+                renders += 1;
+                rendered += 1;
+                if let Some(k) = k {
+                    made.push((k, Arc::clone(&profile)));
+                }
+            }
+            (false, Some(k)) => reused.push(k),
+            (false, None) => {}
         }
         profiles.push(profile);
-        rendered += 1;
     }
+    let mut phases: Vec<(&'static str, f64)> =
+        vec![("render and measure", t0.elapsed().as_secs_f64())];
+    progress.stage.store(STAGE_RULES, Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     progress.diagnosing.store(true, Ordering::Relaxed);
-    let mut tracks = Vec::new();
-    let mut master = None;
-    for (p, prof) in planned.iter().zip(&profiles) {
-        match p.plays {
-            Plays::Master => master = Some((Some(p.track), prof.as_ref())),
-            _ => tracks.push(TrackInput {
-                track: p.track,
-                role: p.role,
-                profile: prof,
-                compare: true,
-                focus: p.focus,
-            }),
-        }
-    }
+    let sourced: Vec<&Planned> = planned
+        .iter()
+        .filter(|p| matches!(p.plays, Plays::Source { .. }))
+        .collect();
+    let tracks: Vec<TrackInput<'_>> = sourced
+        .iter()
+        .zip(&profiles)
+        .map(|(p, prof)| TrackInput {
+            track: p.track,
+            role: p.role,
+            profile: prof,
+            compare: p.compare,
+            focus: p.focus,
+        })
+        .collect();
     let input = DiagnoseInput {
         tracks,
-        master,
-        signal,
-        sections,
-        rules: &rules,
+        master: None,
+        signal: SignalPoint::Source,
+        sections: shared.sections.clone(),
+        rules: &shared.rules,
         cancel: Some(&progress.render.cancel),
+        related: Vec::new(),
     };
-    let report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
+    let mut report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
+    // DC offsets in the material itself.
+    report.merge(faderframe_mix_intelligence::health::diagnose(
+        &faderframe_mix_intelligence::health::HealthInput {
+            subjects: sourced
+                .iter()
+                .zip(&profiles)
+                .filter(|(p, _)| p.focus)
+                .map(
+                    |(p, prof)| faderframe_mix_intelligence::health::HealthSubject {
+                        subject: faderframe_mix_intelligence::Subject::Track(p.track),
+                        profile: prof,
+                    },
+                )
+                .collect(),
+            devices: &[],
+            signal: SignalPoint::Source,
+            rules: &shared.rules.health,
+        },
+    ));
+    phases.push(("rules", t0.elapsed().as_secs_f64()));
+    let fps = fingerprints(base);
+    // Pairs for phase and timing, over excerpts of their sources.
+    let t0 = std::time::Instant::now();
+    let extra = extra::run(
+        &shared.stage(planned, base, fps.as_ref(), sources, progress),
+        &input,
+        &mut report,
+    )?;
+    phases.push(("phase and timing", t0.elapsed().as_secs_f64()));
     Ok(Output {
         report,
         profiles: made,
         reused,
         rendered,
-        fingerprint: base_fp,
+        fingerprint: fps.as_ref().map(|f| f.project),
+        fingerprints: fps,
+        devices: Arc::new(Vec::new()),
+        health_key: None,
+        reference: None,
+        renders,
+        latency: None,
+        notes: Vec::new(),
+        phases,
+        extra,
     })
 }
 
@@ -879,19 +1111,56 @@ impl Session {
                 fraction: p.render.fraction(),
             };
         }
+        if let Some(what) = extra::status(&p.extra) {
+            return MixStatus::Running {
+                what,
+                fraction: p.render.fraction().min(1.0),
+            };
+        }
+        match p.stage.load(Ordering::Relaxed) {
+            STAGE_REFERENCE => {
+                return MixStatus::Running {
+                    what: "Measuring the reference beside the master…".into(),
+                    fraction: 1.0,
+                };
+            }
+            STAGE_RULES => {
+                return MixStatus::Running {
+                    what: "Comparing the tracks…".into(),
+                    fraction: 1.0,
+                };
+            }
+            _ => {}
+        }
         if p.diagnosing.load(Ordering::Relaxed) {
             return MixStatus::Running {
                 what: "Comparing the tracks…".into(),
                 fraction: 1.0,
             };
         }
-        let i = p.track.load(Ordering::Relaxed) as usize;
         let n = j.names.len().max(1);
+        let measuring = p.measuring.load(Ordering::Relaxed) as usize;
+        let threads = p.threads.load(Ordering::Relaxed).max(1);
+        if j.signal == SignalPoint::Processed {
+            let what = if measuring == 0 {
+                "Everything measured is reused: checking the devices once more".to_string()
+            } else {
+                format!(
+                    "Rendering the mix once and measuring {measuring} of {n} signals on \
+                     {threads} thread{} ({} reused)",
+                    if threads == 1 { "" } else { "s" },
+                    n - measuring.min(n)
+                )
+            };
+            return MixStatus::Running {
+                what,
+                fraction: p.render.fraction(),
+            };
+        }
         MixStatus::Running {
             what: format!(
-                "Rendering {} ({} of {n})",
-                j.names.get(i).map_or("", String::as_str),
-                (i + 1).min(n)
+                "Rendering the sources, {threads} at a time ({} of {n} done)",
+                p.done.load(Ordering::Relaxed).min(n as u32)
             ),
             fraction: p.render.fraction(),
         }
@@ -904,6 +1173,29 @@ impl Session {
     /// Why the results no longer describe the project (`None`: they do).
     pub fn mix_stale(&self) -> Option<&str> {
         self.mix.stale.as_deref()
+    }
+
+    /// A finding no longer describes the project: a track it is about
+    /// changed (or went) since the analysis — findings on tracks the
+    /// change did not reach stay valid.
+    pub fn mix_finding_stale(&self, id: u64) -> bool {
+        self.mix.stale_findings.contains(&id)
+    }
+
+    /// What the probes measured of every device (processed analyses).
+    pub fn mix_devices(&self) -> &[DeviceRecord] {
+        self.mix_results().map_or(&[], |r| r.devices.as_slice())
+    }
+
+    /// The master against the reference (processed, with a reference).
+    pub fn mix_reference(&self) -> Option<&ReferenceComparison> {
+        self.mix_results()?.reference.as_ref()
+    }
+
+    /// A device's name now ("a removed device" when it is gone).
+    pub fn mix_device_name(&self, plugin: PluginInstanceId) -> String {
+        self.device_name(plugin)
+            .unwrap_or_else(|| "a removed device".into())
     }
 
     pub fn mix_selected(&self) -> Option<&Finding> {
@@ -981,12 +1273,13 @@ impl Session {
             .map_or_else(|| "(deleted track)".into(), |t| t.name.clone())
     }
 
-    /// The tracks Mix Intelligence compares (roles can be given to them).
+    /// The tracks Mix Intelligence analyses (roles can be given to them):
+    /// audio and instrument tracks, buses and returns.
     pub fn mix_tracks(&self) -> Vec<(TrackId, String, Option<TrackRole>)> {
         self.project
             .tracks
             .iter()
-            .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument))
+            .filter(|t| analysable(t.kind))
             .map(|t| (t.id, t.name.clone(), t.role))
             .collect()
     }
@@ -1004,11 +1297,19 @@ impl Session {
             .recommendations
             .get(recommendation)
             .ok_or_else(|| "no such experiment".to_string())?;
+        if let Some(what) = r.experiment.hand_off() {
+            return Err(format!(
+                "“{what}” hands over to another tool: nothing to apply here"
+            ));
+        }
         if !r.experiment.previewable() {
             return Err("a suggestion to try by hand: nothing to apply".into());
         }
-        if let Some(why) = self.mix_stale() {
-            return Err(why.to_string());
+        if self.mix_finding_stale(finding) {
+            return Err(self.mix_stale().map_or_else(
+                || "the tracks it is about changed: analyse again".to_string(),
+                str::to_string,
+            ));
         }
         let nyquist = f64::from(self.project.sample_rate) / 2.0;
         r.experiment.validate(nyquist)?;
@@ -1023,8 +1324,27 @@ impl Session {
         }
         let target = r.experiment.track().and_then(|t| self.project.track(t));
         if let Some(t) = target {
-            if t.freeze.is_some() {
+            // A frozen track still plays through its delay and polarity.
+            let aligns = matches!(r.experiment, Experiment::Alignment { .. });
+            if t.freeze.is_some() && !aligns {
                 return Err(format!("'{}' is frozen: unfreeze it to change it", t.name));
+            }
+            if let Experiment::Alignment { change_ms, .. } = r.experiment {
+                if !t.takes_delay() {
+                    return Err(format!("'{}' has no delay or polarity of its own", t.name));
+                }
+                let now = if t.delay_ms.is_finite() {
+                    t.delay_ms
+                } else {
+                    0.0
+                };
+                if (now + change_ms).abs() > faderframe_project::MAX_TRACK_DELAY_MS {
+                    return Err(format!(
+                        "'{}''s delay would go past ±{:.0} ms",
+                        t.name,
+                        faderframe_project::MAX_TRACK_DELAY_MS
+                    ));
+                }
             }
             if let Experiment::Level { .. } = r.experiment
                 && t.automation
@@ -1035,6 +1355,20 @@ impl Session {
                     "'{}''s fader is automated: offset its volume automation by hand",
                     t.name
                 ));
+            }
+            if let Some(d) = r.experiment.device() {
+                if !t.inserts.iter().any(|s| s.id == d) {
+                    return Err(format!(
+                        "{} is no longer one of '{}''s devices",
+                        self.mix_device_name(d),
+                        t.name
+                    ));
+                }
+                if let Experiment::Bypass { .. } = r.experiment
+                    && t.inserts.iter().any(|s| s.id == d && s.bypass)
+                {
+                    return Err(format!("{} is bypassed already", self.mix_device_name(d)));
+                }
             }
         }
         Ok(())
@@ -1117,6 +1451,10 @@ impl Session {
                 finding,
                 recommendation,
             } => self.apply_mix_experiment(finding, recommendation)?,
+            MixOp::Open {
+                finding,
+                recommendation,
+            } => self.open_mix_hand_off(finding, recommendation)?,
             MixOp::Reject => {
                 if self.mix.audition.is_some() {
                     self.end_mix_audition();
@@ -1138,6 +1476,7 @@ impl Session {
                 self.mix.results = None;
                 self.mix.selected = None;
                 self.mix.stale = None;
+                self.mix.stale_findings.clear();
                 self.mix.status = MixStatus::Idle;
             }
         }
@@ -1173,15 +1512,12 @@ impl Session {
                 .tracks
                 .iter()
                 .copied()
-                .filter(|t| {
-                    self.project
-                        .track(*t)
-                        .is_some_and(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument))
-                })
+                .filter(|t| self.project.track(*t).is_some_and(|t| analysable(t.kind)))
                 .collect();
             if f.is_empty() {
                 return Err(SessionError::Other(
-                    "select the audio or instrument tracks to analyse first".into(),
+                    "select the audio or instrument tracks (buses, returns) to analyse first"
+                        .into(),
                 ));
             }
             f
@@ -1225,7 +1561,7 @@ impl Session {
                 continue;
             }
             let plays = match signal {
-                SignalPoint::Processed => Plays::Solo,
+                SignalPoint::Processed => Plays::Tapped,
                 SignalPoint::Source => Plays::Source {
                     // An instrument's notes need it (and the MIDI effects
                     // before it).
@@ -1246,6 +1582,7 @@ impl Session {
                 name: t.name.clone(),
                 role: t.role,
                 focus: focus.is_empty() || focus.contains(&t.id),
+                compare: true,
                 spans: Vec::new(),
             });
         }
@@ -1253,6 +1590,50 @@ impl Session {
             return Err(SessionError::Other(
                 "no audio or instrument track plays in the range: nothing to analyse".into(),
             ));
+        }
+        // Buses and returns (processed: tapped in the same render) that an
+        // analysed track reaches. A bus is not compared for masking — the
+        // tracks it sums are; a return is (its reverb or delay is a sound
+        // of its own), never with the tracks it carries.
+        if signal == SignalPoint::Processed {
+            let edges = base.routing_edges();
+            let reaches = |from: TrackId, to: TrackId| {
+                let mut stack = vec![from];
+                let mut seen = BTreeSet::new();
+                while let Some(n) = stack.pop() {
+                    if n == to {
+                        return true;
+                    }
+                    if seen.insert(n) {
+                        stack.extend(edges.iter().filter(|(x, _)| *x == n).map(|(_, y)| *y));
+                    }
+                }
+                false
+            };
+            let tracks = analysed.clone();
+            for t in base
+                .tracks
+                .iter()
+                .filter(|t| matches!(t.kind, TrackKind::Bus | TrackKind::Aux))
+            {
+                if !tracks.iter().any(|x| reaches(*x, t.id)) {
+                    continue;
+                }
+                if t.mute {
+                    skipped.push((t.id, "muted".into()));
+                    continue;
+                }
+                analysed.push(t.id);
+                planned.push(Planned {
+                    track: t.id,
+                    plays: Plays::Tapped,
+                    name: t.name.clone(),
+                    role: t.role,
+                    focus: focus.is_empty() || focus.contains(&t.id),
+                    compare: t.kind == TrackKind::Aux,
+                    spans: Vec::new(),
+                });
+            }
         }
         // Sections in the range (seconds from its start; samples for the
         // master's loudness per section).
@@ -1282,24 +1663,49 @@ impl Session {
                 name: "the master".into(),
                 role: None,
                 focus: true,
+                compare: false,
                 spans,
             });
         }
+        let reference = if signal == SignalPoint::Processed {
+            self.mix_reference_plan()
+        } else {
+            None
+        };
         // A newer analysis replaces a running one.
         if let Some(j) = self.mix.job.take() {
             j.progress.render.cancel.store(true, Ordering::Relaxed);
             self.mix.retired.push(j);
         }
         self.mix.generation += 1;
+        let extra_plan = extra::plan(
+            &|id| self.engine.plugin_is_instrument(id),
+            &base,
+            &planned,
+            signal,
+            &focus,
+            &self.mix.pairs,
+        );
         let progress = Arc::new(Progress {
             render: RenderProgress::default(),
+            stage: AtomicU32::new(STAGE_RENDER),
+            measuring: AtomicU32::new(0),
+            threads: AtomicU32::new(0),
+            done: AtomicU32::new(0),
+            first: std::sync::Mutex::new(None),
             track: AtomicU32::new(0),
             diagnosing: AtomicBool::new(false),
+            extra: extra::ExtraProgress::default(),
         });
+        // One pass over the range, or one per track's source.
+        let passes = match signal {
+            SignalPoint::Processed => 1,
+            SignalPoint::Source => planned.len(),
+        };
         progress
             .render
             .total
-            .store((frames * planned.len()) as u64, Ordering::Relaxed);
+            .store((frames * passes) as u64, Ordering::Relaxed);
         let names: Vec<String> = planned.iter().map(|p| p.name.clone()).collect();
         let p2 = Arc::clone(&progress);
         let shared = Shared {
@@ -1317,6 +1723,9 @@ impl Session {
                 .iter()
                 .map(|e| (e.0, Arc::clone(&e.1)))
                 .collect(),
+            reference,
+            health: self.mix.health.clone(),
+            extra: extra_plan,
         };
         let handle = std::thread::Builder::new()
             .name("faderframe-mix".into())
@@ -1339,9 +1748,36 @@ impl Session {
             names,
             progress,
             handle,
+            started: std::time::Instant::now(),
         });
         self.mix.status = MixStatus::Idle;
         Ok(())
+    }
+
+    /// The reference a processed analysis compares the master with: the one
+    /// the mix is compared with now, else the project's first.
+    fn mix_reference_plan(&self) -> Option<capture::ReferencePlan> {
+        let id = self
+            .current_reference()
+            .or_else(|| self.project.references.tracks.first().map(|r| r.id))?;
+        let r = self.project.references.get(id)?;
+        let SourceSpec::File { path, frames, .. } = &self.project.sources.get(&r.source)?.spec
+        else {
+            return None;
+        };
+        let path = crate::media::resolve(path, self.project_dir().as_deref());
+        let (from, to) = r.span(*frames);
+        let anchor = match r.sync {
+            ReferenceSync::Follow { at } => Some(at - from),
+            ReferenceSync::Loop => None,
+        };
+        Some(capture::ReferencePlan {
+            id,
+            path,
+            from,
+            to,
+            anchor,
+        })
     }
 
     /// Take finished analyses and measurements in (from the session tick).
@@ -1359,17 +1795,20 @@ impl Session {
             {
                 m.progress.cancel.store(true, Ordering::Relaxed);
             }
-            let _ = self.engine.set_monitor_trim(0.0);
+            self.set_listening_mix_gain(0.0);
             self.mix.results = None;
             self.mix.selected = None;
             self.mix.dismissed.clear();
             self.mix.applied.clear();
             self.mix.stale = None;
+            self.mix.stale_findings.clear();
+            self.mix.health = None;
             self.mix.checked = None;
             self.mix.status = MixStatus::Idle;
             self.revision += 1;
         }
         self.mix.retired.retain(|j| !j.handle.is_finished());
+        self.take_first_stage();
         if self
             .mix
             .job
@@ -1385,14 +1824,23 @@ impl Session {
             let current =
                 job.generation == self.mix.generation && job.serial == self.project_serial;
             match result {
-                Ok(out) if current => {
+                Ok(mut out) if current => {
                     for k in &out.reused {
                         let _ = self.mix.cache.get(k);
                     }
                     for (k, p) in out.profiles {
                         self.mix.cache.put(k, p);
                     }
+                    if let Some(k) = out.health_key {
+                        self.mix.health = Some((k, Arc::clone(&out.devices)));
+                    }
+                    let extra_counts =
+                        extra::keep(&mut self.mix.cache, &mut self.mix.pairs, &mut out.extra);
                     let n = out.report.findings.len();
+                    let elapsed = job.started.elapsed().as_secs_f64();
+                    for note in &out.notes {
+                        self.notify(NoticeLevel::Warning, format!("Mix Intelligence: {note}"));
+                    }
                     let results = MixResults {
                         report: out.report,
                         signal: job.signal,
@@ -1411,6 +1859,16 @@ impl Session {
                         serial: job.serial,
                         history_revision: job.revision,
                         fingerprint: out.fingerprint,
+                        fingerprints: out.fingerprints,
+                        devices: out.devices,
+                        reference: out.reference,
+                        renders: out.renders,
+                        elapsed,
+                        latency: out.latency,
+                        phases: out.phases,
+                        notes: out.notes,
+                        extra: extra_counts,
+                        complete: true,
                     };
                     if !self
                         .mix
@@ -1426,12 +1884,13 @@ impl Session {
                     }
                     self.mix.results = Some(Arc::new(results));
                     self.mix.stale = None;
+                    self.mix.stale_findings.clear();
                     self.mix.checked = None;
                     self.mix.status = MixStatus::Idle;
                     self.notify(
                         NoticeLevel::Info,
                         format!(
-                            "Mix Intelligence: {n} finding{} ({})",
+                            "Mix Intelligence: {n} finding{} ({}, {elapsed:.1} s)",
                             if n == 1 { "" } else { "s" },
                             job.signal.label()
                         ),
@@ -1454,7 +1913,71 @@ impl Session {
         self.poll_mix_measure();
     }
 
-    /// Mark the results stale when the project's audio changed since.
+    /// The first stage's findings of the running job, shown while its
+    /// second stage runs (the final results replace them; ids are stable,
+    /// so a selection stays).
+    fn take_first_stage(&mut self) {
+        let Some(job) = &self.mix.job else {
+            return;
+        };
+        if job.generation != self.mix.generation || job.serial != self.project_serial {
+            return;
+        }
+        let Some(first) = job.progress.first.lock().ok().and_then(|mut f| f.take()) else {
+            return;
+        };
+        let results = MixResults {
+            report: first.report,
+            signal: job.signal,
+            scope: job.scope,
+            range: job.range,
+            start_sample: job.start,
+            frames: job.frames,
+            rate: job.rate,
+            tracks: job.tracks.clone(),
+            focus: job.focus.clone(),
+            skipped: job.skipped.clone(),
+            rendered: first.rendered,
+            reused: first.reused,
+            config: job.config.clone(),
+            algorithm: faderframe_mix_intelligence::ALGORITHM_VERSION,
+            serial: job.serial,
+            history_revision: job.revision,
+            fingerprint: first.fingerprint,
+            fingerprints: first.fingerprints,
+            devices: first.devices,
+            reference: first.reference,
+            renders: first.renders,
+            elapsed: job.started.elapsed().as_secs_f64(),
+            latency: first.latency,
+            phases: Vec::new(),
+            notes: Vec::new(),
+            extra: ExtraCounts::default(),
+            complete: false,
+        };
+        if !self
+            .mix
+            .selected
+            .is_some_and(|s| results.report.findings.iter().any(|f| f.id == s))
+        {
+            self.mix.selected = results
+                .report
+                .findings
+                .iter()
+                .find(|f| !self.mix.dismissed.contains(&f.id))
+                .map(|f| f.id);
+        }
+        self.mix.results = Some(Arc::new(results));
+        self.mix.stale = None;
+        self.mix.stale_findings.clear();
+        self.mix.checked = None;
+        self.revision += 1;
+    }
+
+    /// Mark the results stale when the project's audio changed since —
+    /// finding by finding: one whose tracks' fingerprints changed (or that
+    /// went) no longer describes the project; one on tracks the change did
+    /// not reach still does.
     fn check_mix_stale(&mut self) {
         let Some(r) = self.mix.results.clone() else {
             return;
@@ -1468,24 +1991,62 @@ impl Session {
             return;
         }
         self.mix.checked = Some(rev);
-        let gone = r.tracks.iter().any(|t| self.project.track(*t).is_none());
-        let changed = rev != r.history_revision && {
-            let now = fingerprint(&self.project.song());
-            now.is_none() || now != r.fingerprint
+        let gone: Vec<TrackId> = r
+            .tracks
+            .iter()
+            .copied()
+            .filter(|t| self.project.track(*t).is_none())
+            .collect();
+        let now = if rev == r.history_revision {
+            r.fingerprints.clone()
+        } else {
+            fingerprints(&self.project.song())
         };
-        let stale = if gone {
-            Some("A track analysed was deleted: analyse again to refresh the findings.".into())
-        } else if changed {
+        let (project_changed, changed): (bool, Box<dyn Fn(TrackId) -> bool>) =
+            match (now, r.fingerprints.clone()) {
+                (Some(a), Some(b)) => (
+                    a.project != b.project,
+                    Box::new(move |t| a.of(t) != b.of(t)),
+                ),
+                // Nothing to compare by: any change is one.
+                _ => {
+                    let c = rev != r.history_revision;
+                    (c, Box::new(move |_| c))
+                }
+            };
+        let stale: BTreeSet<u64> = r
+            .report
+            .findings
+            .iter()
+            .filter(|f| {
+                f.tracks.iter().any(|t| gone.contains(t) || changed(*t))
+                    || (f.tracks.is_empty() && project_changed)
+            })
+            .map(|f| f.id)
+            .collect();
+        let message = if !gone.is_empty() {
+            Some("A track analysed was deleted: analyse again to refresh the findings.".to_string())
+        } else if !stale.is_empty() {
+            Some(format!(
+                "The project changed after this analysis: {} of {} findings no longer describe it \
+                 (marked) — analyse again to see the mix as it is now (unchanged tracks are \
+                 reused).",
+                stale.len(),
+                r.report.findings.len()
+            ))
+        } else if project_changed {
             Some(
-                "The project changed after this analysis: analyse again to see the mix as it is \
-                 now (unchanged tracks are reused)."
-                    .into(),
+                "The project changed after this analysis: the findings still describe their \
+                 tracks, the master's levels are from before — analyse again to refresh \
+                 (unchanged tracks are reused)."
+                    .to_string(),
             )
         } else {
             None
         };
-        if stale != self.mix.stale {
-            self.mix.stale = stale;
+        if message != self.mix.stale || stale != self.mix.stale_findings {
+            self.mix.stale = message;
+            self.mix.stale_findings = stale;
             self.revision += 1;
         }
     }
@@ -1647,9 +2208,113 @@ impl Session {
                     },
                 ))
             }
+            Experiment::GainStage {
+                track,
+                device,
+                trim_db,
+            } => {
+                use faderframe_plugin_host::devices::utility::id;
+                let index = self
+                    .project
+                    .track(track)
+                    .and_then(|t| t.inserts.iter().position(|s| s.id == device))
+                    .ok_or_else(|| SessionError::Other("the device is gone".into()))?;
+                let before = utility_slot(&mut self.project, &[(id::GAIN, trim_db)]);
+                let after = utility_slot(&mut self.project, &[(id::GAIN, -trim_db)]);
+                let gain = ParameterId(id::GAIN);
+                let toggle = Toggle::Params {
+                    track,
+                    params: vec![
+                        (before.id, gain, 0.0, trim_db),
+                        (after.id, gain, 0.0, -trim_db),
+                    ],
+                };
+                Ok((
+                    vec![
+                        Command::InsertPlugin {
+                            track,
+                            index,
+                            slot: before,
+                        },
+                        // After the device (now one further on).
+                        Command::InsertPlugin {
+                            track,
+                            index: index + 2,
+                            slot: after,
+                        },
+                    ],
+                    toggle,
+                ))
+            }
+            Experiment::DcFilter { track } => {
+                use faderframe_plugin_host::devices::utility::id;
+                let index = self
+                    .project
+                    .track(track)
+                    .map(|t| t.inserts.len())
+                    .ok_or_else(|| SessionError::Other("the track is gone".into()))?;
+                let slot = utility_slot(&mut self.project, &[(id::DC, 1.0)]);
+                let toggle = Toggle::Params {
+                    track,
+                    params: vec![(slot.id, ParameterId(id::DC), 0.0, 1.0)],
+                };
+                Ok((vec![Command::InsertPlugin { track, index, slot }], toggle))
+            }
+            Experiment::Bypass { track, device } => Ok((
+                vec![Command::SetPluginBypass {
+                    track,
+                    plugin: device,
+                    bypass: true,
+                }],
+                Toggle::Bypass {
+                    track,
+                    plugin: device,
+                },
+            )),
+            Experiment::CompareReference { .. } | Experiment::ReferenceEqMatch { .. } => Err(
+                SessionError::Other("this hands over to another tool: nothing to apply".into()),
+            ),
             Experiment::Manual { .. } => Err(SessionError::Other(
                 "a suggestion to try by hand: nothing to apply".into(),
             )),
+            Experiment::Alignment {
+                track,
+                change_ms,
+                invert,
+            } => {
+                let t = self
+                    .project
+                    .track(track)
+                    .ok_or_else(|| SessionError::Other("the track is gone".into()))?;
+                let delay = if t.delay_ms.is_finite() {
+                    t.delay_ms
+                } else {
+                    0.0
+                };
+                let original = (delay, t.phase_invert);
+                let candidate = (delay + change_ms, t.phase_invert != invert);
+                let mut commands = Vec::new();
+                if change_ms != 0.0 {
+                    commands.push(Command::SetTrackDelay {
+                        track,
+                        ms: candidate.0,
+                    });
+                }
+                if invert {
+                    commands.push(Command::SetTrackPhaseInvert {
+                        track,
+                        on: candidate.1,
+                    });
+                }
+                Ok((
+                    commands,
+                    Toggle::Alignment {
+                        track,
+                        original,
+                        candidate,
+                    },
+                ))
+            }
         }
     }
 
@@ -1692,6 +2357,8 @@ impl Session {
                     .ok_or_else(|| SessionError::Other("no such experiment".into()))?,
             )
         };
+        // The candidate is heard against the original, not a reference.
+        self.hear_the_mix();
         // The original, as renders see it (for the loudness match).
         let mut original = self.render_copy();
         let (commands, toggle) = self.mix_candidate(&exp)?;
@@ -1756,7 +2423,8 @@ impl Session {
         (frames > 0).then(|| (r.start_sample + (a * fr) as i64, frames, rate))
     }
 
-    /// The monitor trim the audition asks for now.
+    /// The listening gain on the mix the audition asks for now (the
+    /// candidate at the original's loudness; see [`Session::listening_gain`]).
     fn apply_mix_trim(&mut self) {
         let db = self.mix.audition.as_ref().map_or(0.0, |a| {
             match (&a.measured, a.candidate && a.matching) {
@@ -1767,9 +2435,7 @@ impl Session {
         if let Some(a) = &mut self.mix.audition {
             a.trim_db = db;
         }
-        if let Err(e) = self.engine.set_monitor_trim(db as f32) {
-            tracing::warn!("mix audition: {e}");
-        }
+        self.set_listening_mix_gain(db as f32);
     }
 
     fn mix_compare(&mut self, on: bool) -> Result<()> {
@@ -1779,30 +2445,67 @@ impl Session {
         if a.candidate == on {
             return Ok(());
         }
-        let cmd = match a.toggle {
+        let cmds = match &a.toggle {
             Toggle::Band {
                 track,
                 plugin,
                 band,
-            } => Command::SetPluginParameter {
-                track,
-                plugin,
-                parameter: band_id(band, Field::Enabled),
+            } => vec![Command::SetPluginParameter {
+                track: *track,
+                plugin: *plugin,
+                parameter: band_id(*band, Field::Enabled),
                 // On, or bypassed (shown, not heard).
                 value: Some(if on { 1.0 } else { 2.0 }),
-            },
+            }],
             Toggle::Volume {
                 track,
                 original,
                 candidate,
-            } => Command::SetTrackVolume {
+            } => vec![Command::SetTrackVolume {
+                track: *track,
+                db: if on { *candidate } else { *original },
+            }],
+            Toggle::Params { track, params } => params
+                .iter()
+                .map(
+                    |&(plugin, parameter, original, candidate)| Command::SetPluginParameter {
+                        track: *track,
+                        plugin,
+                        parameter,
+                        value: Some(if on { candidate } else { original }),
+                    },
+                )
+                .collect(),
+            Toggle::Bypass { track, plugin } => vec![Command::SetPluginBypass {
+                track: *track,
+                plugin: *plugin,
+                bypass: on,
+            }],
+            // The delay follows its slot (a crossfade), the polarity at
+            // once: both parameter changes.
+            Toggle::Alignment {
                 track,
-                db: if on { candidate } else { original },
-            },
+                original,
+                candidate,
+            } => {
+                let (ms, invert) = if on { *candidate } else { *original };
+                let mut v = Vec::new();
+                if original.0 != candidate.0 {
+                    v.push(Command::SetTrackDelay { track: *track, ms });
+                }
+                if original.1 != candidate.1 {
+                    v.push(Command::SetTrackPhaseInvert {
+                        track: *track,
+                        on: invert,
+                    });
+                }
+                v
+            }
         };
-        // A parameter change: its inverse is the other way, nothing to
-        // keep (the audition's inverses restore the project in any case).
-        self.apply_unrecorded_mix(vec![cmd])?;
+        // Parameter changes (a bypass): their inverses are the other way,
+        // nothing to keep (the audition's inverses restore the project in
+        // any case).
+        self.apply_unrecorded_mix(cmds)?;
         if let Some(a) = &mut self.mix.audition {
             a.candidate = on;
         }
@@ -1830,7 +2533,7 @@ impl Session {
                 tracing::warn!("mix audition: {e}");
             }
         }
-        let _ = self.engine.set_monitor_trim(0.0);
+        self.set_listening_mix_gain(0.0);
         self.revision += 1;
     }
 
@@ -1844,10 +2547,10 @@ impl Session {
         if keeps_audition(&action) {
             return Ok(Some(action));
         }
-        let candidate = a.plugin();
+        let candidates = a.plugins();
         let own = matches!(
             &action,
-            Action::Edit(Command::SetPluginParameter { plugin, .. }) if candidate == Some(*plugin)
+            Action::Edit(Command::SetPluginParameter { plugin, .. }) if candidates.contains(plugin)
         );
         if own && let Action::Edit(cmd) = action {
             self.apply_unrecorded_mix(vec![cmd])?;
@@ -1856,6 +2559,55 @@ impl Session {
         }
         self.end_mix_audition();
         Ok(Some(action))
+    }
+
+    /// A hand-off experiment: the reference heard instead of the mix (A/B,
+    /// loudness-matched as the reference is set to be), EQ Match opened with
+    /// it. Nothing is applied by Mix Intelligence itself.
+    fn open_mix_hand_off(&mut self, finding: u64, recommendation: usize) -> Result<()> {
+        let exp = self
+            .mix_finding(finding)
+            .and_then(|f| f.recommendations.get(recommendation))
+            .map(|r| r.experiment.clone())
+            .ok_or_else(|| SessionError::Other("no such experiment".into()))?;
+        match exp {
+            Experiment::CompareReference { reference } => {
+                self.end_mix_audition();
+                if self.project.references.get(reference).is_none() {
+                    return Err(SessionError::Other("the reference is gone".into()));
+                }
+                if self.current_reference() != Some(reference) {
+                    self.choose_reference(Some(reference))?;
+                }
+                self.compare_op(crate::compare::CompareOp::Hear(true))?;
+                let matched = self
+                    .project
+                    .references
+                    .get(reference)
+                    .is_some_and(|r| r.match_loudness);
+                self.notify(
+                    NoticeLevel::Info,
+                    format!(
+                        "Hearing the reference instead of the mix{} — Ctrl+Alt+A flips back",
+                        if matched {
+                            ", loudness-matched"
+                        } else {
+                            " (not loudness-matched: its setting is off)"
+                        }
+                    ),
+                );
+                Ok(())
+            }
+            Experiment::ReferenceEqMatch { reference, track } => {
+                self.reference_op(crate::references::ReferenceOp::SendToEqMatch {
+                    reference,
+                    track: Some(track),
+                })
+            }
+            _ => Err(SessionError::Other(
+                "not a hand-off: audition or apply it instead".into(),
+            )),
+        }
     }
 
     /// Make an experiment one undo step (the auditioned candidate as it is
@@ -1871,7 +2623,7 @@ impl Session {
         if auditioned {
             self.mix_compare(true)?;
             if let Some(Toggle::Band { track, plugin, .. }) =
-                self.mix.audition.as_ref().map(|a| a.toggle)
+                self.mix.audition.as_ref().map(|a| a.toggle.clone())
             {
                 self.capture_plugin_state(plugin);
                 kept = self
@@ -1973,5 +2725,301 @@ mod tests {
         assert_eq!(c.entries.len(), 20);
         assert!(c.get(&key(0)).is_none(), "the oldest went");
         assert!(c.get(&key(n as u64 - 1)).is_some());
+    }
+
+    /// The processed analysis as it was before the one pass: each analysed
+    /// track solo in place through the whole mix, then the master (N + 1
+    /// renders), every profile built on the render's thread, then the
+    /// rules. Seconds.
+    fn analyse_as_before(base: &Project) -> (f64, usize) {
+        use crate::render::{RenderProgress, render_each};
+        let rate = base.sample_rate;
+        let t0 = std::time::Instant::now();
+        let mut sources = faderframe_engine::render_generated_sources(base, rate);
+        let failed = crate::media::open_file_sources(base, None, &mut sources);
+        assert!(failed.is_empty(), "the media open");
+        let frames = base
+            .timeline
+            .to_samples(base.content_end(), f64::from(rate))
+            .max(1) as usize;
+        let config = AnalysisConfig::for_rate(rate);
+        let progress = RenderProgress::default();
+        let tracks: Vec<TrackId> = base
+            .tracks
+            .iter()
+            .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) && !t.mute)
+            .map(|t| t.id)
+            .collect();
+        let mut profiles = Vec::new();
+        for t in tracks.iter().map(Some).chain([None]) {
+            let mut x = base.clone();
+            for u in &mut x.tracks {
+                u.solo = t == Some(&u.id);
+            }
+            let mut b =
+                ProfileBuilder::new(rate, 2, &config, &[]).unwrap_or_else(|e| panic!("{e}"));
+            render_each(
+                &x,
+                rate,
+                &sources,
+                (0, frames),
+                &progress,
+                2,
+                None,
+                false,
+                &mut |piece| {
+                    let _ = b.push(piece);
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            profiles.push(b.finish());
+        }
+        let rules = Rules::default();
+        let master = profiles.pop().unwrap_or_else(|| panic!("the master"));
+        let input = DiagnoseInput {
+            tracks: tracks
+                .iter()
+                .zip(&profiles)
+                .map(|(t, p)| TrackInput {
+                    track: *t,
+                    role: None,
+                    profile: p,
+                    compare: true,
+                    focus: true,
+                })
+                .collect(),
+            master: Some((None, &master)),
+            signal: SignalPoint::Processed,
+            sections: Vec::new(),
+            rules: &rules,
+            cancel: None,
+            related: Vec::new(),
+        };
+        let _ = faderframe_mix_intelligence::diagnose(&input).unwrap_or_else(|e| panic!("{e}"));
+        (t0.elapsed().as_secs_f64(), tracks.len() + 1)
+    }
+
+    /// The source analysis as it was: each track's source rendered after
+    /// the other (each render on every core). Seconds.
+    fn sources_as_before(s: &Session, base: &Project) -> f64 {
+        use crate::render::{RenderProgress, render_each};
+        let rate = base.sample_rate;
+        let t0 = std::time::Instant::now();
+        let mut sources = faderframe_engine::render_generated_sources(base, rate);
+        let failed = crate::media::open_file_sources(base, None, &mut sources);
+        assert!(failed.is_empty(), "the media open");
+        let frames = base
+            .timeline
+            .to_samples(base.content_end(), f64::from(rate))
+            .max(1) as usize;
+        let config = AnalysisConfig::for_rate(rate);
+        let progress = RenderProgress::default();
+        for t in base
+            .tracks
+            .iter()
+            .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) && !t.mute)
+        {
+            let keep = if t.kind == TrackKind::Instrument {
+                t.inserts
+                    .iter()
+                    .position(|x| s.engine.plugin_is_instrument(x.id))
+                    .map_or(t.inserts.len(), |i| i + 1)
+            } else {
+                0
+            };
+            let Some((project, outputs)) = source_project(base, t.id, keep) else {
+                continue;
+            };
+            let mut b =
+                ProfileBuilder::new(rate, outputs, &config, &[]).unwrap_or_else(|e| panic!("{e}"));
+            render_each(
+                &project,
+                rate,
+                &sources,
+                (0, frames),
+                &progress,
+                outputs,
+                None,
+                false,
+                &mut |piece| {
+                    let _ = b.push(piece);
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let _ = b.finish();
+        }
+        t0.elapsed().as_secs_f64()
+    }
+
+    /// The analysis as it is now, through the session: seconds of the job,
+    /// its stages, renders, signals.
+    fn analyse_now(s: &mut Session) -> (f64, Vec<(&'static str, f64)>, usize, usize) {
+        analyse_now_as(s, SignalPoint::Processed)
+    }
+
+    fn analyse_now_as(
+        s: &mut Session,
+        signal: SignalPoint,
+    ) -> (f64, Vec<(&'static str, f64)>, usize, usize) {
+        s.dispatch(Action::Mix(MixOp::Analyse {
+            scope: MixScope::Project,
+            signal,
+        }))
+        .unwrap_or_else(|e| panic!("{e}"));
+        s.wait_for_mix();
+        let r = s.mix_results().unwrap_or_else(|| panic!("results"));
+        (r.elapsed, r.phases.clone(), r.renders, r.tracks.len() + 1)
+    }
+
+    /// The demo, and the demo with every track copied three times (four
+    /// times the tracks, the same buses and returns).
+    fn speed_projects() -> Vec<(&'static str, Session)> {
+        let demo = Session::demo(faderframe_engine::EngineConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut large = Session::demo(faderframe_engine::EngineConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let tracks: Vec<TrackId> = large
+            .project()
+            .tracks
+            .iter()
+            .filter(|t| matches!(t.kind, TrackKind::Audio | TrackKind::Instrument))
+            .map(|t| t.id)
+            .collect();
+        for _ in 0..3 {
+            large
+                .dispatch(Action::DuplicateTracks {
+                    tracks: tracks.clone(),
+                    content: true,
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        vec![("demo", demo), ("demo ×4 tracks", large)]
+    }
+
+    /// What the one pass, the measuring on several threads, the second
+    /// stage's capture renders and the caches save: the processed analysis
+    /// (with the phase, timing and dynamics stage) of the demo and of a
+    /// project with four times its tracks, as it was (a render per track and
+    /// the master, profiles on the render's thread; then sources one after
+    /// the other and each pair's tracks solo in place over their excerpt) and
+    /// as it is (one render, profiles beside it; sources side by side, one
+    /// render per excerpt), then again unchanged and after one fader moved.
+    /// Timings only: `cargo test -p faderframe-session --lib one_pass_speed
+    /// -- --ignored --nocapture` (and with `--release`).
+    #[test]
+    #[ignore]
+    fn one_pass_speed() {
+        let stage = |phases: &[(&'static str, f64)]| {
+            phases
+                .iter()
+                .filter(|(n, _)| *n == "sources and pairs")
+                .map(|(_, t)| *t)
+                .sum::<f64>()
+        };
+        let fresh = |s: &Session| {
+            Session::new(
+                s.project().clone(),
+                None,
+                faderframe_engine::EngineConfig::default(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        for (label, warm) in speed_projects() {
+            // A first analysis (untimed) loads what every one shares.
+            let mut s = fresh(&warm);
+            let _ = analyse_now(&mut s);
+            let base = {
+                let mut b = s.render_copy();
+                b.loop_enabled = false;
+                for t in &mut b.tracks {
+                    t.solo = false;
+                }
+                b
+            };
+            let audio = base
+                .timeline
+                .to_samples(base.content_end(), f64::from(base.sample_rate))
+                as f64
+                / f64::from(base.sample_rate);
+            // Now, on a session that has measured nothing yet.
+            let mut s = fresh(&warm);
+            let (now, phases, renders, signals) = analyse_now(&mut s);
+            let counts = s.mix_results().map(|r| r.extra).unwrap_or_default();
+            let (again, _, again_renders, _) = analyse_now(&mut s);
+            let first = s
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.kind == TrackKind::Audio)
+                .map(|t| (t.id, t.volume_db))
+                .unwrap_or_else(|| panic!("an audio track"));
+            s.dispatch(Action::Edit(Command::SetTrackVolume {
+                track: first.0,
+                db: first.1 - 1.0,
+            }))
+            .unwrap_or_else(|e| panic!("{e}"));
+            let (changed, _, _, _) = analyse_now(&mut s);
+            let measured = s.mix_results().map_or(0, |r| r.rendered);
+            // Before: the main pass as it was, and the second stage as it
+            // was (on a session that has measured nothing).
+            let skip_before = std::env::var_os("FADERFRAME_SPEED_NOW_ONLY").is_some();
+            let (main_before, renders_before) = if skip_before {
+                (f64::NAN, 0)
+            } else {
+                analyse_as_before(&base)
+            };
+            let stage_before = if skip_before {
+                f64::NAN
+            } else {
+                let mut old = fresh(&warm);
+                extra::AS_BEFORE.store(true, Ordering::Relaxed);
+                let (_, p, _, _) = analyse_now(&mut old);
+                extra::AS_BEFORE.store(false, Ordering::Relaxed);
+                stage(&p)
+            };
+            let before = main_before + stage_before;
+            // Sources (a render per track): one after the other before,
+            // side by side now.
+            let sources_before = if skip_before {
+                f64::NAN
+            } else {
+                sources_as_before(&s, &base)
+            };
+            // (On a session of its own: the processed analysis's second
+            // stage measured most sources already.)
+            let mut src = fresh(&warm);
+            let (sources_now, _, source_renders, _) = analyse_now_as(&mut src, SignalPoint::Source);
+            println!(
+                "{label}: {audio:.1} s of audio, {signals} signals, {} sources beside them, \
+                 {} pairs compared\n  \
+                 before: {renders_before} renders + the second stage, profiles on the render \
+                 thread: {before:.2} s (main {main_before:.2} s, second stage {stage_before:.2} \
+                 s; {:.2}× real time)\n  \
+                 now: {renders} render + the second stage, profiles on {} threads: {now:.2} s \
+                 ({:.2}× real time, {:.1}× faster) — {}\n  \
+                 unchanged, everything reused: {again:.2} s ({again_renders} renders)\n  \
+                 second stage now: sources {:.2} s, excerpts {:.2} s ({} renders), pairs \
+                 {:.2} s\n  \
+                 one fader moved: {changed:.2} s ({measured} signals measured again)\n  \
+                 source analysis: {source_renders} renders one after the other \
+                 {sources_before:.2} s, side by side {sources_now:.2} s ({:.1}× faster)",
+                counts.sources_rendered + counts.sources_reused,
+                counts.pairs_measured + counts.pairs_reused,
+                audio / before.max(1e-9),
+                measure::threads(signals),
+                audio / now.max(1e-9),
+                before / now.max(1e-9),
+                phases
+                    .iter()
+                    .map(|(n, t)| format!("{n} {t:.2} s"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                counts.sources_seconds,
+                counts.excerpts_seconds,
+                counts.excerpt_renders,
+                counts.pairs_seconds,
+                sources_before / sources_now.max(1e-9)
+            );
+        }
     }
 }

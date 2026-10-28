@@ -21,6 +21,13 @@
 //!   is already where the other one is. A new source (or new settings)
 //!   crossfades from the old one; taking the source away fades back to the
 //!   mix first. Nothing is rebuilt.
+//! * **The listening gain.** The one gain of the monitor path, per side:
+//!   [`CompareShared::set_gain`] plays the compare source louder or quieter
+//!   (a reference or the past brought to the mix's loudness),
+//!   [`CompareShared::set_mix_gain`] the mix (a candidate Mix Intelligence
+//!   auditions brought to the original's loudness). Both are fairness gains
+//!   for a comparison: heard only, never in a render, a file or a meter;
+//!   each ramps over a block, nothing is rebuilt.
 //! * **Realtime.** Streams reach the audio thread through a mailbox and go
 //!   back through another, never freed there; the file is read wait-free
 //!   from its page table ([`StreamSource`]: one reader — this node — whose
@@ -134,6 +141,8 @@ pub struct CompareShared {
     hear: AtomicBool,
     /// The source's gain (f32 bits, linear).
     gain: AtomicU32,
+    /// The mix's gain (f32 bits, linear).
+    mix_gain: AtomicU32,
     seek: AtomicI64,
     /// Published by the audio thread: the file frame read last.
     position: AtomicI64,
@@ -154,6 +163,7 @@ impl Default for CompareShared {
         Self {
             hear: AtomicBool::new(false),
             gain: AtomicU32::new(1.0f32.to_bits()),
+            mix_gain: AtomicU32::new(1.0f32.to_bits()),
             seek: AtomicI64::new(NO_SEEK),
             position: AtomicI64::new(0),
             heard: AtomicU32::new(0),
@@ -185,6 +195,21 @@ impl CompareShared {
 
     pub fn gain(&self) -> f32 {
         f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    /// The mix's gain on the monitor path (linear; a candidate heard at
+    /// the original's loudness). Nonsense is taken as unity.
+    pub fn set_mix_gain(&self, gain: f32) {
+        let g = if gain.is_finite() {
+            gain.clamp(0.0, 16.0)
+        } else {
+            1.0
+        };
+        self.mix_gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn mix_gain(&self) -> f32 {
+        f32::from_bits(self.mix_gain.load(Ordering::Relaxed))
     }
 
     /// `Loop`: play the region from this file frame on.
@@ -333,6 +358,8 @@ pub(crate) struct Compare {
     /// 0: the mix is heard, 1: the source.
     x: f32,
     gain: f32,
+    /// The mix's gain where the last block ended.
+    mix_gain: f32,
     fade_len: usize,
     /// No frame processed yet: the side asked for is heard at once.
     fresh: bool,
@@ -371,6 +398,7 @@ impl Compare {
             retired: None,
             x: 0.0,
             gain: link.shared.gain(),
+            mix_gain: link.shared.mix_gain(),
             fade_len: ((f64::from(rate) * FADE_SECONDS) as usize).max(1),
             fresh: true,
             input_latency: 0,
@@ -447,8 +475,10 @@ impl Compare {
         if self.fresh {
             self.x = target;
             self.gain = shared.gain();
+            self.mix_gain = shared.mix_gain();
             self.fresh = false;
         }
+        let mix_goal = shared.mix_gain();
         shared
             .installed
             .store(self.now.generation, Ordering::Relaxed);
@@ -466,7 +496,27 @@ impl Compare {
                 shared.position.store(p, Ordering::Relaxed);
             }
             shared.heard.store(0.0f32.to_bits(), Ordering::Relaxed);
-            return input;
+            if mix_goal == 1.0 && self.mix_gain == 1.0 {
+                return input;
+            }
+            // The mix at its listening gain, ramped from where it was.
+            let step = (mix_goal - self.mix_gain) / n.max(1) as f32;
+            let channels = self.out.num_channels().min(input.num_channels());
+            for c in 0..channels {
+                let mut g = self.mix_gain;
+                for (o, &m) in self.out.channel_mut(c)[..n]
+                    .iter_mut()
+                    .zip(&input.channel(c)[..n])
+                {
+                    g += step;
+                    *o = m * g;
+                }
+            }
+            for c in channels..self.out.num_channels() {
+                self.out.channel_mut(c)[..n].fill(0.0);
+            }
+            self.mix_gain = mix_goal;
+            return &self.out;
         }
         let history = &cx.data.history;
         let latency = self.input_latency;
@@ -510,10 +560,11 @@ impl Compare {
         let step = 1.0 / self.fade_len as f32;
         let goal = shared.gain();
         let g_step = (goal - self.gain) / n.max(1) as f32;
+        let m_step = (mix_goal - self.mix_gain) / n.max(1) as f32;
         let channels = self.out.num_channels().min(input.num_channels());
-        let (x0, g0) = (self.x, self.gain);
+        let (x0, g0, m0) = (self.x, self.gain, self.mix_gain);
         for c in 0..channels {
-            let (mut x, mut g) = (x0, g0);
+            let (mut x, mut g, mut mg) = (x0, g0, m0);
             let mix = &input.channel(c)[..n];
             let src = &self.a.channel(c)[..n];
             for ((o, &m), &s) in self.out.channel_mut(c)[..n].iter_mut().zip(mix).zip(src) {
@@ -523,8 +574,9 @@ impl Compare {
                     (x - step).max(target)
                 };
                 g += g_step;
+                mg += m_step;
                 let (wm, ws) = weights(x);
-                *o = m * wm + s * g * ws;
+                *o = m * mg * wm + s * g * ws;
             }
         }
         for c in channels..self.out.num_channels() {
@@ -536,6 +588,7 @@ impl Compare {
             (x0 - step * n as f32).max(target)
         };
         self.gain = goal;
+        self.mix_gain = mix_goal;
         if self.x <= 0.0
             && leaving
             && let Some(next) = self.next.take()

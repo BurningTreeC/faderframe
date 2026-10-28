@@ -36,7 +36,26 @@ impl OfflineRenderer {
         block: usize,
         output_channels: usize,
     ) -> Result<Self, EngineError> {
+        Self::with_capture(project, sources, config, block, output_channels, None)
+    }
+
+    /// [`Self::new`] capturing what `plan` asks for (its block is this
+    /// renderer's: the taps hold one callback; see [`crate::capture`]).
+    /// Read the taps after every [`Self::step`]: the controller's
+    /// [`EngineController::capture`].
+    pub fn with_capture(
+        project: &Project,
+        sources: &SourceMap,
+        config: EngineConfig,
+        block: usize,
+        output_channels: usize,
+        plan: Option<crate::capture::CapturePlan>,
+    ) -> Result<Self, EngineError> {
         let (mut controller, mut processor) = create(config);
+        if let Some(mut plan) = plan {
+            plan.block = plan.block.max(block.max(1));
+            controller.set_capture(Some(plan));
+        }
         controller.plugins().set_realtime(false);
         faderframe_audio::AudioCallback::prepare(
             &mut processor,

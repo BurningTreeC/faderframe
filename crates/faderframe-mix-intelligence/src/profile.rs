@@ -22,12 +22,25 @@
 //! five-minute track at 48 kHz with the default settings (3 516 frames,
 //! 30 bands) takes 0.6 MB.
 //!
+//! **Phase.** Per frame and band also the mono fold-down's ((L+R)/2)
+//! *band sum*: its bins added as complex numbers (each scaled by the
+//! square root of its power weight), kept as a power in hundredths of a dB
+//! and a phase in steps of π/32767 (4 bytes more, 0.4 MB for those five
+//! minutes). Two tracks rendered over the same range share the frame grid,
+//! so these give their per-band cross-spectrum and coherence over any
+//! frames ([`crate::same`]): what tells two copies of one audio from two
+//! sounds that only overlap.
+//!
 //! **Levels.** The whole range is also measured by
 //! [`faderframe_analysis::levels::FileMeter`]: sample peak, true peak (4×
 //! oversampled, BS.1770 Annex 2), RMS, samples at full scale and overs,
 //! and BS.1770-4 loudness (integrated, range, highest momentary and
 //! short-term) with both channels weighted 1; and optionally the
 //! integrated loudness of given spans (sections).
+//!
+//! **Dynamics.** A 5 ms envelope (highest sample, mean square) and the
+//! momentary and short-term loudness every 100 ms
+//! ([`crate::dynamics::DynamicsTrace`], 4 bytes per 5 ms).
 
 use crate::bands::{BandLayout, BinWeights};
 use crate::config::{AnalysisConfig, ConfigError};
@@ -54,7 +67,7 @@ pub enum ProfileError {
     Cancelled,
 }
 
-fn to_cdb(power: f64) -> i16 {
+pub(crate) fn to_cdb(power: f64) -> i16 {
     // (NaN falls through to the floor too.)
     if power.is_nan() || power <= FLOOR_POWER {
         return MIN_CDB as i16;
@@ -63,7 +76,7 @@ fn to_cdb(power: f64) -> i16 {
     ((db * 100.0).round() as i32).clamp(MIN_CDB, MAX_CDB) as i16
 }
 
-fn from_cdb(v: i16) -> f64 {
+pub(crate) fn from_cdb(v: i16) -> f64 {
     f64::from(v) / 100.0
 }
 
@@ -93,6 +106,13 @@ pub struct BandFrames {
     left: Vec<i16>,
     right: Vec<i16>,
     corr: Vec<i16>,
+    /// The mono fold-down's band sum: power (hundredths of a dB) and
+    /// phase (steps of π/32767).
+    mid: Vec<(i16, i16)>,
+    /// Stereo only (empty for mono): the left and the right channel's band
+    /// sums, encoded as `mid` — for telling copies apart from each other
+    /// channel by channel ([`crate::same`]).
+    lr: Vec<[(i16, i16); 2]>,
 }
 
 impl BandFrames {
@@ -147,9 +167,35 @@ impl BandFrames {
         )
     }
 
+    /// The mono fold-down's band sum (see the module docs) as a complex
+    /// number (its squared magnitude in the band's power units; `(0, 0)` in
+    /// silence).
+    pub fn mid_sum(&self, frame: usize, band: usize) -> (f64, f64) {
+        let Some(&(p, ph)) = self.mid.get(self.at(frame, band)) else {
+            return (0.0, 0.0);
+        };
+        let m = db_power(from_cdb(p)).sqrt();
+        let a = f64::from(ph) / 32_767.0 * std::f64::consts::PI;
+        (m * a.cos(), m * a.sin())
+    }
+
+    /// A channel's band sum (`channel` 0 left, 1 right), encoded as
+    /// [`Self::mid_sum`]; `None` for a mono profile.
+    pub fn channel_sum(&self, frame: usize, band: usize, channel: usize) -> Option<(f64, f64)> {
+        let &(p, ph) = self.lr.get(self.at(frame, band))?.get(channel)?;
+        let m = db_power(from_cdb(p)).sqrt();
+        let a = f64::from(ph) / 32_767.0 * std::f64::consts::PI;
+        Some((m * a.cos(), m * a.sin()))
+    }
+
+    /// Whether [`Self::channel_sum`] has the channels.
+    pub fn has_channel_sums(&self) -> bool {
+        !self.lr.is_empty()
+    }
+
     /// Memory the frames take (bytes).
     pub fn bytes(&self) -> usize {
-        6 * self.left.len()
+        6 * self.left.len() + 4 * self.mid.len() + 8 * self.lr.len()
     }
 }
 
@@ -174,6 +220,10 @@ pub struct TrackProfile {
     /// Samples that were not finite numbers (NaN, infinity: a device
     /// failing); measured as silence.
     pub non_finite: u64,
+    /// Each channel's mean (its DC offset, linear: −1 to 1).
+    pub dc: Vec<f64>,
+    /// The envelope and loudness over time ([`crate::dynamics`]).
+    pub dynamics: crate::dynamics::DynamicsTrace,
 }
 
 impl TrackProfile {
@@ -221,7 +271,18 @@ impl TrackProfile {
 
     /// Memory the profile takes, roughly (bytes).
     pub fn bytes(&self) -> usize {
-        self.frames.bytes() + 512 + 64 * self.layout.len()
+        self.frames.bytes() + 512 + 64 * self.layout.len() + self.dynamics.bytes()
+    }
+
+    /// The largest DC offset of a channel (dBFS of its magnitude; the floor
+    /// for none).
+    pub fn dc_dbfs(&self) -> f64 {
+        let m = self.dc.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        if m > 0.0 {
+            (20.0 * m.log10()).max(FLOOR_DB)
+        } else {
+            FLOOR_DB
+        }
     }
 }
 
@@ -289,8 +350,12 @@ impl Stft {
     fn bands(&self, stereo: bool, out: &mut BandFrames) {
         for b in 0..out.bands {
             let (mut pl, mut pr, mut cross) = (0.0, 0.0, 0.0);
+            // The mono fold-down's band sum (complex), and each channel's.
+            let (mut zr, mut zi) = (0.0, 0.0);
+            let mut ch = [(0.0f64, 0.0f64); 2];
             for &(k, w) in self.weights.band(b) {
                 let s = self.scale(k) * f64::from(w);
+                let a = self.scale(k).sqrt() * f64::from(w);
                 let (lr, li) = (self.re[0][k], self.im[0][k]);
                 pl += s * (lr * lr + li * li);
                 if stereo {
@@ -298,7 +363,25 @@ impl Stft {
                     pr += s * (rr * rr + ri * ri);
                     // Re(L · conj(R)).
                     cross += s * (lr * rr + li * ri);
+                    zr += a * 0.5 * (lr + rr);
+                    zi += a * 0.5 * (li + ri);
+                    ch[0].0 += a * lr;
+                    ch[0].1 += a * li;
+                    ch[1].0 += a * rr;
+                    ch[1].1 += a * ri;
+                } else {
+                    zr += a * lr;
+                    zi += a * li;
                 }
+            }
+            let encode = |re: f64, im: f64| {
+                let phase = (im.atan2(re) / std::f64::consts::PI * 32_767.0).round() as i16;
+                (to_cdb(re * re + im * im), phase)
+            };
+            out.mid.push(encode(zr, zi));
+            if stereo {
+                out.lr
+                    .push([encode(ch[0].0, ch[0].1), encode(ch[1].0, ch[1].1)]);
             }
             if !stereo {
                 pr = pl;
@@ -341,6 +424,9 @@ pub struct ProfileBuilder {
     clean: Vec<Vec<f32>>,
     spans: Vec<Span>,
     non_finite: u64,
+    /// Each channel's sum (its mean: the DC offset).
+    sums: Vec<f64>,
+    trace: crate::dynamics::TraceBuilder,
 }
 
 impl ProfileBuilder {
@@ -370,6 +456,8 @@ impl ProfileBuilder {
                 left: Vec::new(),
                 right: Vec::new(),
                 corr: Vec::new(),
+                mid: Vec::new(),
+                lr: Vec::new(),
             },
             layout,
             pending: [Vec::new(), Vec::new()],
@@ -391,6 +479,8 @@ impl ProfileBuilder {
                 })
                 .collect(),
             non_finite: 0,
+            sums: vec![0.0; channels],
+            trace: crate::dynamics::TraceBuilder::new(rate, channels),
         })
     }
 
@@ -417,8 +507,15 @@ impl ProfileBuilder {
             }));
         }
         self.non_finite += bad;
+        // Sample by sample: the same sum whatever the pieces.
+        for (sum, c) in self.sums.iter_mut().zip(&self.clean) {
+            for &v in c {
+                *sum += f64::from(v);
+            }
+        }
         let clean: Vec<&[f32]> = self.clean.iter().map(Vec::as_slice).collect();
         self.meter.add(&clean);
+        self.trace.push(&clean);
         let (from, to) = (self.length, self.length + n);
         for (a, b, l) in &mut self.spans {
             let (x, y) = ((*a).max(from), (*b).min(to));
@@ -473,6 +570,7 @@ impl ProfileBuilder {
             self.next += hop;
         }
         let length = self.length;
+        let dynamics = self.trace.finish(self.meter.loudness_meter());
         TrackProfile {
             rate: self.rate,
             fft_size: n,
@@ -493,6 +591,12 @@ impl ProfileBuilder {
                 })
                 .collect(),
             non_finite: self.non_finite,
+            dc: self
+                .sums
+                .iter()
+                .map(|s| if length > 0 { s / length as f64 } else { 0.0 })
+                .collect(),
+            dynamics,
         }
     }
 
@@ -678,6 +782,18 @@ mod tests {
         let b = p.frames.level(t, band_of(&p, 2000.0));
         // Third octaves double their width per octave: +3 dB.
         assert!((b - a - 3.0).abs() < 0.5, "{a} {b}");
+    }
+
+    #[test]
+    fn a_dc_offset_is_each_channels_mean() {
+        let s = sine(200.0, 0.5, 2.0);
+        let offset: Vec<f32> = s.iter().map(|v| v + 0.01).collect();
+        let p = profile(&[&s, &offset]);
+        assert!(p.dc[0].abs() < 1e-4, "{}", p.dc[0]);
+        assert!((p.dc[1] - 0.01).abs() < 1e-4, "{}", p.dc[1]);
+        assert!((p.dc_dbfs() - -40.0).abs() < 0.1, "{}", p.dc_dbfs());
+        let z = vec![0.0f32; 1000];
+        assert_eq!(profile(&[&z]).dc_dbfs(), FLOOR_DB);
     }
 
     #[test]

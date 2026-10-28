@@ -370,6 +370,20 @@ impl WeightedLoudness {
     pub fn max_short_term(&self) -> f64 {
         self.max_short_term
     }
+
+    /// Every short-term loudness value so far (LUFS, ungated): one every
+    /// 100 ms, the first for the 3 s ending 3 s in (value `i` ends at
+    /// `(i + 30) × 100 ms`).
+    pub fn short_terms(&self) -> &[f64] {
+        &self.short_terms
+    }
+
+    /// Every momentary loudness value so far (LUFS, ungated): one every
+    /// 100 ms, the first for the 400 ms ending 400 ms in (value `i` ends
+    /// at `(i + 4) × 100 ms`).
+    pub fn momentary(&self) -> Vec<f64> {
+        self.gating.iter().map(|&e| loudness(e)).collect()
+    }
 }
 
 /// EBU R128 loudness of a stereo signal.

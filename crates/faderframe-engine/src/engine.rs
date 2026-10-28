@@ -448,6 +448,7 @@ pub fn create_with_epoch(
         ahead_misses: Arc::new(AtomicU64::new(0)),
         varispeed: false,
         sent_loop: None,
+        capture: None,
     };
     (controller, processor)
 }
@@ -1606,6 +1607,9 @@ pub struct EngineController {
     varispeed: bool,
     /// The loop as last sent to the transport (samples, switch).
     sent_loop: Option<(Option<LoopRange>, bool)>,
+    /// What an analysis render captures ([`crate::capture`]; `None`:
+    /// nothing, and nothing built for it).
+    capture: Option<Arc<crate::capture::Capture>>,
 }
 
 /// The tracks with launcher clips (sorted).
@@ -1803,6 +1807,24 @@ impl EngineController {
 
     pub fn node_timing(&self) -> bool {
         self.node_timing
+    }
+
+    /// Capture signals inside the graph (an analysis render, see
+    /// [`crate::capture`]): taps on the strips of `plan.tracks`, probes
+    /// after the devices. `None`: nothing is captured — and nothing built
+    /// for it. Takes effect when the graph is rebuilt next
+    /// ([`Self::sync`] with [`Impact::Graph`]).
+    pub fn set_capture(
+        &mut self,
+        plan: Option<crate::capture::CapturePlan>,
+    ) -> Option<Arc<crate::capture::Capture>> {
+        self.capture = plan.map(crate::capture::Capture::new);
+        self.capture.clone()
+    }
+
+    /// What is captured (see [`Self::set_capture`]).
+    pub fn capture(&self) -> Option<&Arc<crate::capture::Capture>> {
+        self.capture.as_ref()
     }
 
     /// Highest single-callback DSP load since the last call (resets it).
@@ -2443,6 +2465,7 @@ impl EngineController {
                 limit: self.low_latency_limit,
             },
             &self.talkback,
+            self.capture.as_deref(),
         )?;
         self.low_latency_tracks = monitoring;
         self.bypassed_for_monitoring = built.bypassed_for_monitoring.clone();
@@ -2913,20 +2936,24 @@ impl EngineController {
         Ok(())
     }
 
-    /// A gain (dB) on what the device plays of the master, for listening
-    /// only: immediate (ramped over a block), no rebuild, never part of a
-    /// render. Mix Intelligence plays a candidate loudness-matched with it.
-    pub fn set_monitor_trim(&mut self, db: f32) -> Result<(), EngineError> {
-        let slot = self.slots.monitor_trim()?;
-        self.params.set(
-            slot,
-            if db.is_finite() {
+    /// The listening gains (dB): what the monitor path plays the mix and
+    /// the compare source at — fairness gains for comparisons (a candidate
+    /// at the original's loudness, a reference at the mix's), immediate
+    /// (ramped over a block), no rebuild, never in a render, a file or a
+    /// meter. Kept within ±24 dB; nonsense is 0 dB. The compare source's
+    /// own controls are [`crate::nodes::CompareShared`]
+    /// ([`Self::listening`]).
+    pub fn set_listening_gain(&mut self, mix_db: f32, other_db: f32) {
+        let gain = |db: f32| {
+            faderframe_core::db_to_gain(if db.is_finite() {
                 db.clamp(-24.0, 24.0)
             } else {
                 0.0
-            },
-        );
-        Ok(())
+            })
+        };
+        let shared = self.listen.link.compare().shared();
+        shared.set_mix_gain(gain(mix_db));
+        shared.set_gain(gain(other_db));
     }
 
     pub fn set_album_monitor(&mut self, song: Option<faderframe_core::SongId>) {

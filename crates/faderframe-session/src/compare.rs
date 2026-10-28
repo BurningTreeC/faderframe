@@ -21,6 +21,14 @@
 //! the disk loader, sets the gain (a loudness match: the other side is
 //! brought to the mix's integrated loudness, EBU R128, measured offline on
 //! both) and hands everything again to an engine made anew.
+//!
+//! **The listening gain** ([`Session::listening_gain`]) is the monitor
+//! path's one gain, per side, and this module owns it: the other side's
+//! (a reference or the past brought to the mix's loudness, plus a
+//! reference's trim) and the mix's (Mix Intelligence playing a candidate
+//! at the original's loudness: [`crate::mix`]). Both are fairness gains for
+//! a comparison — heard only, never in a render, a file or a meter — and
+//! shown beside the real level difference they make up for.
 
 use crate::render::{self, RenderChannels, RenderJob, RenderRange, RenderSettings};
 use crate::{NoticeLevel, Result, Session, SessionError};
@@ -83,6 +91,20 @@ pub struct CompareStatus {
     pub progress: Option<f64>,
 }
 
+/// The listening gain: what the monitor path plays each side at (dB) —
+/// fairness gains for comparisons, never in the project, a render or a
+/// meter.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ListeningGain {
+    /// The mix (a Mix Intelligence candidate at the original's loudness).
+    pub mix_db: f32,
+    /// The other side (a reference or the past, matched to the mix and
+    /// trimmed).
+    pub other_db: f32,
+    /// The other side's is a loudness match.
+    pub other_matched: bool,
+}
+
 /// An audition of the undo history, as the views show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditionInfo {
@@ -137,6 +159,9 @@ pub(crate) struct CompareState {
     match_audition: bool,
     gain_db: f32,
     matched: bool,
+    /// The mix side's listening gain (dB; Mix Intelligence's candidate at
+    /// the original's loudness).
+    mix_gain_db: f32,
     /// The project it belongs to (`Session::project_serial`).
     serial: u64,
     audition: Option<Audition>,
@@ -160,6 +185,7 @@ impl Default for CompareState {
             match_audition: true,
             gain_db: 0.0,
             matched: false,
+            mix_gain_db: 0.0,
             serial: 0,
             audition: None,
             references: Default::default(),
@@ -430,6 +456,15 @@ impl Session {
         (meter.bar_start(bar), meter.bar_start(bar + 16))
     }
 
+    /// The listening gain on each side now (see [`ListeningGain`]).
+    pub fn listening_gain(&self) -> ListeningGain {
+        ListeningGain {
+            mix_db: self.compare.mix_gain_db,
+            other_db: self.compare.gain_db,
+            other_matched: self.compare.matched,
+        }
+    }
+
     /// The engine's compare controls (what is heard, the gain applied).
     pub fn compare_link(&self) -> &Arc<CompareLink> {
         self.engine.listening().link.compare()
@@ -512,6 +547,28 @@ impl Session {
         self.send_compare();
     }
 
+    /// The mix side's listening gain (dB; 0 = none). Kept within ±24 dB.
+    pub(crate) fn set_listening_mix_gain(&mut self, db: f32) {
+        let db = if db.is_finite() {
+            db.clamp(-24.0, 24.0)
+        } else {
+            0.0
+        };
+        if self.compare.mix_gain_db != db {
+            self.compare.mix_gain_db = db;
+            self.send_compare();
+        }
+    }
+
+    /// Hear the mix (not the other side), when something else is heard.
+    pub(crate) fn hear_the_mix(&mut self) {
+        if self.compare.hear {
+            self.compare.hear = false;
+            self.send_compare();
+            self.revision += 1;
+        }
+    }
+
     /// Compare with `what` from now on (a different thing: its source is
     /// prepared anew).
     pub(crate) fn compare_with(&mut self, what: Comparing) {
@@ -565,7 +622,9 @@ impl Session {
         }
         let shared = link.shared();
         shared.hear(self.compare.hear && self.compare.source.is_some());
+        // The listening gain, both sides.
         shared.set_gain(db_to_gain(self.compare.gain_db));
+        shared.set_mix_gain(db_to_gain(self.compare.mix_gain_db));
         link.collect();
     }
 

@@ -33,6 +33,11 @@ pub enum NodeRole {
     /// The driver sends its first event output to MIDI output `port` after
     /// the graph runs.
     EventOutput { port: u16 },
+    /// A sink heard with the outputs: its inputs are aligned with the
+    /// device outputs (and count towards the graph's output latency), but
+    /// the driver copies nothing anywhere — the node reads its own input
+    /// (an analysis render's capture taps).
+    Heard,
 }
 
 /// Port configuration and metadata of a node.

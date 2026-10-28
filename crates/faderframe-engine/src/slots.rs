@@ -138,9 +138,6 @@ pub struct SlotRegistry {
     chains: HashMap<(PluginInstanceId, usize), ChainSlots>,
     /// 1.0 while the mono check is on (listening only).
     monitor_mono: Option<ParamSlot>,
-    /// A gain (dB) on what the device plays of the master, for listening
-    /// only (loudness-matched comparisons); never in renders.
-    monitor_trim: Option<ParamSlot>,
     /// The console's channel drive (dB).
     console_drive: Option<ParamSlot>,
     /// The pan law and the downmix.
@@ -171,7 +168,6 @@ impl SlotRegistry {
             midi_mute: HashMap::new(),
             chains: HashMap::new(),
             monitor_mono: None,
-            monitor_trim: None,
             console_drive: None,
             mix: None,
             bass: None,
@@ -253,20 +249,6 @@ impl SlotRegistry {
                 .ok_or(SlotsExhausted("parameters"))?,
         );
         self.monitor_mono = Some(s);
-        Ok(s)
-    }
-
-    /// The monitor trim (dB; one for the session; see the field).
-    pub fn monitor_trim(&mut self) -> Result<ParamSlot, SlotsExhausted> {
-        if let Some(s) = self.monitor_trim {
-            return Ok(s);
-        }
-        let s = ParamSlot(
-            self.params
-                .allocate(1)
-                .ok_or(SlotsExhausted("parameters"))?,
-        );
-        self.monitor_trim = Some(s);
         Ok(s)
     }
 

@@ -2,8 +2,11 @@
 //! selected tracks; as mixed or before processing), the findings ranked by
 //! relevance on the left, the one selected on the right — what was
 //! measured (with units), how it is interpreted, the rule's limitations
-//! and the experiments to audition, compare loudness-matched and apply.
-//! Tracks get their roles here too.
+//! and the experiments to audition, compare loudness-matched and apply
+//! (or hand over: a reference heard A/B, EQ Match). Tracks get their roles
+//! here too. Health findings name their device; reference findings show
+//! the mix's difference to the reference per band; a finding whose tracks
+//! changed since the analysis is marked stale.
 //!
 //! The view keeps only what it shows (filters, sorting, scroll); the
 //! analysis, its results and the audition are the session's
@@ -12,9 +15,11 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_core::{TrackId, TrackRole};
+use faderframe_core::{PluginInstanceId, TrackId, TrackRole};
 use faderframe_mix_intelligence::bands::format_hz;
-use faderframe_mix_intelligence::{Category, Finding, Grade, SignalPoint, Subject};
+use faderframe_mix_intelligence::{
+    Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject,
+};
 use faderframe_project::Command;
 use faderframe_session::mix::{MixOp, MixResults, MixScope, MixStatus};
 use faderframe_session::{Action, Session};
@@ -50,6 +55,8 @@ pub enum Hit {
     Event(u64, usize),
     Audition(u64, usize),
     Apply(u64, usize),
+    /// A hand-off experiment (a reference heard A/B, EQ Match).
+    Open(u64, usize),
     Compare(bool),
     Match,
     Reject,
@@ -272,6 +279,22 @@ impl MixView {
         move |t| model.mix_track_name(t)
     }
 
+    fn device(model: &Session) -> impl Fn(PluginInstanceId) -> String + '_ {
+        move |d| model.mix_device_name(d)
+    }
+
+    /// A summary's subject as a row names it.
+    fn subject_label(model: &Session, s: Subject) -> String {
+        match s {
+            Subject::Track(t) => model.mix_track_name(t),
+            Subject::Master(_) => "Master (mix)".to_string(),
+            Subject::Pair { target, .. } => model.mix_track_name(target),
+            Subject::Tracks { a, b } => {
+                format!("{} × {}", model.mix_track_name(a), model.mix_track_name(b))
+            }
+        }
+    }
+
     fn span_text(model: &Session, r: &MixResults, a: f64, b: f64) -> String {
         let rate = f64::from(r.rate.max(1));
         let base = r.start_sample as f64 / rate;
@@ -343,7 +366,8 @@ impl MixView {
             Hit::Analyse(MixScope::Project),
             false,
             true,
-            "Render every track offline over the whole project and compare them",
+            "Render the whole mix once offline (every track, bus and return tapped where it \
+             reaches its destination) over the whole project and compare them",
         );
         x = self.button_at(
             p,
@@ -481,19 +505,44 @@ impl MixView {
             return;
         };
         let range = Self::span_text(model, res, 0.0, res.seconds());
-        let skipped = if res.skipped.is_empty() {
+        let mut skipped = if res.skipped.is_empty() {
             String::new()
         } else {
             format!(" · {} left out", res.skipped.len())
         };
+        // Renders of the mix (the analysis and the pairs' excerpts) and the
+        // small source renders beside them.
+        let renders = match res.renders + res.extra.excerpt_renders {
+            0 => "nothing rendered".to_string(),
+            1 => "one render".to_string(),
+            n => format!("{n} renders"),
+        };
+        let renders = match res.extra.sources_rendered {
+            0 => renders,
+            n => format!("{renders} + {n} source{}", if n == 1 { "" } else { "s" }),
+        };
+        let latency = res
+            .latency
+            .filter(|l| *l > 0)
+            .map(|l| format!(" · {l} frames of latency aligned"))
+            .unwrap_or_default();
+        let pairs = res.extra.pairs_measured + res.extra.pairs_reused;
+        if pairs > 0 {
+            skipped.push_str(&format!(
+                " · {pairs} pair{} compared",
+                if pairs == 1 { "" } else { "s" }
+            ));
+        }
         p.text(
             &format!(
-                "{} · {} · {} tracks{skipped} · {} rendered, {} reused · algorithm v{}",
+                "{} · {} · {} signals{skipped} · {} measured, {} reused · {renders}, {:.1} s{latency} · \
+                 algorithm v{}",
                 res.signal.label(),
                 range,
                 res.tracks.len(),
                 res.rendered,
                 res.reused,
+                res.elapsed,
                 res.algorithm
             ),
             text_rect,
@@ -521,6 +570,8 @@ impl MixView {
         for c in Category::ALL {
             let label = match c {
                 Category::Stereo => "Stereo",
+                Category::Health => "Health",
+                Category::Phase => "Phase",
                 _ => c.label(),
             };
             x = self.button_at(
@@ -602,6 +653,7 @@ impl MixView {
         }
         let selected = model.mix_selected_id();
         let name = Self::name(model);
+        let device = Self::device(model);
         for (i, f) in rows.iter().enumerate() {
             let r = Rect::new(
                 list.x,
@@ -613,6 +665,7 @@ impl MixView {
                 continue;
             }
             let dismissed = model.mix_dismissed(f.id);
+            let stale = model.mix_finding_stale(f.id);
             if selected == Some(f.id) {
                 p.fill(r, th.ui.selection.with_alpha(0.35));
             } else if self.hover == Some(Hit::Row(f.id)) {
@@ -623,7 +676,7 @@ impl MixView {
                 Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
                 self.grade_color(sev),
             );
-            let ink = if dismissed {
+            let ink = if dismissed || stale {
                 th.ui.text_faint
             } else {
                 th.ui.text
@@ -631,7 +684,7 @@ impl MixView {
             let tx = r.x + 12.0;
             let tw = r.w - 20.0;
             p.text(
-                &f.title(&name),
+                &f.title_named(&name, &device),
                 Rect::new(tx, r.y + 4.0, tw, LINE),
                 &TextStyle::new(th.fonts.small, ink).bold(),
             );
@@ -654,7 +707,7 @@ impl MixView {
             let n = f
                 .recommendations
                 .iter()
-                .filter(|r| r.experiment.previewable())
+                .filter(|r| r.experiment.previewable() || r.experiment.hand_off().is_some())
                 .count();
             let pattern = f
                 .pattern
@@ -667,7 +720,11 @@ impl MixView {
                     Grade::of_confidence(f.confidence).label(),
                     n,
                     if n == 1 { "" } else { "s" },
-                    if dismissed { " · dismissed" } else { "" }
+                    match (dismissed, stale) {
+                        (true, _) => " · dismissed",
+                        (_, true) => " · stale",
+                        _ => "",
+                    }
                 ),
                 Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
                 &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
@@ -683,11 +740,12 @@ impl MixView {
                 rect: r,
                 enabled: true,
                 label: format!(
-                    "{}, severity {}",
-                    f.title(&name),
-                    sev.label().to_lowercase()
+                    "{}, severity {}{}",
+                    f.title_named(&name, &device),
+                    sev.label().to_lowercase(),
+                    if stale { ", stale" } else { "" }
                 ),
-                tip: f.explanation(&name),
+                tip: f.explanation_named(&name, &device),
                 on: selected == Some(f.id),
             });
         }
@@ -815,6 +873,303 @@ impl MixView {
         );
     }
 
+    /// The mix against the reference, loudness-matched: their difference
+    /// per band (0 dB: as the reference), the finding's range highlighted.
+    fn paint_reference_chart(&self, p: &mut dyn Painter, r: Rect, f: &Finding, model: &Session) {
+        let th = &self.theme;
+        let Some(c) = model.mix_reference() else {
+            return;
+        };
+        p.fill(r, th.ui.surface_alt);
+        p.stroke_rounded(r, 3.0, 1.0, th.ui.border);
+        let (lo, hi) = (20f64, 20_000f64);
+        let x_of = |hz: f64| r.x + (r.w * ((hz / lo).ln() / (hi / lo).ln()) as f32).clamp(0.0, r.w);
+        let plot = Rect::new(r.x, r.y + 18.0, r.w, r.h - 32.0);
+        let span = 12.0;
+        let y_of =
+            |db: f64| plot.y + plot.h * (0.5 - (db.clamp(-span, span) / (2.0 * span)) as f32);
+        if let Some(fr) = f.frequency {
+            let (a, b) = (x_of(fr.lo), x_of(fr.hi));
+            p.fill(
+                Rect::new(a, plot.y, (b - a).max(1.0), plot.h),
+                th.ui.selection.with_alpha(0.3),
+            );
+        }
+        for hz in [100.0, 1000.0, 10_000.0] {
+            let x = x_of(hz);
+            p.vline(x, plot.y, plot.bottom(), th.ui.border.with_alpha(0.5));
+            p.text(
+                &format_hz(hz),
+                Rect::new(x + 2.0, plot.bottom(), 50.0, 14.0),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+            );
+        }
+        p.hline(
+            plot.x,
+            plot.right(),
+            y_of(0.0),
+            th.ui.text_faint.with_alpha(0.6),
+        );
+        let mut path = Path::new();
+        let mut started = false;
+        for (hz, d) in c.centres.iter().zip(&c.difference_db) {
+            let Some(d) = d else {
+                started = false;
+                continue;
+            };
+            let pt = Point::new(x_of(*hz), y_of(*d));
+            if started {
+                path.line_to(pt);
+            } else {
+                path.move_to(pt);
+                started = true;
+            }
+        }
+        p.stroke_path(&path, 1.5, th.ui.accent);
+        p.text(
+            "the mix minus the reference, loudness-matched",
+            Rect::new(r.x + 6.0, r.y + 2.0, r.w - 12.0, 14.0),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_dim),
+        );
+        p.text(
+            &format!("±{span:.0} dB · reference played at {:+.1} dB", c.match_db),
+            Rect::new(r.x, r.y + 2.0, r.w - 6.0, 14.0),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_faint).right(),
+        );
+    }
+
+    /// A chart of the newer rules ([`Chart`]): bands, time or offsets.
+    fn paint_detail_chart(&self, p: &mut dyn Painter, r: Rect, chart: &Chart, model: &Session) {
+        let th = &self.theme;
+        p.fill(r, th.ui.surface_alt);
+        p.stroke_rounded(r, 3.0, 1.0, th.ui.border);
+        let plot = Rect::new(r.x + 34.0, r.y + 18.0, (r.w - 40.0).max(10.0), r.h - 32.0);
+        let tiny = TextStyle::new(th.fonts.tiny, th.ui.text_faint);
+        let colors = [th.ui.accent, th.ui.text_dim, th.ui.text_faint];
+        let (series, caption, zero): (&[ChartSeries], &str, bool) = match chart {
+            Chart::Bands {
+                series,
+                caption,
+                zero,
+                ..
+            } => (series, caption, *zero),
+            Chart::Time {
+                series, caption, ..
+            } => (series, caption, false),
+            Chart::Offsets { caption, .. } => (&[], caption, true),
+        };
+        p.text(
+            caption,
+            Rect::new(r.x, r.y + 2.0, r.w - 6.0, 14.0),
+            &tiny.right(),
+        );
+        // The value range (a few units at least; 0 shown where asked).
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for v in series.iter().flat_map(|s| s.values.iter()) {
+            if v.is_finite() {
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+        }
+        if zero {
+            lo = lo.min(0.0);
+            hi = hi.max(0.0);
+        }
+        if let Chart::Offsets { values, .. } = chart {
+            let m = values.iter().fold(10.0f64, |m, v| m.max(v.abs()));
+            lo = -(m / 10.0).ceil() * 10.0;
+            hi = -lo;
+        }
+        if !(lo.is_finite() && hi.is_finite()) {
+            p.text(
+                "nothing measured to show",
+                plot,
+                &TextStyle::new(th.fonts.small, th.ui.text_faint).center(),
+            );
+            return;
+        }
+        // Shares and ratios (coherence) on their own 0 … 1 scale.
+        let unit_scale = matches!(
+            chart,
+            Chart::Bands {
+                unit: faderframe_mix_intelligence::Unit::Ratio
+                    | faderframe_mix_intelligence::Unit::Share,
+                ..
+            }
+        );
+        if unit_scale {
+            lo = lo.min(0.0);
+            hi = hi.max(1.0);
+        } else if hi - lo < 6.0 {
+            let mid = 0.5 * (hi + lo);
+            lo = mid - 3.0;
+            hi = mid + 3.0;
+        }
+        let pad = 0.05 * (hi - lo);
+        let (lo, hi) = (lo - pad, hi + pad);
+        let y_of = |v: f64| plot.y + (plot.h * ((hi - v) / (hi - lo)).clamp(0.0, 1.0) as f32);
+        let x_lin = |v: f64, a: f64, b: f64| {
+            plot.x + (plot.w * ((v - a) / (b - a).max(1e-9)).clamp(0.0, 1.0) as f32)
+        };
+        // Scale labels and the zero line.
+        if !matches!(chart, Chart::Offsets { .. }) {
+            for v in [hi - pad, lo + pad] {
+                p.text(
+                    &if unit_scale {
+                        format!("{v:.1}")
+                    } else {
+                        format!("{v:.0}")
+                    },
+                    Rect::new(r.x + 2.0, y_of(v) - 7.0, 30.0, 14.0),
+                    &tiny,
+                );
+            }
+        }
+        if zero && lo < 0.0 && hi > 0.0 && !matches!(chart, Chart::Offsets { .. }) {
+            p.hline(plot.x, plot.right(), y_of(0.0), th.ui.border);
+        }
+        let line = |p: &mut dyn Painter, pts: &mut dyn Iterator<Item = Option<Point>>, c: Color| {
+            let mut path = Path::new();
+            let mut started = false;
+            for pt in pts {
+                match pt {
+                    Some(pt) if started => {
+                        path.line_to(pt);
+                    }
+                    Some(pt) => {
+                        path.move_to(pt);
+                        started = true;
+                    }
+                    None => started = false,
+                }
+            }
+            p.stroke_path(&path, 1.5, c);
+        };
+        match chart {
+            Chart::Bands {
+                centres, highlight, ..
+            } => {
+                let (flo, fhi) = (20f64, 20_000f64);
+                let x_of = |hz: f64| {
+                    plot.x
+                        + (plot.w * ((hz / flo).ln() / (fhi / flo).ln()) as f32).clamp(0.0, plot.w)
+                };
+                if let Some((a, b)) = *highlight {
+                    let edge = |i: usize, up: bool| {
+                        centres.get(i).copied().unwrap_or(flo)
+                            * 2f64.powf(if up { 1.0 / 6.0 } else { -1.0 / 6.0 })
+                    };
+                    let (ha, hb) = (x_of(edge(a, false)), x_of(edge(b, true)));
+                    p.fill(
+                        Rect::new(ha, plot.y, (hb - ha).max(1.0), plot.h),
+                        th.ui.selection.with_alpha(0.3),
+                    );
+                }
+                for hz in [100.0, 1000.0, 10_000.0] {
+                    let x = x_of(hz);
+                    p.vline(x, plot.y, plot.bottom(), th.ui.border.with_alpha(0.5));
+                    p.text(
+                        &format_hz(hz),
+                        Rect::new(x + 2.0, plot.bottom(), 50.0, 14.0),
+                        &tiny,
+                    );
+                }
+                for (s, c) in series.iter().zip(colors) {
+                    line(
+                        p,
+                        &mut centres
+                            .iter()
+                            .zip(&s.values)
+                            .map(|(hz, v)| v.is_finite().then(|| Point::new(x_of(*hz), y_of(*v)))),
+                        c,
+                    );
+                }
+            }
+            Chart::Time {
+                start,
+                step,
+                highlight,
+                ..
+            } => {
+                let n = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
+                let end = start + step * n.saturating_sub(1).max(1) as f64;
+                for h in highlight {
+                    let (a, b) = (x_lin(h.start, *start, end), x_lin(h.end, *start, end));
+                    p.fill(
+                        Rect::new(a, plot.y, (b - a).max(1.0), plot.h),
+                        th.ui.selection.with_alpha(0.3),
+                    );
+                }
+                if let Some(res) = model.mix_results() {
+                    let base = res.start_sample as f64 / f64::from(res.rate.max(1));
+                    for (t, align) in [(*start, false), (end, true)] {
+                        let style = if align { tiny.right() } else { tiny };
+                        let x = x_lin(t, *start, end);
+                        p.text(
+                            &mmss(base + t),
+                            Rect::new(if align { x - 60.0 } else { x }, plot.bottom(), 60.0, 14.0),
+                            &style,
+                        );
+                    }
+                }
+                for (s, c) in series.iter().zip(colors) {
+                    line(
+                        p,
+                        &mut s.values.iter().enumerate().map(|(i, v)| {
+                            v.is_finite().then(|| {
+                                Point::new(x_lin(start + step * i as f64, *start, end), y_of(*v))
+                            })
+                        }),
+                        c,
+                    );
+                }
+            }
+            Chart::Offsets { values, median, .. } => {
+                let x0 = x_lin(0.0, lo, hi);
+                p.vline(x0, plot.y, plot.bottom(), th.ui.border);
+                for (v, label) in [(lo + pad, true), (hi - pad, true)] {
+                    if label {
+                        p.text(
+                            &format!("{v:+.0} ms"),
+                            Rect::new(x_lin(v, lo, hi) - 24.0, plot.bottom(), 48.0, 14.0),
+                            &tiny.center(),
+                        );
+                    }
+                }
+                let rows = values.len().max(1) as f32;
+                for (i, v) in values.iter().enumerate() {
+                    let y = plot.y + plot.h * ((i as f32 + 0.5) / rows);
+                    p.fill(
+                        Rect::new(x_lin(*v, lo, hi) - 2.0, y - 2.0, 4.0, 4.0),
+                        th.ui.text_dim,
+                    );
+                }
+                if let Some(m) = median {
+                    let x = x_lin(*m, lo, hi);
+                    p.vline(x, plot.y, plot.bottom(), th.ui.accent);
+                    p.text(
+                        &format!("median {m:+.1} ms"),
+                        Rect::new(r.x + 6.0, r.y + 2.0, 160.0, 14.0),
+                        &TextStyle::new(th.fonts.tiny, th.ui.accent),
+                    );
+                }
+            }
+        }
+        // The legend.
+        let mut lx = r.x + 6.0;
+        for (s, c) in series.iter().zip(colors) {
+            let label = match s.track {
+                Some(t) => format!("{} {}", model.mix_track_name(t), s.label.to_lowercase()),
+                None => s.label.clone(),
+            };
+            let style = TextStyle::new(th.fonts.tiny, th.ui.text_dim);
+            p.fill(Rect::new(lx, r.y + 7.0, 10.0, 3.0), c);
+            p.text(&label, Rect::new(lx + 14.0, r.y + 2.0, 220.0, 14.0), &style);
+            lx += 24.0 + p.text_width(&label, &style);
+        }
+    }
+
     fn paint_details(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
         let th = self.theme.clone();
         p.fill(rect, th.ui.background);
@@ -825,10 +1180,14 @@ impl MixView {
                 "Select a finding to see what was measured, how it is read and what could be \
                  tried."
             } else {
-                "Mix Intelligence renders each track offline (as mixed, or before processing), \
+                "Mix Intelligence renders the mix offline once (as mixed: every track, bus and \
+                 return where it reaches its destination; or each track before processing), \
                  measures it in third-octave bands over time and compares the tracks with \
                  explicit rules: where one may mask another, levels and peaks, how the mix \
-                 folds to mono. Every finding shows its measurements and the rule's limits; \
+                 folds to mono, phase and timing between related tracks, width by frequency, \
+                 dynamics, technical health (DC, overs and clipping between devices, devices \
+                 that change nothing) and, with a reference track, how the mix differs from \
+                 it. Every finding shows its measurements and the rule's limits; \
                  experiments are auditioned in the engine and applied only when you say so, \
                  as one undo step."
             };
@@ -845,12 +1204,33 @@ impl MixView {
             return;
         };
         let name = Self::name(model);
+        let device = Self::device(model);
         let res = model.mix_results();
         let (x, w) = (rect.x + PAD, (rect.w - 2.0 * PAD).max(40.0));
         p.push_clip(rect);
         self.visible = Some(rect);
         let mut y = rect.y + PAD - self.detail_scroll;
-        y = self.para(p, x, y, w, &f.title(&name), th.fonts.normal, th.ui.text);
+        y = self.para(
+            p,
+            x,
+            y,
+            w,
+            &f.title_named(&name, &device),
+            th.fonts.normal,
+            th.ui.text,
+        );
+        if model.mix_finding_stale(f.id) {
+            y = self.para(
+                p,
+                x,
+                y,
+                w,
+                "Stale: a track it is about changed after the analysis. Analyse again before \
+                 trying its experiments.",
+                th.fonts.small,
+                th.ui.accent,
+            );
+        }
         p.text(
             &format!(
                 "{} · rule “{}” v{} · {}",
@@ -902,7 +1282,7 @@ impl MixView {
                 &TextStyle::new(th.fonts.small, th.ui.text_dim),
             );
             p.text(
-                &e.value_text(),
+                &e.value_named(&device),
                 Rect::new(x + label_w, y, w - label_w, LINE),
                 &TextStyle::new(th.fonts.small, th.ui.text),
             );
@@ -962,6 +1342,13 @@ impl MixView {
         if f.spectrum.is_some() {
             self.paint_chart(p, Rect::new(x, y + 4.0, w, CHART_H), &f, model);
             y += CHART_H + 10.0;
+        } else if f.category() == Category::Reference && model.mix_reference().is_some() {
+            self.paint_reference_chart(p, Rect::new(x, y + 4.0, w, CHART_H), &f, model);
+            y += CHART_H + 10.0;
+        }
+        if let Some(chart) = res.and_then(|r| r.report.details.chart(f.id)) {
+            self.paint_detail_chart(p, Rect::new(x, y + 4.0, w, CHART_H), chart, model);
+            y += CHART_H + 10.0;
         }
         // Interpretation.
         y = self.heading(p, x, y, w, "Interpretation");
@@ -970,7 +1357,7 @@ impl MixView {
             x,
             y,
             w,
-            &f.explanation(&name),
+            &f.explanation_named(&name, &device),
             th.fonts.small,
             th.ui.text,
         );
@@ -1052,7 +1439,7 @@ impl MixView {
                 x + 8.0,
                 y + 4.0,
                 w - 16.0,
-                &r.experiment.title(&name),
+                &r.experiment.title_named(&name, &device),
                 th.fonts.small,
                 th.ui.text,
             );
@@ -1137,7 +1524,7 @@ impl MixView {
                 }
                 if here && let Some(a) = &audition {
                     let mut ax = x + 8.0;
-                    ax = self.button_at(p, ax, y, 22.0, "A: Original", Hit::Compare(false), !a.candidate, true, "Hear the project without the experiment (its EQ band bypassed, or the fader as it was)");
+                    ax = self.button_at(p, ax, y, 22.0, "A: Original", Hit::Compare(false), !a.candidate, true, "Hear the project without the experiment (its EQ band bypassed, or the fader, delay and polarity as they were)");
                     ax = self.button_at(
                         p,
                         ax,
@@ -1149,7 +1536,7 @@ impl MixView {
                         true,
                         "Hear the experiment",
                     );
-                    ax = self.button_at(p, ax, y, 22.0, "Loudness matched", Hit::Match, a.matching, true, "Play the candidate at the original's loudness (a gain on the monitor only, never in the project)");
+                    ax = self.button_at(p, ax, y, 22.0, "Loudness matched", Hit::Match, a.matching, true, "Play the candidate at the original's loudness (the listening gain on the mix: the monitor only, never in the project)");
                     let _ = self.button_at(
                         p,
                         ax,
@@ -1171,14 +1558,14 @@ impl MixView {
                                 .unwrap_or_default();
                             let played = if a.matching && a.candidate {
                                 format!(
-                                    " Played {:+.1} dB on the monitor to match (the project is not changed).",
+                                    " Fairness gain: the listening gain plays it {:+.1} dB on the monitor to match (heard only; the project is not changed).",
                                     a.trim_db
                                 )
                             } else {
-                                " Played at its own level.".to_string()
+                                " Played at its own level (no listening gain).".to_string()
                             };
                             format!(
-                                "The candidate measures {:+.1} LU against the original (BS.1770 integrated, master, {:.1} s{band}).{played}",
+                                "Real level change: the candidate measures {:+.1} LU against the original (BS.1770 integrated, master, {:.1} s{band}).{played}",
                                 m.change(),
                                 m.seconds
                             )
@@ -1196,6 +1583,21 @@ impl MixView {
                         th.ui.text_dim,
                     );
                 }
+            } else if let Some(what) = r.experiment.hand_off() {
+                y += 4.0;
+                let _ = self.button_at(
+                    p,
+                    x + 8.0,
+                    y,
+                    22.0,
+                    what,
+                    Hit::Open(f.id, i),
+                    false,
+                    true,
+                    "Hand over to the reference comparison or EQ Match: nothing is applied by \
+                     Mix Intelligence",
+                );
+                y += 28.0;
             } else {
                 y = self.para(
                     p,
@@ -1326,11 +1728,7 @@ impl MixView {
             }
         };
         for sm in &r.report.summaries {
-            let label = match sm.subject {
-                Subject::Track(t) => model.mix_track_name(t),
-                Subject::Master(_) => "Master (mix)".to_string(),
-                Subject::Pair { target, .. } => model.mix_track_name(target),
-            };
+            let label = Self::subject_label(model, sm.subject);
             let silent = !sm.sample_peak.is_finite();
             let style = TextStyle::new(
                 th.fonts.small,
@@ -1392,6 +1790,9 @@ impl MixView {
                 y += LINE;
             }
         }
+        y = self.paint_dynamics_table(p, x, y, w, name_w, r, model);
+        y = self.paint_width_tables(p, x, y, w, name_w, r, model);
+        y = self.paint_pairs(p, x, y, w, r, model);
         if !r.skipped.is_empty() {
             y = self.heading(p, x, y, w, "Left out");
             for (t, why) in &r.skipped {
@@ -1412,6 +1813,258 @@ impl MixView {
         self.detail_scroll = self
             .detail_scroll
             .clamp(0.0, (self.detail_content - rect.h).max(0.0));
+    }
+
+    /// A table's header row; returns the next y.
+    fn table_head(
+        &self,
+        p: &mut dyn Painter,
+        (x, y, w, name_w): (f32, f32, f32, f32),
+        columns: &[&str],
+    ) -> f32 {
+        let th = &self.theme;
+        let col = (w - name_w) / columns.len().max(1) as f32;
+        let head = TextStyle::new(th.fonts.tiny, th.ui.text_faint).right();
+        for (i, c) in columns.iter().enumerate() {
+            p.text(
+                c,
+                Rect::new(x + name_w + i as f32 * col, y, col - 4.0, LINE),
+                &head,
+            );
+        }
+        p.hline(x, x + w, y + LINE, th.ui.border);
+        y + LINE
+    }
+
+    /// A table's row of cells; returns the next y.
+    fn table_row(
+        &self,
+        p: &mut dyn Painter,
+        (x, y, w, name_w): (f32, f32, f32, f32),
+        label: &str,
+        cells: &[String],
+    ) -> f32 {
+        let th = &self.theme;
+        let col = (w - name_w) / cells.len().max(1) as f32;
+        let style = TextStyle::new(th.fonts.small, th.ui.text);
+        p.text(label, Rect::new(x, y + 2.0, name_w, LINE), &style);
+        for (i, c) in cells.iter().enumerate() {
+            p.text(
+                c,
+                Rect::new(x + name_w + i as f32 * col, y + 2.0, col - 4.0, LINE),
+                &style.right(),
+            );
+        }
+        y + LINE + 4.0
+    }
+
+    /// Every subject's dynamics indicators (defined in the text above
+    /// them).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_dynamics_table(
+        &self,
+        p: &mut dyn Painter,
+        x: f32,
+        y: f32,
+        w: f32,
+        name_w: f32,
+        r: &MixResults,
+        model: &Session,
+    ) -> f32 {
+        let th = self.theme.clone();
+        let d = &r.report.details.dynamics;
+        if d.is_empty() {
+            return y;
+        }
+        let mut y = self.heading(p, x, y, w, "Dynamics");
+        y = self.para(
+            p,
+            x,
+            y,
+            w,
+            "Crest = sample peak − RMS; PLR = true peak − integrated loudness; LRA = EBU Tech \
+             3342 loudness range; ST = gated short-term loudness at its 10th, 50th and 95th \
+             percentiles (LUFS); TSR = transient-to-sustain, the median over envelope events of \
+             the peak within 30 ms over the RMS 60–200 ms later; Δ TSR = processed − source at \
+             the source's events. Descriptions, not ratings.",
+            th.fonts.tiny,
+            th.ui.text_faint,
+        );
+        let at = (x, y, w, name_w);
+        y = self.table_head(
+            p,
+            at,
+            &[
+                "Crest", "PLR", "LRA", "ST 10%", "ST 50%", "ST 95%", "TSR", "Δ TSR",
+            ],
+        );
+        let n = |v: Option<f64>| {
+            v.filter(|v| v.is_finite())
+                .map_or("—".into(), |v| format!("{v:.1}"))
+        };
+        for s in d {
+            let dy = &s.dynamics;
+            let st = |i: usize| dy.short_term.map(|q| q[i]);
+            let cells = [
+                n(dy.crest_db),
+                n(dy.plr_db),
+                n(dy.lra_lu),
+                n(st(0)),
+                n(st(1)),
+                n(st(2)),
+                n(dy.tsr_db),
+                n(s.flattening.map(|f| f.tsr_change_db)),
+            ];
+            y = self.table_row(
+                p,
+                (x, y, w, name_w),
+                &Self::subject_label(model, s.subject),
+                &cells,
+            );
+        }
+        y
+    }
+
+    /// Width and mono change by broad region for every stereo subject.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_width_tables(
+        &self,
+        p: &mut dyn Painter,
+        x: f32,
+        y: f32,
+        w: f32,
+        name_w: f32,
+        r: &MixResults,
+        model: &Session,
+    ) -> f32 {
+        use faderframe_mix_intelligence::bands::BROAD_NAMES;
+        let th = self.theme.clone();
+        let ws = &r.report.details.width;
+        if ws.is_empty() {
+            return y;
+        }
+        let n = |v: f64| {
+            if v.is_finite() {
+                format!("{v:.1}")
+            } else {
+                "—".into()
+            }
+        };
+        let mut y = y;
+        for (title, text, pick) in [
+            (
+                "Stereo width by region (side − mid, dB)",
+                "Very negative: centred; 0: as wide as it is centred (uncorrelated, or one \
+                 side); above 0: more side than mid. Low correlation alone is not a fault.",
+                0usize,
+            ),
+            (
+                "Mono fold-down change by region (dB)",
+                "The mono fold-down's power against the channels' mean: 0 centred, −3 one side \
+                 or uncorrelated, lower where left and right cancel.",
+                1usize,
+            ),
+        ] {
+            y = self.heading(p, x, y, w, title);
+            y = self.para(p, x, y, w, text, th.fonts.tiny, th.ui.text_faint);
+            y = self.table_head(p, (x, y, w, name_w), &BROAD_NAMES);
+            for s in ws {
+                let v = if pick == 0 {
+                    &s.broad_width_db
+                } else {
+                    &s.broad_mono_db
+                };
+                let cells: Vec<String> = v.iter().map(|x| n(*x)).collect();
+                y = self.table_row(
+                    p,
+                    (x, y, w, name_w),
+                    &Self::subject_label(model, s.subject),
+                    &cells,
+                );
+            }
+        }
+        y
+    }
+
+    /// The pairs compared for phase and timing (with or without a
+    /// finding), and those left out.
+    fn paint_pairs(
+        &self,
+        p: &mut dyn Painter,
+        x: f32,
+        y: f32,
+        w: f32,
+        r: &MixResults,
+        model: &Session,
+    ) -> f32 {
+        let th = self.theme.clone();
+        let d = &r.report.details;
+        if d.pairs.is_empty() && d.skipped_pairs.is_empty() {
+            return y;
+        }
+        let mut y = self.heading(p, x, y, w, "Pairs compared (phase and timing)");
+        let name = |t: TrackId| model.mix_track_name(t);
+        let db = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:+.1} dB"));
+        for s in &d.pairs {
+            let lag = match s.lag {
+                Some(l) if l.related => format!(
+                    "{} {:+.3} ms{} (confidence {:.2}, clarity {:.2})",
+                    name(s.b),
+                    l.ms,
+                    if l.inverted { ", inverted" } else { "" },
+                    l.confidence,
+                    l.clarity
+                ),
+                Some(_) => "no common signal found".into(),
+                None => "nothing to compare".into(),
+            };
+            let onsets = match (s.onset_median_ms, s.onset_spread_ms) {
+                (Some(m), Some(sp)) if s.onsets_paired > 0 => format!(
+                    "; {} onsets paired, median {m:+.1} ms, spread {sp:.1} ms",
+                    s.onsets_paired
+                ),
+                _ => String::new(),
+            };
+            let why: Vec<&str> = s.reasons.iter().map(|r| r.label()).collect();
+            y = self.para(
+                p,
+                x,
+                y,
+                w,
+                &format!("{} × {} — {}", name(s.a), name(s.b), why.join(", ")),
+                th.fonts.small,
+                th.ui.text,
+            );
+            y = self.para(
+                p,
+                x + 10.0,
+                y,
+                w - 10.0,
+                &format!(
+                    "{lag}; sum against energies {} now, {} corrected, {} in mono; coherence \
+                     {}; {:.1} s together{onsets}",
+                    db(s.sum_db),
+                    db(s.corrected_db),
+                    db(s.mono_db),
+                    s.coherence.map_or("—".into(), |c| format!("{c:.2}")),
+                    s.together,
+                ),
+                th.fonts.tiny,
+                th.ui.text_dim,
+            );
+        }
+        for (a, b, why) in &d.skipped_pairs {
+            y = self.para(
+                p,
+                x,
+                y,
+                w,
+                &format!("{} × {}: not compared — {why}", name(*a), name(*b)),
+                th.fonts.small,
+                th.ui.text_faint,
+            );
+        }
+        y
     }
 
     fn role_menu(track: TrackId, now: Option<TrackRole>) -> Vec<MenuItem<Action>> {
@@ -1497,6 +2150,10 @@ impl MixView {
                 }));
             }
             Hit::Apply(finding, recommendation) => cx.emit(Action::Mix(MixOp::Apply {
+                finding,
+                recommendation,
+            })),
+            Hit::Open(finding, recommendation) => cx.emit(Action::Mix(MixOp::Open {
                 finding,
                 recommendation,
             })),
@@ -1660,6 +2317,10 @@ impl CanvasView<Session, Action> for MixView {
                     recommendation,
                 })),
                 Hit::Apply(finding, recommendation) => Some(Action::Mix(MixOp::Apply {
+                    finding,
+                    recommendation,
+                })),
+                Hit::Open(finding, recommendation) => Some(Action::Mix(MixOp::Open {
                     finding,
                     recommendation,
                 })),

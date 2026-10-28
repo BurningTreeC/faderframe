@@ -6289,16 +6289,17 @@ DAW does well yet):
       mix as it was some steps ago can play beside the mix as it is (A/B)
       without undoing anything.
 16. **Pro features no DAW does well yet**:
-    - ~~*Auto-align*~~ — done (see *Track delay and Auto-Align*; the
-      health check is open): delay and polarity between overheads, close and room
-      microphones by cross-correlation, set in one undo step; and a
-      project health check (phase, DC offset, clipping inside chains,
-      unused plugins costing DSP).
+    - ~~*Auto-align*~~ — done (see *Track delay and Auto-Align*): delay
+      and polarity between overheads, close and room microphones by
+      cross-correlation, set in one undo step; ~~a project health check
+      (phase, DC offset, clipping inside chains, unused plugins costing
+      DSP)~~ — done in Mix Intelligence (Health and Phase findings).
     - ~~*Reference tracks*~~ — done (see *A/B listening*): a loudness-matched A/B player in the monitor
       path, its spectral balance compared and handed to EQ Match.
     - ~~*A masking map*~~ — done (see *Mix Intelligence*): every pair of
       tracks compared in time and frequency, with auditionable cuts; with
-      level and mono diagnostics, the start of the health check.
+      level, mono, phase, width, dynamics, reference and health
+      diagnostics.
     - ~~*Spectral editing*~~ — done (see Spectral editing): a
       spectrogram to paint noises away in.
     - *Mix scenes*: console snapshots recalled, compared and crossfaded.
@@ -6318,10 +6319,9 @@ DAW does well yet):
     toolbar: they only name themselves so far); merging project versions
     (three-way, from `faderframe_project::compare`) for collaborators.
 
-Suggested next: Mix Intelligence's phase/timing rule and the rest of the
-health check (DC offset, clipping inside chains, unused plugins costing
-DSP), then mix scenes — 11, the auto-align, reference tracks and the
-masking map, the earlier suggestions, are done.
+Suggested next: mix scenes, then adaptive music for games — 11, the
+auto-align, reference tracks, the masking map and the health check, the
+earlier suggestions, are done.
 
 
 ### Guitar Station
@@ -7381,30 +7381,93 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   fold-down loss against the sum without cancellation (`(√L+√R)²/4`: a
   panned source loses nothing, uncorrelated channels 3 dB), an inverted
   channel.
-* `faderframe_session::mix` renders what is analysed offline on a thread
-  of its own: *processed* — each track solo in place through the whole mix
-  (its devices, automation, sidechains, fader, sends, buses and the master
-  chain), and the master; *source* — each track's clips before any device.
-  Renders take the graph's latency off the front, so every signal shares
-  the range's time reference (no second delay compensation). Profiles are
-  cached (LRU, 256 MB) by track, signal, range, rate, settings and a
-  fingerprint of the project without presentation; a superseded or
-  replaced job's results are dropped, and results whose project changed
-  show as stale with their experiments refused. Experiments are auditioned
+* `faderframe_session::mix` analyses on a thread of its own. *Processed*
+  analyses render the whole mix **once** (`faderframe_engine::capture`):
+  a tap on every track, bus and return analysed hears it where it reaches
+  its destination — taps are `NodeRole::Heard` sinks, so the compiler
+  aligns them with the device outputs and the render takes the graph's
+  latency off the front of all of them alike (no second delay
+  compensation); bus and master dynamics react to the whole mix. A probe
+  after every device compares its output with its input (aligned by the
+  graph), and the engine's node timing gives each device's cost; the
+  master is the device output. Profiles are built beside the render on at
+  most 8 threads (`mix::measure`, bounded chunks). *Source* analyses render
+  each track's clips before any device, side by side. Fingerprints are per
+  track (`mix::fingerprint`: the upstream closure — what is routed, sent,
+  keyed or modulated into it — plus the global settings; nothing downstream
+  changes a tap), so an edit re-measures what it reaches and makes stale
+  only the findings about those tracks (`Session::mix_finding_stale`); a
+  superseded or replaced job's results are dropped. Measured on the demo
+  (release): 20.1 s before, 2.6 s now (7.7×); the demo with every track
+  four times: 54.4 s before, 3.6 s now (15×); analysed again unchanged:
+  0.13 s. The first stage's findings show while the second runs
+  (`MixResults::complete`). Experiments are auditioned
   by applying them unrecorded with their inverses kept (a built-in EQ
   appended to the masker — keyed from the target for a dynamic cut — or a
   fader): A/B by the band's bypass or the fader's two values, loudness
-  matched by an offline BS.1770 measurement and the listening-only
-  `EngineController::set_monitor_trim` (the real level change shown beside
-  it). Anything that edits, undoes, saves or renders takes the candidate
+  matched by an offline BS.1770 measurement and the mix side of the one
+  listening gain (`EngineController::set_listening_gain`,
+  `Session::listening_gain`; the real level change and the fairness gain
+  shown apart). Anything that edits, undoes, saves or renders takes the candidate
   out first; Apply is one undo step ("Mix Intelligence: …").
 * `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
   ranked findings (filtered, sorted), each one's measurements (clickable
   events: the tracks selected and the range shown), a band chart,
   interpretation, method, limitations and experiments; levels; roles.
 
-Next: a phase/timing rule on the pairs a finding names through Auto-Align's
-estimator (and its per-track delay as the experiment), the audition on the
-A/B compare source (one listening gain instead of two), reference-track
-comparisons from the reference profiles, a one-pass multi-tap render
-instead of one render per track.
+**Phase, timing, width, dynamics, same audio** (a second stage,
+`session::mix::extra`, for what needs more than one profile per track):
+
+* *Pairs* (`phase::candidates`): the selection, roles that share a source
+  (kit tracks against the loudest "Drums" track, same-role groups against
+  their loudest), same-audio pairs, kick and bass, masking pairs, pairs
+  whose levels rise and fall together — at most 12, never a track against
+  a bus it reaches; their excerpts (up to 12 s, the busiest stretch both
+  play in) tapped in one render. `phase::measure_pair`: Auto-Align's lag
+  and polarity, per band coherence, phase and the residual phase, the sum
+  against the energies (now, corrected, flipped, in mono, onset-aligned),
+  onset pairing. Rules `PolarityInverted` (a clear peak), `TimeOffset`
+  (comb filtering from 0.05 to 15 ms; longer offsets are musical — no
+  delay suggested), `FrequencyDependentPhase` (cancellation the correction
+  leaves; a manual all-pass suggestion), `OnsetOffset`/`LooseTiming`;
+  `Experiment::Alignment` sets the track's delay and polarity (the bass
+  moves first; leads and the kit's reference keep their place).
+* *Width* (`width`): side against mid and the mono change per band and
+  region; `WideLowEnd`, `MonoBalanceShift` (naming the side-signal
+  contributors); low correlation is never a fault in itself.
+* *Dynamics* (`dynamics`): profiles carry a 5 ms envelope and BS.1770
+  momentary/short-term loudness every 100 ms; crest, PLR, LRA, short-term
+  percentiles, transient-to-sustain, attack rise; `TransientFlattening`
+  ("possible": the processed track against its source), `WideLoudnessRange`
+  and `LevelJump` judged against the mix.
+* *Same audio* (`same`): copies of one source — panned, at another gain,
+  through an EQ, a little later, a stereo recording split in two, one
+  source processed two ways — are not masking. Profiles keep complex band
+  sums per frame of the mono fold-down and, stereo, of each channel;
+  per-band coherence in 4 s windows (delays up to 1 ms allowed); a window
+  is the same audio when the fold-downs reach the threshold (≥ 0.85
+  weighted and plain over at least 2 bands) or left against left and right
+  against right do (copies panned apart through a wide source, a stereo
+  chorus: their fold-downs differ, their channels do not); windows with
+  too little to judge (a fade, a clip's ends) take the verdict of the
+  nearest judged one. Those frames are left out of the masking rule
+  (`conflicts_except`) and reported as `SameAudio` (the copies' level, their
+  mono sum: +6 dB for equal copies in phase). Two performances of a part
+  are different audio and still judged.
+
+**Health** (`health`): DC offset per track, bus or master (the Utility's
+DC filter); overs and flattened peaks between devices (gain staging around
+the device); the first device producing invalid samples; a device that
+silences its input; a device that changes nothing, with its measured cost
+(bypass it); bypassed devices. **Reference** (`reference`): against a
+reference track (`Project::references`), loudness-matched — loudness,
+spectral differences, section balance, stereo and mono — handed to A/B
+listening and EQ Match; a comparison target, never a standard.
+
+`ALGORITHM_VERSION` 5. Limits: same audio misses copies more than about
+1 ms apart or through nonlinear or time-varying processing; pair excerpts
+start 1 s early (longer tails and a compressor's earlier state are
+missing); a surround tap is measured on its first two channels; device
+cost is timed offline (a guide); the master depends on everything, so any
+audio change renders the mix once more (cached measurement work is what is
+saved).

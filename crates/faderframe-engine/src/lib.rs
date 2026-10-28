@@ -20,6 +20,7 @@
 
 pub mod ahead;
 mod build;
+pub mod capture;
 mod click;
 mod context;
 mod engine;

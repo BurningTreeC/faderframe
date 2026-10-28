@@ -311,3 +311,257 @@ fn places_scrolled_out_of_view_cannot_be_clicked() {
     let r = view.rect_of(Hit::Audition(f, 0)).unwrap();
     assert!(r.y >= HEADER_H + STATUS_H, "under the header: {r:?}");
 }
+
+#[test]
+fn health_findings_name_their_device_and_references_hand_over() {
+    use faderframe_project::PluginRef;
+    use faderframe_session::references::ReferenceOp;
+    let (mut s, vocal, _) = session();
+    // A Utility at rest on the vocal: it changes nothing.
+    s.dispatch(Action::InsertPlugin {
+        track: vocal,
+        index: 0,
+        plugin: PluginRef::builtin(faderframe_core::builtin::GAIN, "Utility"),
+    })
+    .unwrap();
+    let utility = s.project().track(vocal).unwrap().inserts[0].id;
+    // A reference: a louder record of a tone.
+    let dir = std::env::temp_dir().join(format!("ff-view-mix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("Record.wav");
+    let n = 6 * SR as usize;
+    let x: Vec<f32> = (0..n)
+        .map(|i| (0.8 * (std::f64::consts::TAU * 80.0 * i as f64 / f64::from(SR)).sin()) as f32)
+        .collect();
+    faderframe_audio_files::write_wav(
+        &file,
+        &[x.clone(), x],
+        SR,
+        faderframe_audio_files::WavFormat::Float32,
+        false,
+    )
+    .unwrap();
+    s.dispatch(Action::Reference(ReferenceOp::Add(vec![file])))
+        .unwrap();
+    assert!(s.wait_for_compare(std::time::Duration::from_secs(300)));
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let mut view = MixView::new(Theme::default());
+    // The health check: the device by its name, in the list and details.
+    let health = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.rule == faderframe_mix_intelligence::RuleId::DeviceNoChange)
+        .unwrap()
+        .clone();
+    assert_eq!(health.device(), Some(utility));
+    s.dispatch(Action::Mix(MixOp::Select(Some(health.id))))
+        .unwrap();
+    paint(&mut view, &s);
+    let _ = click(&mut view, &s, Hit::Category(Some(Category::Health)));
+    let p = paint(&mut view, &s);
+    let texts = p.texts();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Utility on Vocal changes nothing")),
+        "{texts:?}"
+    );
+    assert!(texts.contains(&"Utility"), "the device evidence by name");
+    // A reference finding: its hand-offs are buttons asking the session.
+    let reference = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.category() == Category::Reference)
+        .unwrap()
+        .clone();
+    s.dispatch(Action::Mix(MixOp::Select(Some(reference.id))))
+        .unwrap();
+    let _ = click(&mut view, &s, Hit::Category(Some(Category::Reference)));
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"Listen A/B"), "{:?}", p.texts());
+    let i = reference
+        .recommendations
+        .iter()
+        .position(|r| r.experiment.hand_off().is_some())
+        .unwrap();
+    let (a, _) = click(&mut view, &s, Hit::Open(reference.id, i));
+    assert_eq!(
+        a,
+        [Action::Mix(MixOp::Open {
+            finding: reference.id,
+            recommendation: i
+        })]
+    );
+    // The vocal's device changes: its findings are marked stale.
+    s.dispatch(Action::Edit(Command::SetPluginBypass {
+        track: vocal,
+        plugin: utility,
+        bypass: true,
+    }))
+    .unwrap();
+    s.tick(0.016);
+    s.dispatch(Action::Mix(MixOp::Select(Some(health.id))))
+        .unwrap();
+    let _ = click(&mut view, &s, Hit::Category(Some(Category::Health)));
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().iter().any(|t| t.starts_with("Stale:")),
+        "{:?}",
+        p.texts()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two microphones on one snare, the bottom one inverted and 3 dB down.
+fn snares() -> (Session, TrackId, TrackId) {
+    let mut p = Project::new("Phase", SR);
+    let mut add = |name: &str| -> TrackId {
+        let src = p.ids.allocate();
+        p.sources.insert(
+            src,
+            AudioSource {
+                id: src,
+                name: name.into(),
+                spec: SourceSpec::Generated {
+                    generator: GeneratorSpec::DrumLoop {
+                        bpm: 120.0,
+                        bars: 4,
+                        seed: 9,
+                    },
+                },
+            },
+        );
+        let id: TrackId = p.ids.allocate();
+        let mut t = Track::new(id, TrackKind::Audio, name, TrackColor::palette(3))
+            .with_layout(faderframe_core::ChannelLayout::Stereo);
+        t.role = Some(TrackRole::Snare);
+        let clip = Clip {
+            id: p.ids.allocate(),
+            track: id,
+            name: name.into(),
+            color: None,
+            start: faderframe_timeline::MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Audio(AudioClip {
+                source: src,
+                source_offset: 0,
+                length: 8 * i64::from(SR),
+                gain_db: -6.0,
+                fades: ClipFades::default(),
+                stretch: StretchSettings::Off,
+                reversed: false,
+                warp: None,
+                pitch: None,
+                effects: None,
+                spectral: None,
+            }),
+        };
+        t.clips.push(clip.id);
+        p.clips.insert(clip.id, clip);
+        p.tracks.push(t);
+        id
+    };
+    let a = add("Top");
+    let b = add("Bottom");
+    if let Some(t) = p.tracks.iter_mut().find(|t| t.id == b) {
+        t.phase_invert = true;
+        t.volume_db = -3.0;
+    }
+    (
+        Session::new(p, None, EngineConfig::default()).unwrap(),
+        a,
+        b,
+    )
+}
+
+#[test]
+fn phase_findings_show_their_chart_and_filter_by_category() {
+    use faderframe_mix_intelligence::RuleId;
+    let (mut s, _, _) = snares();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.rule == RuleId::PolarityInverted)
+        .unwrap()
+        .clone();
+    s.dispatch(Action::Mix(MixOp::Select(Some(f.id)))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    let texts = p.texts();
+    // Evidence with its units, the chart's legend, the experiment.
+    assert!(
+        texts.contains(&"Delay of the second track (Bottom)"),
+        "{texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.ends_with(" ms")));
+    for legend in ["Sum now", "Corrected", "In mono"] {
+        assert!(texts.contains(&legend), "{legend}: {texts:?}");
+    }
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("polarity inverted") || t.contains("earlier")),
+        "{texts:?}"
+    );
+    assert!(texts.iter().any(|t| t.contains("Phase and Timing")));
+    let i = f
+        .recommendations
+        .iter()
+        .position(|r| r.experiment.previewable())
+        .unwrap();
+    assert_eq!(view.enabled(Hit::Audition(f.id, i)), Some(true));
+    // The status line counts the pairs compared.
+    assert!(
+        texts.iter().any(|t| t.contains("1 pair compared")),
+        "{texts:?}"
+    );
+    // Only phase and timing: the other categories' rows go.
+    let _ = click(&mut view, &s, Hit::Category(Some(Category::Phase)));
+    paint(&mut view, &s);
+    for g in s.mix_findings() {
+        let shown = view.rect_of(Hit::Row(g.id)).is_some();
+        assert_eq!(shown, g.category() == Category::Phase, "{:?}", g.rule);
+    }
+    let _ = click(&mut view, &s, Hit::Category(Some(Category::Dynamics)));
+    paint(&mut view, &s);
+    assert!(view.rect_of(Hit::Row(f.id)).is_none());
+}
+
+#[test]
+fn the_levels_panel_shows_dynamics_width_and_the_pairs_compared() {
+    let (mut s, _, _) = snares();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let mut view = MixView::new(Theme::default());
+    paint(&mut view, &s);
+    let _ = click(&mut view, &s, Hit::Levels);
+    let p = paint(&mut view, &s);
+    let texts = p.texts();
+    for t in [
+        "Dynamics",
+        "TSR",
+        "Δ TSR",
+        "Stereo width by region (side − mid, dB)",
+        "Mono fold-down change by region (dB)",
+        "low mids",
+        "Pairs compared (phase and timing)",
+        "Top × Bottom",
+    ] {
+        assert!(texts.iter().any(|x| x.contains(t)), "{t}: {texts:?}");
+    }
+}

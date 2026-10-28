@@ -179,13 +179,29 @@ fn profiles_are_reused_until_the_sound_changes() {
     // The roles weigh in now.
     let f = s.mix_selected().unwrap();
     assert_eq!(f.severity_terms[0].value, 1.0, "kick and bass");
-    // A fader moves: stale, and every processed track is rendered again.
+    // A fader moves: stale where it reaches (that track's findings, the
+    // master); one render measures that track and the master again, the
+    // others' profiles are reused (nothing downstream changes a tap).
+    let a_only = s
+        .mix_findings()
+        .iter()
+        .find(|f| f.tracks == [a])
+        .map(|f| f.id);
     s.dispatch(Action::Edit(Command::SetTrackVolume { track: b, db: -3.0 }))
         .unwrap();
     s.tick(0.016);
     assert!(s.mix_stale().is_some());
+    let f = s.mix_selected().unwrap().id;
+    assert!(s.mix_finding_stale(f), "the pair names the changed track");
+    if let Some(id) = a_only {
+        assert!(
+            !s.mix_finding_stale(id),
+            "a finding on the other track stays"
+        );
+    }
     analyse(&mut s, MixScope::Project, SignalPoint::Processed);
-    assert_eq!(s.mix_results().unwrap().rendered, 4);
+    let r = s.mix_results().unwrap();
+    assert_eq!((r.rendered, r.reused, r.renders), (2, 2, 1));
     assert_eq!(s.mix_stale(), None);
     // Sources: the fader is not part of them…
     analyse(&mut s, MixScope::Project, SignalPoint::Source);
