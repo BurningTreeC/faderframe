@@ -5,6 +5,9 @@ use crate::edit::{CoalesceKey, Command, EditError, Impact};
 #[derive(Clone, Debug)]
 struct Transaction {
     label: String,
+    /// Which step this is ([`History::last_step`]): kept through undo and
+    /// redo, never given to another step.
+    id: u64,
     /// Inverses in application order (undo applies them in reverse).
     inverses: Vec<Command>,
     keys: Vec<CoalesceKey>,
@@ -14,9 +17,10 @@ struct Transaction {
 }
 
 impl Transaction {
-    fn new(label: String) -> Self {
+    fn new(label: String, id: u64) -> Self {
         Self {
             label,
+            id,
             inverses: Vec::new(),
             keys: Vec::new(),
             mark: None,
@@ -53,6 +57,8 @@ pub struct History {
     limit: usize,
     /// Number of committed changes since creation/last save marker.
     revision: u64,
+    /// The id the next step gets.
+    next_id: u64,
 }
 
 impl Default for History {
@@ -77,13 +83,21 @@ impl History {
             depth: 0,
             limit: limit.max(1),
             revision: 0,
+            next_id: 1,
         }
+    }
+
+    fn fresh_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Start a gesture. Nested begins are flattened into the outermost.
     pub fn begin(&mut self, label: impl Into<String>) {
         if self.depth == 0 {
-            self.open = Some(Transaction::new(label.into()));
+            let id = self.fresh_id();
+            self.open = Some(Transaction::new(label.into(), id));
         }
         self.depth += 1;
     }
@@ -181,7 +195,7 @@ impl History {
                 self.redo.clear();
             }
             None => {
-                let mut tx = Transaction::new(label);
+                let mut tx = Transaction::new(label, self.fresh_id());
                 tx.record(inverse, key);
                 self.push(tx);
             }
@@ -252,12 +266,44 @@ impl History {
         self.revision
     }
 
+    /// The id of the step an undo would take back now (`None`: nothing to
+    /// undo). A step keeps its id while it is undone and redone, so a
+    /// caller can tell later whether the step it made is still done
+    /// ([`Self::is_done`]).
+    pub fn last_step(&self) -> Option<u64> {
+        self.undo.last().map(|t| t.id)
+    }
+
+    /// The step is done (undoing would take it back), not undone or
+    /// forgotten.
+    pub fn is_done(&self, step: u64) -> bool {
+        self.undo.iter().any(|t| t.id == step)
+    }
+
+    /// The step is done or can be redone: the history still holds it.
+    pub fn knows(&self, step: u64) -> bool {
+        self.is_done(step) || self.redo.iter().any(|t| t.id == step)
+    }
+
+    /// What takes back one step that is done, whatever was done after it:
+    /// its inverses as a batch named `label`, to be applied as a new step
+    /// (undoing that brings the step back; a batch that fails rolls back,
+    /// so a step whose things a later step removed is not taken back at
+    /// all). `None` when the step is not done.
+    pub fn inverse_of(&self, step: u64, label: &str) -> Option<Command> {
+        let tx = self.undo.iter().find(|t| t.id == step)?;
+        Some(Command::Batch {
+            label: label.to_string(),
+            commands: tx.inverses.iter().rev().cloned().collect(),
+        })
+    }
+
     fn replay(project: &mut Project, tx: Transaction) -> Result<Transaction, EditError> {
         // Stored inverses are replayed last-to-first. Applying them yields
         // the opposite commands in that same last-to-first order, which is
         // exactly the storage order a later replay (which again iterates in
         // reverse) needs to re-apply them first-to-last.
-        let mut opposite = Transaction::new(tx.label);
+        let mut opposite = Transaction::new(tx.label, tx.id);
         for inv in tx.inverses.into_iter().rev() {
             opposite.inverses.push(inv.apply(project)?);
         }
@@ -366,6 +412,58 @@ mod project_at_tests {
         h.undo(&mut p).unwrap();
         h.undo(&mut p).unwrap();
         assert_eq!(then, p);
+    }
+}
+
+#[cfg(test)]
+mod step_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn bpm(p: &Project) -> f64 {
+        p.timeline
+            .tempo
+            .bpm_at(faderframe_timeline::MusicalTime::ZERO)
+    }
+
+    #[test]
+    fn a_step_keeps_its_id_through_undo_and_redo() {
+        let mut p = Project::new("A", 48_000);
+        let mut h = History::default();
+        h.apply(&mut p, Command::SetTempo { bpm: 100.0 }).unwrap();
+        let first = h.last_step().unwrap();
+        h.apply(&mut p, Command::SetTempo { bpm: 110.0 }).unwrap();
+        let second = h.last_step().unwrap();
+        assert_ne!(first, second);
+        h.undo(&mut p).unwrap();
+        assert!(h.is_done(first) && !h.is_done(second));
+        h.redo(&mut p).unwrap();
+        assert_eq!(h.last_step(), Some(second));
+        assert!(h.is_done(second));
+    }
+
+    #[test]
+    fn a_step_long_done_is_taken_back_as_a_new_step() {
+        let mut p = Project::new("A", 48_000);
+        let mut h = History::default();
+        h.apply(&mut p, Command::SetTempo { bpm: 100.0 }).unwrap();
+        let tempo = h.last_step().unwrap();
+        h.apply(&mut p, Command::RenameProject { name: "B".into() })
+            .unwrap();
+        let start = bpm(&Project::new("A", 48_000));
+        let back = h.inverse_of(tempo, "Undo tempo").unwrap();
+        h.apply(&mut p, back).unwrap();
+        assert_eq!(bpm(&p), start);
+        assert_eq!(p.name, "B", "the later step stays");
+        let back = h.last_step().unwrap();
+        assert!(h.is_done(tempo) && h.is_done(back));
+        assert_eq!(h.undo_label(), Some("Undo tempo"));
+        // Undoing the revert brings the step back.
+        h.undo(&mut p).unwrap();
+        assert_eq!(bpm(&p), 100.0);
+        assert!(h.knows(back) && !h.is_done(back));
+        assert!(h.inverse_of(999, "nothing").is_none());
     }
 }
 

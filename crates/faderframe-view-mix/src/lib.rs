@@ -21,7 +21,7 @@ use faderframe_mix_intelligence::{
     Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject,
 };
 use faderframe_project::Command;
-use faderframe_session::mix::{MixOp, MixResults, MixScope, MixStatus};
+use faderframe_session::mix::{Applied, MixOp, MixResults, MixScope, MixStatus};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
     AccessNode, AccessRole, CanvasView, Color, EventCx, HostRequest, MenuItem, Painter, Path,
@@ -55,6 +55,8 @@ pub enum Hit {
     Event(u64, usize),
     Audition(u64, usize),
     Apply(u64, usize),
+    /// Take an applied experiment back (its history step).
+    Undo(u64),
     /// A hand-off experiment (a reference heard A/B, EQ Match).
     Open(u64, usize),
     Compare(bool),
@@ -313,6 +315,15 @@ impl MixView {
             format!("bars {ba}–{bb}")
         };
         format!("{}–{} ({bars})", mmss(base + a), mmss(base + b))
+    }
+
+    /// The badge of a finding an experiment was applied for.
+    fn applied_badge(state: Applied) -> &'static str {
+        match state {
+            Applied::Found => "Applied",
+            Applied::Checking => "Checking",
+            Applied::Resolved => "Resolved",
+        }
     }
 
     /// The findings listed: filtered and sorted.
@@ -665,7 +676,8 @@ impl MixView {
                 continue;
             }
             let dismissed = model.mix_dismissed(f.id);
-            let stale = model.mix_finding_stale(f.id);
+            let applied = model.mix_applied_state(f.id);
+            let stale = model.mix_finding_stale(f.id) && applied.is_none();
             if selected == Some(f.id) {
                 p.fill(r, th.ui.selection.with_alpha(0.35));
             } else if self.hover == Some(Hit::Row(f.id)) {
@@ -676,16 +688,18 @@ impl MixView {
                 Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
                 self.grade_color(sev),
             );
-            let ink = if dismissed || stale {
+            let ink = if dismissed || stale || applied == Some(Applied::Resolved) {
                 th.ui.text_faint
             } else {
                 th.ui.text
             };
             let tx = r.x + 12.0;
             let tw = r.w - 20.0;
+            // Room for the applied badge on the right.
+            let title_w = if applied.is_some() { tw - 76.0 } else { tw };
             p.text(
                 &f.title_named(&name, &device),
-                Rect::new(tx, r.y + 4.0, tw, LINE),
+                Rect::new(tx, r.y + 4.0, title_w.max(0.0), LINE),
                 &TextStyle::new(th.fonts.small, ink).bold(),
             );
             let mut second = Vec::new();
@@ -729,6 +743,14 @@ impl MixView {
                 Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
                 &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
             );
+            if let Some(state) = applied {
+                let badge = Self::applied_badge(state);
+                let style = TextStyle::new(th.fonts.tiny, th.ui.accent).center();
+                let bw = p.text_width(badge, &style) + 12.0;
+                let b = Rect::new(r.right() - bw - 8.0, r.y + 5.0, bw, 15.0);
+                p.fill_rounded(b, 3.0, &th.ui.accent.with_alpha(0.18).into());
+                p.text(badge, b, &style);
+            }
             p.hline(
                 r.x,
                 r.right(),
@@ -740,10 +762,13 @@ impl MixView {
                 rect: r,
                 enabled: true,
                 label: format!(
-                    "{}, severity {}{}",
+                    "{}, severity {}{}{}",
                     f.title_named(&name, &device),
                     sev.label().to_lowercase(),
-                    if stale { ", stale" } else { "" }
+                    if stale { ", stale" } else { "" },
+                    applied
+                        .map(|a| format!(", {}", Self::applied_badge(a).to_lowercase()))
+                        .unwrap_or_default()
                 ),
                 tip: f.explanation_named(&name, &device),
                 on: selected == Some(f.id),
@@ -1219,7 +1244,8 @@ impl MixView {
             th.fonts.normal,
             th.ui.text,
         );
-        if model.mix_finding_stale(f.id) {
+        let applied_state = model.mix_applied_state(f.id);
+        if model.mix_finding_stale(f.id) && applied_state.is_none() {
             y = self.para(
                 p,
                 x,
@@ -1230,6 +1256,44 @@ impl MixView {
                 th.fonts.small,
                 th.ui.accent,
             );
+        }
+        if let Some(state) = applied_state {
+            let text = match state {
+                Applied::Resolved => {
+                    "Resolved: the analysis after applying no longer finds it. Undo takes the \
+                     change back."
+                }
+                Applied::Checking => "Applied: analysing the tracks it changed…",
+                Applied::Found => {
+                    "Applied, and still found after the change: its measurements below are \
+                     from after it."
+                }
+            };
+            y = self.para(p, x, y, w, text, th.fonts.small, th.ui.accent);
+            for a in model.mix_applied_to(f.id) {
+                let label = a
+                    .label
+                    .strip_prefix("Mix Intelligence: ")
+                    .unwrap_or(&a.label)
+                    .to_string();
+                let bx = self.button_at(
+                    p,
+                    x,
+                    y + 2.0,
+                    22.0,
+                    "Undo",
+                    Hit::Undo(a.step),
+                    false,
+                    true,
+                    format!("Take “{label}” back (one undo step; what was done after it stays)"),
+                );
+                p.text(
+                    &label,
+                    Rect::new(bx + 4.0, y + 2.0, (x + w - bx - 4.0).max(0.0), 22.0),
+                    &TextStyle::new(th.fonts.small, th.ui.text_dim),
+                );
+                y += 28.0;
+            }
         }
         p.text(
             &format!(
@@ -1488,21 +1552,41 @@ impl MixView {
                         why.clone()
                     },
                 );
-                bx = self.button_at(
-                    p,
-                    bx,
-                    y,
-                    22.0,
-                    "Apply",
-                    Hit::Apply(f.id, i),
-                    false,
-                    enabled,
-                    if enabled {
-                        "Make it one step of the project's history (Undo takes it back)".to_string()
-                    } else {
-                        why.clone()
-                    },
-                );
+                let undo = model
+                    .mix_applied_to(f.id)
+                    .into_iter()
+                    .rev()
+                    .find(|a| a.experiment == r.experiment);
+                bx = match (&undo, applied) {
+                    (Some(a), true) => self.button_at(
+                        p,
+                        bx,
+                        y,
+                        22.0,
+                        "Undo",
+                        Hit::Undo(a.step),
+                        false,
+                        true,
+                        "Take it back (one undo step; what was done after it stays)".to_string(),
+                    ),
+                    _ => self.button_at(
+                        p,
+                        bx,
+                        y,
+                        22.0,
+                        "Apply",
+                        Hit::Apply(f.id, i),
+                        false,
+                        enabled,
+                        if enabled {
+                            "Make it one step of the project's history (Undo takes it back); \
+                             the tracks it changes are analysed again at once"
+                                .to_string()
+                        } else {
+                            why.clone()
+                        },
+                    ),
+                };
                 if applied {
                     p.text(
                         "Applied",
@@ -1511,7 +1595,7 @@ impl MixView {
                     );
                 }
                 y += 28.0;
-                if !enabled && !why.is_empty() {
+                if !enabled && !why.is_empty() && !applied {
                     y = self.para(
                         p,
                         x + 8.0,
@@ -2153,6 +2237,7 @@ impl MixView {
                 finding,
                 recommendation,
             })),
+            Hit::Undo(step) => cx.emit(Action::Mix(MixOp::Undo(step))),
             Hit::Open(finding, recommendation) => cx.emit(Action::Mix(MixOp::Open {
                 finding,
                 recommendation,
@@ -2320,6 +2405,7 @@ impl CanvasView<Session, Action> for MixView {
                     finding,
                     recommendation,
                 })),
+                Hit::Undo(step) => Some(Action::Mix(MixOp::Undo(step))),
                 Hit::Open(finding, recommendation) => Some(Action::Mix(MixOp::Open {
                     finding,
                     recommendation,

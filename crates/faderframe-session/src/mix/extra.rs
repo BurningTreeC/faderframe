@@ -25,12 +25,20 @@
 //!   range's time reference: the delay found is what the mix hears, after
 //!   the engine's delay compensation, never a second one.
 //!
+//! Excerpts come from the signals the analysis' renders held
+//! ([`super::held`]: the one pass, the sources, earlier analyses' signals
+//! that did not change) whenever they are there; only the tracks missing
+//! there are rendered for their excerpts, in a render of what they need
+//! ([`super::capture::pruned`]).
+//!
 //! Pair measurements are cached (like the profiles: by the pair, the
 //! signal, the two tracks' fingerprints — their processed ones, or their
 //! source renders' —, the excerpt, the rate, the analysis settings and the
 //! pair settings with [`faderframe_mix_intelligence::ALGORITHM_VERSION`]);
 //! the results' staleness is the analysis' (finding by finding).
 
+use super::capture::{needed, pruned};
+use super::held::HeldAudio;
 use super::{CacheKey, Fingerprints, Planned, Plays, fingerprint, source_project};
 use crate::render::{RenderProgress, render_captured, render_each_on};
 use faderframe_core::{PluginInstanceId, TrackId};
@@ -174,6 +182,8 @@ pub struct ExtraCounts {
     pub pairs_skipped: usize,
     /// Renders made for the pairs' excerpts.
     pub excerpt_renders: usize,
+    /// Excerpts read from signals held from a render instead.
+    pub excerpts_held: usize,
     /// Seconds spent on the sources, the excerpts' renders and measuring
     /// the pairs.
     pub sources_seconds: f64,
@@ -189,6 +199,25 @@ pub(super) struct ExtraOutcome {
     pairs: Vec<(PairKey, Arc<PairPhase>)>,
     reused_pairs: Vec<PairKey>,
     pub(super) counts: ExtraCounts,
+}
+
+impl ExtraOutcome {
+    /// Take in the sources an earlier run of the stage in the same job
+    /// rendered (the later run found them as reused); its pairs are left
+    /// out (measured on a first look's signals, measured again).
+    pub(super) fn absorb_sources(&mut self, earlier: ExtraOutcome) {
+        let e = earlier.counts;
+        let c = &mut self.counts;
+        c.sources_reused = c.sources_reused.saturating_sub(e.sources_rendered);
+        c.sources_rendered += e.sources_rendered;
+        c.sources_seconds += e.sources_seconds;
+        self.profiles.extend(earlier.profiles);
+    }
+
+    /// The source profiles it made (for a later run's cache).
+    pub(super) fn made_profiles(&self) -> impl Iterator<Item = &(CacheKey, Arc<TrackProfile>)> {
+        self.profiles.iter()
+    }
 }
 
 /// Plan the extra stage of an analysis (see the module docs).
@@ -300,6 +329,8 @@ pub(super) struct Stage<'a> {
     pub(super) rules: &'a Rules,
     pub(super) cache: &'a [(CacheKey, Arc<TrackProfile>)],
     pub(super) plan: &'a ExtraPlan,
+    /// Each signal held from a render over the whole range (by track).
+    pub(super) held: &'a HashMap<TrackId, Arc<HeldAudio>>,
     pub(super) render: &'a RenderProgress,
     pub(super) progress: &'a ExtraProgress,
     /// The threads working (shown in the progress).
@@ -341,10 +372,12 @@ impl Stage<'_> {
         (start, frames): (i64, usize),
         each: &mut dyn FnMut(&[&[f32]]),
     ) -> Result<(), String> {
+        // Beside the others: streams of its own.
+        let sources = super::own_sources(project, self.sources);
         render_each_on(
             project,
             self.rate,
-            self.sources,
+            &sources,
             (start, frames),
             self.render,
             outputs,
@@ -388,6 +421,7 @@ fn tapped_together(
                     for t in [cands[*i].a, cands[*i].b] {
                         if matches!(signals.get(&t), Some(Some(Signal::Tapped(_))))
                             && !tracks.contains(&t)
+                            && !audio.contains_key(&(t, ex.start, ex.frames))
                         {
                             tracks.push(t);
                         }
@@ -444,8 +478,10 @@ fn tapped_together(
     // Each tap's frames so far (from `begin`), each window's audio.
     let mut pos: HashMap<TrackId, i64> = HashMap::new();
     let mut kept: HashMap<(TrackId, usize), Vec<Vec<f32>>> = HashMap::new();
+    // Only what the tapped tracks need sounds.
+    let project = pruned(st.base, &needed(st.base, &tracks));
     render_captured(
-        st.base,
+        &project,
         st.rate,
         st.sources,
         (begin, span.max(0) as usize),
@@ -710,6 +746,26 @@ pub(super) fn run(
         .total
         .store((excerpt_list.len() + todo.len()) as u32, Ordering::Relaxed);
     let t0 = std::time::Instant::now();
+    // What the renders held already (never as it was before).
+    if !as_before() {
+        for (i, ex, _) in &todo {
+            for t in [cands[*i].a, cands[*i].b] {
+                let k = (t, ex.start, ex.frames);
+                if audio.contains_key(&k) {
+                    continue;
+                }
+                if let Some(h) = st.held.get(&t).filter(|h| h.frames() >= st.frames) {
+                    let bytes = 4 * h.channels() * ex.frames;
+                    if held + bytes > MAX_EXCERPT_BYTES {
+                        continue;
+                    }
+                    held += bytes;
+                    audio.insert(k, h.excerpt(ex.start, ex.frames));
+                    out.counts.excerpts_held += 1;
+                }
+            }
+        }
+    }
     let together = tapped_together(st, &cands, &todo, &excerpt_list, &signals, &mut audio)?;
     if together {
         out.counts.excerpt_renders += 1;
@@ -724,11 +780,14 @@ pub(super) fn run(
         for (i, e, _) in &todo {
             if same_span(e, ex) {
                 for t in [cands[*i].a, cands[*i].b] {
-                    if !wanted.contains(&t) {
+                    if !wanted.contains(&t) && !audio.contains_key(&(t, ex.start, ex.frames)) {
                         wanted.push(t);
                     }
                 }
             }
+        }
+        if wanted.is_empty() {
+            continue;
         }
         let at = st.start + ex.start as i64;
         let run_up = ((RUN_UP * fr) as i64).min(at.max(0)) as usize;
@@ -779,8 +838,10 @@ pub(super) fn run(
                 .fetch_add((ex.frames + run_up) as u64, Ordering::Relaxed);
             let mut chans: HashMap<TrackId, Vec<Vec<f32>>> = HashMap::new();
             let mut skip: HashMap<TrackId, usize> = HashMap::new();
+            // Only what the tapped tracks need sounds.
+            let project = pruned(st.base, &needed(st.base, &tapped));
             render_captured(
-                st.base,
+                &project,
                 st.rate,
                 st.sources,
                 (at - run_up as i64, ex.frames + run_up),

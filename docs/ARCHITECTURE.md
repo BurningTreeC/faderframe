@@ -7397,10 +7397,26 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   keyed or modulated into it — plus the global settings; nothing downstream
   changes a tap), so an edit re-measures what it reaches and makes stale
   only the findings about those tracks (`Session::mix_finding_stale`); a
-  superseded or replaced job's results are dropped. Measured on the demo
-  (release): 20.1 s before, 2.6 s now (7.7×); the demo with every track
-  four times: 54.4 s before, 3.6 s now (15×); analysed again unchanged:
-  0.13 s. The first stage's findings show while the second runs
+  superseded or replaced job's results are dropped. The signals a render
+  measures are held (`mix::held`: 16 bits with a scale per 1024 frames, up
+  to 512 MB in a job, 192 MB kept between analyses under the profiles'
+  keys) so the pairs read their excerpts there, never rendering the mix a
+  second time. After a change the tracks it reached get a *first look*:
+  a render of only what reaches them (`capture::pruned` — every other
+  track's clips, devices, sends and automation taken out; taps bit-identical
+  to the whole mix's, test `a_pruned_render_taps_what_the_whole_mix_taps`)
+  cut into segments rendered side by side, each with a 2 s run-up
+  (`render_look`; one piece when a third-party plugin is involved), shown
+  with their pairs while the master and buses show as last measured
+  (`MixResults::{provisional, pairs}`); the whole render then measures the
+  changed tracks again exactly (the first look is never cached). Health
+  checks are kept for the last 8 project fingerprints. Measured on the demo
+  (release): 20.1 s before the one pass, 1.7 s now; the demo with every
+  track four times: 54.4 s before, 2.5 s now; analysed again unchanged:
+  0.13 s; an experiment applied: its track shown again after 0.47 s,
+  everything after 1.95 s (the one heavy chain — a preamp, a saturator
+  and a compressor in series, 0.9 s on one thread — bounds the whole
+  render). The first stage's findings show while the second runs
   (`MixResults::complete`). Experiments are auditioned
   by applying them unrecorded with their inverses kept (a built-in EQ
   appended to the masker — keyed from the target for a dynamic cut — or a
@@ -7409,7 +7425,15 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   listening gain (`EngineController::set_listening_gain`,
   `Session::listening_gain`; the real level change and the fairness gain
   shown apart). Anything that edits, undoes, saves or renders takes the candidate
-  out first; Apply is one undo step ("Mix Intelligence: …").
+  out first; Apply is one undo step ("Mix Intelligence: …") and starts the
+  analysis again by itself (same range and tracks). History steps have
+  ids (`History::{last_step, is_done, knows, inverse_of}`): an applied
+  experiment's "Applied" — "Resolved" when the analysis after it no longer
+  finds the finding, which stays listed — follows its step through undo
+  and redo (both analyse again); its Undo (`MixOp::Undo(step)`) undoes the
+  step when it is the last, else applies its inverse as a step of its own
+  ("Undo Mix Intelligence: …", later edits kept; refused whole when a later
+  step removed what it changed).
 * `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
   ranked findings (filtered, sorted), each one's measurements (clickable
   events: the tracks selected and the range shown), a band chart,
@@ -7466,8 +7490,14 @@ listening and EQ Match; a comparison target, never a standard.
 
 `ALGORITHM_VERSION` 5. Limits: same audio misses copies more than about
 1 ms apart or through nonlinear or time-varying processing; pair excerpts
-start 1 s early (longer tails and a compressor's earlier state are
-missing); a surround tap is measured on its first two channels; device
+read from held signals carry the whole render's state, rendered ones (past
+the memory share) start 1 s early (longer tails and a compressor's earlier
+state are missing, so a pair can measure a little differently then); a
+surround tap is measured on its first two channels; device
 cost is timed offline (a guide); the master depends on everything, so any
-audio change renders the mix once more (cached measurement work is what is
-saved).
+audio change renders the mix once more after the first look (a change of
+only the master renders the whole mix at once); a first look differs from
+the whole render where a device remembers longer than its 2 s run-up (it
+is replaced, never kept); held signals cover a job's range only while they
+fit 512 MB (beyond, the pairs' excerpts are rendered, pruned to the tracks
+they need).

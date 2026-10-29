@@ -8,8 +8,10 @@
 //! per signal keeps its audio in order). The way to each thread holds at
 //! most [`IN_FLIGHT`] chunks: a render faster than its measurement waits
 //! for it (memory stays bounded, whatever the range's length); chunks come
-//! back to the render thread to be filled again.
+//! back to the render thread to be filled again. A signal to be held
+//! ([`super::held`]) is held by the same thread as it is measured.
 
+use super::held::HeldAudio;
 use faderframe_mix_intelligence::TrackProfile;
 use faderframe_mix_intelligence::profile::ProfileBuilder;
 use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
@@ -33,17 +35,22 @@ type Chunk = Vec<Vec<f32>>;
 /// A signal's chunk on its way to its measuring thread.
 type Handed = (usize, Chunk);
 
-/// Build `builders` (one per signal, by index) from audio `render` hands
-/// to the feed it is given (`feed(signal, piece)`) on [`threads`] threads.
-/// Returns what `render` returned and each signal's profile (or why it
-/// could not be measured).
+/// A signal's profile and, when it was to be held, its audio.
+pub(super) type MeasuredSignal = (TrackProfile, Option<HeldAudio>);
+
+/// Build `builders` (one per signal, by index; each with the audio to hold
+/// it in, or none) from audio `render` hands to the feed it is given
+/// (`feed(signal, piece)`) on [`threads`] threads. Returns what `render`
+/// returned and each signal's profile and held audio (or why it could not
+/// be measured).
 pub(super) fn in_parallel<R>(
-    builders: Vec<ProfileBuilder>,
+    builders: Vec<(ProfileBuilder, Option<HeldAudio>)>,
     render: impl FnOnce(&mut dyn FnMut(usize, &[&[f32]])) -> R,
-) -> (R, Vec<Result<TrackProfile, String>>) {
+) -> (R, Vec<Result<MeasuredSignal, String>>) {
     let n = builders.len();
     let k = threads(n);
-    let mut owned: Vec<Vec<(usize, ProfileBuilder)>> = (0..k).map(|_| Vec::new()).collect();
+    type Owned = (usize, (ProfileBuilder, Option<HeldAudio>));
+    let mut owned: Vec<Vec<Owned>> = (0..k).map(|_| Vec::new()).collect();
     for (i, b) in builders.into_iter().enumerate() {
         owned[i % k].push((i, b));
     }
@@ -61,22 +68,25 @@ pub(super) fn in_parallel<R>(
                     let mut mine = mine;
                     let mut failed: Vec<(usize, String)> = Vec::new();
                     for (i, chunk) in rx {
-                        if let Some((_, b)) = mine.iter_mut().find(|(x, _)| *x == i)
+                        if let Some((_, (b, held))) = mine.iter_mut().find(|(x, _)| *x == i)
                             && !failed.iter().any(|(x, _)| *x == i)
                         {
                             let views: Vec<&[f32]> = chunk.iter().map(Vec::as_slice).collect();
                             if let Err(e) = b.push(&views) {
                                 failed.push((i, e.to_string()));
                             }
+                            if let Some(h) = held {
+                                h.push(&views);
+                            }
                         }
                         // Back to be filled again (the render may be done).
                         let _ = back.send(chunk);
                     }
                     mine.into_iter()
-                        .map(|(i, b)| {
+                        .map(|(i, (b, held))| {
                             let r = match failed.iter().find(|(x, _)| *x == i) {
                                 Some((_, e)) => Err(e.clone()),
-                                None => Ok(b.finish()),
+                                None => Ok((b.finish(), held.map(HeldAudio::finish))),
                             };
                             (i, r)
                         })
@@ -136,7 +146,7 @@ pub(super) fn in_parallel<R>(
             }
         }
         drop(senders);
-        let mut out: Vec<Result<TrackProfile, String>> = (0..n)
+        let mut out: Vec<Result<MeasuredSignal, String>> = (0..n)
             .map(|_| Err("the measuring thread stopped".to_string()))
             .collect();
         for h in handles {
@@ -189,11 +199,15 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"))
             })
             .collect();
-        let builders: Vec<ProfileBuilder> = signals
+        let builders: Vec<(ProfileBuilder, Option<HeldAudio>)> = signals
             .iter()
-            .map(|s| {
-                ProfileBuilder::new(rate, s.len(), &config, &[(1000, 90_000)])
-                    .unwrap_or_else(|e| panic!("{e}"))
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    ProfileBuilder::new(rate, s.len(), &config, &[(1000, 90_000)])
+                        .unwrap_or_else(|e| panic!("{e}")),
+                    (i % 2 == 0).then(|| HeldAudio::new(s.len(), s[0].len())),
+                )
             })
             .collect();
         // Pieces of an odd size, the signals interleaved as a render gives
@@ -213,8 +227,14 @@ mod tests {
             calls
         });
         assert!(calls > 100);
-        for (g, w) in got.into_iter().zip(&whole) {
-            assert_eq!(&g.unwrap_or_else(|e| panic!("{e}")), w);
+        for (i, (g, w)) in got.into_iter().zip(&whole).enumerate() {
+            let (profile, held) = g.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(&profile, w);
+            // Held where asked, every frame of it.
+            assert_eq!(
+                held.map(|h| h.frames()),
+                (i % 2 == 0).then_some(rate as usize * 3)
+            );
         }
     }
 }

@@ -141,6 +141,20 @@ pub(crate) fn reject(a: &Rc<AppState>, _: &str) {
     op(a, MixOp::Reject);
 }
 
+/// `mix-undo:x`: take back the newest experiment applied for the selected
+/// finding (its Undo).
+pub(crate) fn undo(a: &Rc<AppState>, _: &str) {
+    let step = {
+        let s = a.session.borrow();
+        s.mix_selected_id()
+            .and_then(|id| s.mix_applied_to(id).last().map(|x| x.step))
+    };
+    match step {
+        Some(step) => op(a, MixOp::Undo(step)),
+        None => tracing::warn!("mix-undo: nothing applied for the selected finding"),
+    }
+}
+
 pub(crate) fn dismiss(a: &Rc<AppState>, _: &str) {
     let id = a.session.borrow().mix_selected_id();
     if let Some(id) = id {

@@ -180,7 +180,8 @@ fn profiles_are_reused_until_the_sound_changes() {
     let f = s.mix_selected().unwrap();
     assert_eq!(f.severity_terms[0].value, 1.0, "kick and bass");
     // A fader moves: stale where it reaches (that track's findings, the
-    // master); one render measures that track and the master again, the
+    // master); that track is measured again in a render of it alone (its
+    // findings shown at once), the master in one of the whole mix, the
     // others' profiles are reused (nothing downstream changes a tap).
     let a_only = s
         .mix_findings()
@@ -201,7 +202,14 @@ fn profiles_are_reused_until_the_sound_changes() {
     }
     analyse(&mut s, MixScope::Project, SignalPoint::Processed);
     let r = s.mix_results().unwrap();
-    assert_eq!((r.rendered, r.reused, r.renders), (2, 2, 1));
+    assert_eq!((r.rendered, r.reused, r.renders), (2, 2, 2));
+    assert!(
+        r.phases
+            .iter()
+            .any(|(n, _)| n.contains("the changed tracks")),
+        "{:?}",
+        r.phases
+    );
     assert_eq!(s.mix_stale(), None);
     // Sources: the fader is not part of them…
     analyse(&mut s, MixScope::Project, SignalPoint::Source);

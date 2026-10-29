@@ -20,10 +20,11 @@
 //! **The trade-off.** Per-track fingerprints let a later analysis reuse
 //! the profiles of unchanged tracks (skipping their measurement) and let
 //! findings stay valid when only other tracks changed (a kick/bass
-//! finding is not made stale by a vocal edit). They cannot save the
-//! render: the master's closure is the whole mix, so any change that
-//! needs a new measurement renders the mix again (one pass, as fast as one
-//! track alone was before). The global part is conservative (anything not
+//! finding is not made stale by a vocal edit). They cannot save the whole
+//! render: the master's closure is the whole mix, so any change that needs
+//! a new measurement renders the mix again — after a first look at the
+//! changed tracks alone, a render of their [`upstream`] closures
+//! (`super::capture::pruned`). The global part is conservative (anything not
 //! in a track invalidates everything), and so is a send counted whether it
 //! is enabled or not.
 

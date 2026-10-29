@@ -44,10 +44,23 @@
 //! settings — nothing downstream changes a tap — the master's the whole
 //! project's (without names, colours, markers, sections, roles, solo, ids,
 //! references …); a source render's is its own one-track project's. So a
-//! change re-measures only the tracks it reaches (the render itself runs
-//! again whenever anything is missing: the master needs the whole mix),
-//! and the health check is kept for the project fingerprint it was made
-//! with. Results say which project serial, history revision and
+//! change re-measures only the tracks it reaches, and the health checks are
+//! kept for the project fingerprints they were made with (a few: an undo
+//! finds the one of the project as it was). The signals a render measures
+//! are held too ([`held`], 16 bits with a scale per block, up to
+//! [`held::KEEP_BYTES`] between analyses): the pairs' excerpts are read
+//! there instead of rendering the mix again.
+//!
+//! **After a change.** The tracks a change reached are measured first, in
+//! a render of only what reaches them (`capture::pruned`: bit-identical
+//! taps) cut into segments rendered side by side (each with a run-up) — a
+//! first look shown at once with their pairs (an unchanged partner's
+//! excerpts from its held signal), the master and buses as the last
+//! analysis measured them meanwhile ([`MixResults::provisional`]). Then the
+//! whole mix renders (the master needs everything; the health check) and
+//! measures the changed tracks again exactly: the first look is never
+//! kept, so results stay deterministic. Results say which project serial,
+//! history revision and
 //! fingerprints they came from: a job for a project that was replaced, or
 //! superseded by a newer job (generation), is dropped; a finding whose
 //! tracks' fingerprints changed since is stale ([`Session::mix_finding_stale`])
@@ -71,7 +84,16 @@
 //! candidate taken out again), so no undo step or file ever holds it;
 //! edits of the candidate's own EQ stay part of the candidate. Apply takes
 //! the candidate out and makes it again as one recorded step ("Mix
-//! Intelligence: …"): undo restores the project as it was.
+//! Intelligence: …") and analyses again at once (see above). An applied
+//! experiment follows its history step ([`History::last_step`]): its
+//! "Applied" (or "Resolved", when the analysis after it no longer finds the
+//! finding — listed still, with its Undo) goes with an undo of that step
+//! and comes back with a redo, which analyse again too. Its Undo
+//! ([`MixOp::Undo`]) undoes the step when it is the last, else makes its
+//! inverse a step of its own ("Undo Mix Intelligence: …"), leaving what was
+//! done after it.
+//!
+//! [`History::last_step`]: faderframe_project::History::last_step
 
 use crate::editing::{EditRange, ZoomRequest};
 use crate::render::{RenderProgress, render_each};
@@ -98,6 +120,7 @@ use std::thread::JoinHandle;
 
 mod capture;
 mod fingerprint;
+mod held;
 mod measure;
 
 pub use faderframe_mix_intelligence as intelligence;
@@ -117,6 +140,8 @@ pub const CACHE_BYTES: usize = 256 << 20;
 pub const MEASURE_SECONDS: f64 = 30.0;
 /// … and the shortest (BS.1770's gating needs some time).
 const MEASURE_MIN_SECONDS: f64 = 4.0;
+/// Health checks kept (each of another project or range).
+const HEALTH_KEPT: usize = 8;
 /// The built-in EQ's name as a slot names it.
 const EQ_NAME: &str = "EQ";
 /// The built-in Utility's.
@@ -170,11 +195,16 @@ pub enum MixOp {
     Compare(bool),
     /// While auditioning: play the candidate loudness-matched.
     LoudnessMatch(bool),
-    /// Make an experiment (the auditioned one as it is now) one undo step.
+    /// Make an experiment (the auditioned one as it is now) one undo step;
+    /// the tracks it changed are analysed again at once.
     Apply {
         finding: u64,
         recommendation: usize,
     },
+    /// Take an applied experiment back ([`AppliedInfo::step`]): undone
+    /// when it is the last step, else its inverse made a step of its own
+    /// (what was done after it stays). Analysed again at once.
+    Undo(u64),
     /// Do what a hand-off experiment says (`Experiment::hand_off`): hear
     /// the reference A/B, open EQ Match with it.
     Open {
@@ -249,6 +279,14 @@ pub struct MixResults {
     /// signals, phase and timing between pairs) still runs: the findings of
     /// the first are shown meanwhile.
     pub complete: bool,
+    /// While the tracks a change reached are shown already: the signals
+    /// (the master, buses) still being measured again — their findings are
+    /// the last analysis' meanwhile.
+    pub provisional: Vec<TrackId>,
+    /// The second stage's findings (phase and timing between pairs,
+    /// sources beside the processed signals) are in — of the tracks a
+    /// change reached, while `provisional` signals are measured again.
+    pub pairs: bool,
     /// Sources measured beside the processed signals, pairs compared
     /// (rendered now or reused).
     pub extra: ExtraCounts,
@@ -285,6 +323,41 @@ impl Measured {
     pub fn change(&self) -> f64 {
         self.candidate_lufs - self.original_lufs
     }
+}
+
+/// An experiment applied as one undo step ([`MixOp::Apply`]), as long as
+/// the history holds the step.
+#[derive(Clone, Debug)]
+struct AppliedExperiment {
+    /// The finding as it was when the experiment was applied (listed as
+    /// resolved when the analysis after it no longer finds it).
+    finding: Finding,
+    experiment: Experiment,
+    label: String,
+    /// Its history step.
+    step: u64,
+    /// The step that took it back while later steps stayed ([`MixOp::Undo`]).
+    reverted: Option<u64>,
+}
+
+/// An applied experiment, as views show it (its Undo button).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedInfo {
+    /// Its history step ([`MixOp::Undo`]).
+    pub step: u64,
+    pub label: String,
+    pub experiment: Experiment,
+}
+
+/// What became of a finding an experiment was applied for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// Still found (the analysis after it measured it again).
+    Found,
+    /// The analysis after it is still running.
+    Checking,
+    /// The analysis after it no longer finds it.
+    Resolved,
 }
 
 /// The audition, as views show it.
@@ -401,10 +474,17 @@ struct Shared {
     cache: Vec<(CacheKey, Arc<TrackProfile>)>,
     /// The reference the master is compared with.
     reference: Option<capture::ReferencePlan>,
-    /// The last health check and its key (reused for the same project).
-    health: Option<(u64, Arc<Vec<DeviceRecord>>)>,
+    /// The last health checks and their keys (reused for the same project;
+    /// newest last).
+    health: Vec<(u64, Arc<Vec<DeviceRecord>>)>,
     /// Sources beside processed signals, pairs ([`extra`]).
     extra: extra::ExtraPlan,
+    /// Signals held from earlier renders ([`held`]).
+    held: Vec<(CacheKey, Arc<held::HeldAudio>)>,
+    /// The last analysis' profiles of these signals (by track; the master
+    /// `u64::MAX`), shown for a signal still being measured again while
+    /// the tracks a change reached are shown already.
+    previous: Vec<(u64, Arc<TrackProfile>)>,
 }
 
 impl Shared {
@@ -416,8 +496,10 @@ impl Shared {
         fps: Option<&'a Fingerprints>,
         sources: &'a faderframe_engine::SourceMap,
         progress: &'a Progress,
+        held: &'a std::collections::HashMap<TrackId, Arc<held::HeldAudio>>,
     ) -> extra::Stage<'a> {
         extra::Stage {
+            held,
             planned,
             base,
             fps,
@@ -477,6 +559,11 @@ struct Progress {
 /// runs ([`Session::mix_results`] with `complete: false`).
 struct Partial {
     report: Report,
+    /// Signals shown as the last analysis measured them (being measured
+    /// again).
+    provisional: Vec<TrackId>,
+    /// The second stage's findings (pairs, sources) are in.
+    pairs: bool,
     rendered: usize,
     reused: usize,
     fingerprint: Option<u64>,
@@ -491,6 +578,8 @@ struct Partial {
 const STAGE_RENDER: u32 = 0;
 const STAGE_REFERENCE: u32 = 1;
 const STAGE_RULES: u32 = 2;
+/// A first look at the tracks a change reached ([`capture`]).
+const STAGE_LOOK: u32 = 3;
 
 struct Output {
     report: Report,
@@ -512,6 +601,9 @@ struct Output {
     /// Seconds each stage took.
     phases: Vec<(&'static str, f64)>,
     extra: extra::ExtraOutcome,
+    /// Signals held now, and the keys of those held earlier and used.
+    held: Vec<(CacheKey, Arc<held::HeldAudio>)>,
+    held_used: Vec<CacheKey>,
 }
 
 struct Job {
@@ -568,6 +660,12 @@ enum Toggle {
     },
 }
 
+/// An analysis made again: the earlier one's range and tracks in focus.
+struct Again {
+    range: (MusicalTime, MusicalTime),
+    focus: Vec<TrackId>,
+}
+
 struct MeasureJob {
     progress: Arc<RenderProgress>,
     handle: JoinHandle<std::result::Result<Measured, String>>,
@@ -610,7 +708,11 @@ pub(crate) struct MixState {
     selected: Option<u64>,
     dismissed: BTreeSet<u64>,
     show_dismissed: bool,
-    applied: BTreeSet<(u64, usize)>,
+    /// Experiments applied (newest last).
+    applied: Vec<AppliedExperiment>,
+    /// The applied steps in the project when last looked at: an undo or
+    /// redo of one of them analyses again.
+    applied_live: Vec<u64>,
     audition: Option<Audition>,
     /// The history revision staleness was last checked at.
     checked: Option<u64>,
@@ -618,12 +720,15 @@ pub(crate) struct MixState {
     serial: u64,
     config: Option<AnalysisConfig>,
     rules: Rules,
-    /// The last health check and the key it was made for.
-    health: Option<(u64, Arc<Vec<DeviceRecord>>)>,
+    /// The last health checks and the keys they were made for (newest
+    /// last, at most [`HEALTH_KEPT`]).
+    health: Vec<(u64, Arc<Vec<DeviceRecord>>)>,
     /// Findings no longer describing the project (their tracks changed).
     stale_findings: BTreeSet<u64>,
     /// Pair measurements kept for reuse ([`extra`]).
     pairs: extra::PairCache,
+    /// Signals kept from renders for the pairs' excerpts ([`held`]).
+    held: held::HeldStore,
 }
 
 impl Default for MixState {
@@ -638,16 +743,18 @@ impl Default for MixState {
             selected: None,
             dismissed: BTreeSet::new(),
             show_dismissed: false,
-            applied: BTreeSet::new(),
+            applied: Vec::new(),
+            applied_live: Vec::new(),
             audition: None,
             checked: None,
             stale: None,
             serial: 0,
             config: None,
             rules: Rules::default(),
-            health: None,
+            health: Vec::new(),
             stale_findings: BTreeSet::new(),
             pairs: extra::PairCache::default(),
+            held: held::HeldStore::default(),
         }
     }
 }
@@ -817,6 +924,25 @@ fn job_worker(
     }
 }
 
+/// `sources` for a render running beside others: the decoded ones shared,
+/// every streamed one of `project` opened again — a stream's pages are
+/// loaded and evicted under one renderer's epoch, so two renders reading
+/// one stream at once could free a page the other is reading.
+pub(super) fn own_sources(
+    project: &Project,
+    sources: &faderframe_engine::SourceMap,
+) -> faderframe_engine::SourceMap {
+    let mut own: faderframe_engine::SourceMap = sources
+        .iter()
+        .filter(|(_, s)| matches!(s, faderframe_engine::Source::Memory(_)))
+        .map(|(k, s)| (*k, s.clone()))
+        .collect();
+    for (_, path, e) in crate::media::open_file_sources(project, None, &mut own) {
+        tracing::warn!("mix analysis: {}: {e}", path.display());
+    }
+    own
+}
+
 /// The source analysis: each track's clips through what makes their
 /// sound (an instrument), a render per track.
 fn source_worker(
@@ -834,10 +960,22 @@ fn source_worker(
     let threads = measure::threads(n);
     progress.threads.store(threads as u32, Ordering::Relaxed);
     progress.measuring.store(n as u32, Ordering::Relaxed);
-    type Done = std::result::Result<(Arc<TrackProfile>, Option<CacheKey>, bool), String>;
+    /// A source's profile, its key, whether it was rendered now, and its
+    /// audio held (now or earlier).
+    type Done = std::result::Result<
+        (
+            Arc<TrackProfile>,
+            Option<CacheKey>,
+            bool,
+            Option<Arc<held::HeldAudio>>,
+        ),
+        String,
+    >;
     let results: std::sync::Mutex<Vec<Option<Done>>> =
         std::sync::Mutex::new((0..n).map(|_| None).collect());
     let next = std::sync::atomic::AtomicUsize::new(0);
+    // Memory left to hold the sources in (for the pairs' excerpts).
+    let room = std::sync::atomic::AtomicUsize::new(held::HOLD_BYTES);
     let one = |p: &Planned| -> Done {
         let Plays::Source { keep } = p.plays else {
             return Err(format!("{}: not a source", p.name));
@@ -846,16 +984,32 @@ fn source_worker(
             return Err(format!("{}: no master to render through", p.name));
         };
         let k = fingerprint(&project).map(|fp| shared.key(p.track.0, fp, &p.spans));
+        let kept = k.and_then(|k| {
+            shared
+                .held
+                .iter()
+                .find(|e| e.0 == k)
+                .map(|e| Arc::clone(&e.1))
+        });
         if let Some(found) = k.and_then(|k| shared.cache.iter().find(|e| e.0 == k)) {
-            return Ok((Arc::clone(&found.1), Some(found.0), false));
+            return Ok((Arc::clone(&found.1), Some(found.0), false, kept));
         }
         let mut builder = ProfileBuilder::new(shared.rate, outputs, &shared.config, &p.spans)
             .map_err(|e| e.to_string())?;
+        let bytes = held::HeldAudio::bytes_for(outputs, shared.frames);
+        let mut holding = room
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| {
+                r.checked_sub(bytes)
+            })
+            .is_ok()
+            .then(|| held::HeldAudio::new(outputs, shared.frames));
         let mut failed = None;
+        // Beside the others: streams of its own.
+        let sources = own_sources(&project, sources);
         crate::render::render_each_on(
             &project,
             shared.rate,
-            sources,
+            &sources,
             (shared.start, shared.frames),
             &progress.render,
             outputs,
@@ -866,13 +1020,17 @@ fn source_worker(
                 {
                     failed = Some(e);
                 }
+                if let Some(h) = &mut holding {
+                    h.push(piece);
+                }
             },
         )
         .map_err(|e| e.to_string())?;
         if let Some(e) = failed {
             return Err(e.to_string());
         }
-        Ok((Arc::new(builder.finish()), k, true))
+        let held = holding.map(|h| Arc::new(h.finish()));
+        Ok((Arc::new(builder.finish()), k, true, held))
     };
     std::thread::scope(|scope| {
         for w in 0..threads {
@@ -907,9 +1065,22 @@ fn source_worker(
     let (mut made, mut reused) = (Vec::new(), Vec::new());
     let mut rendered = 0;
     let mut renders = 0;
+    let mut holds: std::collections::HashMap<TrackId, Arc<held::HeldAudio>> =
+        std::collections::HashMap::new();
+    let (mut held_made, mut held_used) = (Vec::new(), Vec::new());
     for (p, r) in planned.iter().zip(results) {
-        let (profile, key, fresh) =
+        let (profile, key, fresh, held) =
             r.unwrap_or_else(|| Err(format!("{}: not rendered", p.name)))?;
+        if let Some(h) = held {
+            if let Some(k) = key {
+                if fresh {
+                    held_made.push((k, Arc::clone(&h)));
+                } else {
+                    held_used.push(k);
+                }
+            }
+            holds.insert(p.track, h);
+        }
         match (fresh, key) {
             (true, k) => {
                 renders += 1;
@@ -977,7 +1148,7 @@ fn source_worker(
     // Pairs for phase and timing, over excerpts of their sources.
     let t0 = std::time::Instant::now();
     let extra = extra::run(
-        &shared.stage(planned, base, fps.as_ref(), sources, progress),
+        &shared.stage(planned, base, fps.as_ref(), sources, progress, &holds),
         &input,
         &mut report,
     )?;
@@ -997,6 +1168,8 @@ fn source_worker(
         notes: Vec::new(),
         phases,
         extra,
+        held: held_made,
+        held_used,
     })
 }
 
@@ -1130,6 +1303,17 @@ impl Session {
                     fraction: 1.0,
                 };
             }
+            STAGE_LOOK => {
+                let n = p.measuring.load(Ordering::Relaxed);
+                return MixStatus::Running {
+                    what: format!(
+                        "A first look at the {n} track{} the change reached (rendered in pieces \
+                         side by side); the whole mix follows",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    fraction: p.render.fraction(),
+                };
+            }
             _ => {}
         }
         if p.diagnosing.load(Ordering::Relaxed) {
@@ -1199,24 +1383,21 @@ impl Session {
     }
 
     pub fn mix_selected(&self) -> Option<&Finding> {
-        let id = self.mix.selected?;
-        self.mix_results()?
-            .report
-            .findings
-            .iter()
-            .find(|f| f.id == id)
+        self.mix_finding(self.mix.selected?)
     }
 
     pub fn mix_selected_id(&self) -> Option<u64> {
         self.mix.selected
     }
 
+    /// A finding of the results, or one an applied experiment resolved.
     pub fn mix_finding(&self, id: u64) -> Option<&Finding> {
         self.mix_results()?
             .report
             .findings
             .iter()
             .find(|f| f.id == id)
+            .or_else(|| self.applied_gone().into_iter().find(|f| f.id == id))
     }
 
     pub fn mix_dismissed(&self, id: u64) -> bool {
@@ -1237,21 +1418,106 @@ impl Session {
         self.mix.show_dismissed
     }
 
-    /// An experiment has been applied.
+    /// The applied experiment is in the project now: its step done (not
+    /// undone), not taken back by its Undo since.
+    fn applied_now(&self, a: &AppliedExperiment) -> bool {
+        self.history.is_done(a.step) && !a.reverted.is_some_and(|r| self.history.is_done(r))
+    }
+
+    /// The experiments applied for a finding that are in the project now
+    /// (newest last).
+    fn applied_for(&self, finding: u64) -> impl Iterator<Item = &AppliedExperiment> {
+        self.mix
+            .applied
+            .iter()
+            .filter(move |a| a.finding.id == finding && self.applied_now(a))
+    }
+
+    /// The experiment (the finding's recommendation as listed now) is
+    /// applied and in the project.
     pub fn mix_applied(&self, finding: u64, recommendation: usize) -> bool {
-        self.mix.applied.contains(&(finding, recommendation))
+        let Some(e) = self
+            .mix_finding(finding)
+            .and_then(|f| f.recommendations.get(recommendation))
+            .map(|r| &r.experiment)
+        else {
+            return false;
+        };
+        self.applied_for(finding).any(|a| a.experiment == *e)
+    }
+
+    /// The experiments applied for a finding that are in the project now —
+    /// each with its Undo (newest last).
+    pub fn mix_applied_to(&self, finding: u64) -> Vec<AppliedInfo> {
+        self.applied_for(finding)
+            .map(|a| AppliedInfo {
+                step: a.step,
+                label: a.label.clone(),
+                experiment: a.experiment.clone(),
+            })
+            .collect()
+    }
+
+    /// What became of a finding an experiment applied for is in the project
+    /// (`None`: nothing applied for it).
+    pub fn mix_applied_state(&self, finding: u64) -> Option<Applied> {
+        let applied = &self.applied_for(finding).last()?.finding;
+        let r = self.mix_results()?;
+        // Measured again already: its signals are not the last analysis'.
+        let measured = match applied.subject {
+            faderframe_mix_intelligence::Subject::Master(_) => r.provisional.is_empty(),
+            _ => !applied.tracks.iter().any(|t| r.provisional.contains(t)),
+        };
+        // Results from before the latest change, a new analysis running.
+        let older = self.mix.job.is_some() && r.history_revision != self.history.revision();
+        if r.report.findings.iter().any(|f| f.id == finding) {
+            return Some(if self.mix_finding_stale(finding) || !measured || older {
+                Applied::Checking
+            } else {
+                Applied::Found
+            });
+        }
+        let decided = (r.complete && self.mix.job.is_none())
+            || (!older && measured && (r.pairs || !applied.rule.second_stage()));
+        Some(if decided {
+            Applied::Resolved
+        } else {
+            Applied::Checking
+        })
+    }
+
+    /// Findings an experiment applied for (in the project now) that the
+    /// results no longer hold: as they were when it was applied.
+    fn applied_gone(&self) -> Vec<&Finding> {
+        let Some(r) = self.mix_results() else {
+            return Vec::new();
+        };
+        let mut out: Vec<&Finding> = Vec::new();
+        for a in self.mix.applied.iter().rev() {
+            if self.applied_now(a)
+                && !r.report.findings.iter().any(|f| f.id == a.finding.id)
+                && !out.iter().any(|f| f.id == a.finding.id)
+            {
+                out.push(&a.finding);
+            }
+        }
+        out
     }
 
     /// The findings to list (most relevant first; dismissed ones unless
-    /// asked for).
+    /// asked for) — first those an applied experiment resolved (or is
+    /// being checked for), each with its Undo.
     pub fn mix_findings(&self) -> Vec<&Finding> {
-        self.mix_results().map_or_else(Vec::new, |r| {
-            r.report
-                .findings
-                .iter()
-                .filter(|f| self.mix.show_dismissed || !self.mix.dismissed.contains(&f.id))
-                .collect()
-        })
+        let mut v = self.applied_gone();
+        if let Some(r) = self.mix_results() {
+            v.extend(
+                r.report
+                    .findings
+                    .iter()
+                    .filter(|f| self.mix.show_dismissed || !self.mix.dismissed.contains(&f.id)),
+            );
+        }
+        v
     }
 
     pub fn mix_audition(&self) -> Option<AuditionInfo> {
@@ -1304,6 +1570,20 @@ impl Session {
         }
         if !r.experiment.previewable() {
             return Err("a suggestion to try by hand: nothing to apply".into());
+        }
+        if self.mix_applied(finding, recommendation) {
+            return Err("applied: Undo takes it back".into());
+        }
+        if self
+            .mix_results()
+            .is_some_and(|res| !res.report.findings.iter().any(|f| f.id == finding))
+        {
+            return Err(match self.mix_applied_state(finding) {
+                Some(Applied::Resolved) => {
+                    "resolved: the analysis after applying no longer finds it".into()
+                }
+                _ => "being analysed again after the change".into(),
+            });
         }
         if self.mix_finding_stale(finding) {
             return Err(self.mix_stale().map_or_else(
@@ -1451,6 +1731,7 @@ impl Session {
                 finding,
                 recommendation,
             } => self.apply_mix_experiment(finding, recommendation)?,
+            MixOp::Undo(step) => self.undo_mix_experiment(step)?,
             MixOp::Open {
                 finding,
                 recommendation,
@@ -1485,6 +1766,17 @@ impl Session {
     }
 
     fn start_mix_analysis(&mut self, scope: MixScope, signal: SignalPoint) -> Result<()> {
+        self.start_mix_analysis_as(scope, signal, None)
+    }
+
+    /// An analysis; `again` an earlier one's range and focus (the selection
+    /// may have moved since).
+    fn start_mix_analysis_as(
+        &mut self,
+        scope: MixScope,
+        signal: SignalPoint,
+        again: Option<Again>,
+    ) -> Result<()> {
         // Never analyse a candidate: the audition ends first.
         self.end_mix_audition();
         let rate = self.project.sample_rate.max(1);
@@ -1496,7 +1788,10 @@ impl Session {
         config
             .validate(rate)
             .map_err(|e| SessionError::Other(e.to_string()))?;
-        let selection = self.selection.range.filter(|r| !r.is_empty());
+        let selection = match &again {
+            Some(g) if scope != MixScope::Project => Some(EditRange::new(g.range.0, g.range.1)),
+            _ => self.selection.range.filter(|r| !r.is_empty()),
+        };
         let (a, b) = match (scope, selection) {
             (MixScope::Selection, None) => {
                 return Err(SessionError::Other(
@@ -1506,10 +1801,12 @@ impl Session {
             (MixScope::Selection | MixScope::SelectedTracks, Some(r)) => (r.start, r.end),
             _ => (MusicalTime::ZERO, self.project.content_end()),
         };
+        let chosen = match &again {
+            Some(g) => g.focus.clone(),
+            None => self.selection.tracks.iter().copied().collect(),
+        };
         let focus: Vec<TrackId> = if scope == MixScope::SelectedTracks {
-            let f: Vec<TrackId> = self
-                .selection
-                .tracks
+            let f: Vec<TrackId> = chosen
                 .iter()
                 .copied()
                 .filter(|t| self.project.track(*t).is_some_and(|t| analysable(t.kind)))
@@ -1708,7 +2005,7 @@ impl Session {
             .store((frames * passes) as u64, Ordering::Relaxed);
         let names: Vec<String> = planned.iter().map(|p| p.name.clone()).collect();
         let p2 = Arc::clone(&progress);
-        let shared = Shared {
+        let mut shared = Shared {
             start,
             frames,
             rate,
@@ -1726,7 +2023,27 @@ impl Session {
             reference,
             health: self.mix.health.clone(),
             extra: extra_plan,
+            held: self.mix.held.snapshot(),
+            previous: Vec::new(),
         };
+        // The last analysis' signals of the same range and settings: shown
+        // for those being measured again while the changed tracks are shown.
+        if let Some(r) = self.mix.results.as_deref()
+            && r.signal == signal
+            && (r.start_sample, r.frames, r.rate) == (start, frames, rate)
+            && let Some(fps) = &r.fingerprints
+        {
+            for p in &planned {
+                let (track, fp) = match p.plays {
+                    Plays::Master => (u64::MAX, fps.project),
+                    _ => (p.track.0, fps.of(p.track)),
+                };
+                let k = shared.key(track, fp, &p.spans);
+                if let Some(e) = self.mix.cache.entries.iter().find(|e| e.0 == k) {
+                    shared.previous.push((track, Arc::clone(&e.1)));
+                }
+            }
+        }
         let handle = std::thread::Builder::new()
             .name("faderframe-mix".into())
             .spawn(move || job_worker(planned, base, shared, p2))
@@ -1800,9 +2117,10 @@ impl Session {
             self.mix.selected = None;
             self.mix.dismissed.clear();
             self.mix.applied.clear();
+            self.mix.held.clear();
             self.mix.stale = None;
             self.mix.stale_findings.clear();
-            self.mix.health = None;
+            self.mix.health.clear();
             self.mix.checked = None;
             self.mix.status = MixStatus::Idle;
             self.revision += 1;
@@ -1832,10 +2150,20 @@ impl Session {
                         self.mix.cache.put(k, p);
                     }
                     if let Some(k) = out.health_key {
-                        self.mix.health = Some((k, Arc::clone(&out.devices)));
+                        // A few kept: an undo finds the check of the
+                        // project as it was.
+                        self.mix.health.retain(|e| e.0 != k);
+                        self.mix.health.push((k, Arc::clone(&out.devices)));
+                        if self.mix.health.len() > HEALTH_KEPT {
+                            self.mix.health.remove(0);
+                        }
                     }
                     let extra_counts =
                         extra::keep(&mut self.mix.cache, &mut self.mix.pairs, &mut out.extra);
+                    self.mix.held.touch(&out.held_used);
+                    for (k, h) in out.held.drain(..) {
+                        self.mix.held.put(k, h);
+                    }
                     let n = out.report.findings.len();
                     let elapsed = job.started.elapsed().as_secs_f64();
                     for note in &out.notes {
@@ -1869,11 +2197,14 @@ impl Session {
                         notes: out.notes,
                         extra: extra_counts,
                         complete: true,
+                        provisional: Vec::new(),
+                        pairs: true,
                     };
                     if !self
                         .mix
                         .selected
                         .is_some_and(|s| results.report.findings.iter().any(|f| f.id == s))
+                        && !self.selected_applied()
                     {
                         self.mix.selected = results
                             .report
@@ -1927,6 +2258,8 @@ impl Session {
             return;
         };
         let results = MixResults {
+            provisional: first.provisional,
+            pairs: first.pairs,
             report: first.report,
             signal: job.signal,
             scope: job.scope,
@@ -1959,6 +2292,7 @@ impl Session {
             .mix
             .selected
             .is_some_and(|s| results.report.findings.iter().any(|f| f.id == s))
+            && !self.selected_applied()
         {
             self.mix.selected = results
                 .report
@@ -1991,6 +2325,14 @@ impl Session {
             return;
         }
         self.mix.checked = Some(rev);
+        // Applied experiments the history forgot are gone for good; one
+        // undone or redone (Ctrl+Z, the history) is analysed again.
+        let h = &self.history;
+        self.mix.applied.retain(|a| h.knows(a.step));
+        if self.applied_steps() != self.mix.applied_live {
+            self.mix.applied_live = self.applied_steps();
+            self.analyse_mix_again();
+        }
         let gone: Vec<TrackId> = r
             .tracks
             .iter()
@@ -2659,12 +3001,103 @@ impl Session {
             label: label.clone(),
             commands,
         })?;
-        self.mix.applied.insert((finding, recommendation));
+        let found = self.mix_finding(finding).cloned();
+        if let (Some(step), Some(f)) = (self.history.last_step(), found) {
+            self.mix.applied.push(AppliedExperiment {
+                finding: f,
+                experiment: exp,
+                label: label.clone(),
+                step,
+                reverted: None,
+            });
+        }
         self.notify(
             NoticeLevel::Info,
-            format!("{label} — applied as one step (Undo takes it back)"),
+            format!("{label} — applied as one step; analysing what it changed"),
         );
+        self.analyse_mix_again();
         Ok(())
+    }
+
+    /// Take an applied experiment back (see [`MixOp::Undo`]).
+    fn undo_mix_experiment(&mut self, step: u64) -> Result<()> {
+        self.end_mix_audition();
+        let a = self
+            .mix
+            .applied
+            .iter()
+            .find(|a| a.step == step)
+            .cloned()
+            .ok_or_else(|| SessionError::Other("no such experiment was applied".into()))?;
+        if !self.applied_now(&a) {
+            return Err(SessionError::Other(
+                "it is not in the project any more (undone already)".into(),
+            ));
+        }
+        if self.history.last_step() == Some(step) && !self.history.in_gesture() {
+            if let Some(r) = self.history.undo(&mut self.project)? {
+                self.sync(r.impact)?;
+            }
+        } else {
+            let label = format!("Undo {}", a.label);
+            let back = self
+                .history
+                .inverse_of(step, &label)
+                .ok_or_else(|| SessionError::Other("its step is gone".into()))?;
+            self.edit(back).map_err(|e| {
+                SessionError::Other(format!(
+                    "it cannot be taken back alone (a later edit changed what it changed): {e}"
+                ))
+            })?;
+            let id = self.history.last_step();
+            if let Some(x) = self.mix.applied.iter_mut().find(|x| x.step == step) {
+                x.reverted = id;
+            }
+        }
+        self.notify(
+            NoticeLevel::Info,
+            format!("{} — taken back; analysing what it changed", a.label),
+        );
+        self.analyse_mix_again();
+        Ok(())
+    }
+
+    /// The selected finding is one an experiment in the project was applied
+    /// for (it stays selected, listed as resolved when it is gone).
+    fn selected_applied(&self) -> bool {
+        self.mix
+            .selected
+            .is_some_and(|id| self.applied_for(id).next().is_some())
+    }
+
+    /// The applied experiments' steps in the project now.
+    fn applied_steps(&self) -> Vec<u64> {
+        self.mix
+            .applied
+            .iter()
+            .filter(|a| self.applied_now(a))
+            .map(|a| a.step)
+            .collect()
+    }
+
+    /// After an applied experiment or its Undo: the analysis made again
+    /// over the same range, tracks and signal — only what the change
+    /// reached is measured again (the rest comes from the caches).
+    fn analyse_mix_again(&mut self) {
+        let Some(r) = self.mix.results.clone() else {
+            return;
+        };
+        self.mix.applied_live = self.applied_steps();
+        let again = Again {
+            range: r.range,
+            focus: r.focus.clone(),
+        };
+        if let Err(e) = self.start_mix_analysis_as(r.scope, r.signal, Some(again)) {
+            self.notify(
+                NoticeLevel::Warning,
+                format!("Mix Intelligence: not analysed again: {e}"),
+            );
+        }
     }
 }
 
@@ -2960,6 +3393,52 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
             let (changed, _, _, _) = analyse_now(&mut s);
             let measured = s.mix_results().map_or(0, |r| r.rendered);
+            // An experiment applied: analysed again by itself — how soon the
+            // tracks it changed are shown, and everything.
+            let target = s.mix_findings().into_iter().find_map(|f| {
+                (0..f.recommendations.len())
+                    .find(|&i| {
+                        f.recommendations[i].experiment.previewable()
+                            && s.mix_can_try(f.id, i).is_ok()
+                    })
+                    .map(|i| (f.id, i))
+            });
+            let mut applied = String::from("nothing to apply");
+            if let Some((finding, recommendation)) = target {
+                let t0 = std::time::Instant::now();
+                s.dispatch(Action::Mix(MixOp::Apply {
+                    finding,
+                    recommendation,
+                }))
+                .unwrap_or_else(|e| panic!("{e}"));
+                let rev = s.history.revision();
+                let mut shown = None;
+                while s.mix_analysing() {
+                    s.poll_mix();
+                    if shown.is_none() && s.mix_results().is_some_and(|r| r.history_revision == rev)
+                    {
+                        shown = Some(t0.elapsed().as_secs_f64());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                s.poll_mix();
+                let done = t0.elapsed().as_secs_f64();
+                let r = s.mix_results().unwrap_or_else(|| panic!("results"));
+                applied = format!(
+                    "the changed tracks shown after {:.2} s, everything after {done:.2} s \
+                     ({} signals measured, {} renders, {} excerpts held, {} rendered; {})",
+                    shown.unwrap_or(done),
+                    r.rendered,
+                    r.renders,
+                    r.extra.excerpts_held,
+                    r.extra.excerpt_renders,
+                    r.phases
+                        .iter()
+                        .map(|(n, t)| format!("{n} {t:.2} s"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             // Before: the main pass as it was, and the second stage as it
             // was (on a session that has measured nothing).
             let skip_before = std::env::var_os("FADERFRAME_SPEED_NOW_ONLY").is_some();
@@ -2998,9 +3477,10 @@ mod tests {
                  now: {renders} render + the second stage, profiles on {} threads: {now:.2} s \
                  ({:.2}× real time, {:.1}× faster) — {}\n  \
                  unchanged, everything reused: {again:.2} s ({again_renders} renders)\n  \
-                 second stage now: sources {:.2} s, excerpts {:.2} s ({} renders), pairs \
-                 {:.2} s\n  \
+                 second stage now: sources {:.2} s, excerpts {:.2} s ({} renders, {} held), \
+                 pairs {:.2} s\n  \
                  one fader moved: {changed:.2} s ({measured} signals measured again)\n  \
+                 an experiment applied: {applied}\n  \
                  source analysis: {source_renders} renders one after the other \
                  {sources_before:.2} s, side by side {sources_now:.2} s ({:.1}× faster)",
                 counts.sources_rendered + counts.sources_reused,
@@ -3017,6 +3497,7 @@ mod tests {
                 counts.sources_seconds,
                 counts.excerpts_seconds,
                 counts.excerpt_renders,
+                counts.excerpts_held,
                 counts.pairs_seconds,
                 sources_before / sources_now.max(1e-9)
             );

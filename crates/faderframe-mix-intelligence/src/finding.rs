@@ -179,6 +179,21 @@ pub enum RuleId {
 }
 
 impl RuleId {
+    /// Found by the second stage ([`crate::diagnose_extra`]: pairs over
+    /// excerpts, sources beside the processed signals), not from the
+    /// profiles alone.
+    pub fn second_stage(self) -> bool {
+        matches!(
+            self,
+            RuleId::PolarityInverted
+                | RuleId::TimeOffset
+                | RuleId::FrequencyDependentPhase
+                | RuleId::OnsetOffset
+                | RuleId::LooseTiming
+                | RuleId::TransientFlattening
+        )
+    }
+
     pub fn category(self) -> Category {
         match self {
             RuleId::SpectralMasking => Category::Masking,

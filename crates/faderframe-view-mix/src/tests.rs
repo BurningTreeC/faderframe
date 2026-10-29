@@ -565,3 +565,50 @@ fn the_levels_panel_shows_dynamics_width_and_the_pairs_compared() {
         assert!(texts.iter().any(|x| x.contains(t)), "{t}: {texts:?}");
     }
 }
+
+#[test]
+fn an_applied_experiment_shows_its_undo() {
+    let (mut s, _, _) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s.mix_selected().unwrap().clone();
+    let i = f
+        .recommendations
+        .iter()
+        .position(|r| r.experiment.previewable())
+        .unwrap();
+    let mut view = MixView::new(Theme::default());
+    paint(&mut view, &s);
+    let (a, _) = click(&mut view, &s, Hit::Apply(f.id, i));
+    s.dispatch(a[0].clone()).unwrap();
+    // While the changed tracks are analysed again: checking.
+    let p = paint(&mut view, &s);
+    let step = s.mix_applied_to(f.id)[0].step;
+    assert!(view.rect_of(Hit::Undo(step)).is_some(), "an Undo beside it");
+    assert!(p.texts().contains(&"Checking"), "{:?}", p.texts());
+    s.wait_for_mix();
+    s.dispatch(Action::Mix(MixOp::Select(Some(f.id)))).unwrap();
+    let p = paint(&mut view, &s);
+    let state = s.mix_applied_state(f.id).unwrap();
+    assert!(
+        p.texts()
+            .contains(&if state == faderframe_session::mix::Applied::Resolved {
+                "Resolved"
+            } else {
+                "Applied"
+            }),
+        "{:?}",
+        p.texts()
+    );
+    let (a, _) = click(&mut view, &s, Hit::Undo(step));
+    assert_eq!(a, [Action::Mix(MixOp::Undo(step))]);
+    s.dispatch(a[0].clone()).unwrap();
+    s.wait_for_mix();
+    paint(&mut view, &s);
+    assert!(view.rect_of(Hit::Undo(step)).is_none(), "taken back");
+    assert!(view.rect_of(Hit::Apply(f.id, i)).is_some());
+}

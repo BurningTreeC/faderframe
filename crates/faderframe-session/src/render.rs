@@ -636,10 +636,37 @@ pub(crate) fn render_captured(
     project: &Project,
     sample_rate: u32,
     sources: &faderframe_engine::SourceMap,
+    range: (i64, usize),
+    progress: &RenderProgress,
+    outputs: usize,
+    plan: faderframe_engine::capture::CapturePlan,
+    each: &mut CapturedPiece<'_>,
+) -> Result<CaptureReport, RenderError> {
+    render_captured_on(
+        project,
+        sample_rate,
+        sources,
+        range,
+        progress,
+        outputs,
+        plan,
+        faderframe_realtime::default_worker_count(),
+        each,
+    )
+}
+
+/// [`render_captured`] with `workers` DSP threads beside the calling one
+/// (0: the calling thread alone — for renders run side by side).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_captured_on(
+    project: &Project,
+    sample_rate: u32,
+    sources: &faderframe_engine::SourceMap,
     (start, frames): (i64, usize),
     progress: &RenderProgress,
     outputs: usize,
     plan: faderframe_engine::capture::CapturePlan,
+    workers: usize,
     each: &mut CapturedPiece<'_>,
 ) -> Result<CaptureReport, RenderError> {
     const BLOCK: usize = 1024;
@@ -661,7 +688,6 @@ pub(crate) fn render_captured(
         .cloned()
         .ok_or_else(|| RenderError::NoTrack("nothing to capture".into()))?;
     let taps = capture.taps();
-    let workers = faderframe_realtime::default_worker_count();
     if workers > 0 {
         r.processor.set_worker_pool(Some(std::sync::Arc::new(
             faderframe_realtime::WorkerPool::new(faderframe_realtime::PoolConfig::new(workers)),

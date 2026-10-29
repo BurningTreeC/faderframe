@@ -27,7 +27,32 @@ dockable, detachable editors.
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
 > comes next.
 
-## What's new in 0.35
+## What's new in 0.36
+
+* **Mix Intelligence answers right after a change**: applying a proposal
+  analyses again by itself. The tracks the change reached are rendered
+  first, alone and in pieces side by side, so their findings — and their
+  phase and timing pairs — are back in about half a second; the master
+  and buses follow from one render of the whole mix, which measures
+  everything exactly (the quick look is never kept). Undo and redo of an
+  applied proposal analyse again too; after an undo everything comes from
+  the cache.
+* **Undo for each applied proposal**: an Undo button beside it and at the
+  top of its finding takes it back — undone when it was the last step,
+  else taken back alone as a step of its own, with later edits kept. The
+  badge follows the history: *Checking* while the tracks are measured
+  again, *Applied*, or *Resolved* when the analysis no longer finds the
+  problem (the finding stays listed, with its Undo). Ctrl+Z and redo move
+  the badge too.
+* **Faster analyses**: the phase and timing pairs read their excerpts
+  from the signals the main render already measured instead of rendering
+  the mix a second time — the demo analyses in 1.7 s (was 2.6 s), a four
+  times larger project in 2.5 s (was 3.6 s).
+* Renders running side by side no longer share a streamed audio file
+  (copied tracks playing one recording could read pages another render
+  had just freed).
+
+### 0.35
 
 * **Mix Intelligence, complete**: everything the first milestone left
   open.

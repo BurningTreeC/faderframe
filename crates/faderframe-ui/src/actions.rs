@@ -2217,6 +2217,7 @@ pub fn install(app: &Rc<AppState>) {
         named("mix-apply", crate::mix_actions::apply),
         named("mix-open", crate::mix_actions::open),
         named("mix-reject", crate::mix_actions::reject),
+        named("mix-undo", crate::mix_actions::undo),
         named("mix-dismiss", crate::mix_actions::dismiss),
         named("track-role", crate::mix_actions::track_role),
         named("mix-log", crate::mix_actions::log),
