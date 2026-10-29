@@ -695,7 +695,7 @@ checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
 name = "faderframe-adm"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "roxmltree",
@@ -704,11 +704,11 @@ dependencies = [
 
 [[package]]
 name = "faderframe-analysis"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "faderframe-app"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-plugin-check",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-realtime",
  "rtrb",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio-cpal"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "cpal",
  "faderframe-audio",
@@ -744,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio-files"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "audioadapter-buffers",
  "faderframe-realtime",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio-graph"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-midi",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio-jack"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "jack",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-audio-pipewire"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-realtime",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-automation"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-timeline",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-bench"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-audio-files",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-binaural"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "hdf5-reader",
@@ -826,11 +826,11 @@ dependencies = [
 
 [[package]]
 name = "faderframe-circuit"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "faderframe-conform"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "serde_json",
@@ -839,14 +839,14 @@ dependencies = [
 
 [[package]]
 name = "faderframe-control"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "faderframe-core"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-disc"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "encoding_rs",
  "thiserror 2.0.21",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-engine"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "base64",
  "faderframe-analysis",
@@ -889,14 +889,14 @@ dependencies = [
 
 [[package]]
 name = "faderframe-guitar"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-circuit",
 ]
 
 [[package]]
 name = "faderframe-iamf"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "flacenc",
  "opus",
@@ -905,14 +905,14 @@ dependencies = [
 
 [[package]]
 name = "faderframe-leadsheet"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-midi",
 ]
 
 [[package]]
 name = "faderframe-midi"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "rtrb",
  "serde",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-midi-io"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-midi",
  "faderframe-midi-ump",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-midi-ump"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "alsa-sys",
  "faderframe-midi",
@@ -942,7 +942,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-mix-intelligence"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-analysis",
  "faderframe-audio-files",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-au"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-graph",
  "faderframe-automation",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-check"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-graph",
  "faderframe-core",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-clap"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "clack-extensions",
  "clack-host",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-host"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-audio-graph",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-lv2"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "cc",
  "faderframe-audio-graph",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-sandbox"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-audio-graph",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-plugin-vst3"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-graph",
  "faderframe-automation",
@@ -1090,11 +1090,11 @@ dependencies = [
 
 [[package]]
 name = "faderframe-polypitch"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "faderframe-project"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-automation",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-realtime"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "libc",
  "rtrb",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-session"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-adm",
  "faderframe-analysis",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-spectral"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-project",
  "realfft",
@@ -1173,7 +1173,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-speech"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1182,14 +1182,14 @@ dependencies = [
 
 [[package]]
 name = "faderframe-stretch"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "faderframe-timeline"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "serde",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-transcribe"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-transport"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-timeline",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-ui"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-adm",
  "faderframe-audio",
@@ -1286,11 +1286,11 @@ dependencies = [
 
 [[package]]
 name = "faderframe-ui-canvas"
-version = "0.35.0"
+version = "0.36.0"
 
 [[package]]
 name = "faderframe-ui-gpu"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "ash",
  "faderframe-ui-canvas",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-video"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-core",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-adr"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-album"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-audio-files",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-arranger"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-audio-files",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-automation"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-automation",
  "faderframe-core",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-clipfx"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-ddp"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-disc",
  "faderframe-engine",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-devices"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-analysis",
  "faderframe-audio-files",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-events"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-history"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-inspector"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-automation",
  "faderframe-core",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-launcher"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-leadsheet"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-mix"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-core",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-mixer"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-automation",
  "faderframe-core",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-modulators"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1520,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-performance"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio",
  "faderframe-core",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-pianoroll"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1544,7 +1544,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-pitch"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-reference"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-analysis",
  "faderframe-audio-files",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-setlist"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-engine",
  "faderframe-project",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-spectral"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-audio-files",
  "faderframe-core",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-surround"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-automation",
  "faderframe-core",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-tools"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-analysis",
  "faderframe-core",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-view-video"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "faderframe-engine",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "faderframe-workspace"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "faderframe-core",
  "serde",
