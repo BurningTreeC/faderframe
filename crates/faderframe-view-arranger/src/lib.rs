@@ -11,10 +11,13 @@
 mod access;
 mod automation;
 mod clip_edit;
+mod clip_envelope;
 pub mod edit_bar;
 mod global;
 mod harmony;
 mod header;
+mod lyric_lane;
+mod presence;
 mod scratch;
 mod video_lane;
 
@@ -209,6 +212,19 @@ pub enum Hit {
     },
     /// The bottom edge of a track's take lanes: drag to size them.
     TakeLanesEdge(TrackId),
+    /// A word in a take lane (`word`: the folder's word, its column).
+    TakeWord {
+        clip: ClipId,
+        take: usize,
+        word: usize,
+    },
+    /// A word in the lyrics comp row under a folder's lanes.
+    LyricWord {
+        clip: ClipId,
+        word: usize,
+    },
+    /// The lyrics comp row away from its words.
+    LyricRow(ClipId),
     Empty(MusicalTime),
     /// The "+" under the last track header.
     AddTrack,
@@ -414,6 +430,8 @@ pub struct ArrangerView {
     /// Files being dragged in: target track (`None` = new tracks) and time.
     drop_at: Option<(Option<TrackId>, MusicalTime)>,
     comp: Option<CompDrag>,
+    /// The last word clicked in a take lane (Shift+click comps from it).
+    word_anchor: Option<lyric_lane::WordAnchor>,
     marquee: Option<Marquee>,
     auto_drag: Option<automation::AutoDrag>,
     /// Track header column width (from the layout, else the theme).
@@ -592,6 +610,25 @@ fn sample_items(model: &Session, track: TrackId, clip: Option<ClipId>) -> Vec<Me
         .collect()
 }
 
+/// "Slice", REX-style: the session's slicing entries for the track's
+/// selection (or the clip) in a submenu (none when there is nothing to
+/// slice).
+fn slice_items(model: &Session, track: TrackId, clip: Option<ClipId>) -> Vec<MenuItem<Action>> {
+    let entries: Vec<MenuItem<Action>> = model
+        .slice_choices(track, clip)
+        .into_iter()
+        .map(|(label, action, separated)| {
+            let item = MenuItem::new(label, action);
+            if separated { item.separated() } else { item }
+        })
+        .collect();
+    if entries.is_empty() {
+        Vec::new()
+    } else {
+        vec![MenuItem::submenu("Slice to Pads or Keys", entries)]
+    }
+}
+
 fn color_of(c: TrackColor) -> Color {
     Color::rgb8(c.r, c.g, c.b)
 }
@@ -618,6 +655,7 @@ impl ArrangerView {
             law: FaderLaw::console(),
             drop_at: None,
             comp: None,
+            word_anchor: None,
             marquee: None,
             auto_drag: None,
             header_width,
@@ -793,6 +831,7 @@ impl ArrangerView {
         for t in Self::lane_tracks(model) {
             y += self.base_h(model, t.id)
                 + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id)
+                + Self::lyric_row_h(t, model)
                 + model.shown_lanes(t.id).len() as f32 * AUTO_LANE_H;
             self.rows.push(y);
         }
@@ -1134,6 +1173,22 @@ impl ArrangerView {
                         take: k as usize,
                     });
                 }
+                if k >= 0.0
+                    && (k as usize) < f.takes.len()
+                    && let Some(word) = self.take_word_at(
+                        model,
+                        clip,
+                        k as usize,
+                        Rect::new(rect.x, lanes_top + k * lane_h, rect.w, lane_h - 1.0),
+                        pos,
+                    )
+                {
+                    return Some(Hit::TakeWord {
+                        clip: clip.id,
+                        take: k as usize,
+                        word,
+                    });
+                }
                 if k >= 0.0 && (k as usize) < f.takes.len() {
                     let rate = p.sample_rate as f64;
                     let frame =
@@ -1143,6 +1198,21 @@ impl ArrangerView {
                         track: t.id,
                         take: k as usize,
                         pos: frame.clamp(0, f.length),
+                    });
+                }
+                // The lyrics comp row under the lanes.
+                let row_top = lanes_top + Self::open_lanes(t, model) as f32 * lane_h;
+                if Self::has_lyric_row(model, clip.id)
+                    && pos.y >= row_top
+                    && pos.y < row_top + lyric_lane::LYRIC_ROW_H
+                {
+                    let lyric = Rect::new(rect.x, row_top, rect.w, lyric_lane::LYRIC_ROW_H);
+                    return Some(match self.lyric_word_at(model, clip, lyric, pos) {
+                        Some(word) => Hit::LyricWord {
+                            clip: clip.id,
+                            word,
+                        },
+                        None => Hit::LyricRow(clip.id),
                     });
                 }
             }
@@ -1640,6 +1710,8 @@ impl ArrangerView {
                 );
                 p.stroke_rounded(r, 1.5, 1.0, color.lighten(0.35));
             }
+            // The words it sings (comping by lyric).
+            self.paint_take_words(p, lane, vis, clip, f, k, model);
             // The ▶ that auditions it; the take heard is outlined.
             let mut label_x = vis.0 + 3.0;
             if let Some(b) = self.audition_rect(clip_rect, lane.y, lane_h)
@@ -1916,6 +1988,8 @@ impl ArrangerView {
             ClipContent::Takes(f) => self.paint_comp(p, content, vis, clip, f, model, color),
         }
         self.paint_fades(p, model, clip, rect, color);
+        self.paint_strip_preview(p, model, clip, rect);
+        self.paint_envelope(p, model, clip, rect);
         self.paint_gain(p, clip, rect, text_color);
         if clip.muted {
             p.fill(rect, Color::rgba(0.08, 0.08, 0.09, 0.6));
@@ -1971,6 +2045,19 @@ impl ArrangerView {
     /// A folder's header: its triangle, name, what it holds, mute and solo.
     /// A time-locked track's padlock before its name (in `name`, the
     /// name's rect); returns the rect left for the name.
+    /// A track played from its self-freeze cache: a star before its name;
+    /// returns the rect left for the name.
+    fn paint_cached(&self, p: &mut dyn Painter, t: &Track, name: Rect, model: &Session) -> Rect {
+        if !model.is_self_frozen(t.id) {
+            return name;
+        }
+        let (glyph, rest) = header::lock_rect(name);
+        let side = glyph.w.min(glyph.h);
+        let square = Rect::new(glyph.x, glyph.center().y - side / 2.0, side, side);
+        controls::cache_glyph(p, square, self.theme.ui.accent);
+        rest
+    }
+
     fn paint_time_lock(&self, p: &mut dyn Painter, t: &Track, name: Rect) -> Rect {
         if !t.is_time_locked() {
             return name;
@@ -2030,6 +2117,7 @@ impl ArrangerView {
             );
         }
         let name = self.paint_time_lock(p, t, name);
+        let name = self.paint_cached(p, t, name, model);
         p.text(
             &t.name,
             name,
@@ -2146,6 +2234,7 @@ impl ArrangerView {
             return;
         }
         let name = self.paint_time_lock(p, t, l.name);
+        let name = self.paint_cached(p, t, name, model);
         p.text(
             &t.name,
             name,
@@ -2818,8 +2907,9 @@ impl ArrangerView {
         );
         // Groups and VCAs.
         items.extend(model.group_menu(t.id).into_iter().map(entry_item));
-        // A sample of the selection (audio tracks).
+        // A sample of the selection (audio tracks), and its slices.
         items.extend(sample_items(model, t.id, None));
+        items.extend(slice_items(model, t.id, None));
         // Folders: what this one holds; into and out of folders.
         if t.is_folder() {
             let open = model.folder_open(t.id);
@@ -2894,6 +2984,53 @@ impl ArrangerView {
         if !bases.is_empty() {
             items.push(MenuItem::submenu("Time Base", bases));
         }
+
+        // What its notes play by: articulation and drum maps.
+        for (title, list) in [
+            ("Articulation Map", model.articulation_map_choices(t.id)),
+            ("Drum Map", model.drum_map_choices(t.id)),
+        ] {
+            let maps: Vec<MenuItem<Action>> = list
+                .into_iter()
+                .map(|c| {
+                    let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                    if c.group_start {
+                        item.separated()
+                    } else {
+                        item
+                    }
+                })
+                .collect();
+            if !maps.is_empty() {
+                items.push(MenuItem::submenu(title, maps));
+            }
+        }
+        // The tuning it plays and how its plugins are told it
+        // (instrument and MIDI tracks; see `faderframe_project::tuning`).
+        let choices = |list: Vec<faderframe_session::InputChoice>| -> Vec<MenuItem<Action>> {
+            list.into_iter()
+                .map(|c| {
+                    let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                    if c.group_start {
+                        item.separated()
+                    } else {
+                        item
+                    }
+                })
+                .collect()
+        };
+        let mut tunings = choices(model.tuning_choices(Some(t.id)));
+        if !tunings.is_empty() {
+            tunings.push(MenuItem::submenu(
+                "More Equal Temperaments",
+                choices(model.more_tuning_choices(Some(t.id))),
+            ));
+            tunings.push(
+                MenuItem::submenu("Retune Plugins", choices(model.retune_choices(t.id)))
+                    .separated(),
+            );
+            items.push(MenuItem::submenu("Tuning", tunings));
+        }
         // Freezing and bouncing (tracks with clips).
         if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
             let busy = model.bouncing().contains(&t.id);
@@ -2914,10 +3051,29 @@ impl ArrangerView {
                     Action::BounceTrack(t.id),
                 ));
             }
+            // Played from a cache of its devices' output while nobody
+            // touches it, or always live.
+            let auto: Vec<MenuItem<Action>> = model
+                .self_freeze_choices(t.id)
+                .into_iter()
+                .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+                .collect();
+            if !auto.is_empty() {
+                items.push(MenuItem::submenu("Self-Freeze", auto));
+            }
         }
         // The microphones of one source in time and polarity; the
         // track's own delay back to none.
         items.extend(model.auto_align_menu(t.id).into_iter().map(entry_item));
+        // Its audio split into vocals, drums, bass and the rest.
+        let stems: Vec<MenuItem<Action>> = model
+            .stems_menu(faderframe_session::separate::StemTarget::Track(t.id))
+            .into_iter()
+            .map(entry_item)
+            .collect();
+        if !stems.is_empty() {
+            items.push(MenuItem::submenu("Separate Stems", stems));
+        }
         // Instrument (instrument tracks): the plugin browser.
         if t.kind == TrackKind::Instrument {
             let current = model
@@ -3187,6 +3343,29 @@ impl ArrangerView {
                     of: faderframe_session::leadsheet::LeadSheetOf::Track(t.id),
                 },
             ));
+            // Its MIDI clips (and the other selected tracks') as notation.
+            if matches!(t.kind, TrackKind::Midi | TrackKind::Instrument) {
+                let mut tracks = score_tracks(model);
+                tracks.retain(|x| {
+                    model
+                        .project()
+                        .track(*x)
+                        .is_some_and(|x| matches!(x.kind, TrackKind::Midi | TrackKind::Instrument))
+                });
+                if !tracks.contains(&t.id) {
+                    tracks = vec![t.id];
+                }
+                items.push(MenuItem::new(
+                    if tracks.len() > 1 {
+                        format!("Edit the {} Selected Tracks as Notation", tracks.len())
+                    } else {
+                        "Edit This Track as Notation".to_string()
+                    },
+                    Action::Score(faderframe_session::score::ScoreOp::Show(
+                        faderframe_session::score::ScoreOf::Tracks(tracks),
+                    )),
+                ));
+            }
             // A score of the selected tracks it is one of, a staff each.
             let score = score_tracks(model);
             if score.len() > 1 && score.contains(&t.id) {
@@ -3354,6 +3533,20 @@ impl ArrangerView {
                 Action::ToggleTakeLanes(clip.id),
             ));
             items.push(MenuItem::new("Flatten Comp", Action::FlattenTakes(clip.id)));
+            if model.lyric_comp(clip.id).is_none() && model.hearing_words(clip.id).is_none() {
+                // Hear the words, the lanes open to show them.
+                let hear = Action::LyricComp(faderframe_session::lyric_comp::LyricCompOp::Hear {
+                    clip: clip.id,
+                });
+                items.push(MenuItem::new(
+                    "Comp by Lyrics",
+                    if model.takes_open(clip.id) {
+                        hear
+                    } else {
+                        Action::Several(vec![hear, Action::ToggleTakeLanes(clip.id)])
+                    },
+                ));
+            }
         }
         if clip.as_midi().is_some() {
             items.push(MenuItem::new(
@@ -3438,6 +3631,15 @@ impl ArrangerView {
                     items.push(if i == 0 { item.separated() } else { item });
                 }
             }
+            // A MIDI clip is edited as notation in the score.
+            if clip.as_midi().is_some() {
+                items.push(MenuItem::new(
+                    "Edit as Notation",
+                    Action::Score(faderframe_session::score::ScoreOp::Show(
+                        faderframe_session::score::ScoreOf::Clip(clip.id),
+                    )),
+                ));
+            }
             if clip.as_audio().is_some() {
                 use faderframe_session::to_midi::ToMidi;
                 for (i, how) in [ToMidi::Melody, ToMidi::Harmony, ToMidi::Drums]
@@ -3454,6 +3656,18 @@ impl ArrangerView {
                     "Clip Effects…",
                     Action::OpenClipEffects(clip.id),
                 ));
+                // Melodyne and the like: open the clip with an ARA plug-in
+                // (or in the one its track has).
+                let ara: Vec<MenuItem<Action>> = model
+                    .ara_menu(clip.id)
+                    .into_iter()
+                    .map(entry_item)
+                    .collect();
+                if ara.len() > 2 {
+                    items.push(MenuItem::submenu("Open with ARA", ara));
+                } else {
+                    items.extend(ara);
+                }
                 items.push(MenuItem::new(
                     "Spectral Editor (Remove Noises, Heal)…",
                     Action::OpenSpectralEditor(clip.id),
@@ -3461,6 +3675,25 @@ impl ArrangerView {
                 items.push(MenuItem::new(
                     "Transcribe Words to the Lyrics Lane",
                     Action::Transcribe(clip.id),
+                ));
+                // Vocals, drums, bass and the rest on tracks of their own.
+                let stems: Vec<MenuItem<Action>> = model
+                    .stems_menu(faderframe_session::separate::StemTarget::Clip(clip.id))
+                    .into_iter()
+                    .map(entry_item)
+                    .collect();
+                if !stems.is_empty() {
+                    items.push(MenuItem::submenu("Stems", stems));
+                }
+                items.push(MenuItem::submenu(
+                    "Clip Envelope",
+                    Self::clip_envelope_items(model, &targets),
+                ));
+                items.push(MenuItem::new(
+                    "Strip Silence…",
+                    Action::StripSilence(faderframe_session::strip_silence::StripSilenceOp::Open {
+                        clips: targets.clone(),
+                    }),
                 ));
                 items.extend(lead_sheet_items(model, clip, &targets));
                 // The selected audio clips (a multitrack jam) or this one.
@@ -3481,7 +3714,9 @@ impl ArrangerView {
                         } else {
                             "Find the Song's Structure (Sections)"
                         },
-                        Action::SongStructure { clips: audio },
+                        Action::SongStructure {
+                            clips: audio.clone(),
+                        },
                     )
                     .separated(),
                 );
@@ -3493,6 +3728,15 @@ impl ArrangerView {
                     "Warp Clip to Project Tempo",
                     from(FromClip::WarpToTempo),
                 ));
+                // A double (or several) warped onto another track's take.
+                let align: Vec<MenuItem<Action>> = model
+                    .align_timing_menu(&audio)
+                    .into_iter()
+                    .map(entry_item)
+                    .collect();
+                if !align.is_empty() {
+                    items.push(MenuItem::submenu("Align Timing to", align));
+                }
             }
             if clip.as_audio().is_some() || clip.as_midi().is_some() {
                 let item = MenuItem::new("Set Key from Clip", from(FromClip::SetKey));
@@ -3555,6 +3799,7 @@ impl ArrangerView {
         }
         Self::clip_edit_menu(model, clip, at, &mut items);
         items.extend(sample_items(model, clip.track, Some(clip.id)));
+        items.extend(slice_items(model, clip.track, Some(clip.id)));
         items.push(
             MenuItem::new(
                 if many { "Delete Clips" } else { "Delete" },
@@ -3636,6 +3881,7 @@ impl ArrangerView {
             "Hide Takes",
             Action::ToggleTakeLanes(clip.id),
         ));
+        items.extend(Self::lyric_items(model, clip.id));
         HostRequest::ContextMenu { at, items }
     }
 
@@ -3948,6 +4194,19 @@ impl ArrangerView {
                 }
             }
             Hit::TakeToggle(clip) => cx.emit(Action::ToggleTakeLanes(clip)),
+            Hit::TakeWord { clip, take, word } => {
+                self.press_take_word(clip, take, word, clicks, mods, cx);
+            }
+            Hit::LyricWord { clip, word } => {
+                // A click takes the suggestion for the word.
+                cx.emit(Action::LyricComp(
+                    faderframe_session::lyric_comp::LyricCompOp::UseBest {
+                        clip,
+                        words: Some((word, word)),
+                    },
+                ));
+            }
+            Hit::LyricRow(_) => {}
             Hit::TakeLane {
                 clip,
                 take,
@@ -4614,6 +4873,11 @@ impl CanvasView<Session, Action> for ArrangerView {
                     let top = row.y + self.base_h(model, t.id);
                     let lane_h = model.take_lane_height(t.id);
                     self.paint_take_lanes(p, rect, (top, lane_h), lanes, clip, f, model, color);
+                    if Self::has_lyric_row(model, clip.id) {
+                        let y = top + Self::open_lanes(t, model) as f32 * lane_h;
+                        let lyric = Rect::new(rect.x, y, rect.w, lyric_lane::LYRIC_ROW_H);
+                        self.paint_lyric_row(p, rect, lyric, lanes, clip, f, model, color);
+                    }
                 }
             }
             // The track plays the clip launcher, not the arrangement.
@@ -4639,6 +4903,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             );
         }
         self.paint_edit_overlay(p, lanes, size, &tracks, model);
+        self.paint_collaborators(p, lanes, size, &tracks, model);
         let px = self.x_of(model.playhead());
         if px >= lanes.x {
             let glow = theme.console.look.glow;
@@ -4912,6 +5177,11 @@ impl CanvasView<Session, Action> for ArrangerView {
                                 cx.request(Self::fade_menu(model, c, edge, pos));
                                 return true;
                             }
+                            // A clip envelope's point: its shape, remove it.
+                            if let Some(menu) = self.envelope_point_menu(model, size, c, pos) {
+                                cx.request(menu);
+                                return true;
+                            }
                             if !model.selection.clips.contains(&clip) {
                                 cx.emit(Action::SelectClips {
                                     clips: vec![clip],
@@ -4951,6 +5221,18 @@ impl CanvasView<Session, Action> for ArrangerView {
                         if let Some(c) = model.project().clip(clip) {
                             cx.request(Self::take_menu(model, c, take, pos));
                         }
+                    }
+                    Some(Hit::TakeWord { clip, take, word }) => {
+                        cx.request(Self::take_word_menu(model, clip, take, word, pos));
+                    }
+                    Some(Hit::LyricWord { clip, word }) => {
+                        cx.request(Self::lyric_word_menu(model, clip, word, pos));
+                    }
+                    Some(Hit::LyricRow(clip)) => {
+                        cx.request(HostRequest::ContextMenu {
+                            at: pos,
+                            items: Self::lyric_items(model, clip),
+                        });
                     }
                     Some(Hit::Automation { track, header, .. }) => {
                         let tracks = Self::lane_tracks(model);
@@ -5017,6 +5299,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::HeaderEdge) => Cursor::ResizeHorizontal,
                         Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
                         Some(Hit::TakeAudition { .. }) => Cursor::Pointer,
+                        Some(Hit::TakeWord { .. } | Hit::LyricWord { .. }) => Cursor::Pointer,
                         Some(Hit::TakeLanesEdge(_)) => Cursor::ResizeVertical,
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
@@ -5334,6 +5617,14 @@ impl CanvasView<Session, Action> for ArrangerView {
             Hit::TakeLanesEdge(_) => {
                 Some("Drag to size the take lanes · Double-click: the default height".into())
             }
+            hit @ (Hit::TakeWord { .. } | Hit::LyricWord { .. }) => {
+                Self::lyric_tooltip(model, &hit)
+            }
+            Hit::LyricRow(_) => Some(
+                "The line word by word, each from the take chosen for it (★: another take is \
+                 suggested) · Right-click: suggestions, hear again"
+                    .into(),
+            ),
             Hit::Automation { header: true, .. } => {
                 Some("Click the name to choose parameters · the mode button sets Off/Read/Touch/Latch/Write".into())
             }
@@ -5423,6 +5714,13 @@ impl CanvasView<Session, Action> for ArrangerView {
         model: &Session,
     ) -> Option<Action> {
         self.drop_at = None;
+        // Files from the media browser: placed matched to the project.
+        if let Some(files) = faderframe_session::browser::parse_payload(payload) {
+            let (track, at) = self.drop_target(pos, size, model)?;
+            return Some(Action::Browser(
+                faderframe_session::browser::BrowserOp::Place { files, track, at },
+            ));
+        }
         let clips = launcher_payload(payload, model)?;
         let (track, at) = self.clip_drop_target(pos, size, model)?;
         Some(Action::Launcher(
@@ -5483,6 +5781,23 @@ mod ripple_tests;
 
 #[cfg(test)]
 mod time_lock_tests;
+
+#[cfg(test)]
+mod align_tests;
+#[cfg(test)]
+mod ara_tests;
+#[cfg(test)]
+mod clip_envelope_tests;
+#[cfg(test)]
+mod lyric_tests;
+#[cfg(test)]
+mod presence_tests;
+#[cfg(test)]
+mod self_freeze_tests;
+#[cfg(test)]
+mod slice_tests;
+#[cfg(test)]
+mod stems_tests;
 
 /// The launcher clips a payload carries (arrangement clips move inside the
 /// arranger's own drag).

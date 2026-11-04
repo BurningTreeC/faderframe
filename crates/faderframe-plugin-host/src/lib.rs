@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "ara-mock")]
+pub mod ara_mock;
 pub mod builtin;
 pub mod devices;
 pub mod dsp;
@@ -32,6 +34,9 @@ pub mod program_eq;
 pub mod scan;
 pub mod tap;
 
+/// ARA 2 hosting (the document, its model, the factory and extension
+/// types the formats hand out).
+pub use faderframe_ara as ara;
 pub use harmony::{Harmony, NO_HARMONY};
 pub use params::ParamValues;
 
@@ -590,6 +595,29 @@ pub trait PluginInstance {
         &mut self,
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError>;
+
+    /// The plugin's ARA factory, when it is an ARA 2 plugin (VST3's
+    /// `ARA::IPlugInEntryPoint`, CLAP's ARA plug-in extension).
+    fn ara_factory(&mut self) -> Option<faderframe_ara::Factory> {
+        None
+    }
+
+    /// Bind the instance to an ARA document's controller, taking `roles`
+    /// on: once, before its state is loaded, it is activated or its editor
+    /// opens. The extension stays valid while the instance lives.
+    fn bind_ara(
+        &mut self,
+        _controller: faderframe_ara::ControllerRef,
+        _roles: faderframe_ara::Roles,
+    ) -> Result<faderframe_ara::Extension, PluginError> {
+        Err(PluginError::Failed("not an ARA plugin".into()))
+    }
+
+    /// Stop processing now: graphs holding its processor go silent, and the
+    /// next [`create_processor`](Self::create_processor) activates it anew
+    /// (a new [`activation`](Self::activation)). ARA playback renderers
+    /// change their playback regions only while inactive.
+    fn deactivate(&mut self) {}
 }
 
 /// Audio-thread side of a plugin instance. Must be realtime-safe.
@@ -608,6 +636,12 @@ pub trait PluginProcessor: Send {
     }
     /// Whole device callback's bounded work deadline, shared by all chunks.
     fn set_callback_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
+    /// What each key sounds (the track's tuning; see
+    /// `faderframe_midi::tuning`). Instruments that play tunings keep a
+    /// copy and start notes from it; the rest ignore it. Called by the
+    /// engine when the table changes, before the block it applies to.
+    /// Realtime-safe: the table is copied, never allocated.
+    fn set_tuning(&mut self, _tuning: &faderframe_midi::tuning::TuningTable) {}
 }
 
 /// Something that can list and instantiate plugins of one format.
@@ -615,6 +649,16 @@ pub trait PluginFactory {
     fn format(&self) -> PluginFormat;
     fn scan(&self) -> Vec<PluginDescriptor>;
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError>;
+    /// The ids of its plugins that are ARA plugins (from the scan).
+    fn ara_plugins(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Instantiate in this process even where the factory would use a
+    /// helper process: ARA plugins read the host's audio and model through
+    /// pointers, which cannot cross processes.
+    fn instantiate_in_process(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
+        self.instantiate(id)
+    }
 }
 
 /// All available plugin formats.
@@ -671,6 +715,30 @@ impl PluginRegistry {
             .find(|f| f.format() == format)
             .ok_or(PluginError::UnsupportedFormat(format))?
             .instantiate(id)
+    }
+
+    /// [`instantiate`](Self::instantiate) in this process (ARA plugins).
+    pub fn instantiate_in_process(
+        &self,
+        format: PluginFormat,
+        id: &str,
+    ) -> Result<Box<dyn PluginInstance>, PluginError> {
+        self.factories
+            .iter()
+            .find(|f| f.format() == format)
+            .ok_or(PluginError::UnsupportedFormat(format))?
+            .instantiate_in_process(id)
+    }
+
+    /// The ARA plugins of every format (format, id).
+    pub fn ara_plugins(&self) -> Vec<(PluginFormat, String)> {
+        self.factories
+            .iter()
+            .flat_map(|f| {
+                let format = f.format();
+                f.ara_plugins().into_iter().map(move |id| (format, id))
+            })
+            .collect()
     }
 }
 

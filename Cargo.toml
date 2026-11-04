@@ -78,10 +78,26 @@ faderframe-view-pitch = { path = "crates/faderframe-view-pitch" }
 faderframe-view-clipfx = { path = "crates/faderframe-view-clipfx" }
 faderframe-view-inspector = { path = "crates/faderframe-view-inspector" }
 faderframe-view-mix = { path = "crates/faderframe-view-mix" }
+faderframe-codec = { path = "crates/faderframe-codec" }
+faderframe-view-scenes = { path = "crates/faderframe-view-scenes" }
 faderframe-transcribe = { path = "crates/faderframe-transcribe" }
 faderframe-speech = { path = "crates/faderframe-speech" }
+faderframe-separate = { path = "crates/faderframe-separate" }
 faderframe-view-pianoroll = { path = "crates/faderframe-view-pianoroll" }
 faderframe-ui = { path = "crates/faderframe-ui" }
+faderframe-qc = { path = "crates/faderframe-qc" }
+faderframe-restore = { path = "crates/faderframe-restore" }
+faderframe-ara = { path = "crates/faderframe-ara" }
+faderframe-interchange = { path = "crates/faderframe-interchange" }
+faderframe-script = { path = "crates/faderframe-script" }
+faderframe-aaf = { path = "crates/faderframe-aaf" }
+faderframe-view-browser = { path = "crates/faderframe-view-browser" }
+faderframe-audio-aes67 = { path = "crates/faderframe-audio-aes67" }
+faderframe-remote = { path = "crates/faderframe-remote" }
+faderframe-view-score = { path = "crates/faderframe-view-score" }
+faderframe-collab = { path = "crates/faderframe-collab" }
+faderframe-view-adaptive = { path = "crates/faderframe-view-adaptive" }
+faderframe-view-maps = { path = "crates/faderframe-view-maps" }
 
 # --- external crates -------------------------------------------------------
 # GUI shell (Linux first; GTK 4.14+ for GSK path rendering).
@@ -131,6 +147,21 @@ gst-pbutils = { package = "gstreamer-pbutils", version = "0.25" }
 gst-allocators = { package = "gstreamer-allocators", version = "0.25" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Checksums of downloaded models (the publishers give MD5).
+md-5 = "0.10"
+# AES67 network audio: socket options std lacks (address reuse, multicast
+# interface, DSCP) without unsafe code.
+socket2 = { version = "0.6", features = ["all"] }
+# Live collaboration: the Noise protocol (Noise_NNpsk0_25519_ChaChaPoly_SHA256,
+# pure Rust, Apache-2.0 OR MIT; no `std` feature, which would pull in ring),
+# MessagePack for what is sent (exact floats, self-describing), invite codes
+# from the OS's randomness.
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+rmp-serde = "1.3"
+rmpv = "1.3"
+serde_bytes = "0.11"
+sha2 = "0.10"
+getrandom = "0.3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -158,6 +189,10 @@ opt-level = 3
 [profile.dev.package.faderframe-speech]
 opt-level = 3
 
+# Stem separation: LSTMs and Wiener filtering over whole recordings.
+[profile.dev.package.faderframe-separate]
+opt-level = 3
+
 # Spectral edits and spectrograms: FFTs over whole clips.
 [profile.dev.package.faderframe-spectral]
 opt-level = 3
@@ -179,6 +214,14 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.faderframe-mix-intelligence]
+opt-level = 3
+
+# The codec monitor resamples and codes the master in real time.
+[profile.dev.package.faderframe-codec]
+opt-level = 3
+
+# The restoration devices run FFTs and AR fits on the audio thread.
+[profile.dev.package.faderframe-restore]
 opt-level = 3
 
 [profile.release]

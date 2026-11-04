@@ -46,6 +46,11 @@ impl Detokenizer {
         Some(Self { pieces })
     }
 
+    /// A token's bytes (empty for tokens beyond the vocabulary).
+    pub fn piece(&self, token: u32) -> &[u8] {
+        self.pieces.get(token as usize).map_or(&[], Vec::as_slice)
+    }
+
     /// The text of `tokens` (special tokens, beyond the vocabulary, left
     /// out).
     pub fn decode(&self, tokens: &[u32]) -> String {

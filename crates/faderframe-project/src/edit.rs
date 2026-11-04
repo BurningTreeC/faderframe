@@ -99,10 +99,13 @@ pub enum CoalesceKey {
     Modulators(TrackId),
     ChainMix(PluginInstanceId, usize),
     Video,
+    ReferencePitch,
+    ClipEnvelope(ClipId),
+    InteractiveScore,
 }
 
 /// State needed to undo a track removal.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RemovedTrack {
     pub track: Track,
     pub index: usize,
@@ -122,7 +125,10 @@ pub struct RemovedTrack {
     )>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Commands serialise (for live collaboration, which sends them between
+/// sessions: `faderframe-session`'s `collab`); a command's types must
+/// therefore be serialisable like the project's.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     // --- track parameters ------------------------------------------------
     SetTrackVolume {
@@ -725,11 +731,118 @@ pub enum Command {
     RenameProject {
         name: String,
     },
+    /// Add (`index`: where in the list), change, rename, move or remove
+    /// (`value: None`) a mix scene (see [`crate::scenes`]).
+    SetMixScene {
+        scene: faderframe_core::MixSceneId,
+        value: Option<Box<crate::scenes::MixScene>>,
+        index: usize,
+    },
+    /// How recalls go unless a scene has its own, and the scenes A and B
+    /// (compare, morph).
+    SetMixSceneOptions {
+        fade: crate::scenes::SceneFade,
+        a: Option<faderframe_core::MixSceneId>,
+        b: Option<faderframe_core::MixSceneId>,
+    },
+    /// Add (`index`: where in the list), change or remove (`value: None`;
+    /// refused while a track names it) an articulation map.
+    SetArticulationMap {
+        map: faderframe_core::ArticulationMapId,
+        value: Option<Box<crate::articulation::ArticulationMap>>,
+        index: usize,
+    },
+    /// The articulation map a track plays by (`None`: none).
+    SetTrackArticulationMap {
+        track: TrackId,
+        map: Option<faderframe_core::ArticulationMapId>,
+    },
+    /// Add (`index`: where in the list), change or remove (`value: None`;
+    /// refused while a track names it) a drum map.
+    SetDrumMap {
+        map: faderframe_core::DrumMapId,
+        value: Option<Box<crate::drum_map::DrumMap>>,
+        index: usize,
+    },
+    /// The drum map a track plays by (`None`: none).
+    SetTrackDrumMap {
+        track: TrackId,
+        map: Option<faderframe_core::DrumMapId>,
+    },
 
     /// Several commands applied atomically (all or nothing).
     Batch {
         label: String,
         commands: Vec<Command>,
+    },
+    /// Let a track be played from a self-freeze cache, or keep its devices
+    /// always running ([`Track::no_self_freeze`]). What it sounds like is
+    /// not changed: the session plays it from its chain at once.
+    SetTrackSelfFreeze {
+        track: TrackId,
+        off: bool,
+    },
+    /// Replace (or with `None` forget) the words heard in a source (see
+    /// [`crate::lyric_comp`]).
+    SetSourceWords {
+        source: AudioSourceId,
+        words: Option<Box<crate::lyric_comp::SourceWords>>,
+    },
+    /// Bind an insert to ARA (it renders its track's audio clips, previews
+    /// edits and shows the document in its editor), or let it go
+    /// ([`crate::ara`]). The instance is made anew either way.
+    SetAraSlot {
+        slot: PluginInstanceId,
+        on: bool,
+    },
+    /// The project's tuning (`track: None`; `tuning: None` = twelve-tone
+    /// equal temperament) or a track's own (`None`: the project's). See
+    /// [`crate::tuning`].
+    SetTuning {
+        track: Option<TrackId>,
+        tuning: Option<faderframe_midi::tuning::Tuning>,
+    },
+    /// The project's reference pitch (A4, Hz; within
+    /// [`faderframe_midi::tuning::REFERENCE_RANGE`]).
+    SetReferencePitch {
+        hz: f64,
+    },
+    /// How a track's hosted plugins and MIDI outputs are retuned.
+    SetTrackRetune {
+        track: TrackId,
+        retune: crate::tuning::Retune,
+    },
+    /// The whole project in another state (a merge of versions, see
+    /// [`crate::merge`]): one undo step, its inverse the state before.
+    ReplaceProject {
+        project: Box<Project>,
+        label: String,
+    },
+    /// A device's A/B compare: the side heard and the other side's
+    /// settings (`None`: side A, no B). A switch pairs it with the slot's
+    /// [`Command::SetPluginState`] in one step (see
+    /// [`crate::device_compare`]).
+    SetDeviceCompare {
+        plugin: PluginInstanceId,
+        compare: Option<crate::device_compare::DeviceCompare>,
+    },
+    /// Replace an audio clip's envelopes (`None`: none).
+    SetClipEnvelope {
+        clip: ClipId,
+        envelope: Option<Box<crate::clip_envelope::ClipEnvelope>>,
+    },
+    /// How the score writes a MIDI clip (`None`: as it reads it; see
+    /// [`crate::notation`]). Score edits pair it with the clip's
+    /// `SetClipContent` in one step.
+    SetClipNotation {
+        clip: ClipId,
+        notation: Option<Box<crate::notation::ClipNotation>>,
+    },
+    /// Replace the interactive score (normalised: see
+    /// [`crate::interactive::InteractiveScore::tidy`]). The session wraps
+    /// it in a [`Command::Batch`] named after the edit.
+    SetInteractiveScore {
+        score: Box<crate::interactive::InteractiveScore>,
     },
 }
 
@@ -855,7 +968,9 @@ fn check_output(p: &Project, track: TrackId, output: OutputRouting) -> Result<()
         ));
     }
     let compatible = if src.kind == TrackKind::Midi {
-        dst.kind == TrackKind::Instrument
+        // An instrument, or an audio track whose devices take notes (a
+        // pitch corrector's target notes).
+        matches!(dst.kind, TrackKind::Instrument | TrackKind::Audio)
     } else {
         dst.kind.is_summing()
     };
@@ -1039,7 +1154,31 @@ impl Command {
             RemoveMidiMapping { .. } => "Remove MIDI Mapping".into(),
             UpdateMidiMapping { .. } => "Change MIDI Mapping".into(),
             RenameProject { .. } => "Rename Project".into(),
+            SetMixScene { value: None, .. } => "Delete Mix Scene".into(),
+            SetMixScene { .. } => "Mix Scene".into(),
+            SetMixSceneOptions { .. } => "Mix Scene Options".into(),
+            SetArticulationMap { value: None, .. } => "Delete Articulation Map".into(),
+            SetArticulationMap { .. } => "Articulation Map".into(),
+            SetTrackArticulationMap { .. } => "Track Articulation Map".into(),
+            SetDrumMap { value: None, .. } => "Delete Drum Map".into(),
+            SetDrumMap { .. } => "Drum Map".into(),
+            SetTrackDrumMap { .. } => "Track Drum Map".into(),
             Batch { label, .. } => label.clone(),
+            SetTrackSelfFreeze { off: true, .. } => "Never Self-Freeze".into(),
+            SetTrackSelfFreeze { off: false, .. } => "Self-Freeze Automatically".into(),
+            SetTuning { track: None, .. } => "Project Tuning".into(),
+            SetTuning { track: Some(_), .. } => "Track Tuning".into(),
+            SetReferencePitch { .. } => "Reference Pitch".into(),
+            SetTrackRetune { retune, .. } => format!("Retune: {}", retune.label()),
+            SetSourceWords { words: Some(_), .. } => "Hear Words".into(),
+            SetSourceWords { words: None, .. } => "Forget Words".into(),
+            SetAraSlot { on: true, .. } => "Open with ARA".into(),
+            SetAraSlot { on: false, .. } => "Stop ARA".into(),
+            ReplaceProject { label, .. } => label.clone(),
+            SetDeviceCompare { .. } => "A/B Compare".into(),
+            SetClipEnvelope { .. } => "Clip Envelope".into(),
+            SetClipNotation { .. } => "Score Notation".into(),
+            SetInteractiveScore { .. } => "Edit Interactive Score".into(),
         }
     }
 
@@ -1062,6 +1201,7 @@ impl Command {
             SetTempo { .. } => CoalesceKey::Tempo,
             SetConsoleDrive { .. } => CoalesceKey::ConsoleDrive,
             SetVideo { .. } => CoalesceKey::Video,
+            SetReferencePitch { .. } => CoalesceKey::ReferencePitch,
             SetLoop { .. } => CoalesceKey::Loop,
             SetPunch { .. } => CoalesceKey::Punch,
             SetPlayStart { .. } => CoalesceKey::PlayStart,
@@ -1075,6 +1215,8 @@ impl Command {
             SetPluginParameter {
                 plugin, parameter, ..
             } => CoalesceKey::PluginParameter(*plugin, *parameter),
+            SetClipEnvelope { clip, .. } => CoalesceKey::ClipEnvelope(*clip),
+            SetInteractiveScore { .. } => CoalesceKey::InteractiveScore,
             _ => return None,
         })
     }
@@ -1132,6 +1274,9 @@ impl Command {
             | SetTrackGroup { .. }
             | SetFolderGroup { .. }
             | SetTrackRippleExcluded { .. }
+            // The session follows it (back to the chain, which sounds the
+            // same).
+            | SetTrackSelfFreeze { .. }
             // Moves nothing: tempo changes from now on keep its place.
             | SetTrackTimeBase { .. }
             | SetTrackRole { .. }
@@ -1150,7 +1295,17 @@ impl Command {
             | SetLaunchRecording { .. }
             // A pad put aside plays nothing; the shown one's entry holds
             // only its name.
-            | SetScratchPad { .. } => Impact::None,
+            | SetScratchPad { .. }
+            // Stored snapshots: a recall is made of other commands.
+            | SetMixScene { .. }
+            | SetMixSceneOptions { .. } => Impact::None,
+            // What was heard in a source: nothing plays differently.
+            | SetSourceWords { .. } => Impact::None,
+            // Keyswitches and changed notes are in the timeline snapshot.
+            SetArticulationMap { .. } | SetTrackArticulationMap { .. } => Impact::Timeline,
+            // Notes remapped in the snapshot, live input in the MIDI input
+            // node, sounds with ports of their own on output nodes.
+            SetDrumMap { .. } | SetTrackDrumMap { .. } => Impact::Graph,
             AddSource { .. }
             | RemoveSource { .. }
             | AddAutomationLane { .. }
@@ -1174,6 +1329,21 @@ impl Command {
             | SetArrangement { .. }
             | ShowArrangement { .. }
             | SetTimeSignature { .. } => Impact::Timeline,
+            // The snapshot carries each track's key table (instruments
+            // read it, plugins and outputs are retuned from it).
+            SetTuning { .. } | SetReferencePitch { .. } => Impact::Timeline,
+            // Which way a plugin is retuned is part of its node.
+            SetTrackRetune { .. } => Impact::Graph,
+            ReplaceProject { .. } => Impact::Graph,
+            // Bookkeeping: what plays is the slot's own state.
+            SetDeviceCompare { .. } => Impact::None,
+            // The clip player reads it from the timeline snapshot.
+            SetClipEnvelope { .. } => Impact::Timeline,
+            // How notes are written, not what is heard.
+            SetClipNotation { .. } => Impact::None,
+            // Read by the session's preview and its exports; nothing plays
+            // differently.
+            SetInteractiveScore { .. } => Impact::None,
             SetLoop { .. } => Impact::Transport,
             SetCrosstalk { .. }
             | SetConsole { .. }
@@ -1204,6 +1374,7 @@ impl Command {
             | RestoreTrack(_)
             | SetTrackFreeze { .. }
             | SetFolderBus { .. }
+            | SetAraSlot { .. }
             | SetPluginSidechain { .. } => Impact::Graph,
             // VCA automation travels with the timeline snapshot.
             SetTrackVca { .. } => Impact::Timeline,
@@ -1225,8 +1396,26 @@ impl Command {
     }
 
     /// Apply to `project`; on success returns the inverse command.
-    /// On error the project is unchanged.
+    /// On error the project is unchanged. While the project's journal is
+    /// on, the command and its inverse are written there (see
+    /// [`crate::journal`]).
     pub fn apply(self, p: &mut Project) -> Result<Command, EditError> {
+        if !p.journal.is_on() {
+            return self.apply_to(p);
+        }
+        // Commands inside (a batch's) are not written again, and a project
+        // replaced whole keeps the journal.
+        let mut journal = std::mem::take(&mut p.journal);
+        let forward = self.clone();
+        let result = self.apply_to(p);
+        if let Ok(inverse) = &result {
+            journal.record(forward, inverse.clone());
+        }
+        p.journal = journal;
+        result
+    }
+
+    fn apply_to(self, p: &mut Project) -> Result<Command, EditError> {
         use Command::*;
         Ok(match self {
             SetTrackVolume { track, db } => {
@@ -1870,6 +2059,27 @@ impl Command {
                 let old = std::mem::replace(&mut t.folder_group, on);
                 SetFolderGroup { track, on: old }
             }
+            SetTrackSelfFreeze { track, off } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.no_self_freeze, off);
+                SetTrackSelfFreeze { track, off: old }
+            }
+            SetAraSlot { slot, on } => {
+                let exists = p
+                    .tracks
+                    .iter()
+                    .any(|t| t.slots().iter().any(|s| s.id == slot));
+                if on && !exists {
+                    return Err(EditError::Invalid(format!("no insert {slot}")));
+                }
+                let old = p.ara.slots.contains(&slot);
+                if on {
+                    p.ara.slots.insert(slot);
+                } else {
+                    p.ara.slots.remove(&slot);
+                }
+                SetAraSlot { slot, on: old }
+            }
             SetTrackRippleExcluded { track, excluded } => {
                 let t = track_mut(p, track)?;
                 let old = std::mem::replace(&mut t.ripple_excluded, excluded);
@@ -2511,6 +2721,210 @@ impl Command {
                     },
                 }
             }
+            SetMixScene {
+                scene,
+                value,
+                index,
+            } => {
+                let scenes = &mut p.mix_scenes;
+                let at = scenes.index_of(scene);
+                if let Some(v) = &value
+                    && v.id != scene
+                {
+                    return Err(EditError::Invalid("mix scene id mismatch".into()));
+                }
+                let inverse = match (at, value) {
+                    (Some(i), None) => SetMixScene {
+                        scene,
+                        value: Some(Box::new(scenes.scenes.remove(i))),
+                        index: i,
+                    },
+                    (Some(i), Some(v)) => {
+                        let old = scenes.scenes.remove(i);
+                        scenes.scenes.insert(index.min(scenes.scenes.len()), *v);
+                        SetMixScene {
+                            scene,
+                            value: Some(Box::new(old)),
+                            index: i,
+                        }
+                    }
+                    (None, Some(v)) => {
+                        let i = index.min(scenes.scenes.len());
+                        scenes.scenes.insert(i, *v);
+                        SetMixScene {
+                            scene,
+                            value: None,
+                            index: i,
+                        }
+                    }
+                    (None, None) => SetMixScene {
+                        scene,
+                        value: None,
+                        index,
+                    },
+                };
+                // A or B naming a scene that goes is cleared; the inverse
+                // puts the scene back first, then names it again.
+                let (a, b) = (scenes.a, scenes.b);
+                scenes.tidy();
+                if (a, b) != (scenes.a, scenes.b) {
+                    return Ok(Batch {
+                        label: "Mix Scene".into(),
+                        commands: vec![
+                            inverse,
+                            SetMixSceneOptions {
+                                fade: scenes.fade,
+                                a,
+                                b,
+                            },
+                        ],
+                    });
+                }
+                inverse
+            }
+            SetMixSceneOptions { fade, a, b } => {
+                let scenes = &mut p.mix_scenes;
+                let old = SetMixSceneOptions {
+                    fade: scenes.fade,
+                    a: scenes.a,
+                    b: scenes.b,
+                };
+                scenes.fade = fade;
+                scenes.a = a;
+                scenes.b = b;
+                scenes.tidy();
+                old
+            }
+            SetArticulationMap { map, value, index } => {
+                if let Some(v) = &value
+                    && v.id != map
+                {
+                    return Err(EditError::Invalid("articulation map id mismatch".into()));
+                }
+                let maps = &mut p.articulation_maps;
+                let at = maps.iter().position(|m| m.id == map);
+                match (at, value) {
+                    (Some(i), None) => {
+                        if let Some(t) = p.tracks.iter().find(|t| t.articulation_map == Some(map)) {
+                            return Err(EditError::Invalid(format!(
+                                "'{}' plays by this articulation map",
+                                t.name
+                            )));
+                        }
+                        SetArticulationMap {
+                            map,
+                            value: Some(Box::new(p.articulation_maps.remove(i))),
+                            index: i,
+                        }
+                    }
+                    (Some(i), Some(mut v)) => {
+                        v.tidy();
+                        let old = maps.remove(i);
+                        maps.insert(index.min(maps.len()), *v);
+                        SetArticulationMap {
+                            map,
+                            value: Some(Box::new(old)),
+                            index: i,
+                        }
+                    }
+                    (None, Some(mut v)) => {
+                        v.tidy();
+                        let i = index.min(maps.len());
+                        maps.insert(i, *v);
+                        SetArticulationMap {
+                            map,
+                            value: None,
+                            index: i,
+                        }
+                    }
+                    (None, None) => SetArticulationMap {
+                        map,
+                        value: None,
+                        index,
+                    },
+                }
+            }
+            SetTrackArticulationMap { track, map } => {
+                if let Some(m) = map
+                    && p.articulation_map(m).is_none()
+                {
+                    return Err(EditError::Invalid(format!("no articulation map {m}")));
+                }
+                let t = track_mut(p, track)?;
+                if map.is_some() && !matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+                    return Err(EditError::Invalid(format!(
+                        "'{}' plays no notes: articulation maps are for instrument and MIDI tracks",
+                        t.name
+                    )));
+                }
+                let old = std::mem::replace(&mut t.articulation_map, map);
+                SetTrackArticulationMap { track, map: old }
+            }
+            SetDrumMap { map, value, index } => {
+                if let Some(v) = &value
+                    && v.id != map
+                {
+                    return Err(EditError::Invalid("drum map id mismatch".into()));
+                }
+                let maps = &mut p.drum_maps;
+                let at = maps.iter().position(|m| m.id == map);
+                match (at, value) {
+                    (Some(i), None) => {
+                        if let Some(t) = p.tracks.iter().find(|t| t.drum_map == Some(map)) {
+                            return Err(EditError::Invalid(format!(
+                                "'{}' plays by this drum map",
+                                t.name
+                            )));
+                        }
+                        SetDrumMap {
+                            map,
+                            value: Some(Box::new(p.drum_maps.remove(i))),
+                            index: i,
+                        }
+                    }
+                    (Some(i), Some(mut v)) => {
+                        v.tidy();
+                        let old = maps.remove(i);
+                        maps.insert(index.min(maps.len()), *v);
+                        SetDrumMap {
+                            map,
+                            value: Some(Box::new(old)),
+                            index: i,
+                        }
+                    }
+                    (None, Some(mut v)) => {
+                        v.tidy();
+                        let i = index.min(maps.len());
+                        maps.insert(i, *v);
+                        SetDrumMap {
+                            map,
+                            value: None,
+                            index: i,
+                        }
+                    }
+                    (None, None) => SetDrumMap {
+                        map,
+                        value: None,
+                        index,
+                    },
+                }
+            }
+            SetTrackDrumMap { track, map } => {
+                if let Some(m) = map
+                    && p.drum_map(m).is_none()
+                {
+                    return Err(EditError::Invalid(format!("no drum map {m}")));
+                }
+                let t = track_mut(p, track)?;
+                if map.is_some() && !matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) {
+                    return Err(EditError::Invalid(format!(
+                        "'{}' plays no notes: drum maps are for instrument and MIDI tracks",
+                        t.name
+                    )));
+                }
+                let old = std::mem::replace(&mut t.drum_map, map);
+                SetTrackDrumMap { track, map: old }
+            }
             SetAlbum { album } => SetAlbum {
                 album: Box::new(std::mem::replace(&mut p.album, *album)),
             },
@@ -2664,6 +3078,96 @@ impl Command {
                     commands: inverses,
                 }
             }
+            SetSourceWords { source, words } => {
+                let old = match words {
+                    Some(w) => p.source_words.insert(source, *w),
+                    None => p.source_words.remove(&source),
+                };
+                SetSourceWords {
+                    source,
+                    words: old.map(Box::new),
+                }
+            }
+            SetTuning { track, tuning } => {
+                if let Some(t) = &tuning {
+                    t.check()
+                        .map_err(|e| EditError::Invalid(format!("tuning: {e}")))?;
+                }
+                let old = match track {
+                    Some(id) => std::mem::replace(&mut track_mut(p, id)?.tuning, tuning),
+                    None => std::mem::replace(&mut p.tuning, tuning),
+                };
+                SetTuning { track, tuning: old }
+            }
+            SetReferencePitch { hz } => {
+                let (lo, hi) = faderframe_midi::tuning::REFERENCE_RANGE;
+                if !hz.is_finite() || !(lo..=hi).contains(&hz) {
+                    return Err(EditError::Invalid(format!(
+                        "a reference pitch is {lo} to {hi} Hz"
+                    )));
+                }
+                let old = std::mem::replace(&mut p.reference_pitch, hz);
+                SetReferencePitch { hz: old }
+            }
+            SetTrackRetune { track, retune } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.retune, retune);
+                SetTrackRetune { track, retune: old }
+            }
+            ReplaceProject { project, label } => ReplaceProject {
+                project: Box::new(std::mem::replace(p, *project)),
+                label,
+            },
+            SetDeviceCompare { plugin, compare } => {
+                let old = match compare {
+                    Some(c) => p.device_compare.insert(plugin, c),
+                    None => p.device_compare.remove(&plugin),
+                };
+                SetDeviceCompare {
+                    plugin,
+                    compare: old,
+                }
+            }
+            SetClipEnvelope { clip, envelope } => {
+                let c = clip_mut(p, clip)?;
+                let ClipContent::Audio(a) = &mut c.content else {
+                    return Err(EditError::Invalid(format!(
+                        "'{}' is no audio clip: only audio clips have envelopes",
+                        c.name
+                    )));
+                };
+                let envelope = envelope.and_then(|e| e.sanitized().boxed());
+                let old = std::mem::replace(&mut a.envelope, envelope);
+                SetClipEnvelope {
+                    clip,
+                    envelope: old,
+                }
+            }
+            SetClipNotation { clip, notation } => {
+                if notation.is_some() && p.clip(clip).and_then(|c| c.as_midi()).is_none() {
+                    return Err(EditError::Invalid(
+                        "only MIDI clips are written in the score".into(),
+                    ));
+                }
+                let notation = notation.map(|mut n| {
+                    n.tidy();
+                    n
+                });
+                let old = match notation.filter(|n| !n.is_default()) {
+                    Some(n) => p.notation.insert(clip, *n),
+                    None => p.notation.remove(&clip),
+                };
+                SetClipNotation {
+                    clip,
+                    notation: old.map(Box::new),
+                }
+            }
+            SetInteractiveScore { mut score } => {
+                score.tidy();
+                SetInteractiveScore {
+                    score: Box::new(std::mem::replace(&mut p.interactive, *score)),
+                }
+            }
         })
     }
 }
@@ -2744,6 +3248,10 @@ impl Clip {
                     None => r.source_offset = l.source_offset + offset,
                 }
                 r.length = l.length - offset;
+                if let Some(e) = l.envelope.take() {
+                    r.envelope = e.slice(offset, offset + r.length).boxed();
+                    l.envelope = e.slice(0, offset).boxed();
+                }
                 l.length = offset;
                 l.fades = ClipFades {
                     fade_out: 0,
@@ -2793,6 +3301,18 @@ impl Clip {
                     })
                     .collect();
                 l.sysex.retain(|e| e.time < rel);
+                // Articulation directions by time (the one in effect at the
+                // cut goes on: directions carry from clip to clip).
+                r.articulations = l
+                    .articulations
+                    .iter()
+                    .filter(|e| e.time >= rel)
+                    .map(|e| crate::articulation::ArticulationEvent {
+                        time: e.time - rel,
+                        ..*e
+                    })
+                    .collect();
+                l.articulations.retain(|e| e.time < rel);
                 // Expression goes with its note.
                 r.expressions = l
                     .expressions
@@ -2803,14 +3323,14 @@ impl Clip {
                 l.prune_expressions();
                 // Controller values continue across the cut.
                 for (rl, ll) in r.controllers.iter_mut().zip(l.controllers.iter_mut()) {
-                    let carried = ll.value_at(rel);
+                    let carried = ll.point_at(rel).copied();
                     rl.points = ll
                         .points
                         .iter()
                         .filter(|p| p.time >= rel)
                         .map(|p| crate::ControllerPoint {
                             time: p.time - rel,
-                            value: p.value,
+                            ..*p
                         })
                         .collect();
                     if let Some(v) = carried
@@ -2820,7 +3340,7 @@ impl Clip {
                             0,
                             crate::ControllerPoint {
                                 time: MusicalTime::ZERO,
-                                value: v,
+                                ..v
                             },
                         );
                     }

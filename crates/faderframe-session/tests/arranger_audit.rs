@@ -68,6 +68,7 @@ fn audio(t: TrackId, source: AudioSourceId, start: MusicalTime, bars: f64, id: u
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     }
 }
@@ -82,6 +83,9 @@ fn midi(t: TrackId, start: MusicalTime, id: u64) -> Clip {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     Clip {
         id: ClipId(id),

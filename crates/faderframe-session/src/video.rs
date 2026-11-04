@@ -195,10 +195,10 @@ pub(crate) fn instant_in(ns: i64) -> std::time::Instant {
 
 /// A share done, shared with the shell.
 #[derive(Default)]
-struct Share(AtomicU64);
+pub(crate) struct Share(AtomicU64);
 
 impl Share {
-    fn set(&self, s: f64) {
+    pub(crate) fn set(&self, s: f64) {
         self.0.store(s.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
     fn get(&self) -> f64 {
@@ -207,14 +207,14 @@ impl Share {
 }
 
 /// An imported video, read and its sound written.
-struct Imported {
+pub(crate) struct Imported {
     path: PathBuf,
     info: MediaInfo,
     index: FrameIndex,
     sound: Option<ImportedAudio>,
 }
 
-enum Done {
+pub(crate) enum Done {
     Imported(Box<Imported>),
     Indexed {
         source: VideoSourceId,
@@ -248,6 +248,8 @@ enum Done {
         spans: ((f64, f64), (f64, f64)),
         name: String,
     },
+    /// A stretch of an object's path through a clip's picture.
+    Followed(Box<crate::object_tracking::FollowedStretch>),
 }
 
 struct Job {
@@ -274,6 +276,9 @@ struct Known {
     /// The service has it as it is now.
     registered: bool,
     error: Option<String>,
+    /// Its picture is 360° (its frames come through memory, to be looked
+    /// into).
+    spherical: bool,
 }
 
 /// The state of a video file, for the shell.
@@ -302,6 +307,13 @@ pub(crate) struct VideoState {
     late: AtomicU64,
     /// The last frame number shown per video (for counting).
     last: Mutex<Option<(VideoSourceId, usize)>>,
+    /// A/V calibration (see [`crate::av_calibration`]).
+    pub(crate) calibration: crate::av_calibration::CalibrationState,
+    /// An object followed through the picture (see
+    /// [`crate::object_tracking`]).
+    pub(crate) tracking: crate::object_tracking::TrackingState,
+    /// Where 360° pictures are looked at from (see [`crate::sphere`]).
+    pub(crate) sphere: crate::sphere::SphereState,
 }
 
 impl Drop for VideoState {
@@ -400,6 +412,19 @@ pub enum VideoOp {
     ChooseImport,
     /// Ask where to write the movie (the shell's chooser).
     ChooseExport,
+    /// Calibrate the picture offset with a camera and a microphone (see
+    /// [`crate::av_calibration`]).
+    Calibrate(crate::av_calibration::CalibrationSettings),
+    /// Stop calibrating.
+    CancelCalibration,
+    /// Look for cameras.
+    FindCameras,
+    /// Follow an object through the picture and pan a track with it (see
+    /// [`crate::object_tracking`]).
+    Follow(crate::object_tracking::FollowOp),
+    /// Look into a 360° picture, turn the listener with it, pan by it (see
+    /// [`crate::sphere`]).
+    Sphere(crate::sphere::SphereOp),
 }
 
 impl crate::Session {
@@ -409,30 +434,37 @@ impl crate::Session {
             .get_or_insert_with(|| FrameService::new(FRAME_BUDGET))
     }
 
-    fn spawn_video(
+    /// Run `work` on a job thread; its cancel flag.
+    pub(crate) fn spawn_video(
         &mut self,
         label: impl Into<String>,
         source: Option<VideoSourceId>,
         work: impl FnOnce(&Share, &AtomicBool) -> std::result::Result<Done, String> + Send + 'static,
-    ) {
+    ) -> Option<Arc<AtomicBool>> {
         let share = Arc::new(Share::default());
         let cancel = Arc::new(AtomicBool::new(false));
         let (s, c) = (Arc::clone(&share), Arc::clone(&cancel));
         let label = label.into();
+        self.revision += 1;
         match std::thread::Builder::new()
             .name("faderframe-video-job".into())
             .spawn(move || work(&s, &c))
         {
-            Ok(handle) => self.video.jobs.push(Job {
-                label,
-                share,
-                cancel,
-                source,
-                handle: Some(handle),
-            }),
-            Err(e) => self.notify(NoticeLevel::Error, format!("{label}: {e}")),
+            Ok(handle) => {
+                self.video.jobs.push(Job {
+                    label,
+                    share,
+                    cancel: Arc::clone(&cancel),
+                    source,
+                    handle: Some(handle),
+                });
+                Some(cancel)
+            }
+            Err(e) => {
+                self.notify(NoticeLevel::Error, format!("{label}: {e}"));
+                None
+            }
         }
-        self.revision += 1;
     }
 
     /// The running video jobs.
@@ -558,24 +590,7 @@ impl crate::Session {
         let playing = self.transport.playing;
         let offset = (self.project.video.offset_ms * 1e6) as i64;
         let shuttled = self.shuttle_position(lead_ns - offset);
-        let position = if let Some(p) = shuttled {
-            p
-        } else if let Some(p) = self.held_position() {
-            // A locate shown before the engine got there, as the playhead
-            // shows it (not where the sound still is).
-            p
-        } else if playing {
-            // What is heard when the picture reaches the screen, from the
-            // play history: after Play the stopped position until the
-            // latency has filled (the processing position less the latency
-            // went back before it: the frame before, or none at a clip's
-            // start), a locate's target at once.
-            self.engine
-                .heard_ahead(instant_in(lead_ns - offset))
-                .map_or(self.transport.position, |h| h.jumped.unwrap_or(h.position))
-        } else {
-            self.transport.position
-        };
+        let position = self.picture_position(lead_ns);
         let (clip, file_time) = match track {
             Some(t) => self.project.video.at_track(t, position, rate)?,
             None => self.project.video.at(position, rate)?,
@@ -584,6 +599,11 @@ impl crate::Session {
         let index = known.index.as_ref()?;
         let frame = clip_frame(index, clip, file_time)?;
         let (clip, source) = (clip.id, clip.source);
+        // A 360° picture is decoded as wide as the view into it needs.
+        let max = match self.video_spherical(source) {
+            Some(s) => self.sphere_decode_size(&s, max),
+            None => max,
+        };
         // Shuttling seeks (in reverse too): from the proxy where there is
         // one.
         let want = if playing && shuttled.is_none() {
@@ -619,6 +639,38 @@ impl crate::Session {
             file_time,
             position,
         })
+    }
+
+    /// The timeline position whose picture is on the screen when a frame
+    /// drawn now reaches it, `lead_ns` from now: the position heard then
+    /// less the picture offset (while shuttling, the shuttle's; a locate
+    /// not reached yet, its target). The video window and A/V
+    /// calibration's flashes are timed by it alike.
+    pub(crate) fn picture_position(&self, lead_ns: i64) -> i64 {
+        let offset = (self.project.video.offset_ms * 1e6) as i64;
+        if let Some(p) = self.shuttle_position(lead_ns - offset) {
+            p
+        } else if let Some(p) = self.held_position() {
+            // A locate shown before the engine got there, as the playhead
+            // shows it (not where the sound still is).
+            p
+        } else if self.transport.playing {
+            // What is heard when the picture reaches the screen, from the
+            // play history: after Play the stopped position until the
+            // latency has filled (the processing position less the latency
+            // went back before it: the frame before, or none at a clip's
+            // start), a locate's target at once.
+            self.engine
+                .heard_ahead(instant_in(lead_ns - offset))
+                .map_or(self.transport.position, |h| h.jumped.unwrap_or(h.position))
+        } else {
+            self.transport.position
+        }
+    }
+
+    /// The proxy a video is read from for speed, once made.
+    pub(crate) fn video_proxy(&self, source: VideoSourceId) -> Option<(PathBuf, (u32, u32))> {
+        self.video.known.get(&source)?.proxy.clone()
     }
 
     /// A filmstrip picture of `source` at `file_time` (ns), `height` high
@@ -728,6 +780,7 @@ impl crate::Session {
                 .unwrap_or_else(|| Err("the job stopped".into()));
             self.revision += 1;
             match result {
+                Ok(Done::Followed(f)) => self.followed(*f),
                 Ok(done) => {
                     if let Err(e) = self.video_done(done) {
                         self.notify(NoticeLevel::Error, format!("{}: {e}", job.label));
@@ -735,6 +788,9 @@ impl crate::Session {
                 }
                 Err(e) if job.cancel.load(Ordering::Relaxed) => {
                     tracing::info!("{}: {e}", job.label);
+                }
+                Err(e) if job.label == crate::object_tracking::JOB_LABEL => {
+                    self.follow_failed(&e);
                 }
                 Err(e) => {
                     if let Some(k) = job.source.and_then(|s| self.video.known.get_mut(&s)) {
@@ -745,6 +801,8 @@ impl crate::Session {
             }
         }
         self.reconcile_video();
+        self.tick_av_calibration();
+        self.tick_following();
     }
 
     /// Bring what is known in line with the project's videos.
@@ -773,12 +831,22 @@ impl crate::Session {
         }
         let busy = |s: &Self, id: VideoSourceId| s.video.jobs.iter().any(|j| j.source == Some(id));
         for (id, path) in sources {
+            let spherical = self
+                .project
+                .video
+                .sources
+                .get(&id)
+                .is_some_and(|s| s.spherical.is_some());
             let known = self.video.known.entry(id).or_default();
             if known.path != path {
                 *known = Known {
                     path: path.clone(),
                     ..Known::default()
                 };
+            }
+            if known.spherical != spherical {
+                known.spherical = spherical;
+                known.registered = false;
             }
             if known.error.is_some() {
                 continue;
@@ -825,6 +893,7 @@ impl crate::Session {
                     size: (s.width, s.height),
                     par: s.par,
                     proxy: known.proxy.clone(),
+                    memory: s.spherical.is_some(),
                 };
                 known.registered = true;
                 self.video_service().set_media(id.raw(), media);
@@ -938,6 +1007,9 @@ impl crate::Session {
                             id: self.project.ids.allocate(),
                             position: self.engine.samples_to_musical(&self.project, pos),
                             name: format!("Cut {}", i + 1),
+                            // A cut is the picture's: it stays where it
+                            // is whatever the tempo.
+                            time_base: faderframe_project::TimeBase::TimeLocked,
                         },
                     });
                 }
@@ -964,6 +1036,10 @@ impl crate::Session {
                     s.notify(NoticeLevel::Info, format!("wrote {}", out.display()));
                     Ok(())
                 })
+            }
+            Done::Followed(f) => {
+                self.followed(*f);
+                Ok(())
             }
             Done::SyncTest { video, sound } => {
                 self.import_video(video, false);
@@ -1058,6 +1134,7 @@ impl crate::Session {
                 duration: index.end,
                 timecode: index.timecode,
                 sound: info.audio.iter().map(|a| a.channels).collect(),
+                spherical: info.spherical,
             },
         );
         if video.tracks.is_empty() {
@@ -1096,10 +1173,17 @@ impl crate::Session {
             let skip = ns_to_samples(offset, rate);
             let length = source.frames(rate) - skip;
             let id: TrackId = p.ids.allocate();
-            let layout = if audio.channels == 1 {
-                faderframe_core::ChannelLayout::Mono
-            } else {
-                faderframe_core::ChannelLayout::Stereo
+            // A sound the file marks as an ambisonic field (AmbiX) is one.
+            let field = info
+                .audio
+                .first()
+                .and_then(|a| a.ambisonic.as_ref())
+                .and_then(|a| a.field())
+                .filter(|o| o.channels() == audio.channels);
+            let layout = match field {
+                Some(order) => faderframe_core::ChannelLayout::Ambisonic(order),
+                None if audio.channels == 1 => faderframe_core::ChannelLayout::Mono,
+                None => faderframe_core::ChannelLayout::Stereo,
             };
             let track = Track::new(
                 id,
@@ -1132,6 +1216,7 @@ impl crate::Session {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             };
             let mut clip = clip;
@@ -1164,10 +1249,14 @@ impl crate::Session {
             commands,
         })?;
         self.reconcile_video();
+        let spherical = info
+            .spherical
+            .map(|s| format!(", {}", s.label()))
+            .unwrap_or_default();
         self.notify(
             NoticeLevel::Info,
             format!(
-                "imported {} ({}×{}, {})",
+                "imported {} ({}×{}, {}{spherical})",
                 v.codec,
                 v.width,
                 v.height,
@@ -1436,6 +1525,17 @@ impl crate::Session {
                 }
                 Ok(())
             }
+            VideoOp::Calibrate(settings) => self.start_av_calibration(settings),
+            VideoOp::CancelCalibration => {
+                self.cancel_av_calibration(None);
+                Ok(())
+            }
+            VideoOp::FindCameras => {
+                self.find_cameras();
+                Ok(())
+            }
+            VideoOp::Follow(op) => self.follow_op(op),
+            VideoOp::Sphere(op) => self.sphere_op(op),
         }
     }
 
@@ -1497,10 +1597,24 @@ impl crate::Session {
             ));
         }
         let tc = self.timecode();
+        // A 360° picture stays marked; an ambisonic master goes in as the
+        // first order of its field, marked (as YouTube takes it).
+        let field = crate::render::master_field(&self.project);
+        if !container.carries_spherical() && (source.spherical.is_some() || field.is_some()) {
+            self.notify(
+                NoticeLevel::Warning,
+                "Matroska movies carry no 360° or ambisonic marks: write MOV or MP4 \
+                 for players that turn the picture and the sound",
+            );
+        }
         let options = faderframe_video::mux::MuxOptions {
             from: k0,
             to: k_end,
             timecode: Some((tc.at(seg_start, rate), tc.rate)),
+            spherical: source.spherical,
+            ambisonic: field
+                .filter(|_| container.carries_spherical())
+                .map(|_| faderframe_core::AmbiOrder::First),
         };
         let start = self.engine.samples_to_musical(&self.project, from);
         let stop = self.engine.samples_to_musical(&self.project, end);
@@ -1584,6 +1698,11 @@ impl crate::Session {
             watch.map_err(|e| e.to_string())?;
             // Silence before the project's start; exactly the span's length.
             let mut data = faderframe_audio_files::read_wav(&wav).map_err(|e| e.to_string())?;
+            // An ambisonic master's first order: its first four channels
+            // (W, Y, Z, X in AmbiX).
+            if let Some(order) = options.ambisonic {
+                data.channels.truncate(order.channels());
+            }
             for ch in &mut data.channels {
                 let mut c = vec![0.0; lead];
                 c.extend_from_slice(ch);
@@ -1630,6 +1749,8 @@ impl crate::Session {
 
     /// Forget what was known (another project).
     pub(crate) fn forget_video(&mut self) {
+        self.cancel_av_calibration(Some("A/V calibration stopped: another project".into()));
+        self.forget_following();
         for j in &self.video.jobs {
             j.cancel.store(true, Ordering::Relaxed);
         }

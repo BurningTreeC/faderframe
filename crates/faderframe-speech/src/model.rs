@@ -415,6 +415,81 @@ impl Model {
 
     /// Feed `tokens` (after those cached); the logits after the last.
     pub fn step(&self, tokens: &[u32], cache: &mut Cache) -> Vec<f32> {
+        let Dims { d, vocab, .. } = self.dims;
+        let n = tokens.len();
+        let h = self.forward(tokens, cache, |_, _, _| {});
+        let last = &h[(n - 1) * d..n * d];
+        let last = self.dec_norm.apply(last, d);
+        // Logits: the token embedding's transpose.
+        let mut logits = vec![0.0f32; vocab];
+        let t = threads();
+        let cols = vocab.div_ceil(t);
+        std::thread::scope(|s| {
+            for (c, part) in logits.chunks_mut(cols).enumerate() {
+                let last = &last;
+                s.spawn(move || {
+                    for (k, dst) in part.iter_mut().enumerate() {
+                        let j = c * cols + k;
+                        *dst = dot(last, &self.tokens[j * d..(j + 1) * d]);
+                    }
+                });
+            }
+        });
+        logits
+    }
+
+    /// The scaled scores (before the softmax) of the cross-attention heads
+    /// `heads` (decoder layer, head) for the whole token sequence `tokens`
+    /// over an encoded window: per head, `tokens.len()` rows of the first
+    /// `frames` encoder positions. The word timings are read from these
+    /// (see [`crate::timing`]).
+    pub fn cross_scores(
+        &self,
+        tokens: &[u32],
+        encoded: &[f32],
+        heads: &[(usize, usize)],
+        frames: usize,
+    ) -> Vec<Vec<f32>> {
+        let Dims {
+            d,
+            heads: nh,
+            positions,
+            ..
+        } = self.dims;
+        let hd = d / nh;
+        let scale = (hd as f32).powf(-0.5);
+        let frames = frames.min(positions);
+        let n = tokens.len();
+        let mut out = vec![Vec::new(); heads.len()];
+        let mut cache = self.cache(encoded);
+        self.forward(tokens, &mut cache, |layer, q, keys| {
+            for (k, &(l, h)) in heads.iter().enumerate() {
+                if l != layer || h >= nh {
+                    continue;
+                }
+                let mut m = vec![0.0f32; n * frames];
+                for i in 0..n {
+                    let qi = &q[i * d + h * hd..i * d + (h + 1) * hd];
+                    for j in 0..frames {
+                        m[i * frames + j] =
+                            dot(qi, &keys[j * d + h * hd..j * d + (h + 1) * hd]) * scale;
+                    }
+                }
+                out[k] = m;
+            }
+        });
+        out
+    }
+
+    /// The decoder over `tokens` (after those cached): the hidden states
+    /// after the last block (rows of `d`); `cross` hears each layer's
+    /// cross-attention queries and the encoder keys they score.
+    fn forward(
+        &self,
+        tokens: &[u32],
+        cache: &mut Cache,
+        mut cross_queries: impl FnMut(usize, &[f32], &[f32]),
+    ) -> Vec<f32> {
         let Dims {
             d,
             heads,
@@ -444,6 +519,7 @@ impl Model {
                 let nrm = norm.apply(&h, d);
                 let q = cross.q.apply(&nrm, n);
                 let (ck, cv) = &cache.cross[l];
+                cross_queries(l, &q, ck);
                 let a = attend(&q, ck, cv, n, positions, d, heads, None);
                 add(&mut h, &cross.o.apply(&a, n));
             }
@@ -453,24 +529,7 @@ impl Model {
             add(&mut h, &b.fc2.apply(&f, n));
         }
         cache.len += n;
-        let last = &h[(n - 1) * d..n * d];
-        let last = self.dec_norm.apply(last, d);
-        // Logits: the token embedding's transpose.
-        let mut logits = vec![0.0f32; vocab];
-        let t = threads();
-        let cols = vocab.div_ceil(t);
-        std::thread::scope(|s| {
-            for (c, part) in logits.chunks_mut(cols).enumerate() {
-                let last = &last;
-                s.spawn(move || {
-                    for (k, dst) in part.iter_mut().enumerate() {
-                        let j = c * cols + k;
-                        *dst = dot(last, &self.tokens[j * d..(j + 1) * d]);
-                    }
-                });
-            }
-        });
-        logits
+        h
     }
 }
 

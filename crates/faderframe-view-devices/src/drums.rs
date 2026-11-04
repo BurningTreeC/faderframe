@@ -2,7 +2,9 @@
 //! note; lit when it sounds; click to pick and play one, double-click to
 //! load its sample, several files fill the pads from there), the picked
 //! pad's waveform with its start and end (drag their markers) and buttons
-//! to load or clear it, and that pad's controls.
+//! to load or clear it, and that pad's controls. A pad's right-click menu
+//! slices its sample onto the free pads (or a new Drum Sampler), with a
+//! MIDI clip playing the slices as they were.
 
 use crate::kit::{
     self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale,
@@ -11,7 +13,10 @@ use crate::values::note_name;
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::devices::drums::{self as drm, PADS, id, value};
 use faderframe_plugin_host::devices::samples::Contents;
-use faderframe_ui_canvas::{Accent, Color, Paint, Painter, Rect, Size, TextStyle, ViewEvent};
+use faderframe_ui_canvas::{
+    Accent, Color, HostRequest, MenuItem, Paint, Painter, PointerButton, Rect, Size, TextStyle,
+    ViewEvent,
+};
 
 pub(crate) struct DrumsFace {
     accent: Color,
@@ -43,7 +48,7 @@ impl DrumsFace {
 
     /// The pads (4 × 4, the first bottom left as on a drum machine), the
     /// waveform, its buttons.
-    fn split(r: Rect) -> ([Rect; PADS], Rect, Rect, Rect) {
+    pub(crate) fn split(r: Rect) -> ([Rect; PADS], Rect, Rect, Rect) {
         let side = (r.h - 16.0).min(r.w * 0.42);
         let grid = Rect::new(r.x + 8.0, r.y + 8.0, side, side);
         let cell = (side - 3.0 * 6.0) / 4.0;
@@ -342,6 +347,30 @@ impl Face for DrumsFace {
     ) -> bool {
         let (pads, wave, load, clear) = Self::split(r);
         match *ev {
+            // A pad's menu: slice its sample.
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                ..
+            } if pads.iter().any(|p| p.contains(pos)) => {
+                let Some(pad) = pads.iter().position(|p| p.contains(pos)) else {
+                    return false;
+                };
+                self.selected = pad;
+                let items: Vec<MenuItem<faderframe_session::Action>> = cx
+                    .model
+                    .sample_slice_choices(cx.plugin, pad)
+                    .into_iter()
+                    .map(|(label, action, separated)| {
+                        let item = MenuItem::new(label, action);
+                        if separated { item.separated() } else { item }
+                    })
+                    .collect();
+                if !items.is_empty() {
+                    edit.cx.request(HostRequest::ContextMenu { at: pos, items });
+                }
+                true
+            }
             ViewEvent::PointerDown { pos, clicks, .. } => {
                 if let Some(pad) = pads.iter().position(|p| p.contains(pos)) {
                     self.selected = pad;

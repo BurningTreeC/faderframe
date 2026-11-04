@@ -74,6 +74,7 @@ fn setup() -> (Session, TrackId, ClipId) {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     });
@@ -82,6 +83,7 @@ fn setup() -> (Session, TrackId, ClipId) {
             id: faderframe_core::MarkerId(77_000),
             position: at(&s, 12 * S),
             name: "line 4".into(),
+            time_base: Default::default(),
         },
     });
     for c in cmds {

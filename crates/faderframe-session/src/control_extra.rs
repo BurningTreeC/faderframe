@@ -263,7 +263,12 @@ impl Session {
                 self.control.extra.param_offset = 0;
             }
             Button::Function(n) => {
-                if shift {
+                if self.control.extra.held(Modifier::Control) {
+                    // Control + F1…F8: macros 1–8.
+                    self.dispatch(Action::Script(crate::script::ScriptOp::RunMacro(
+                        u16::from(n) + 1,
+                    )))?;
+                } else if shift {
                     // A marker (by time).
                     let mut at: Vec<MusicalTime> =
                         self.project.markers.iter().map(|m| m.position).collect();

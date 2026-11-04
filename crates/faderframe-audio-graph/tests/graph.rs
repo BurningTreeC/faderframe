@@ -281,6 +281,75 @@ fn processors_with_matching_keys_are_adopted() {
     assert_eq!(new.audio_output(n, 0).unwrap().channel(0)[0], 3.0);
 }
 
+/// A rebuilt graph carries the compensation delay lines over where the
+/// same source arrives through one as long: a ramp delayed on its way to
+/// a summing point goes on without a gap when the graph is replaced (here
+/// with a node added beside it).
+#[test]
+fn compensation_delays_carry_over_into_a_rebuilt_graph() {
+    struct Ramp(f32);
+    impl Processor<Ctx> for Ramp {
+        fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, io: &mut NodeIo<'_>) {
+            for s in io.audio_out[0].channel_mut(0) {
+                self.0 += 1.0;
+                *s = self.0;
+            }
+        }
+    }
+    let block = 16;
+    let build = |extra: bool| {
+        let mut b = GraphBuilder::<Ctx>::new();
+        let ramp = b.add_node(
+            NodeSpec::new("Ramp").key(NodeKey(1)).audio_out(Mono),
+            Box::new(Ramp(0.0)),
+        );
+        let slow = b.add_node(
+            NodeSpec::new("Slow")
+                .key(NodeKey(2))
+                .audio_in(Mono)
+                .audio_out(Mono),
+            Box::new(LatencyProbe::new(40)),
+        );
+        let silent = source(&mut b, "Silent", 0.0);
+        b.connect_audio(silent, 0, slow, 0).unwrap();
+        let sum = b.add_node(
+            NodeSpec::new("Sum")
+                .key(NodeKey(3))
+                .audio_in(Mono)
+                .audio_out(Mono),
+            Box::new(Passthrough),
+        );
+        b.connect_audio(ramp, 0, sum, 0).unwrap();
+        b.connect_audio(slow, 0, sum, 0).unwrap();
+        if extra {
+            let other = source(&mut b, "Other", 0.0);
+            let fx = b.add_node(
+                NodeSpec::new("Other FX").audio_in(Mono).audio_out(Mono),
+                Box::new(Gain { gain: 1.0 }),
+            );
+            b.connect_audio(other, 0, fx, 0).unwrap();
+        }
+        let g = b.compile(&config(block)).unwrap();
+        (g, sum)
+    };
+    let (mut old, _) = build(false);
+    let mut out = Vec::new();
+    for _ in 0..4 {
+        run(&mut old, block);
+    }
+    let (mut new, sum) = build(true);
+    new.adopt_state_from(&mut old);
+    for _ in 0..8 {
+        run(&mut new, block);
+        out.extend_from_slice(new.audio_output(sum, 0).unwrap().channel(0));
+    }
+    // The ramp's value 40 frames back, on and on: 4 blocks had gone in.
+    let first = (4 * block) as f32 - 40.0 + 1.0;
+    for (i, v) in out.iter().enumerate() {
+        assert_eq!(*v, first + i as f32, "frame {i}");
+    }
+}
+
 #[test]
 fn timings_are_published_per_callback_for_nodes_and_groups() {
     /// Spends at least `us` microseconds per call.

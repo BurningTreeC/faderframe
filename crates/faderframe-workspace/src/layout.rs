@@ -53,10 +53,23 @@ pub enum ViewKind {
     Reference,
     /// Mix Intelligence: the mix analysed, its findings and experiments.
     MixIntelligence,
+    /// Mix scenes: console snapshots stored, recalled, crossfaded,
+    /// morphed and compared.
+    MixScenes,
+    /// The media browser: places, search, previews, tags, similar sounds
+    /// (left of the arranger).
+    Browser,
+    /// MIDI clips as a score, engraved and edited.
+    Score,
+    /// The interactive score (music for a game): states, transition
+    /// rules, layers, parameters, stingers; its preview and export.
+    InteractiveMusic,
+    /// Articulation maps and drum maps, edited row by row.
+    Maps,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 24] = [
+    pub const ALL: [ViewKind; 29] = [
         ViewKind::Arranger,
         ViewKind::Mixer,
         ViewKind::PianoRoll,
@@ -81,15 +94,21 @@ impl ViewKind {
         ViewKind::ChannelOverview,
         ViewKind::Reference,
         ViewKind::MixIntelligence,
+        ViewKind::MixScenes,
+        ViewKind::Browser,
+        ViewKind::Score,
+        ViewKind::InteractiveMusic,
+        ViewKind::Maps,
     ];
 
     /// The order tabs keep, whichever opened first: the arranger, the
     /// mixer, then as the View menu lists them.
-    pub const TAB_ORDER: [ViewKind; 24] = [
+    pub const TAB_ORDER: [ViewKind; 29] = [
         ViewKind::Arranger,
         ViewKind::Inspector,
         ViewKind::Mixer,
         ViewKind::ChannelOverview,
+        ViewKind::MixScenes,
         ViewKind::PianoRoll,
         ViewKind::Events,
         ViewKind::Automation,
@@ -110,6 +129,10 @@ impl ViewKind {
         ViewKind::Adr,
         ViewKind::LeadSheet,
         ViewKind::Setlist,
+        ViewKind::Browser,
+        ViewKind::Score,
+        ViewKind::InteractiveMusic,
+        ViewKind::Maps,
     ];
 
     /// Its place in [`Self::TAB_ORDER`].
@@ -152,6 +175,11 @@ impl ViewKind {
             ViewKind::ChannelOverview => "Channel Overview",
             ViewKind::Reference => "Reference",
             ViewKind::MixIntelligence => "Mix Intelligence",
+            ViewKind::MixScenes => "Mix Scenes",
+            ViewKind::Browser => "Browser",
+            ViewKind::Score => "Score",
+            ViewKind::InteractiveMusic => "Interactive Music",
+            ViewKind::Maps => "Map Editor",
         }
     }
 
@@ -160,7 +188,7 @@ impl ViewKind {
     /// dock for the others.
     pub fn default_area(self) -> DockAreaId {
         match self {
-            ViewKind::Inspector => DockAreaId::left(),
+            ViewKind::Inspector | ViewKind::Browser => DockAreaId::left(),
             _ => DockAreaId::bottom(),
         }
     }
@@ -191,6 +219,11 @@ impl ViewKind {
             ViewKind::ChannelOverview => ViewId::channel_overview(),
             ViewKind::Reference => ViewId::reference(),
             ViewKind::MixIntelligence => ViewId::mix_intelligence(),
+            ViewKind::MixScenes => ViewId::mix_scenes(),
+            ViewKind::Browser => ViewId::browser(),
+            ViewKind::Score => ViewId::score(),
+            ViewKind::InteractiveMusic => ViewId::interactive_music(),
+            ViewKind::Maps => ViewId::maps(),
         }
     }
 }

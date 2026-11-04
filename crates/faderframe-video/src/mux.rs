@@ -1,6 +1,13 @@
 //! Movies with new sound: the picture copied as it is coded (no
 //! re-encoding, so nothing is lost and it takes seconds), next to one or
 //! more sound tracks (the mix, stems) from WAV files.
+//!
+//! Sounds of more than two channels go in as they are, every channel kept
+//! and none given a speaker (QuickTime's PCM and Opus's discrete mapping
+//! take them so; Matroska keeps the WAV's speakers up to eight channels).
+//! A 360° picture and an ambisonic first sound are marked in MP4 and
+//! QuickTime movies ([`crate::spherical`]); Matroska movies carry neither
+//! mark.
 
 use crate::streams::{Kind, Pipeline, make};
 use crate::{Result, VideoError};
@@ -50,6 +57,11 @@ impl Container {
         self != Self::Mp4
     }
 
+    /// Whether it carries 360° and spatial audio metadata.
+    pub fn carries_spherical(self) -> bool {
+        self != Self::Mkv
+    }
+
     /// Channels a sound track can have.
     pub fn max_channels(self) -> usize {
         match self {
@@ -60,7 +72,8 @@ impl Container {
     }
 }
 
-/// What of the picture goes in, and its timecode.
+/// What of the picture goes in, its timecode, and how picture and sound
+/// are marked.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MuxOptions {
     /// The picture from the keyframe starting at `from` (ns, the file's
@@ -74,6 +87,11 @@ pub struct MuxOptions {
         faderframe_core::timecode::Timecode,
         faderframe_core::timecode::FrameRate,
     )>,
+    /// The picture is 360°, laid out so (MP4 and QuickTime).
+    pub spherical: Option<faderframe_core::spherical::Spherical>,
+    /// The first sound is an AmbiX field of this order (MP4 and
+    /// QuickTime; its channels as many as the order has).
+    pub ambisonic: Option<faderframe_core::AmbiOrder>,
 }
 
 /// Write `out`: the picture of `video` (copied, `options` say which of
@@ -130,36 +148,62 @@ pub fn mux(
     p.pipeline.add_many([&mux, &sink])?;
     mux.link(&sink)?;
 
-    for wav in sounds {
+    for (i, wav) in sounds.iter().enumerate() {
         if !wav.is_file() {
             return Err(VideoError::media(wav, "no such file"));
         }
-        let src = gst::ElementFactory::make("filesrc")
-            .property("location", wav.to_string_lossy().as_ref())
-            .build()
-            .map_err(|_| VideoError::Missing("filesrc".into()))?;
+        let wav_info = faderframe_audio_files::wavstream::WavFile::open(wav)
+            .map_err(|e| VideoError::media(wav, e.to_string()))?;
+        let channels = wav_info.channels();
+        let field = i == 0 && options.ambisonic.is_some();
+        if channels > container.max_channels() {
+            return Err(VideoError::media(
+                wav,
+                format!(
+                    "{} takes up to {} channels a track, the sound has {channels}",
+                    container.label(),
+                    container.max_channels()
+                ),
+            ));
+        }
+        // Every channel as it is: no speakers for QuickTime (its PCM takes
+        // no more than two placed channels), a field, or more channels than
+        // GStreamer has default places for.
+        let unplaced = field || channels > 8 || (channels > 2 && container == Container::Mov);
         let mut caps = gst::Caps::builder("audio/x-raw")
             .field("format", format)
             .field("layout", "interleaved");
         if container == Container::Mp4 {
             caps = caps.field("rate", 48_000);
         }
+        if unplaced {
+            caps = caps
+                .field("channels", channels as i32)
+                .field("channel-mask", gst::Bitmask::new(0));
+        }
         let caps = caps.build();
         let filter = gst::ElementFactory::make("capsfilter")
             .property("caps", &caps)
             .build()
             .map_err(|_| VideoError::Missing("capsfilter".into()))?;
-        let mut row = vec![
-            src,
-            make("wavparse")?,
-            make("audioconvert")?,
-            make("audioresample")?,
-            filter,
-        ];
+        let mut row = if unplaced {
+            vec![unplaced_source(wav, &wav_info)?]
+        } else {
+            let src = gst::ElementFactory::make("filesrc")
+                .property("location", wav.to_string_lossy().as_ref())
+                .build()
+                .map_err(|_| VideoError::Missing("filesrc".into()))?;
+            vec![src, make("wavparse")?]
+        };
+        row.extend([make("audioconvert")?, make("audioresample")?, filter]);
         if container == Container::Mp4 {
             row.push(
                 gst::ElementFactory::make("opusenc")
-                    .property("bitrate", 256_000)
+                    // 256 kb/s a pair, as far as Opus goes.
+                    .property(
+                        "bitrate",
+                        (128_000 * (channels as i32 + 1) / 2 * 2).clamp(256_000, 650_000),
+                    )
                     .build()
                     .map_err(|_| VideoError::Missing("opusenc".into()))?,
             );
@@ -274,6 +318,20 @@ pub fn mux(
     p.parse(move |_, kind, n, _| (kind == Kind::Picture && n == 0).then(|| next.clone()))?;
     let result = p.run(cancel, progress);
     drop(p);
+    let meta = crate::spherical::Metadata {
+        video: options.spherical,
+        audio: options
+            .ambisonic
+            .filter(|_| !sounds.is_empty())
+            .map(crate::spherical::SpatialAudio::ambix),
+    };
+    let result = result.and_then(|()| {
+        if container.carries_spherical() {
+            crate::spherical::write(&partial, &meta)
+        } else {
+            Ok(())
+        }
+    });
     match result {
         Ok(()) => {
             std::fs::rename(&partial, out)?;
@@ -284,6 +342,79 @@ pub fn mux(
             Err(e)
         }
     }
+}
+
+/// Samples per buffer of an unplaced sound.
+const BLOCK_FRAMES: u64 = 4096;
+
+/// A WAV file's samples as they are stored, its channels given no
+/// speakers (`wavparse` would place more than two, and nothing converts
+/// placed channels to unplaced ones).
+fn unplaced_source(
+    wav: &Path,
+    info: &faderframe_audio_files::wavstream::WavFile,
+) -> Result<gst::Element> {
+    use faderframe_audio_files::WavFormat;
+    use std::io::{Read, Seek, SeekFrom};
+    let (_, data, size) = faderframe_audio_files::wavstream::chunks(wav)
+        .map_err(|e| VideoError::media(wav, e.to_string()))?
+        .into_iter()
+        .find(|(id, _, _)| id == b"data")
+        .ok_or_else(|| VideoError::media(wav, "no sound in the file"))?;
+    let (format, bytes) = match info.format() {
+        WavFormat::Pcm16 => ("S16LE", 2),
+        WavFormat::Pcm24 => ("S24LE", 3),
+        WavFormat::Float32 => ("F32LE", 4),
+    };
+    let channels = info.channels().max(1);
+    let rate = info.sample_rate().max(1);
+    let caps = gst::Caps::builder("audio/x-raw")
+        .field("format", format)
+        .field("layout", "interleaved")
+        .field("rate", rate as i32)
+        .field("channels", channels as i32)
+        .field("channel-mask", gst::Bitmask::new(0))
+        .build();
+    let src = gst_app::AppSrc::builder()
+        .caps(&caps)
+        .format(gst::Format::Time)
+        .build();
+    let frame = (channels * bytes) as u64;
+    let mut file = std::fs::File::open(wav)?;
+    file.seek(SeekFrom::Start(data))?;
+    let total = size / frame;
+    let state = std::sync::Mutex::new((file, 0u64));
+    let ns = move |frames: u64| (frames as u128 * 1_000_000_000 / rate as u128) as u64;
+    src.set_callbacks(
+        gst_app::AppSrcCallbacks::builder()
+            .need_data(move |src, _| {
+                let Ok(mut s) = state.lock() else {
+                    let _ = src.end_of_stream();
+                    return;
+                };
+                let (file, done) = &mut *s;
+                let n = BLOCK_FRAMES.min(total - *done);
+                if n == 0 {
+                    let _ = src.end_of_stream();
+                    return;
+                }
+                let mut data = vec![0u8; (n * frame) as usize];
+                if let Err(e) = file.read_exact(&mut data) {
+                    tracing::warn!("reading the sound: {e}");
+                    let _ = src.end_of_stream();
+                    return;
+                }
+                let mut buf = gst::Buffer::from_mut_slice(data);
+                if let Some(b) = buf.get_mut() {
+                    b.set_pts(gst::ClockTime::from_nseconds(ns(*done)));
+                    b.set_duration(gst::ClockTime::from_nseconds(ns(*done + n) - ns(*done)));
+                }
+                *done += n;
+                let _ = src.push_buffer(buf);
+            })
+            .build(),
+    );
+    Ok(src.upcast())
 }
 
 /// The picture's coded caps, as the parser hands them on.

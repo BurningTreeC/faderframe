@@ -303,7 +303,7 @@ pub mod filter {
 const MAX_VOICES: usize = 32;
 const MAX_UNISON: usize = 7;
 /// Filter coefficients and pitches are recomputed every this many samples.
-const CONTROL_INTERVAL: u32 = 16;
+pub(crate) const CONTROL_INTERVAL: u32 = 16;
 /// Drift at full depth: cents (a fixed offset per voice and a slow
 /// wander at this rate).
 const DRIFT_CENTS: f32 = 12.0;
@@ -312,7 +312,7 @@ const DRIFT_HZ: f32 = 0.4;
 /// amount 100 % (the amount is squared, so the low range is fine).
 const FM_CYCLES: f32 = 1.5;
 /// The effects: wet signal below this is a tail that has ended.
-const TAIL_FLOOR: f32 = 1e-5;
+pub(crate) const TAIL_FLOOR: f32 = 1e-5;
 
 fn ranged(id: u32, name: &str, min: f64, max: f64, default: f64) -> ParameterInfo {
     ParameterInfo {
@@ -604,7 +604,7 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Stage {
+pub(crate) enum Stage {
     Idle,
     Attack,
     Decay,
@@ -614,27 +614,27 @@ enum Stage {
 
 /// An ADSR's per-sample settings.
 #[derive(Clone, Copy, Default)]
-struct EnvSettings {
-    attack_step: f32,
-    decay_coef: f32,
-    sustain: f32,
-    release_coef: f32,
+pub(crate) struct EnvSettings {
+    pub(crate) attack_step: f32,
+    pub(crate) decay_coef: f32,
+    pub(crate) sustain: f32,
+    pub(crate) release_coef: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Env {
-    stage: Stage,
-    value: f32,
+pub(crate) struct Env {
+    pub(crate) stage: Stage,
+    pub(crate) value: f32,
 }
 
 impl Env {
-    const IDLE: Env = Env {
+    pub(crate) const IDLE: Env = Env {
         stage: Stage::Idle,
         value: 0.0,
     };
 
     #[inline]
-    fn tick(&mut self, s: &EnvSettings) -> f32 {
+    pub(crate) fn tick(&mut self, s: &EnvSettings) -> f32 {
         match self.stage {
             Stage::Attack => {
                 self.value += s.attack_step;
@@ -662,7 +662,7 @@ impl Env {
         self.value
     }
 
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         if self.stage != Stage::Idle {
             self.stage = Stage::Release;
         }
@@ -671,15 +671,15 @@ impl Env {
 
 /// A TPT state-variable filter's state.
 #[derive(Clone, Copy, Debug, Default)]
-struct Svf {
-    ic1: f32,
-    ic2: f32,
+pub(crate) struct Svf {
+    pub(crate) ic1: f32,
+    pub(crate) ic2: f32,
 }
 
 impl Svf {
     /// Low, band and high for coefficients `(a1, a2, a3, k)`.
     #[inline]
-    fn run(&mut self, x: f32, c: (f32, f32, f32, f32)) -> (f32, f32, f32) {
+    pub(crate) fn run(&mut self, x: f32, c: (f32, f32, f32, f32)) -> (f32, f32, f32) {
         let (a1, a2, a3, k) = c;
         let v3 = x - self.ic2;
         let v1 = a1 * self.ic1 + a2 * v3;
@@ -690,7 +690,7 @@ impl Svf {
     }
 }
 
-fn svf_coefs(g: f32, k: f32) -> (f32, f32, f32, f32) {
+pub(crate) fn svf_coefs(g: f32, k: f32) -> (f32, f32, f32, f32) {
     let a1 = 1.0 / (1.0 + g * (g + k));
     let a2 = g * a1;
     (a1, a2, g * a2, k)
@@ -700,7 +700,12 @@ fn svf_coefs(g: f32, k: f32) -> (f32, f32, f32, f32) {
 /// with the state-variable damping `k` and the resonance (0…1): two SVF
 /// stages, or for the ladder its one-pole gain's powers and (second
 /// entry) `1 − G` and the feedback.
-fn filter_coefs(filter: usize, g: f32, k: f32, resonance: f32) -> [(f32, f32, f32, f32); 2] {
+pub(crate) fn filter_coefs(
+    filter: usize,
+    g: f32,
+    k: f32,
+    resonance: f32,
+) -> [(f32, f32, f32, f32); 2] {
     match filter {
         filter::LP24 => [svf_coefs(g, std::f32::consts::SQRT_2), svf_coefs(g, k)],
         filter::LADDER => {
@@ -716,7 +721,7 @@ fn filter_coefs(filter: usize, g: f32, k: f32, resonance: f32) -> [(f32, f32, f3
 
 /// A cheap tanh (within 2 % to ±3, clamped beyond).
 #[inline]
-fn fast_tanh(x: f32) -> f32 {
+pub(crate) fn fast_tanh(x: f32) -> f32 {
     let x = x.clamp(-3.0, 3.0);
     let x2 = x * x;
     x * (27.0 + x2) / (27.0 + 9.0 * x2)
@@ -725,7 +730,7 @@ fn fast_tanh(x: f32) -> f32 {
 /// A four-pole ladder (zero-delay feedback solved linearly, the input and
 /// feedback saturated): `c` from [`filter_coefs`].
 #[inline]
-fn ladder(st: &mut [f32; 4], x: f32, c: [(f32, f32, f32, f32); 2]) -> f32 {
+pub(crate) fn ladder(st: &mut [f32; 4], x: f32, c: [(f32, f32, f32, f32); 2]) -> f32 {
     let (g, g2, g3, g4) = c[0];
     let (one_g, k, _, _) = c[1];
     let sum = one_g * (g3 * st[0] + g2 * st[1] + g * st[2] + st[3]);
@@ -748,6 +753,9 @@ struct Voice {
     /// The mod envelope.
     menv: Env,
     key: u8,
+    /// What the key sounds in the track's tuning (semitones from A4 at
+    /// 440 Hz).
+    pitch: f32,
     channel: u8,
     velocity: f32,
     /// Oscillator phases: per unison copy, oscillator 1 and 2.
@@ -798,6 +806,7 @@ impl Voice {
         filt: Env::IDLE,
         menv: Env::IDLE,
         key: 0,
+        pitch: 0.0,
         channel: 0,
         velocity: 0.0,
         phase: [[0.0; 2]; MAX_UNISON],
@@ -860,29 +869,29 @@ impl Voice {
 }
 
 /// MPE member channels' default bend range.
-const MPE_BEND_RANGE: f32 = 48.0;
+pub(crate) const MPE_BEND_RANGE: f32 = 48.0;
 /// A note's full vibrato expression: depth in semitones, at this rate (the
 /// mod wheel's depth is its slot's).
-const VIBRATO_DEPTH: f32 = 0.5;
-const VIBRATO_HZ: f32 = 5.5;
+pub(crate) const VIBRATO_DEPTH: f32 = 0.5;
+pub(crate) const VIBRATO_HZ: f32 = 5.5;
 
 /// Per-channel controller state.
 #[derive(Clone, Copy, Debug)]
-struct ChannelState {
-    sustain: bool,
+pub(crate) struct ChannelState {
+    pub(crate) sustain: bool,
     /// The pitch wheel, −1…1.
-    bend: f32,
+    pub(crate) bend: f32,
     /// A range set by RPN 0 (or an MPE zone) for this channel; None: the
     /// Pitch Bend Range parameter's.
-    bend_range: Option<f32>,
-    modulation: f32,
-    pressure: f32,
-    timbre: f32,
-    rpn: (u8, u8),
+    pub(crate) bend_range: Option<f32>,
+    pub(crate) modulation: f32,
+    pub(crate) pressure: f32,
+    pub(crate) timbre: f32,
+    pub(crate) rpn: (u8, u8),
 }
 
 impl ChannelState {
-    const REST: ChannelState = ChannelState {
+    pub(crate) const REST: ChannelState = ChannelState {
         sustain: false,
         bend: 0.0,
         bend_range: None,
@@ -1057,7 +1066,7 @@ struct Segment {
 
 /// A PolyBLEP correction at phase `t` with increment `dt`.
 #[inline]
-fn blep(t: f32, dt: f32) -> f32 {
+pub(crate) fn blep(t: f32, dt: f32) -> f32 {
     if t < dt {
         let x = t / dt;
         x + x - x * x - 1.0
@@ -1071,7 +1080,7 @@ fn blep(t: f32, dt: f32) -> f32 {
 
 /// One sample of a wave at phase `t`.
 #[inline]
-fn wave(kind: usize, t: f32, dt: f32, pw: f32) -> f32 {
+pub(crate) fn wave(kind: usize, t: f32, dt: f32, pw: f32) -> f32 {
     match kind {
         1 => {
             let naive = if t < pw { 1.0 } else { -1.0 };
@@ -1105,28 +1114,28 @@ fn naive(kind: usize, t: f32, pw: f32) -> f32 {
 }
 
 /// A random value in −1…1 from an integer.
-fn spread_random(x: u32) -> f32 {
+pub(crate) fn spread_random(x: u32) -> f32 {
     let h = x.wrapping_mul(2_246_822_519) ^ (x >> 15);
     let h = h.wrapping_mul(3_266_489_917) ^ (h >> 13);
     h as f32 / u32::MAX as f32 * 2.0 - 1.0
 }
 
 /// The effects' block settings.
-struct FxSettings {
-    chorus_mix: f32,
-    chorus_rate: f64,
-    chorus_depth: f64,
-    ensemble: bool,
-    delay_mix: f32,
-    delay_samples: f64,
-    feedback: f64,
-    pingpong: bool,
-    delay_tone: f64,
-    reverb_mix: f32,
-    size: f64,
+pub(crate) struct FxSettings {
+    pub(crate) chorus_mix: f32,
+    pub(crate) chorus_rate: f64,
+    pub(crate) chorus_depth: f64,
+    pub(crate) ensemble: bool,
+    pub(crate) delay_mix: f32,
+    pub(crate) delay_samples: f64,
+    pub(crate) feedback: f64,
+    pub(crate) pingpong: bool,
+    pub(crate) delay_tone: f64,
+    pub(crate) reverb_mix: f32,
+    pub(crate) size: f64,
     /// Seconds to −60 dB.
-    decay: f64,
-    reverb_tone: f64,
+    pub(crate) decay: f64,
+    pub(crate) reverb_tone: f64,
 }
 
 /// The reverb's delay lines (ms at size 1).
@@ -1142,7 +1151,7 @@ const REVERB_IN: [f64; 8] = [1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0];
 /// The effects after the voices: a chorus/ensemble, a stereo delay and a
 /// small feedback-delay-network reverb. Each is run only while it is
 /// mixed in; `ringing` says whether a tail is still on its way.
-struct Fx {
+pub(crate) struct Fx {
     sr: f64,
     chorus: [DelayLine; 2],
     chorus_phase: f64,
@@ -1162,7 +1171,7 @@ struct Fx {
 }
 
 impl Fx {
-    fn new(sr: f64) -> Self {
+    pub(crate) fn new(sr: f64) -> Self {
         Self {
             sr,
             chorus: std::array::from_fn(|_| DelayLine::new((0.03 * sr) as usize)),
@@ -1183,7 +1192,7 @@ impl Fx {
         }
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         for l in self
             .chorus
             .iter_mut()
@@ -1199,14 +1208,14 @@ impl Fx {
         self.tails = [0; 3];
     }
 
-    fn ringing(&self) -> bool {
+    pub(crate) fn ringing(&self) -> bool {
         self.tails.iter().any(|t| *t > 0)
     }
 
     /// Run the effects over `l`/`r` (`r` None: mono, the wet sides
     /// averaged), where `input_peak` is the loudest the voices got this
     /// block.
-    fn process(
+    pub(crate) fn process(
         &mut self,
         set: &FxSettings,
         l: &mut [f32],
@@ -1432,8 +1441,10 @@ pub struct SynthProcessor {
     lfo2: Lfo,
     /// The last note's pitch (semitones from A4), for glide.
     last_pitch: Option<f32>,
-    /// Keys held in mono modes, oldest first.
-    held: [(u8, u8, u8); 16],
+    /// What each key sounds (the track's tuning).
+    tuning: faderframe_midi::tuning::TuningTable,
+    /// Keys held in mono modes, oldest first (channel, key, velocity 0…1).
+    held: [(u8, u8, f32); 16],
     held_len: usize,
     /// Keys down right now (any mode), for glide between held keys.
     keys_down: u32,
@@ -1457,7 +1468,8 @@ impl SynthProcessor {
             lfo: Lfo::new(0x51_7e),
             lfo2: Lfo::new(0x2b_91),
             last_pitch: None,
-            held: [(0, 0, 0); 16],
+            tuning: faderframe_midi::tuning::TuningTable::STANDARD,
+            held: [(0, 0, 0.0); 16],
             held_len: 0,
             keys_down: 0,
             fx: Fx::new(f64::from(sr)),
@@ -1594,13 +1606,13 @@ impl SynthProcessor {
         idx: usize,
         channel: u8,
         key: u8,
-        velocity: u8,
+        velocity: f32,
         retrigger: bool,
         legato: bool,
         s: &Settings,
     ) {
         self.counter += 1;
-        let pitch = key as f32 - 69.0;
+        let pitch = (self.tuning.pitch_or_key(key) - 69.0) as f32;
         let glide = match self.last_pitch {
             Some(from) if s.glide_coef > 0.0 && (legato || !s.glide_legato) => {
                 from - pitch
@@ -1617,6 +1629,7 @@ impl SynthProcessor {
         if !retrigger {
             // Legato: the same voice slides on, envelopes untouched.
             v.key = key;
+            v.pitch = pitch;
             v.channel = channel;
             v.glide = glide;
             v.age = self.counter;
@@ -1652,8 +1665,9 @@ impl SynthProcessor {
                 value: if keep { menv } else { 0.0 },
             },
             key,
+            pitch,
             channel,
-            velocity: velocity as f32 / 127.0,
+            velocity,
             age: self.counter,
             glide,
             noise: 0x9e37_79b9 ^ n.wrapping_mul(2_654_435_761),
@@ -1681,7 +1695,9 @@ impl SynthProcessor {
         }
     }
 
-    fn note_on(&mut self, channel: u8, key: u8, velocity: u8) {
+    /// A note at `velocity` 0…1 (MIDI 2.0's 16 bits where it came with
+    /// them).
+    fn note_on(&mut self, channel: u8, key: u8, velocity: f32) {
         let s = self.settings();
         let others = self.keys_down > 0;
         self.keys_down += 1;
@@ -1783,13 +1799,19 @@ impl SynthProcessor {
         self.keys_down = 0;
     }
 
-    fn handle(&mut self, event: MidiEvent) {
+    fn handle(&mut self, event: MidiEvent, fine: faderframe_midi::Fine) {
         match event {
+            // A key the tuning leaves out plays nothing (its note-off
+            // still ends whatever it started before the tuning changed).
+            MidiEvent::NoteOn { key, .. } if !self.tuning.is_mapped(key) => {}
             MidiEvent::NoteOn {
                 channel,
                 key,
                 velocity,
-            } => self.note_on(channel, key, velocity),
+            } => {
+                let unit = event.full_unit(fine).unwrap_or(f64::from(velocity) / 127.0);
+                self.note_on(channel, key, unit as f32)
+            }
             MidiEvent::NoteOff { channel, key, .. } => self.note_off(channel, key),
             MidiEvent::ControlChange { controller, .. }
                 if controller == MidiEvent::CC_ALL_NOTES_OFF
@@ -1946,7 +1968,7 @@ impl SynthProcessor {
                         source::LFO2 => lfo2,
                         source::MOD_ENV => v.menv.value,
                         source::VELOCITY => v.velocity,
-                        source::KEY => ((v.key as f32 - 60.0) / 36.0).clamp(-1.0, 1.0),
+                        source::KEY => ((v.pitch + 9.0) / 36.0).clamp(-1.0, 1.0),
                         source::AFTERTOUCH => (ch.pressure + v.pressure).min(1.0),
                         source::WHEEL => ch.modulation,
                         source::RANDOM => v.random,
@@ -1971,7 +1993,7 @@ impl SynthProcessor {
                     pan_l: (1.0 - pan).min(1.0),
                     pan_r: (1.0 + pan).min(1.0),
                     sub_scale: if s.sub_key != 0.0 {
-                        2f32.powf(-s.sub_key * (v.key as f32 - 60.0) / 12.0)
+                        2f32.powf(-s.sub_key * (v.pitch + 9.0) / 12.0)
                             .clamp(0.0625, 4.0)
                     } else {
                         1.0
@@ -2004,7 +2026,7 @@ impl SynthProcessor {
                     let drift = s.drift
                         * (DRIFT_CENTS / 100.0)
                         * (0.6 * v.drift_offset + 0.4 * v.drift.value(Shape::Drift, 0.0) as f32);
-                    let semis = v.key as f32 - 69.0
+                    let semis = v.pitch
                         + v.glide
                         + seg.bend
                         + v.tuning
@@ -2029,7 +2051,7 @@ impl SynthProcessor {
                     let fc = (s.cutoff
                         * 2f32.powf(
                             s.env_octaves * filt_env * vel
-                                + s.key_track * (v.key as f32 - 60.0) / 12.0
+                                + s.key_track * (v.pitch + 9.0) / 12.0
                                 + lfo * s.lfo_cutoff
                                 + (ch.timbre - 0.5 + v.brightness - 0.5) * 4.0
                                 + 0.05 * s.drift * v.drift_offset,
@@ -2284,7 +2306,7 @@ impl PluginProcessor for SynthProcessor {
                     }
                     pos = at;
                 }
-                self.handle(e.event);
+                self.handle(e.event, e.fine);
             }
         }
         if frames > pos {
@@ -2369,6 +2391,10 @@ impl PluginProcessor for SynthProcessor {
         self.keys_down = 0;
         self.last_pitch = None;
         self.fx.reset();
+    }
+
+    fn set_tuning(&mut self, tuning: &faderframe_midi::tuning::TuningTable) {
+        self.tuning = *tuning;
     }
 }
 
@@ -3444,5 +3470,56 @@ mod tests {
                 assert_eq!(h, WANT[n], "patch {n}: {h:016x}");
             }
         }
+    }
+
+    /// Notes sound where the track's tuning puts their keys; keys it
+    /// leaves out stay silent.
+    #[test]
+    fn notes_play_the_tuning_and_unmapped_keys_stay_silent() {
+        use faderframe_midi::tuning::{KeyboardMap, Tuning};
+        let plain = || {
+            Play::new(&[
+                (id::CUTOFF, 20_000.0),
+                (id::ENV_AMOUNT, 0.0),
+                (id::DETUNE, 0.0),
+                (id::OSC1_WAVE, 3.0),
+                (id::OSC2_LEVEL, 0.0),
+                (id::SUB, 0.0),
+            ])
+        };
+        // Key 57 plays 220 Hz in the standard tuning (see the wheels).
+        let mut s = plain();
+        s.p.set_tuning(&Tuning::twelve_tet().table(432.0));
+        s.send(on(57));
+        let (l, _) = s.run(0.5);
+        assert!(bin_db(&l, 216.0) > bin_db(&l, 220.0) + 6.0, "A = 432 Hz");
+        // 19-EDO: key 57 is three steps below middle C.
+        let mut s = plain();
+        s.p.set_tuning(&Tuning::equal(19).table(440.0));
+        s.send(on(57));
+        let (l, _) = s.run(0.5);
+        let want = 220.0 * 2f64.powf(3.0 / 12.0) * 2f64.powf(-3.0 / 19.0);
+        assert!(
+            bin_db(&l, want) > bin_db(&l, 220.0) + 10.0,
+            "{want}: {} vs {}",
+            bin_db(&l, want),
+            bin_db(&l, 220.0)
+        );
+        // A key the mapping leaves out: nothing.
+        let mut map = KeyboardMap::standard(12);
+        map.size = 2;
+        map.map = vec![Some(0), None];
+        map.octave_degree = 1;
+        let t = Tuning::equal(12).with_mapping(Some(map)).unwrap();
+        let mut s = plain();
+        s.p.set_tuning(&t.table(440.0));
+        assert!(!t.table(440.0).is_mapped(57));
+        s.send(on(57));
+        let (l, _) = s.run(0.2);
+        assert!(l.iter().all(|v| *v == 0.0), "unmapped key 57 is silent");
+        assert_eq!(s.p.voices.iter().filter(|v| v.sounding()).count(), 0);
+        s.send(on(58));
+        let (l, _) = s.run(0.2);
+        assert!(l.iter().any(|v| v.abs() > 1e-3), "key 58 plays");
     }
 }

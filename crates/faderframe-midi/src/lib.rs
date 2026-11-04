@@ -21,10 +21,11 @@ mod output;
 pub mod theory;
 pub mod timecode;
 mod tracker;
+pub mod tuning;
 pub mod ump;
 
 pub use buffer::{MidiBuffer, MidiBufferFull};
-pub use event::{ExpressionValue, MidiEvent, NoteExpressionKind, SysexRef, TimedMidiEvent};
+pub use event::{ExpressionValue, Fine, MidiEvent, NoteExpressionKind, SysexRef, TimedMidiEvent};
 pub use input::{
     MAX_MIDI_PORTS, MidiClock, MidiControlFeed, MidiInputEvent, MidiInputQueue, MidiInputSender,
     MidiSystemEvent, SystemMessage, UmpInput, midi_input_queue,

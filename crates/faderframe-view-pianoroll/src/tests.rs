@@ -397,6 +397,64 @@ fn folding_shows_only_scale_or_used_keys() {
     assert!(view.rows.windows(2).all(|w| w[0] > w[1]), "top to bottom");
 }
 
+/// A track in a tuning of its own: rows are its degrees and cents, and
+/// "scale keys only" keeps the keys its keyboard mapping plays.
+#[test]
+fn a_tuned_track_labels_rows_with_degrees_and_folds_to_its_keys() {
+    use faderframe_project::tuning::{KeyboardMap, Tuning};
+    let mut s = session();
+    let clip = s.editor_clip().unwrap();
+    let track = s.project().clip(clip).unwrap().track;
+    let mut view = PianoRollView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"C4"), "note names in 12-TET");
+    s.dispatch(Action::Edit(faderframe_project::Command::SetTuning {
+        track: Some(track),
+        tuning: Some(Tuning::equal(19)),
+    }))
+    .unwrap();
+    let p = paint(&mut view, &s);
+    let texts = p.texts();
+    assert!(texts.contains(&"0 · 0¢"), "the tonic labelled: {texts:?}");
+    assert!(!texts.contains(&"C4"));
+    assert_eq!(view.key_label(61), "1 · 63¢");
+    // Only the white keys play (a mapping leaving the black keys out).
+    let mut map = KeyboardMap::standard(7);
+    map.size = 12;
+    map.octave_degree = 7;
+    map.map = vec![
+        Some(0),
+        None,
+        Some(1),
+        None,
+        Some(2),
+        Some(3),
+        None,
+        Some(4),
+        None,
+        Some(5),
+        None,
+        Some(6),
+    ];
+    let white = Tuning::equal(7).with_mapping(Some(map)).unwrap();
+    s.dispatch(Action::Edit(faderframe_project::Command::SetTuning {
+        track: Some(track),
+        tuning: Some(white),
+    }))
+    .unwrap();
+    let mut pr = s.editor.piano;
+    pr.fold = KeyFold::Scale;
+    s.dispatch(Action::SetPianoRoll(pr)).unwrap();
+    paint(&mut view, &s);
+    let notes: std::collections::BTreeSet<u8> = notes(&s).iter().map(|n| n.key).collect();
+    assert!(
+        view.rows.iter().all(|k| !is_black(*k) || notes.contains(k)),
+        "black keys folded away (unless a note is there)"
+    );
+    assert!(view.rows.contains(&60) && view.rows.contains(&62));
+    assert_eq!(view.key_label(61), "C#4", "an unmapped key keeps its name");
+}
+
 #[test]
 fn expression_lane_draws_the_notes_under_the_pointer_in_one_step() {
     use faderframe_project::ExpressionKind;
@@ -1033,4 +1091,303 @@ fn drum_notes_are_diamonds_grabbed_at_their_start() {
     let moved = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
     assert_eq!(moved.start, n.start + MusicalTime::from_quarters_i(1));
     assert_eq!(moved.length, n.length, "its length kept");
+}
+
+/// A note locked to time: the note menu locks it (checked once locked),
+/// it shows a padlock at its start, and the inspector, tooltip and
+/// accessible name say so.
+#[test]
+fn a_note_locked_to_time_shows_a_padlock_and_its_menu_locks_it() {
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    view.set_tool(Tool::Pointer);
+    let n = notes(&s)[0];
+    let y = row_y(&mut view, &s, n.key);
+    let r = view.note_rect(&n).unwrap();
+    let pos = Point::new(r.x + r.w * 0.6, y);
+    let menu = |view: &mut PianoRollView, s: &mut Session| {
+        let (_, requests) = run(
+            view,
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                modifiers: Modifiers::NONE,
+                clicks: 1,
+            },
+            s,
+        );
+        let Some(HostRequest::ContextMenu { items, .. }) = requests.into_iter().next() else {
+            panic!("the note menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Lock to Time")
+            .expect("Lock to Time")
+    };
+    let padlock = |p: &RecordingPainter, at: Rect| {
+        p.ops.iter().any(
+            |o| matches!(o, faderframe_ui_canvas::DrawOp::Rounded(g) if at.contains(g.center())),
+        )
+    };
+    let glyph = crate::paint::lock_rect(r, false).unwrap();
+    assert!(!padlock(&paint(&mut view, &s), glyph), "none while musical");
+    let lock = menu(&mut view, &mut s);
+    assert_eq!(lock.checked, Some(false));
+    s.dispatch(lock.action.unwrap()).unwrap();
+    let locked = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    assert!(locked.time_locked);
+    let r = view.note_rect(&locked).unwrap();
+    let glyph = crate::paint::lock_rect(r, false).unwrap();
+    assert!(
+        padlock(&paint(&mut view, &s), glyph),
+        "a padlock at its start"
+    );
+    assert!(
+        view.inspector_text(&s).contains("locked at"),
+        "{}",
+        view.inspector_text(&s)
+    );
+    let tip = view.tooltip_at(pos, SIZE, &s).unwrap();
+    assert!(tip.contains("locked to time at"), "{tip}");
+    assert!(
+        view.accessible(SIZE, &s)
+            .iter()
+            .flat_map(|a| a.children.iter())
+            .any(|a| a.label.contains("locked to time"))
+    );
+    // Checked now; again: free.
+    let unlock = menu(&mut view, &mut s);
+    assert_eq!(unlock.checked, Some(true));
+    s.dispatch(unlock.action.unwrap()).unwrap();
+    assert!(!notes(&s).into_iter().any(|m| m.id == n.id && m.time_locked));
+}
+
+/// With a drum map, drum mode lists the map's sounds by name in its
+/// order, and drawing on a sound with a grid of its own keeps to it.
+#[test]
+fn a_drum_map_lists_its_sounds_by_name_and_draws_on_their_grids() {
+    use faderframe_session::maps::MapOp;
+    let mut s = session();
+    let clip = s.editor_clip().unwrap();
+    let track = s.project().clip(clip).unwrap().track;
+    s.use_drum_map_named(track, "gm").unwrap();
+    let mut view = PianoRollView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(view.diamonds, "a drum map makes a drum track");
+    assert!(view.drum_rows);
+    // Kick, kick, snare … as the map lists them, top to bottom.
+    assert_eq!(&view.rows[..3], &[36, 35, 38]);
+    assert_eq!(view.row_of(38), Some(2));
+    assert!(view.y_of(36).unwrap() < view.y_of(35).unwrap());
+    assert!(p.texts().contains(&"Bass Drum 1"), "{:?}", p.texts());
+    // The closed hi-hat on a triplet grid of its own.
+    let mut map = s.project().track_drum_map(track).unwrap().clone();
+    map.sound_mut(42).unwrap().quantize = Some(faderframe_timeline::GridDivision::Triplet(8));
+    s.dispatch(Action::Maps(MapOp::EditDrumMap(Box::new(map))))
+        .unwrap();
+    let y = row_y(&mut view, &s, 42);
+    assert_eq!(view.key_at(y), 42);
+    view.set_tool(Tool::Pencil);
+    let before = notes(&s).len();
+    let x = view.x_of(MusicalTime::from_quarters(0.45));
+    run(
+        &mut view,
+        down(Point::new(x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    run(&mut view, up(Point::new(x, y), Modifiers::NONE), &mut s);
+    let drawn: Vec<MidiNote> = notes(&s).into_iter().filter(|n| n.key == 42).collect();
+    assert_eq!(notes(&s).len(), before + 1);
+    let third = MusicalTime::from_quarters(1.0 / 3.0);
+    assert!(
+        drawn
+            .iter()
+            .any(|n| (n.start.ticks() - third.ticks()).abs() <= 1
+                && (n.length.ticks() - third.ticks()).abs() <= 1),
+        "on the triplet eighth: {drawn:?}"
+    );
+    // The names say where a sound goes.
+    let tip = view
+        .tooltip(Point::new(view.layout(SIZE).keys.x + 10.0, y), SIZE, &s)
+        .unwrap();
+    assert!(tip.starts_with("Closed Hi-Hat"), "{tip}");
+}
+
+/// The articulation lane: chosen from the lane menu, the map's
+/// articulations by name, a click sets a direction (or removes it), a
+/// click under a note gives it an attribute; notes' menus offer them.
+#[test]
+fn the_articulation_lane_sets_directions_and_attributes() {
+    use faderframe_project::articulation::ArticulationKind;
+    let mut s = session();
+    let clip = s.editor_clip().unwrap();
+    let track = s.project().clip(clip).unwrap().track;
+    s.use_articulation_map_named(track, "strings").unwrap();
+    let map = s.project().track_articulation_map(track).unwrap().clone();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let l = view.layout(SIZE);
+    let (_, requests) = run(
+        &mut view,
+        down(l.lane_header.center(), Modifiers::NONE, 1),
+        &mut s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = requests
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the lane menu");
+    };
+    let item = items.iter().find(|i| i.label == "Articulations").unwrap();
+    s.dispatch(item.action.clone().unwrap()).unwrap();
+    assert!(s.editor.piano.articulations);
+    let p = paint(&mut view, &s);
+    assert_eq!(view.lane(), LaneKind::Articulation);
+    assert!(p.texts().contains(&"→ Pizzicato"), "{:?}", p.texts());
+    assert!(p.texts().contains(&"• Staccato"));
+    let l = view.layout(SIZE);
+    let area = PianoRollView::lane_value_rect(l.lane);
+    let n = map.articulations.len();
+    let row_of = |name: &str| {
+        map.articulations
+            .iter()
+            .position(|a| a.name == name)
+            .unwrap()
+    };
+    // A direction where the pointer is (on the grid).
+    let pizz = row_of("Pizzicato");
+    let y = PianoRollView::articulation_row(area, pizz, n).center().y;
+    let x = view.x_of(MusicalTime::from_quarters(2.0));
+    run(
+        &mut view,
+        down(Point::new(x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    let lane = |s: &Session| {
+        s.project()
+            .clip(clip)
+            .unwrap()
+            .as_midi()
+            .unwrap()
+            .articulations
+            .clone()
+    };
+    assert_eq!(lane(&s).len(), 1);
+    assert_eq!(lane(&s)[0].time, MusicalTime::from_quarters(2.0));
+    assert_eq!(lane(&s)[0].articulation, map.articulations[pizz].id);
+    // Clicked again: gone.
+    run(
+        &mut view,
+        down(Point::new(x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    assert!(lane(&s).is_empty());
+    // An attribute under the first note.
+    let first = notes(&s)[0];
+    let stacc = row_of("Staccato");
+    assert_eq!(map.articulations[stacc].kind, ArticulationKind::Attribute);
+    let y = PianoRollView::articulation_row(area, stacc, n).center().y;
+    let x = view.x_of(first.start + MusicalTime(first.length.ticks() / 2));
+    run(
+        &mut view,
+        down(Point::new(x, y), Modifiers::NONE, 1),
+        &mut s,
+    );
+    let marked = notes(&s).into_iter().find(|m| m.id == first.id).unwrap();
+    assert_eq!(marked.articulation, Some(map.articulations[stacc].id));
+    // Shown on the note, by its symbol.
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().iter().any(|t| t.ends_with("stacc."))
+            || view.note_rect(&marked).is_none_or(|r| r.w <= 28.0),
+        "{:?}",
+        p.texts()
+    );
+    // A note's menu offers the articulations.
+    let y = row_y(&mut view, &s, first.key);
+    let x = view.x_of(first.start) + 2.0;
+    let (_, requests) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: Point::new(x, y),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        &mut s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = requests
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the note menu");
+    };
+    let sub = items.iter().find(|i| i.label == "Articulation").unwrap();
+    assert!(
+        sub.children
+            .iter()
+            .any(|c| c.label == "Staccato" && c.checked == Some(true))
+    );
+    // The lane's menu opens the map in the map editor.
+    let (_, requests) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: area.center(),
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        &mut s,
+    );
+    let Some(HostRequest::ContextMenu { items, .. }) = requests
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the lane's menu");
+    };
+    let edit = items
+        .iter()
+        .find(|i| i.label == "Edit Articulation Map…")
+        .unwrap();
+    s.dispatch(edit.action.clone().unwrap()).unwrap();
+    assert_eq!(
+        s.map_editor(),
+        Some(faderframe_session::maps::MapRef::Articulation(map.id))
+    );
+}
+
+/// The velocity lane drags at MIDI 2.0's 16 bits: a few pixels move a
+/// velocity by less than a MIDI 1.0 step, and the inspector shows the
+/// fraction.
+#[test]
+fn velocity_drags_are_at_16_bits() {
+    let mut s = session();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let n = notes(&s)[0];
+    let l = view.layout(SIZE);
+    let area = PianoRollView::lane_value_rect(l.lane);
+    let x = view.x_of(n.start);
+    let y0 = area.bottom() - area.h * n.velocity_unit() as f32;
+    let to = Point::new(x, y0 - area.h / 300.0);
+    run(
+        &mut view,
+        down(Point::new(x, y0), Modifiers::NONE, 1),
+        &mut s,
+    );
+    run(&mut view, drag(to, Modifiers::NONE), &mut s);
+    run(&mut view, up(to, Modifiers::NONE), &mut s);
+    let moved = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    let by = i32::from(moved.velocity16()) - i32::from(n.velocity16());
+    assert!(by > 0 && by < 512, "moved by {by} of 65535");
+    assert!(moved.has_fine_velocity());
+    assert!(
+        moved.velocity_text().contains('.'),
+        "{}",
+        moved.velocity_text()
+    );
+    // One undo step.
+    s.dispatch(Action::Undo).unwrap();
+    let back = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
+    assert_eq!(back.velocity16(), n.velocity16());
 }

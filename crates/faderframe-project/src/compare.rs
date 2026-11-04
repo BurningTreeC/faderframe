@@ -156,6 +156,22 @@ pub fn differences(then: &Project, now: &Project) -> Vec<String> {
     if then.timecode != now.timecode {
         out.push("Timecode changed".into());
     }
+    if then.tuning != now.tuning {
+        let name = |p: &Project| {
+            p.tuning
+                .as_ref()
+                .map_or("12-TET", |t| t.name.as_str())
+                .to_string()
+        };
+        out.push(format!("Tuning {} → {}", name(then), name(now)));
+    }
+    if then.reference_pitch != now.reference_pitch {
+        out.push(format!(
+            "Reference pitch {} → {} Hz",
+            crate::tuning::trim_hz(then.reference_pitch),
+            crate::tuning::trim_hz(now.reference_pitch)
+        ));
+    }
     let (a, b) = (&then.scratch_pads, &now.scratch_pads);
     for p in &b.pads {
         match a.pad(p.id) {
@@ -239,6 +255,22 @@ fn track_differences(a: &Track, b: &Track, now: &Project, out: &mut Vec<String>)
             "time base {} → {}",
             a.time_base.label(),
             b.time_base.label()
+        ));
+    }
+    if a.tuning != b.tuning {
+        let name = |t: &Track| {
+            t.tuning
+                .as_ref()
+                .map_or("the project's", |t| t.name.as_str())
+                .to_string()
+        };
+        push(format!("tuning {} → {}", name(a), name(b)));
+    }
+    if a.retune != b.retune {
+        push(format!(
+            "retuning {} → {}",
+            a.retune.label(),
+            b.retune.label()
         ));
     }
     if a.color != b.color {

@@ -967,6 +967,7 @@ fn the_tape_machine_face_paints_in_every_theme_and_learns() {
     for _ in 0..60 {
         let cx = Ctx {
             model: &s,
+            plugin,
             tap: &tap,
             theme: &theme,
             accent: face.accent(),
@@ -1020,4 +1021,599 @@ fn the_tape_machine_face_paints_in_every_theme_and_learns() {
     run(view.as_mut(), &mut s, up(to, PointerButton::Primary), size);
     let after = f64::from(tap.params.get(id::BIAS as usize));
     assert!(after > before + 1.0, "{before} → {after}");
+}
+
+/// The restoration devices' faces: every setting has a control inside a
+/// section (none over the display, none overlapping) at the window's size
+/// and at the smallest; they paint in every theme.
+#[test]
+fn the_restoration_faces_hold_their_controls_and_paint_in_every_theme() {
+    use crate::kit::Face;
+    use faderframe_plugin_host::devices::denoise;
+    let theme = Theme::default();
+    // A device, its name, its face and texts its display shows.
+    type Case<'a> = (&'a str, &'a str, Box<dyn Face>, Vec<&'a str>);
+    let faces: Vec<Case<'_>> = vec![
+        (
+            builtin::DENOISE,
+            "De-noise",
+            Box::new(crate::denoise::DenoiseFace::new(&theme)),
+            vec!["LEARN NOISE", "NOISE", "CHARACTER"],
+        ),
+        (
+            builtin::DECLICK,
+            "De-click",
+            Box::new(crate::declick::DeclickFace::new(&theme)),
+            vec!["CLICKS / S", "DETECTION"],
+        ),
+        (
+            builtin::DEHUM,
+            "De-hum",
+            Box::new(crate::dehum::DehumFace::new(&theme)),
+            vec!["FUNDAMENTAL", "NOTCHES"],
+        ),
+        (
+            builtin::DECLIP,
+            "De-clip",
+            Box::new(crate::declip::DeclipFace::new(&theme)),
+            vec!["CLIP LEVEL", "REBUILD"],
+        ),
+        (
+            builtin::DEREVERB,
+            "De-reverb",
+            Box::new(crate::dereverb::DereverbFace::new(&theme)),
+            vec!["ROOM", "early"],
+        ),
+    ];
+    for (id, name, face, wants) in faces {
+        let (w, h) = crate::editor_size(id).unwrap();
+        let size = Size::new(w as f32, (h - 46) as f32);
+        for at in [size, face.min_size()] {
+            let panel = face.panel(at);
+            let display = panel.display.unwrap();
+            for c in &panel.controls {
+                let r = c.rect;
+                assert!(
+                    panel.sections.iter().any(|s| r.x >= s.rect.x - 0.5
+                        && r.right() <= s.rect.right() + 0.5
+                        && r.y >= s.rect.y
+                        && r.bottom() <= s.rect.bottom() + 0.5),
+                    "{id}: {} ({r:?}) outside every section at {at:?}",
+                    c.label
+                );
+                assert!(
+                    r.y >= display.bottom(),
+                    "{id}: {} over the display",
+                    c.label
+                );
+            }
+            for (i, a) in panel.controls.iter().enumerate() {
+                for b in &panel.controls[i + 1..] {
+                    let (p, q) = (a.rect, b.rect);
+                    let apart = p.right() <= q.x
+                        || q.right() <= p.x
+                        || p.bottom() <= q.y
+                        || q.bottom() <= p.y;
+                    assert!(apart, "{id}: {} and {} overlap at {at:?}", a.label, b.label);
+                }
+            }
+            for p in faderframe_plugin_host::presets::parameters(id) {
+                // De-noise's profile is its display's (Learn, Forget).
+                if id == builtin::DENOISE && (denoise::hidden(p.id) || p.id.0 == denoise::id::LEARN)
+                {
+                    continue;
+                }
+                assert!(
+                    panel.controls.iter().any(|c| c.id == p.id),
+                    "{id}: no control for {}",
+                    p.name
+                );
+            }
+        }
+        let (s, plugin) = session(id, name);
+        for th in Theme::all() {
+            let mut view = crate::editor_for(id, plugin, &th).unwrap();
+            let mut p = RecordingPainter::new();
+            view.paint(&mut p, size, &s, &th);
+            assert!(p.balanced_clips(), "{id}: {}", th.name);
+            let texts = p.texts();
+            for want in &wants {
+                assert!(texts.contains(want), "{id} in {}: no {want}", th.name);
+            }
+        }
+    }
+}
+
+/// De-noise's Learn: pressed, it learns; pressed again, what it learned
+/// becomes the profile (and the source Learned) in one undo step; Forget
+/// goes back to tracking.
+#[test]
+fn de_noise_learns_a_profile_in_one_undo_step_and_forgets_it() {
+    use faderframe_plugin_host::devices::denoise::{BANDS, id, value};
+    let (mut s, plugin) = session(builtin::DENOISE, "De-noise");
+    let theme = Theme::default();
+    let (w, h) = crate::editor_size(builtin::DENOISE).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let mut view = crate::editor_for(builtin::DENOISE, plugin, &theme).unwrap();
+    let display = {
+        use crate::kit::Face;
+        crate::denoise::DenoiseFace::new(&theme)
+            .panel(size)
+            .display
+            .unwrap()
+    };
+    let (_, learn, forget) = crate::denoise::DenoiseFace::layout(display);
+    let tap = s.plugin_tap(plugin).unwrap();
+    let get =
+        |s: &mut Session, pid: u32| s.plugin_parameter_value(plugin, ParameterId(pid)).unwrap();
+    let click = |view: &mut Box<dyn CanvasView<Session, Action>>, s: &mut Session, at: Point| {
+        run(view.as_mut(), s, down(at, PointerButton::Primary, 1), size);
+        run(view.as_mut(), s, up(at, PointerButton::Primary), size);
+    };
+    click(&mut view, &mut s, learn.center());
+    assert_eq!(get(&mut s, id::LEARN), 1.0, "learning");
+    // What the processor learned (as it publishes it).
+    tap.set_value(value::LEARNED, 2.5);
+    for b in 0..BANDS {
+        tap.set_value(value::NOISE + b, -50.0 + b as f32 * 0.25);
+    }
+    let steps = s.history_steps().0.len();
+    click(&mut view, &mut s, learn.center());
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+    assert_eq!(get(&mut s, id::LEARN), 0.0);
+    assert_eq!(get(&mut s, id::SOURCE), 1.0);
+    assert_eq!(get(&mut s, id::PROFILE_SET), 1.0);
+    assert_eq!(get(&mut s, id::profile(8)), -48.0);
+    // Undo: still learning, no profile.
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(get(&mut s, id::LEARN), 1.0);
+    assert_eq!(get(&mut s, id::PROFILE_SET), 0.0);
+    s.dispatch(Action::Redo).unwrap();
+    // The painted display shows the profile is in use.
+    tap.set_value(value::ADAPTIVE, 0.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"Learned profile"));
+    assert!(p.texts().contains(&"FORGET"));
+    click(&mut view, &mut s, forget.center());
+    assert_eq!(get(&mut s, id::PROFILE_SET), 0.0);
+    assert_eq!(get(&mut s, id::SOURCE), 0.0);
+}
+
+/// A face's controls at `at`: each inside a section, none over the
+/// display, none overlapping.
+fn controls_in_place(id: &str, panel: &crate::kit::Panel, at: Size) {
+    let display = panel.display.unwrap();
+    for c in &panel.controls {
+        let r = c.rect;
+        assert!(
+            panel.sections.iter().any(|s| r.x >= s.rect.x - 0.5
+                && r.right() <= s.rect.right() + 0.5
+                && r.y >= s.rect.y
+                && r.bottom() <= s.rect.bottom() + 0.5),
+            "{id}: {} ({r:?}) outside every section at {at:?}",
+            c.label
+        );
+        assert!(
+            r.y >= display.bottom(),
+            "{id}: {} over the display",
+            c.label
+        );
+    }
+    for (i, a) in panel.controls.iter().enumerate() {
+        for b in &panel.controls[i + 1..] {
+            let (p, q) = (a.rect, b.rect);
+            let apart =
+                p.right() <= q.x || q.right() <= p.x || p.bottom() <= q.y || q.bottom() <= p.y;
+            assert!(apart, "{id}: {} and {} overlap at {at:?}", a.label, b.label);
+        }
+    }
+}
+
+/// The Convolution Reverb's, Multiband Dynamics' and Vocoder's faces:
+/// every setting has a control (the multiband's band settings for the band
+/// it shows, every band in turn), inside a section, at the window's size and
+/// the smallest; they paint in every theme.
+#[test]
+fn the_convolution_multiband_and_vocoder_faces_hold_their_controls() {
+    use crate::kit::Face;
+    let theme = Theme::default();
+    type Case<'a> = (&'a str, &'a str, Vec<Box<dyn Face>>, Vec<&'a str>);
+    let multiband: Vec<Box<dyn Face>> = (0..faderframe_plugin_host::devices::multiband::BANDS)
+        .map(|b| {
+            let mut f = crate::multiband::MultibandFace::new(&theme);
+            f.selected = b;
+            Box::new(f) as Box<dyn Face>
+        })
+        .collect();
+    let cases: Vec<Case<'_>> = vec![
+        (
+            builtin::CONVOLUTION_REVERB,
+            "Convolution Reverb",
+            vec![Box::new(crate::convolution::ConvolutionFace::new(&theme))],
+            vec!["LOAD…"],
+        ),
+        (
+            builtin::MULTIBAND_DYNAMICS,
+            "Multiband Dynamics",
+            multiband,
+            vec!["THRESHOLD", "SPLIT"],
+        ),
+        (
+            builtin::VOCODER,
+            "Vocoder",
+            vec![Box::new(crate::vocoder::VocoderFace::new(&theme))],
+            vec!["UNVOICED", "The synth: Minor on C3 carries the input"],
+        ),
+    ];
+    for (id, name, faces, wants) in cases {
+        let (w, h) = crate::editor_size(id).unwrap();
+        let size = Size::new(w as f32, (h - 46) as f32);
+        let mut covered = std::collections::HashSet::new();
+        for face in &faces {
+            for at in [size, face.min_size()] {
+                let panel = face.panel(at);
+                controls_in_place(id, &panel, at);
+                covered.extend(panel.controls.iter().map(|c| c.id));
+            }
+        }
+        for p in faderframe_plugin_host::presets::parameters(id) {
+            assert!(covered.contains(&p.id), "{id}: no control for {}", p.name);
+        }
+        let (s, plugin) = session(id, name);
+        for th in Theme::all() {
+            let mut view = crate::editor_for(id, plugin, &th).unwrap();
+            let mut p = RecordingPainter::new();
+            view.paint(&mut p, size, &s, &th);
+            assert!(p.balanced_clips(), "{id}: {}", th.name);
+            let texts = p.texts();
+            for want in &wants {
+                assert!(
+                    texts.contains(want),
+                    "{id} in {}: no {want} ({texts:?})",
+                    th.name
+                );
+            }
+        }
+    }
+}
+
+/// The multiband face: a tab picks the band the deck shows; dragging a
+/// crossover moves it as one undo step.
+#[test]
+fn the_multiband_face_picks_bands_and_drags_crossovers() {
+    use crate::kit::Face;
+    use faderframe_plugin_host::devices::multiband::id;
+    let (mut s, plugin) = session(builtin::MULTIBAND_DYNAMICS, "Multiband Dynamics");
+    let theme = Theme::default();
+    let (w, h) = crate::editor_size(builtin::MULTIBAND_DYNAMICS).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let mut view = crate::editor_for(builtin::MULTIBAND_DYNAMICS, plugin, &theme).unwrap();
+    let display = crate::multiband::MultibandFace::new(&theme)
+        .panel(size)
+        .display
+        .unwrap();
+    let (tabs, spec) = crate::multiband::MultibandFace::layout(display);
+    // Band 3's tab: the deck's band section is band 3's.
+    let tab = crate::multiband::MultibandFace::tab(tabs, 2).center();
+    run(
+        view.as_mut(),
+        &mut s,
+        down(tab, PointerButton::Primary, 1),
+        size,
+    );
+    run(view.as_mut(), &mut s, up(tab, PointerButton::Primary), size);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"BAND 3"), "{:?}", p.texts());
+    // Drag the first crossover (120 Hz) to about 300 Hz.
+    let x = crate::kit::Spectrum::x_of(spec, 120.0);
+    let from = Point::new(x, spec.center().y);
+    let to = Point::new(crate::kit::Spectrum::x_of(spec, 300.0), spec.center().y);
+    let steps = s.history_steps().0.len();
+    run(
+        view.as_mut(),
+        &mut s,
+        down(from, PointerButton::Primary, 1),
+        size,
+    );
+    run(view.as_mut(), &mut s, drag(to), size);
+    run(view.as_mut(), &mut s, up(to, PointerButton::Primary), size);
+    let f = s
+        .plugin_parameter_value(plugin, ParameterId(id::CROSSOVER))
+        .unwrap();
+    assert!((f / 300.0 - 1.0).abs() < 0.05, "{f}");
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+}
+
+/// The convolution face: Load asks for a file; Use File chooses the file
+/// as the space.
+#[test]
+fn the_convolution_face_loads_and_uses_a_file() {
+    use crate::kit::Face;
+    use faderframe_plugin_host::devices::convolution::id;
+    let (mut s, plugin) = session(builtin::CONVOLUTION_REVERB, "Convolution Reverb");
+    let theme = Theme::default();
+    let (w, h) = crate::editor_size(builtin::CONVOLUTION_REVERB).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let mut view = crate::editor_for(builtin::CONVOLUTION_REVERB, plugin, &theme).unwrap();
+    let display = crate::convolution::ConvolutionFace::new(&theme)
+        .panel(size)
+        .display
+        .unwrap();
+    let (_, _, load, clear) = crate::convolution::ConvolutionFace::layout(display);
+    let requests = run(
+        view.as_mut(),
+        &mut s,
+        down(load.center(), PointerButton::Primary, 1),
+        size,
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|r| matches!(r, HostRequest::ChooseFiles { .. })),
+        "a file chooser"
+    );
+    run(
+        view.as_mut(),
+        &mut s,
+        up(load.center(), PointerButton::Primary),
+        size,
+    );
+    run(
+        view.as_mut(),
+        &mut s,
+        down(clear.center(), PointerButton::Primary, 1),
+        size,
+    );
+    run(
+        view.as_mut(),
+        &mut s,
+        up(clear.center(), PointerButton::Primary),
+        size,
+    );
+    assert_eq!(
+        s.plugin_parameter_value(plugin, ParameterId(id::SPACE)),
+        Some(0.0)
+    );
+}
+
+/// Pitch Correct's face: every setting has a control inside a section at
+/// the window's size and the smallest, none overlapping; the display
+/// draws the sung and played pitch over the notes the target allows, the
+/// target note and the correction, in every theme.
+#[test]
+fn pitch_correct_shows_the_pitch_and_holds_its_controls() {
+    use crate::kit::Face;
+    use faderframe_plugin_host::devices::pitch_correct::{id, value};
+    let theme = Theme::default();
+    let face = crate::pitch_correct::PitchCorrectFace::new(&theme);
+    let id_ = builtin::PITCH_CORRECT;
+    let (w, h) = crate::editor_size(id_).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    for at in [size, face.min_size()] {
+        let panel = face.panel(at);
+        let display = panel.display.unwrap();
+        for c in &panel.controls {
+            let r = c.rect;
+            assert!(
+                panel.sections.iter().any(|s| r.x >= s.rect.x - 0.5
+                    && r.right() <= s.rect.right() + 0.5
+                    && r.y >= s.rect.y
+                    && r.bottom() <= s.rect.bottom() + 0.5),
+                "{} ({r:?}) outside every section at {at:?}",
+                c.label
+            );
+            assert!(r.y >= display.bottom(), "{} over the display", c.label);
+        }
+        for (i, a) in panel.controls.iter().enumerate() {
+            for b in &panel.controls[i + 1..] {
+                let (p, q) = (a.rect, b.rect);
+                let apart =
+                    p.right() <= q.x || q.right() <= p.x || p.bottom() <= q.y || q.bottom() <= p.y;
+                assert!(apart, "{} and {} overlap at {at:?}", a.label, b.label);
+            }
+        }
+        for p in faderframe_plugin_host::presets::parameters(id_) {
+            assert!(
+                panel.controls.iter().any(|c| c.id == p.id),
+                "no control for {}",
+                p.name
+            );
+        }
+    }
+    let (s, plugin) = session(id_, "Pitch Correct");
+    // What the processor published: A4 sung 23 cents sharp, corrected,
+    // in C major.
+    let tap = s.plugin_tap(plugin).unwrap();
+    tap.set_value(value::INPUT, 69.23);
+    tap.set_value(value::TARGET, 69.0);
+    tap.set_value(value::OUTPUT, 69.0);
+    tap.set_value(value::CORRECTION, -0.23);
+    tap.set_value(value::ALLOWED, f32::from(0b1010_1011_0101u16));
+    let rate = f64::from(s.sample_rate());
+    let lat = faderframe_plugin_host::devices::pitch_correct::latency(&tap.params, rate);
+    let latency = format!("latency {:.1} ms", f64::from(lat) / rate * 1000.0);
+    for th in Theme::all() {
+        let mut view = crate::editor_for(id_, plugin, &th).unwrap();
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &th);
+        assert!(p.balanced_clips(), "{}", th.name);
+        let texts = p.texts();
+        for want in [
+            "TARGET NOTE",
+            "A4",
+            "+23 ¢",
+            "−23 ¢",
+            "C5",
+            latency.as_str(),
+        ] {
+            assert!(texts.contains(&want), "{}: no {want} in {texts:?}", th.name);
+        }
+        // B♭ is not in C major: not named.
+        assert!(!texts.contains(&"A#4"));
+    }
+    assert!(faderframe_core::builtin::has_editor(id_));
+    let _ = id::MIX;
+}
+
+/// The Sampler's waveform menu slices its sample into equal parts (a
+/// key each), shows the cuts, takes one away and drags another; a Drum
+/// Sampler pad's menu slices its sample onto the free pads.
+#[test]
+fn the_samplers_slice_their_samples_from_their_faces() {
+    use crate::kit::Face;
+    use faderframe_plugin_host::devices::sampler::id;
+    use faderframe_plugin_host::devices::samples::Contents;
+    use faderframe_session::sampling::SampleTarget;
+    use faderframe_timeline::MusicalTime;
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    let start = s.project().clips_of(bass)[0].start;
+    s.dispatch(Action::MakeSample {
+        track: bass,
+        start,
+        end: start + MusicalTime::from_quarters(4.0),
+        target: SampleTarget::Sampler,
+    })
+    .unwrap();
+    let wait = |s: &mut Session| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !s.sampling().is_empty() || s.slicing() {
+            assert!(std::time::Instant::now() < end);
+            s.tick(0.016);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        s.wait_for_samples();
+    };
+    wait(&mut s);
+    let track = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass Sample")
+        .unwrap()
+        .clone();
+    let plugin = s.instrument_slot(&track).unwrap().id;
+    let theme = Theme::default();
+    let (w, h) = crate::editor_size(builtin::SAMPLER).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let mut view = crate::editor_for(builtin::SAMPLER, plugin, &theme).unwrap();
+    let display = crate::sampler::SamplerFace::new(&theme)
+        .panel(size)
+        .display
+        .unwrap();
+    let (_, _, wave, _) = crate::sampler::SamplerFace::split(display);
+    let menu = |view: &mut Box<dyn CanvasView<Session, Action>>, s: &mut Session, x: f32| {
+        let at = Point::new(x, wave.y + wave.h / 2.0);
+        let r = run(
+            view.as_mut(),
+            s,
+            down(at, PointerButton::Secondary, 1),
+            size,
+        );
+        run(view.as_mut(), s, up(at, PointerButton::Secondary), size);
+        r.into_iter()
+            .find_map(|r| match r {
+                HostRequest::ContextMenu { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("a menu")
+    };
+    let items = menu(&mut view, &mut s, wave.x + wave.w * 0.5);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Cut a Slice Here"), "{labels:?}");
+    assert!(labels.contains(&"Play Slices (a Key Each)"));
+    let four = items
+        .iter()
+        .find(|i| i.label == "Slice into 4 Equal Parts")
+        .unwrap();
+    s.dispatch(four.action.clone().unwrap()).unwrap();
+    wait(&mut s);
+    let contents = |s: &Session| s.plugin_tap(plugin).unwrap().assets::<Contents>().unwrap();
+    let frames = contents(&s).set.slot(0).unwrap().frames as u64;
+    assert_eq!(contents(&s).doc.slices.len(), 3);
+    assert_eq!(contents(&s).set.slices.len(), 4, "the processor's slices");
+    assert!(s.plugin_parameter_value(plugin, ParameterId(id::SLICES)) == Some(1.0));
+    // Painted: the cuts and their numbers.
+    let mut p = RecordingPainter::default();
+    view.paint(&mut p, size, &s, &theme);
+    let texts = p.texts();
+    for n in ["1", "2", "3", "4"] {
+        assert!(texts.contains(&n), "slice {n} numbered: {texts:?}");
+    }
+    // A cut is removed from its own menu.
+    let cut = wave.x + wave.w * 0.25;
+    let items = menu(&mut view, &mut s, cut);
+    let remove = items
+        .iter()
+        .find(|i| i.label == "Remove the Cut Before Slice 2")
+        .unwrap();
+    s.dispatch(remove.action.clone().unwrap()).unwrap();
+    wait(&mut s);
+    assert_eq!(contents(&s).doc.slices, vec![frames / 2, 3 * frames / 4]);
+    // The middle cut dragged: one step.
+    let steps = s.history_steps().0.len();
+    let from = Point::new(wave.x + wave.w * 0.5, wave.y + 10.0);
+    let to = Point::new(wave.x + wave.w * 0.6, wave.y + 10.0);
+    run(
+        view.as_mut(),
+        &mut s,
+        down(from, PointerButton::Primary, 1),
+        size,
+    );
+    run(view.as_mut(), &mut s, drag(to), size);
+    run(view.as_mut(), &mut s, up(to, PointerButton::Primary), size);
+    wait(&mut s);
+    assert_eq!(s.history_steps().0.len(), steps + 1);
+    let moved = contents(&s).doc.slices[0];
+    assert!(
+        (moved as f64 / frames as f64 - 0.6).abs() < 0.01,
+        "{moved} of {frames}"
+    );
+    // A Drum Sampler pad's menu.
+    s.dispatch(Action::Slice {
+        source: faderframe_session::slicing::SliceSource::Sample { plugin, slot: 0 },
+        by: faderframe_session::slicing::SliceBy::Parts(4),
+        target: faderframe_session::slicing::SliceTarget::NewDrums,
+        midi: false,
+    })
+    .unwrap();
+    wait(&mut s);
+    let kit_track = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name.ends_with("Slices"))
+        .unwrap()
+        .clone();
+    let kit = s.instrument_slot(&kit_track).unwrap().id;
+    let (w, h) = crate::editor_size(builtin::DRUMS).unwrap();
+    let size = Size::new(w as f32, (h - 46) as f32);
+    let mut view = crate::editor_for(builtin::DRUMS, kit, &theme).unwrap();
+    let display = crate::drums::DrumsFace::new(&theme)
+        .panel(size)
+        .display
+        .unwrap();
+    let (pads, ..) = crate::drums::DrumsFace::split(display);
+    let r = run(
+        view.as_mut(),
+        &mut s,
+        down(pads[1].center(), PointerButton::Secondary, 1),
+        size,
+    );
+    let items = r
+        .into_iter()
+        .find_map(|r| match r {
+            HostRequest::ContextMenu { items, .. } => Some(items),
+            _ => None,
+        })
+        .expect("a pad's menu");
+    assert_eq!(items[0].label, "Slice Pad 2 at Transients to the Free Pads");
 }

@@ -99,11 +99,18 @@ VENDORED = [
         "crates/faderframe-leadsheet/data/AFM-NOTICE.txt",
     ),
     (
-        "libopus (IAMF masters; bundled by opusic-sys, built with CMake, statically linked)",
+        "libopus (IAMF masters, the codec monitor; bundled by opusic-sys, built with CMake, statically linked)",
         "1.6.1",
         "BSD-3-Clause",
         "https://opus-codec.org",
         "crates/faderframe-iamf/LICENSE-libopus.txt",
+    ),
+    (
+        "Lua (scripts and macros; bundled by lua-src, statically linked)",
+        "5.4.9",
+        "MIT",
+        "https://www.lua.org",
+        "crates/faderframe-script/LICENSE-Lua.txt",
     ),
     (
         "Alliance for Open Media Patent License 1.0 (IAMF)",
@@ -111,6 +118,41 @@ VENDORED = [
         "AOM Patent License 1.0",
         "https://aomedia.org/license/patent-license/",
         "AOM-PATENT-LICENSE.txt",
+    ),
+    (
+        "ARA Audio Random Access API (C interface translated to Rust; Celemony Software GmbH)",
+        "2.3.0",
+        "Apache-2.0",
+        "https://github.com/Celemony/ARA_API",
+        "crates/faderframe-ara/vendor/LICENSE-ARA_API.txt",
+    ),
+    (
+        "AAF object model tables (classes, properties, types; generated from pyaaf2 by scripts/aaf_model.py)",
+        "pyaaf2 1.7.1",
+        "MIT",
+        "https://github.com/markreidvfx/pyaaf2",
+        "crates/faderframe-aaf/data/LICENSE-pyaaf2.txt",
+    ),
+]
+
+
+# Models FaderFrame downloads when asked (never in the repository or the
+# packages): (name, version, license, source, attribution).
+DOWNLOADED = [
+    (
+        "X-UMXL stem separation weights (CrossNet-Open-Unmix Large; Sony)",
+        "zenodo 7128659 (pretrained_xumxl.pth)",
+        "CC-BY-4.0",
+        "https://doi.org/10.5281/zenodo.7128659",
+        "Ryosuke Sawata, Stefan Uhlich, Shusuke Takahashi and Yuki Mitsufuji (Sony); "
+        "used unmodified; https://creativecommons.org/licenses/by/4.0/",
+    ),
+    (
+        "Whisper speech recognition weights (OpenAI)",
+        "whisper-base",
+        "Apache-2.0",
+        "https://huggingface.co/openai/whisper-base",
+        "OpenAI; https://www.apache.org/licenses/LICENSE-2.0",
     ),
 ]
 
@@ -224,6 +266,18 @@ def render(meta: dict) -> str:
         key = hashlib.sha256(normalise(text).encode()).hexdigest()
         g = groups.setdefault(key, {"name": Path(path).name, "text": text, "crates": []})
         g["crates"].append(f"{name} (vendored)")
+    lines += [
+        "",
+        f"## Models downloaded on request ({len(DOWNLOADED)}, not shipped)",
+        "",
+        "FaderFrame fetches these from their publishers only when asked; they",
+        "are not part of the source or the packages.",
+        "",
+        "| Model | Version | License | Source | Attribution |",
+        "|---|---|---|---|---|",
+    ]
+    for name, version, lic, url, credit in DOWNLOADED:
+        lines.append(f"| {name} | {version} | {lic} | {url} | {credit} |")
     if missing:
         lines += [
             "",

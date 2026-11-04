@@ -154,6 +154,44 @@ pub enum MappingTarget {
     /// The talkback microphone: on while the button is held (a note's
     /// length, a CC's high value).
     Talkback,
+    /// Mix scenes: recall one, the next or the previous, or the morph
+    /// between A and B (a value).
+    MixScene {
+        control: SceneControl,
+    },
+    /// Run a recorded macro or a numbered script (its `--! macro:`
+    /// number, from 1); a press runs it once.
+    RunMacro {
+        number: u16,
+    },
+}
+
+/// What a controller does with the mix scenes (see [`crate::scenes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum SceneControl {
+    /// Recall this scene (with its crossfade).
+    Recall {
+        scene: faderframe_core::MixSceneId,
+    },
+    /// The scene after (before) the one recalled last.
+    Next,
+    Previous,
+    /// The position between scenes A and B (a fader or knob; it ends as
+    /// one undo step once the control rests).
+    Morph,
+}
+
+impl SceneControl {
+    /// "Next Scene", "Morph A–B" (a recall is named by the session).
+    pub fn label(self) -> &'static str {
+        match self {
+            SceneControl::Recall { .. } => "Recall Scene",
+            SceneControl::Next => "Next Scene",
+            SceneControl::Previous => "Previous Scene",
+            SceneControl::Morph => "Morph A–B",
+        }
+    }
 }
 
 /// Show mode's buttons.
@@ -180,7 +218,11 @@ impl MappingTarget {
     pub fn is_button(&self) -> bool {
         !matches!(
             self,
-            MappingTarget::Parameter { .. } | MappingTarget::Macro { .. }
+            MappingTarget::Parameter { .. }
+                | MappingTarget::Macro { .. }
+                | MappingTarget::MixScene {
+                    control: SceneControl::Morph
+                }
         )
     }
 
@@ -196,7 +238,9 @@ impl MappingTarget {
             MappingTarget::Transport { .. }
             | MappingTarget::LauncherScene { .. }
             | MappingTarget::Show { .. }
-            | MappingTarget::Talkback => None,
+            | MappingTarget::Talkback
+            | MappingTarget::MixScene { .. }
+            | MappingTarget::RunMacro { .. } => None,
         }
     }
 }

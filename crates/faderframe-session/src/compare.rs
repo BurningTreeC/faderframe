@@ -5,9 +5,11 @@
 //!
 //! Two things are compared with the mix:
 //!
-//! * **The undo history** ([`Action::AuditionHistory`]): the project as it
-//!   was some steps ago, made on a copy of the project as undoing would
-//!   make it ([`faderframe_project::History::project_at`]: neither the
+//! * **The undo history** ([`Action::AuditionNode`], or
+//!   [`Action::AuditionHistory`] by its place on the current line): the
+//!   project as it is in any step of the history tree, made on a copy of
+//!   the project as going there would make it
+//!   ([`faderframe_project::History::project_at_node`]: neither the
 //!   project nor the history moves), rendered offline on its own engine
 //!   over [`Session::audition_range`] with two seconds of run-up (tails
 //!   from before it sound), into a file in a per-session temporary folder.
@@ -15,6 +17,9 @@
 //!   to match the two in loudness. "Then" and "Now" then flip with
 //!   [`CompareOp::Flip`].
 //! * **Reference tracks** ([`crate::references`]).
+//!
+//! Audio Bisect ([`crate::bisect`]) uses the same path to play two states
+//! of the history against each other, neither of them the mix.
 //!
 //! The session hands the engine the file and its settings
 //! (`CompareLink::set`, crossfaded there), keeps its pages resident through
@@ -48,11 +53,17 @@ pub const AUDITION_RUN_UP_SECONDS: f64 = 2.0;
 /// What the mix is compared with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Comparing {
-    /// The project as it was with `done` steps of the history done
-    /// ("Then"; the mix is "Now").
-    History { done: usize },
+    /// The project as it is in step `node` of the history ("Then"; the mix
+    /// is "Now").
+    History { node: u64 },
     /// A reference track.
     Reference(ReferenceId),
+    /// Two states of the history against each other (Audio Bisect).
+    Bisect,
+    /// The last merge of versions with another choice for one of its
+    /// conflicts ("Other"; the merge as applied is the mix, see
+    /// [`crate::version_merge`]).
+    MergeChoice,
 }
 
 /// Switching between the mix and what it is compared with.
@@ -108,7 +119,11 @@ pub struct ListeningGain {
 /// An audition of the undo history, as the views show it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuditionInfo {
-    /// Steps done in the project auditioned.
+    /// The step auditioned ([`faderframe_project::History::ROOT`]: the
+    /// project as opened).
+    pub node: u64,
+    /// Its steps from the start (on the current line: the steps done
+    /// there).
     pub done: usize,
     /// The step it is just after ("Project opened" for none).
     pub label: String,
@@ -134,6 +149,9 @@ struct AuditionJob {
 }
 
 struct Audition {
+    /// What it is heard as ([`Comparing::History`] or
+    /// [`Comparing::MergeChoice`]).
+    what: Comparing,
     info: AuditionInfo,
     now_path: PathBuf,
     /// Engine samples: the file's first frame plays at `anchor`; the
@@ -147,18 +165,18 @@ struct Audition {
 }
 
 pub(crate) struct CompareState {
-    what: Option<Comparing>,
+    pub(crate) what: Option<Comparing>,
     /// The file heard on the other side and how (once prepared).
     pub(crate) source: Option<CompareSource>,
     /// Where it was handed (an engine made anew gets it again) and whether
     /// it changed since.
     sent: Option<Arc<CompareLink>>,
     dirty: bool,
-    hear: bool,
+    pub(crate) hear: bool,
     /// An audition played as loud as the mix.
     match_audition: bool,
     gain_db: f32,
-    matched: bool,
+    pub(crate) matched: bool,
     /// The mix side's listening gain (dB; Mix Intelligence's candidate at
     /// the original's loudness).
     mix_gain_db: f32,
@@ -168,6 +186,9 @@ pub(crate) struct CompareState {
     pub(crate) references: crate::references::ReferenceState,
     /// The session's temporary folder (renders, resampled references).
     dir: Option<PathBuf>,
+    /// File frames from where the source plays to other places in it the
+    /// disk loader keeps resident too (Audio Bisect's other side).
+    pub(crate) also: Vec<i64>,
     /// Files to delete once nothing holds them (Windows keeps open files).
     trash: Vec<PathBuf>,
     /// A crossfade was moving when last polled (views repaint).
@@ -190,6 +211,7 @@ impl Default for CompareState {
             audition: None,
             references: Default::default(),
             dir: None,
+            also: Vec::new(),
             trash: Vec::new(),
             moving: false,
         }
@@ -298,6 +320,11 @@ pub(crate) fn loudness_weights(layout: ChannelLayout) -> Vec<f64> {
                 }
             })
             .collect(),
+        // A field's loudness is its omnidirectional W (SN3D: the
+        // pressure at the listener); the other channels are directions.
+        ChannelLayout::Ambisonic(o) => (0..o.channels())
+            .map(|k| if k == 0 { 1.0 } else { 0.0 })
+            .collect(),
         other => vec![1.0; other.channel_count().max(1)],
     }
 }
@@ -356,6 +383,70 @@ pub(crate) fn read_file(path: &Path) -> std::result::Result<(Vec<Vec<f32>>, u32)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A stretch of the timeline as heard now: the range compared, in samples
+/// `[a, b)`, rendered from `start` (the run-up before it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Stretch {
+    pub range: (MusicalTime, MusicalTime),
+    pub a: i64,
+    pub b: i64,
+    pub start: i64,
+    pub rate: u32,
+}
+
+/// A rendered state of the project over a [`Stretch`]: the file, where it
+/// plays and the stretch heard in it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StateFile {
+    pub path: PathBuf,
+    /// Engine samples: the file's first frame plays at `anchor`; the
+    /// stretch heard is file frames `[from, to)`.
+    pub anchor: i64,
+    pub from: i64,
+    pub to: i64,
+    /// The master's layout in that state (for its loudness).
+    pub layout: ChannelLayout,
+}
+
+/// A state of the project being rendered over a stretch.
+pub(crate) struct StateRender {
+    pub job: RenderJob,
+    pub file: StateFile,
+    /// What is rendered, on the project's own timeline.
+    pub span: (MusicalTime, MusicalTime),
+}
+
+/// Start rendering `project` (a state of the history, absolute paths) over
+/// `stretch` into `path`: the same samples heard now on its own timeline (a
+/// tempo changed since moves the music, not the clock).
+pub(crate) fn render_state(
+    project: Project,
+    stretch: Stretch,
+    path: PathBuf,
+) -> Result<StateRender> {
+    let sr = f64::from(stretch.rate);
+    let span = (
+        project.timeline.to_musical(stretch.start, sr),
+        project.timeline.to_musical(stretch.b, sr),
+    );
+    // Where the render really starts (as `render::start` computes it).
+    let anchor = project.timeline.to_samples(span.0, sr);
+    let layout = master_layout(&project);
+    let settings = compare_render_settings(&project, span, stretch.rate, path.clone());
+    let job = render::start(project, settings).map_err(|e| SessionError::Other(e.to_string()))?;
+    Ok(StateRender {
+        job,
+        file: StateFile {
+            path,
+            anchor,
+            from: stretch.a - anchor,
+            to: stretch.b - anchor,
+            layout,
+        },
+        span,
+    })
+}
+
 impl Session {
     // --- what the views read ---------------------------------------------------
 
@@ -373,10 +464,18 @@ impl Session {
                     .get(id)
                     .map_or_else(|| "the reference".into(), |r| format!("‘{}’", r.name)),
             ),
+            Comparing::Bisect => {
+                let (label, name) = self.bisect_heard();
+                ("Mix", label, name)
+            }
+            Comparing::MergeChoice => ("Merged", "Other", self.audition_label()),
         };
         let progress = match what {
-            Comparing::History { .. } => self.audition_info().and_then(|a| a.progress),
+            Comparing::History { .. } | Comparing::MergeChoice => {
+                self.audition_info().and_then(|a| a.progress)
+            }
             Comparing::Reference(id) => self.reference_progress(id),
+            Comparing::Bisect => self.bisect_progress(),
         };
         let ready = self.compare.source.is_some();
         let hearing_other = self.compare.hear;
@@ -413,9 +512,14 @@ impl Session {
         self.compare
             .audition
             .as_ref()
-            .map_or_else(String::new, |a| match a.info.done {
-                0 => "the project as opened".into(),
-                _ => format!("just after ‘{}’", a.info.label),
+            .map_or_else(String::new, |a| {
+                if a.what == Comparing::MergeChoice {
+                    a.info.label.clone()
+                } else if a.info.node == faderframe_project::History::ROOT {
+                    "the project as opened".into()
+                } else {
+                    format!("just after ‘{}’", a.info.label)
+                }
             })
     }
 
@@ -474,6 +578,10 @@ impl Session {
 
     pub(crate) fn compare_op(&mut self, op: CompareOp) -> Result<()> {
         self.compare_follows_project();
+        if self.compare.what == Some(Comparing::Bisect) {
+            // Audio Bisect's two sides: A and B, not the mix and another.
+            return self.bisect_compare_op(op);
+        }
         match op {
             CompareOp::Hear(on) => {
                 if self.compare.what.is_none() {
@@ -521,6 +629,7 @@ impl Session {
         self.compare.what = None;
         self.compare.hear = false;
         self.compare.source = None;
+        self.compare.also.clear();
         self.compare.dirty = true;
         self.compare.drop_audition();
         self.send_compare();
@@ -573,22 +682,30 @@ impl Session {
     /// prepared anew).
     pub(crate) fn compare_with(&mut self, what: Comparing) {
         if self.compare.what != Some(what) {
-            let history = |w: &Comparing| matches!(w, Comparing::History { .. });
+            let history =
+                |w: &Comparing| matches!(w, Comparing::History { .. } | Comparing::MergeChoice);
             if self.compare.what.as_ref().is_some_and(history) && !history(&what) {
                 self.compare.drop_audition();
             }
             // Another kind of comparison starts on the mix (another step or
             // another reference keeps the side heard).
+            let kind = |w: &Comparing| match w {
+                Comparing::History { .. } => 0,
+                Comparing::Reference(_) => 1,
+                Comparing::Bisect => 2,
+                Comparing::MergeChoice => 3,
+            };
             if self
                 .compare
                 .what
                 .as_ref()
-                .is_none_or(|w| history(w) != history(&what))
+                .is_none_or(|w| kind(w) != kind(&what))
             {
                 self.compare.hear = false;
             }
             self.compare.what = Some(what);
             self.compare.source = None;
+            self.compare.also.clear();
             self.compare.dirty = true;
             self.compare.gain_db = 0.0;
             self.compare.matched = false;
@@ -600,9 +717,25 @@ impl Session {
         self.compare.what
     }
 
+    /// Something heard in the mix's place that compares nothing (A/V
+    /// calibration's beeps: [`crate::av_calibration`]), or the mix again
+    /// (`None`). Only while nothing is compared.
+    pub(crate) fn hear_instead(&mut self, source: Option<CompareSource>) {
+        if self.compare.what.is_some() {
+            return;
+        }
+        self.compare.hear = source.is_some();
+        self.compare.source = source;
+        self.compare.also.clear();
+        self.compare.dirty = true;
+        self.compare.gain_db = 0.0;
+        self.compare.matched = false;
+        self.send_compare();
+    }
+
     /// Hand the engine (and the disk loader) what is wanted — again to an
     /// engine made anew — and the switch and gain.
-    fn send_compare(&mut self) {
+    pub(crate) fn send_compare(&mut self) {
         let link = Arc::clone(self.engine.listening().link.compare());
         let new_link = !self
             .compare
@@ -615,6 +748,7 @@ impl Session {
                 wanted
                     .as_ref()
                     .map(|w| (Arc::clone(&w.source), Arc::clone(link.shared()))),
+                self.compare.also.clone(),
             );
             link.set(wanted);
             self.compare.sent = Some(Arc::clone(&link));
@@ -628,10 +762,10 @@ impl Session {
         link.collect();
     }
 
-    /// Render the project as it was with `done` steps done, and the mix as
-    /// it is, over [`Self::audition_range`], to compare them.
+    /// Render the project as it was with `done` steps done (on the current
+    /// line), and the mix as it is, over [`Self::audition_range`], to
+    /// compare them.
     pub(crate) fn audition_history(&mut self, done: usize) -> Result<()> {
-        self.compare_follows_project();
         let (steps, redo) = self.history_steps();
         let now = steps.len();
         if done > now + redo.len() {
@@ -644,91 +778,152 @@ impl Session {
                 "that is the project as it is now: choose an earlier step to audition".into(),
             ));
         }
-        let label = match done {
-            0 => "Project opened".to_string(),
-            d if d <= now => steps[d - 1].clone(),
-            d => redo[d - now - 1].clone(),
-        };
+        let node = self.history.line_node(done);
+        self.audition_node(node)
+    }
+
+    /// The stretch an audition (or Audio Bisect) renders, in the samples
+    /// heard now: [`Self::audition_range`] with the run-up before it.
+    pub(crate) fn audition_stretch(&self, now: &Project) -> Stretch {
         let range = self.audition_range();
         let rate = self.engine.sample_rate();
         let sr = f64::from(rate);
-        let now_project = self.absolute_copy();
-        let then_project = self.history.project_at(&now_project, done)?;
-        // The stretch in the samples heard now, on each project's own
-        // timeline (a tempo changed since moves the music, not the clock).
-        let a = now_project.timeline.to_samples(range.0, sr);
-        let b = now_project.timeline.to_samples(range.1, sr);
+        let a = now.timeline.to_samples(range.0, sr);
+        let b = now.timeline.to_samples(range.1, sr);
         let run_up = (AUDITION_RUN_UP_SECONDS * sr) as i64;
-        let start = (a - run_up).max(0);
-        let span_on = |p: &Project| {
-            (
-                p.timeline.to_musical(start, sr),
-                p.timeline.to_musical(b, sr),
-            )
-        };
-        let then_span = span_on(&then_project);
-        let now_span = span_on(&now_project);
-        // Where the render really starts (as `render::start` computes it).
-        let anchor = then_project.timeline.to_samples(then_span.0, sr);
-        let dir = self.compare.dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let then_path = dir.join(format!("then-{n}.wav"));
-        let now_path = dir.join(format!("now-{n}.wav"));
-        let layout = master_layout(&now_project);
-        let then_job = render::start(
-            then_project.clone(),
-            compare_render_settings(&then_project, then_span, rate, then_path.clone()),
-        )
-        .map_err(|e| SessionError::Other(e.to_string()))?;
-        let now_job = render::start(
-            now_project.clone(),
-            compare_render_settings(&now_project, now_span, rate, now_path.clone()),
-        )
-        .map_err(|e| SessionError::Other(e.to_string()))?;
-        // The last one goes (its files too).
-        self.compare.drop_audition();
-        self.compare_with(Comparing::History { done });
-        // A new audition of another step: its source comes when rendered.
-        self.compare.source = None;
-        self.compare.dirty = true;
-        self.compare.audition = Some(Audition {
-            info: AuditionInfo {
-                done,
-                label: label.clone(),
-                range,
-                span: then_span,
-                path: then_path,
-                rate,
-                progress: Some(0.0),
-                then_lufs: None,
-                now_lufs: None,
-                error: None,
-            },
-            now_path,
-            anchor,
-            from: a - anchor,
-            to: b - anchor,
-            job: Some(AuditionJob {
-                then: then_job,
-                now: Some(now_job),
-            }),
-            layout,
-        });
-        self.send_compare();
+        Stretch {
+            range,
+            a,
+            b,
+            start: (a - run_up).max(0),
+            rate,
+        }
+    }
+
+    /// Render the project as it is in step `node` of the history (any
+    /// branch), and the mix as it is, over [`Self::audition_range`], to
+    /// compare them.
+    pub(crate) fn audition_node(&mut self, node: u64) -> Result<()> {
+        self.compare_follows_project();
+        if !self.history.knows(node) && node != faderframe_project::History::ROOT {
+            return Err(SessionError::Other(format!(
+                "the history has no step {node}"
+            )));
+        }
+        if node == self.history.current() {
+            return Err(SessionError::Other(
+                "that is the project as it is now: choose another step to audition".into(),
+            ));
+        }
+        let label = self.history_step_label(node);
+        let done = self.history.depth_of(node).unwrap_or(0);
+        let now_project = self.absolute_copy();
+        let then_project = self.history.project_at_node(&now_project, node)?;
+        self.start_audition(
+            Comparing::History { node },
+            then_project,
+            now_project,
+            label.clone(),
+            node,
+            done,
+        )?;
         self.notify(
             NoticeLevel::Info,
             format!(
                 "rendering the mix as it was {} to compare…",
-                if done == 0 {
+                if node == faderframe_project::History::ROOT {
                     "when opened".to_string()
                 } else {
                     format!("just after ‘{label}’")
                 }
             ),
         );
+        Ok(())
+    }
+
+    /// Render the last merge with another choice for the conflict `key`,
+    /// and the mix as it is (the merge as applied), to compare them.
+    pub(crate) fn audition_merge_conflict(&mut self, key: &str) -> Result<()> {
+        self.compare_follows_project();
+        let (mut other, label) = self.merge_alternative(key)?;
+        let now_project = self.absolute_copy();
+        for s in other.sources.values_mut() {
+            if let faderframe_project::SourceSpec::File { path, .. } = &mut s.spec
+                && path.is_relative()
+                && let Some(dir) = self.project_dir()
+            {
+                *path = dir.join(&*path);
+            }
+        }
+        let node = self.history.current();
+        let done = self.history.depth_of(node).unwrap_or(0);
+        self.start_audition(
+            Comparing::MergeChoice,
+            other,
+            now_project,
+            label.clone(),
+            node,
+            done,
+        )?;
+        self.notify(
+            NoticeLevel::Info,
+            format!("rendering the merge with {label} to compare…"),
+        );
+        Ok(())
+    }
+
+    /// Render `then_project` and `now_project` over the audition's stretch
+    /// and compare them as `what`.
+    fn start_audition(
+        &mut self,
+        what: Comparing,
+        then_project: Project,
+        now_project: Project,
+        label: String,
+        node: u64,
+        done: usize,
+    ) -> Result<()> {
+        let stretch = self.audition_stretch(&now_project);
+        let dir = self.compare.dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let layout = master_layout(&now_project);
+        let then = render_state(then_project, stretch, dir.join(format!("then-{n}.wav")))?;
+        let now = render_state(now_project, stretch, dir.join(format!("now-{n}.wav")))?;
+        // The last one goes (its files too).
+        self.compare.drop_audition();
+        self.compare_with(what);
+        // A new audition of another step: its source comes when rendered.
+        self.compare.source = None;
+        self.compare.dirty = true;
+        self.compare.audition = Some(Audition {
+            what,
+            info: AuditionInfo {
+                node,
+                done,
+                label: label.clone(),
+                range: stretch.range,
+                span: then.span,
+                path: then.file.path.clone(),
+                rate: stretch.rate,
+                progress: Some(0.0),
+                then_lufs: None,
+                now_lufs: None,
+                error: None,
+            },
+            now_path: now.file.path.clone(),
+            anchor: then.file.anchor,
+            from: then.file.from,
+            to: then.file.to,
+            job: Some(AuditionJob {
+                then: then.job,
+                now: Some(now.job),
+            }),
+            layout,
+        });
+        self.send_compare();
         self.revision += 1;
         Ok(())
     }
@@ -737,7 +932,10 @@ impl Session {
         let Some(a) = &self.compare.audition else {
             return;
         };
-        if !matches!(self.compare.what, Some(Comparing::History { .. })) {
+        if !matches!(
+            self.compare.what,
+            Some(Comparing::History { .. } | Comparing::MergeChoice)
+        ) {
             return;
         }
         let gain = match_gain(a.info.now_lufs, a.info.then_lufs);
@@ -799,10 +997,10 @@ impl Session {
                 None
             }
         };
-        let (done, error) = (a.info.done, a.info.error.clone());
+        let (what, error) = (a.what, a.info.error.clone());
         if let Some(e) = error {
             self.notify(NoticeLevel::Error, format!("audition: {e}"));
-        } else if self.compare.what == Some(Comparing::History { done }) {
+        } else if self.compare.what == Some(what) {
             self.set_compare_source(source);
             self.apply_audition_gain();
         }
@@ -815,6 +1013,7 @@ impl Session {
         self.compare_follows_project();
         self.poll_audition();
         self.poll_references();
+        self.poll_bisect();
         self.send_compare();
         let heard = self.compare_link().shared().heard();
         let moving = heard > 0.0 && heard < 1.0;

@@ -151,7 +151,15 @@ pub fn describe_module(m: &module::Module) -> Vec<ScannedPlugin> {
         unsafe { f3.setHostContext(context(&host)) };
     }
     let mut out = Vec::new();
-    for c in classes(m) {
+    let classes = classes(m);
+    // ARA plugins pair their processor class with an `ARA::IMainFactory`
+    // class of the same name.
+    let ara: Vec<&str> = classes
+        .iter()
+        .filter(|c| c.category == crate::ara::MAIN_FACTORY_CLASS)
+        .map(|c| c.name.as_str())
+        .collect();
+    for c in &classes {
         if c.category != AUDIO_MODULE_CLASS {
             continue;
         }
@@ -162,11 +170,12 @@ pub fn describe_module(m: &module::Module) -> Vec<ScannedPlugin> {
         if features.is_empty() {
             features.push("audio-effect".into());
         }
+        let is_ara = ara.contains(&c.name.as_str());
         let mut p = ScannedPlugin {
             id: tuid_hex(&c.cid),
-            name: c.name,
-            vendor: c.vendor,
-            version: c.version,
+            name: c.name.clone(),
+            vendor: c.vendor.clone(),
+            version: c.version.clone(),
             features,
             bundle: m.bundle.clone(),
             audio_inputs: Vec::new(),
@@ -178,6 +187,11 @@ pub fn describe_module(m: &module::Module) -> Vec<ScannedPlugin> {
         if let Some(component) = create::<IComponent>(m, &c.cid) {
             // SAFETY: initialise/terminate around the queries.
             if unsafe { component.initialize(context(&host)) } == kResultOk {
+                if (is_ara || crate::ara::is_ara(&component))
+                    && !p.features.iter().any(|f| f == crate::ARA_FEATURE)
+                {
+                    p.features.push(crate::ARA_FEATURE.into());
+                }
                 p.audio_inputs = bus_channels(&component, true);
                 p.audio_outputs = bus_channels(&component, false);
                 p.note_inputs = event_buses(&component, true);

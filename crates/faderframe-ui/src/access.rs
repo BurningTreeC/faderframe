@@ -33,8 +33,8 @@ mod imp {
         pub focusable: Cell<bool>,
         pub focused: Cell<bool>,
         pub context: RefCell<Option<gtk::ATContext>>,
-        /// What was last told to GTK: (label, description, value, checked,
-        /// selected).
+        /// What was last told to GTK: label, description, value, checked,
+        /// selected, menu, disabled.
         pub told: RefCell<Told>,
     }
 
@@ -61,6 +61,8 @@ mod imp {
         pub value: Option<(f64, f64, f64, String)>,
         pub checked: Option<bool>,
         pub selected: Option<bool>,
+        pub menu: bool,
+        pub disabled: bool,
     }
 
     #[glib::object_subclass]
@@ -176,6 +178,8 @@ impl AccessObject {
                 .map(|v| (v.now, v.min, v.max, v.text.clone())),
             checked: node.checked,
             selected: node.selected,
+            menu: node.menu,
+            disabled: node.disabled,
         };
         let told = self.imp().told.borrow().clone();
         if now == told && !told.label.is_empty() {
@@ -209,6 +213,12 @@ impl AccessObject {
         }
         if now.selected != told.selected {
             self.update_state(&[gtk::accessible::State::Selected(now.selected)]);
+        }
+        if now.menu != told.menu {
+            self.update_property(&[gtk::accessible::Property::HasPopup(now.menu)]);
+        }
+        if now.disabled != told.disabled {
+            self.update_state(&[gtk::accessible::State::Disabled(now.disabled)]);
         }
         *self.imp().told.borrow_mut() = now;
     }

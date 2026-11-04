@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 faderframe-analysis.workspace = true
+faderframe-codec.workspace = true
 faderframe-core.workspace = true
 faderframe-binaural.workspace = true
 faderframe-timeline.workspace = true
@@ -33,7 +34,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 faderframe-guitar.workspace = true
+faderframe-plugin-host = { workspace = true, features = ["ara-mock"] }
 faderframe-analysis.workspace = true
+faderframe-audio-aes67.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 libc.workspace = true

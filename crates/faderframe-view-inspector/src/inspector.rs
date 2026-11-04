@@ -339,11 +339,11 @@ impl InspectorView {
                         Kind::Menu,
                     );
                 }
-                if let Some(bed) = p.surround_panned(t) {
+                if let Some(dest) = p.spatially_panned(t) {
                     push(
                         Field::Surround,
                         "Surround",
-                        format!("into {} · Panner…", bed.name()),
+                        format!("into {} · Panner…", layout_name(dest)),
                         Kind::Button,
                     );
                 }
@@ -491,12 +491,15 @@ impl InspectorView {
                 }
                 let bases = model.time_base_choices(t.id);
                 if !bases.is_empty() {
-                    push(
-                        Field::TimeBase,
-                        "Time Base",
-                        chain::checked_label(&bases),
-                        Kind::Menu,
-                    );
+                    // Notes placed in time on their own (hit points in
+                    // musical cues) are counted.
+                    let locked = model.time_locked_notes(t.id);
+                    let value = match locked {
+                        0 => chain::checked_label(&bases),
+                        1 => format!("{} · 1 note in time", chain::checked_label(&bases)),
+                        n => format!("{} · {n} notes in time", chain::checked_label(&bases)),
+                    };
+                    push(Field::TimeBase, "Time Base", value, Kind::Menu);
                 }
                 if matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
                     let value = if model.bouncing().contains(&t.id) {
@@ -540,7 +543,20 @@ impl InspectorView {
             Field::MidiOut => Some(MixerView::midi_out_menu(model, t, at)),
             Field::Format => menu(choice_items(model.format_choices(t.id))),
             Field::PanMode => menu(choice_items(model.pan_mode_choices(t.id))),
-            Field::TimeBase => menu(choice_items(model.time_base_choices(t.id))),
+            Field::TimeBase => {
+                let mut items = choice_items(model.time_base_choices(t.id));
+                if let Some(unlock) = model.unlock_track_notes(t.id) {
+                    let n = model.time_locked_notes(t.id);
+                    items.push(
+                        MenuItem::new(
+                            format!("Unlock {n} Note{} from Time", if n == 1 { "" } else { "s" }),
+                            unlock,
+                        )
+                        .separated(),
+                    );
+                }
+                menu(items)
+            }
             Field::Group => menu(
                 model
                     .group_menu(t.id)
@@ -1390,6 +1406,7 @@ fn layout_name(l: faderframe_core::ChannelLayout) -> String {
         faderframe_core::ChannelLayout::Stereo => "Stereo".into(),
         faderframe_core::ChannelLayout::Surround(f) => f.name().to_string(),
         faderframe_core::ChannelLayout::Discrete(n) => format!("{n} channels"),
+        faderframe_core::ChannelLayout::Ambisonic(o) => o.short_name().to_string(),
     }
 }
 
@@ -1662,7 +1679,8 @@ impl CanvasView<Session, Action> for InspectorView {
                     .into(),
                 Field::TimeBase => "Musical: its clips and automation follow tempo changes · \
                                     Time-locked: they keep their place in time (sound to \
-                                    picture)"
+                                    picture) · Notes locked to time in the piano roll keep \
+                                    theirs either way"
                     .into(),
                 Field::Ripple => "Click to switch · Left out, ripples of edits on other tracks \
                                   never move it (a music bed, a reference); its own edits \

@@ -227,7 +227,7 @@ impl PianoRollView {
         )
     }
 
-    fn inspector_text(&self, model: &Session) -> String {
+    pub(crate) fn inspector_text(&self, model: &Session) -> String {
         let Some((_, clip, m)) = Self::clip(model) else {
             return String::new();
         };
@@ -236,28 +236,56 @@ impl PianoRollView {
         match sel.as_slice() {
             [] => format!("{} · {} notes", clip.name, m.notes.len()),
             [n] => format!(
-                "{} · {} · len {:.3} q · vel {}{}",
+                "{} · {} · len {:.3} q · vel {}{}{}",
                 note_name(n.key),
                 tl.format_bbt(clip.start + n.start),
                 n.length.quarters(),
-                n.velocity,
-                if n.muted { " · muted" } else { "" }
+                n.velocity_text(),
+                if n.muted { " · muted" } else { "" },
+                if n.time_locked {
+                    format!(
+                        " · locked at {}",
+                        Self::time_of(model, clip.start + n.start)
+                    )
+                } else {
+                    String::new()
+                }
             ),
             many => {
                 let lo = many.iter().map(|n| n.key).min().unwrap_or(0);
                 let hi = many.iter().map(|n| n.key).max().unwrap_or(0);
                 let vlo = many.iter().map(|n| n.velocity).min().unwrap_or(0);
                 let vhi = many.iter().map(|n| n.velocity).max().unwrap_or(0);
+                let locked = many.iter().filter(|n| n.time_locked).count();
                 format!(
-                    "{} notes · {}–{} · vel {}–{}",
+                    "{} notes · {}–{} · vel {}–{}{}",
                     many.len(),
                     note_name(lo),
                     note_name(hi),
                     vlo,
-                    vhi
+                    vhi,
+                    if locked > 0 {
+                        format!(" · {locked} locked to time")
+                    } else {
+                        String::new()
+                    }
                 )
             }
         }
+    }
+
+    /// Where a project position sounds, as a place in time (timecode when
+    /// the project has one, else minutes and seconds).
+    pub(crate) fn time_of(model: &Session, at: MusicalTime) -> String {
+        use faderframe_session::editing::{CounterUnit, format_position};
+        let p = model.project();
+        let samples = p.timeline.to_samples(at, f64::from(p.sample_rate.max(1)));
+        let unit = if p.timecode.is_some() {
+            CounterUnit::Timecode
+        } else {
+            CounterUnit::MinSecs
+        };
+        format_position(p, samples, unit)
     }
 
     pub(crate) fn paint_toolbar(&self, p: &mut dyn Painter, r: Rect, model: &Session) {

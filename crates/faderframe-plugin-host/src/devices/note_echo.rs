@@ -186,7 +186,8 @@ impl PluginProcessor for NoteEchoProcessor {
                 match midi_fx::note(&e.event) {
                     Some((true, channel, key, velocity)) => {
                         if dry {
-                            self.sounding.on(out, at as u32, channel, key, velocity);
+                            self.sounding
+                                .on_fine(out, at as u32, channel, key, velocity, e.fine);
                         }
                         let delay = self.delay(ctx);
                         let repeats = self.get(id::REPEATS).round().clamp(1.0, 16.0) as u32;

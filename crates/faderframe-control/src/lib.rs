@@ -18,12 +18,14 @@
 //! clips' colours as the [`LauncherView`] says. Keyboards and surfaces
 //! with a DAW mode of their own ([`controllers`]: Arturia, Novation,
 //! Korg, NI, M-Audio, Akai, Behringer, PreSonus, iCON) are Mackie
-//! profiles or tables ([`mapped`]).
+//! profiles or tables ([`mapped`]). Head trackers ([`headtrack`]) send the
+//! listener's head orientation over OSC.
 
 #![forbid(unsafe_code)]
 
 pub mod controllers;
 pub mod grid;
+pub mod headtrack;
 pub mod hui;
 pub mod mackie;
 pub mod mapped;
@@ -497,6 +499,17 @@ pub enum SurfaceCommand {
     BypassTrack(usize),
     /// Every mute off.
     ClearMutes,
+    /// Mix scenes: the one after (before) the one recalled last, the n-th
+    /// of the list (from 0), and the morph between scenes A and B
+    /// (thousandths of the way from A).
+    SceneNext,
+    ScenePrevious,
+    RecallScene(usize),
+    SceneMorph {
+        permille: u16,
+    },
+    /// Run macro n (its number, from 1; see the session's `script`).
+    RunMacro(u16),
 }
 
 /// A surface protocol (see the crate docs).

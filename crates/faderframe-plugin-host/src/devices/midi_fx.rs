@@ -6,7 +6,7 @@
 //! Each effect keeps its own clock: samples since it started. Nothing
 //! here allocates after construction.
 
-use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+use faderframe_midi::{Fine, MidiBuffer, MidiEvent, TimedMidiEvent};
 use faderframe_transport::TransportInfo;
 
 /// An event due at `at` (the effect's clock), from `source` (an effect's
@@ -104,6 +104,20 @@ impl Default for Sounding {
 impl Sounding {
     /// Start a note (one already sounding is restarted: off, then on).
     pub fn on(&mut self, out: &mut MidiBuffer, offset: u32, channel: u8, key: u8, velocity: u8) {
+        self.on_fine(out, offset, channel, key, velocity, Fine::NONE);
+    }
+
+    /// [`Self::on`] with a played note's MIDI 2.0 resolution (its 16-bit
+    /// velocity counts while `velocity` is still its own).
+    pub fn on_fine(
+        &mut self,
+        out: &mut MidiBuffer,
+        offset: u32,
+        channel: u8,
+        key: u8,
+        velocity: u8,
+        fine: Fine,
+    ) {
         let c = &mut self.count[usize::from(channel & 15)][usize::from(key & 127)];
         if *c > 0 {
             let _ = out.push(TimedMidiEvent::new(
@@ -116,13 +130,14 @@ impl Sounding {
             ));
         }
         *c = c.saturating_add(1);
-        let _ = out.push(TimedMidiEvent::new(
+        let _ = out.push(TimedMidiEvent::with_fine(
             offset,
             MidiEvent::NoteOn {
                 channel,
                 key,
                 velocity: velocity.max(1),
             },
+            fine,
         ));
     }
 

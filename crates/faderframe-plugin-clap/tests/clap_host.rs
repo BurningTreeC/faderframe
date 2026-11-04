@@ -457,13 +457,15 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
                 velocity: 127,
             },
         ),
-        TimedMidiEvent::new(
+        // At MIDI 2.0's resolution: a 16-bit velocity.
+        TimedMidiEvent::with_fine(
             0,
             MidiEvent::NoteOn {
                 channel: 0,
                 key: 62,
-                velocity: 127,
+                velocity: (0xBEEFu16 >> 9) as u8,
             },
+            faderframe_midi::Fine::value(0xBEEF),
         ),
         expr(0, 60, NoteExpressionKind::Tuning, 2.0),
         expr(10, 60, NoteExpressionKind::Volume, -6.0),
@@ -520,6 +522,9 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
     };
     let (a, b) = (id_of("on", 60).1, id_of("on", 62).1);
     assert!(a >= 0 && b >= 0 && a != b, "{seen:?}");
+    // Velocities as floats, the 16 bits of MIDI 2.0 kept.
+    assert_eq!(id_of("on", 60).3, 1.0);
+    assert_eq!(id_of("on", 62).3, f64::from(0xBEEFu16) / 65535.0);
     // Expressions address their note by key and channel (note id −1).
     let tuning = id_of("Some(Tuning)", 60);
     assert_eq!((tuning.1, tuning.3), (-1, 2.0));

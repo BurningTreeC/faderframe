@@ -190,10 +190,7 @@ impl MidiBuffer {
     /// Events that do not fit are dropped and counted.
     pub fn merge_from(&mut self, other: &MidiBuffer, offset_shift: u32) {
         for e in other.iter() {
-            let _ = self.push_from(
-                other,
-                TimedMidiEvent::new(e.sample_offset.saturating_add(offset_shift), e.event),
-            );
+            let _ = self.push_from(other, e.at(e.sample_offset.saturating_add(offset_shift)));
         }
     }
 

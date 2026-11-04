@@ -151,7 +151,7 @@ pub(crate) struct PerformanceMonitor {
     tracks: HashMap<TrackId, (Load, Load)>,
     plugins: HashMap<PluginInstanceId, Load>,
     history: VecDeque<Load>,
-    report: PerformanceReport,
+    pub(crate) report: PerformanceReport,
     /// When the per-track/plugin figures were last read.
     detail_wanted: Cell<Option<Instant>>,
 }

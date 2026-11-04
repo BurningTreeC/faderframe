@@ -155,7 +155,7 @@ impl Session {
         let rate = self.engine.sample_rate();
         let source = self.analysis_source();
         let ahead = source.map_or(0, |t| u64::from(self.engine.meter_delay(t)))
-            + u64::from(self.engine.device_latency());
+            + u64::from(self.engine.heard_latency());
         let a = &mut self.analysis;
         if a.analyzer.sample_rate() != rate {
             a.analyzer = Analyzer::new(rate);

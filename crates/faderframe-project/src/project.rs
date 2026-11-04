@@ -56,6 +56,18 @@ pub struct Marker {
     pub id: MarkerId,
     pub position: MusicalTime,
     pub name: String,
+    /// Musical (moves with the beats) or time-locked (keeps its sample
+    /// through tempo changes: a hit point, a picture cut; see
+    /// [`crate::time_lock`]).
+    #[serde(default, skip_serializing_if = "crate::TimeBase::is_musical")]
+    pub time_base: crate::TimeBase,
+}
+
+impl Marker {
+    /// Is it placed in time rather than with the music?
+    pub fn is_time_locked(&self) -> bool {
+        !self.time_base.is_musical()
+    }
 }
 
 /// A named part of the arrangement (Intro, Verse, Chorus …) on the
@@ -67,6 +79,18 @@ pub struct Section {
     pub start: MusicalTime,
     pub end: MusicalTime,
     pub color: crate::TrackColor,
+    /// Musical (its bounds move with the beats) or time-locked (they keep
+    /// their samples through tempo changes: a scene or a reel; see
+    /// [`crate::time_lock`]).
+    #[serde(default, skip_serializing_if = "crate::TimeBase::is_musical")]
+    pub time_base: crate::TimeBase,
+}
+
+impl Section {
+    /// Is it placed in time rather than with the music?
+    pub fn is_time_locked(&self) -> bool {
+        !self.time_base.is_musical()
+    }
 }
 
 /// A range in musical time (`start < end`).
@@ -216,8 +240,57 @@ pub struct Project {
     /// then counts from 00:00:00:00 at 25 fps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timecode: Option<crate::video::ProjectTimecode>,
+    /// Mix scenes: console snapshots stored and recalled (see
+    /// [`crate::scenes`]).
+    #[serde(default, skip_serializing_if = "crate::scenes::MixScenes::is_empty")]
+    pub mix_scenes: crate::scenes::MixScenes,
+    /// Articulation (expression) maps tracks name (see
+    /// [`crate::articulation`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub articulation_maps: Vec<crate::articulation::ArticulationMap>,
+    /// Drum maps tracks name (see [`crate::drum_map`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drum_maps: Vec<crate::drum_map::DrumMap>,
+    /// ARA: inserts rendering their track's clips, and the plug-ins'
+    /// document archives (see [`crate::ara`]).
+    #[serde(default, skip_serializing_if = "crate::ara::Ara::is_empty")]
+    pub ara: crate::ara::Ara,
     #[serde(default)]
     pub ids: IdAllocator,
+    /// The words heard in sources (take folders comped by lyric, the
+    /// syllables under the pitch editor's notes), by source (see
+    /// [`crate::lyric_comp`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_words: BTreeMap<AudioSourceId, crate::lyric_comp::SourceWords>,
+    /// The tuning tracks play unless they have their own (`None`:
+    /// twelve-tone equal temperament; see [`crate::tuning`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<faderframe_midi::tuning::Tuning>,
+    /// Concert pitch: A4 in Hz (every tuning moves with it).
+    #[serde(
+        default = "crate::tuning::default_reference",
+        skip_serializing_if = "crate::tuning::is_default_reference"
+    )]
+    pub reference_pitch: f64,
+    /// Devices' A/B compares: the side each plays and the other side's
+    /// settings, by slot (see [`crate::device_compare`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub device_compare: BTreeMap<PluginInstanceId, crate::device_compare::DeviceCompare>,
+    /// How the score editor writes MIDI clips, by clip (see
+    /// [`crate::notation`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub notation: BTreeMap<ClipId, crate::notation::ClipNotation>,
+    /// What is applied to this project while it is shared live (see
+    /// [`crate::journal`]); never in files, never in copies.
+    #[serde(skip)]
+    pub journal: crate::journal::Journal,
+    /// The interactive score: music for a game (states, layers, transition
+    /// rules, stingers, parameters; see [`crate::interactive`]).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::interactive::InteractiveScore::is_empty"
+    )]
+    pub interactive: crate::interactive::InteractiveScore,
 }
 
 impl Project {
@@ -265,7 +338,18 @@ impl Project {
             clip_links: BTreeMap::new(),
             video: crate::video::Video::default(),
             timecode: None,
+            mix_scenes: crate::scenes::MixScenes::default(),
+            articulation_maps: Vec::new(),
+            drum_maps: Vec::new(),
+            ara: crate::ara::Ara::default(),
             ids,
+            source_words: BTreeMap::new(),
+            tuning: None,
+            reference_pitch: crate::tuning::default_reference(),
+            device_compare: BTreeMap::new(),
+            notation: BTreeMap::new(),
+            journal: Default::default(),
+            interactive: crate::interactive::InteractiveScore::default(),
         }
     }
 
@@ -583,10 +667,10 @@ impl Project {
         pan
     }
 
-    /// Whether `track` is a stereo source balanced into the bed it feeds
-    /// (its strip's balance then applies there).
+    /// Whether `track` is a stereo source balanced into the bed (or the
+    /// ambisonic field) it feeds (its strip's balance then applies there).
     pub fn balanced_into_bed(&self, track: &Track) -> bool {
-        self.surround_panned(track).is_some()
+        self.spatially_panned(track).is_some()
             && track.layout.channel_count() == 2
             && self.effective_surround(track).stereo
                 == faderframe_core::surround::StereoSource::Balance
@@ -595,15 +679,30 @@ impl Project {
     /// The surround bed `track` is panned into, if any: a mono or stereo
     /// track feeding a bed (a bed into another is folded, not panned).
     pub fn surround_panned(&self, track: &Track) -> Option<faderframe_core::SurroundFormat> {
-        if !track.kind.has_audio()
-            || matches!(track.layout, faderframe_core::ChannelLayout::Surround(_))
-        {
-            return None;
-        }
-        match self.destination_layout(track) {
+        match self.spatially_panned(track)? {
             faderframe_core::ChannelLayout::Surround(f) => Some(f),
             _ => None,
         }
+    }
+
+    /// The ambisonic field `track` is panned into (encoded by the
+    /// direction of its surround panner), if any: a mono or stereo track
+    /// feeding one (a bed or a field into a field is encoded or passes,
+    /// not panned).
+    pub fn ambisonic_panned(&self, track: &Track) -> Option<faderframe_core::AmbiOrder> {
+        match self.spatially_panned(track)? {
+            faderframe_core::ChannelLayout::Ambisonic(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// The bed or ambisonic field `track` is panned into, if any: a track
+    /// that is neither feeding one.
+    pub fn spatially_panned(&self, track: &Track) -> Option<faderframe_core::ChannelLayout> {
+        if !track.kind.has_audio() || track.layout.is_spatial() {
+            return None;
+        }
+        Some(self.destination_layout(track)).filter(|l| l.is_spatial())
     }
 
     /// Whether `track` is an object: marked so, panned into the master's
@@ -914,6 +1013,36 @@ impl Project {
                 .max()
                 .unwrap_or(0),
         );
+        max_id = max_id.max(
+            self.mix_scenes
+                .scenes
+                .iter()
+                .map(|s| s.id.raw())
+                .max()
+                .unwrap_or(0),
+        );
+        // Mix scenes: one of each id, A and B naming scenes there are.
+        let mut seen = BTreeSet::new();
+        let before = self.mix_scenes.scenes.len();
+        self.mix_scenes.scenes.retain(|s| seen.insert(s.id));
+        if self.mix_scenes.scenes.len() != before {
+            notes.push("removed mix scenes with repeated ids".into());
+        }
+        self.mix_scenes.tidy();
+        // Articulation and drum maps: one of each id, sane, named only
+        // where they are.
+        notes.extend(self.repair_maps());
+        notes.extend(self.repair_device_compare());
+        notes.extend(self.repair_notation());
+        max_id = max_id
+            .max(
+                self.articulation_maps
+                    .iter()
+                    .map(|m| m.id.raw())
+                    .max()
+                    .unwrap_or(0),
+            )
+            .max(self.drum_maps.iter().map(|m| m.id.raw()).max().unwrap_or(0));
         self.ids.reserve_through(max_id);
         // Scratch pads: consistent with the tracks, their ids reserved.
         notes.extend(self.repair_scratch_pads());
@@ -996,6 +1125,75 @@ impl Project {
             let mut seen = BTreeSet::new();
             t.cue_sends
                 .retain(|s| feeds && cues.contains(&s.cue) && seen.insert(s.cue));
+        }
+        notes
+    }
+}
+
+impl Project {
+    /// An articulation map by id.
+    pub fn articulation_map(
+        &self,
+        id: faderframe_core::ArticulationMapId,
+    ) -> Option<&crate::articulation::ArticulationMap> {
+        self.articulation_maps.iter().find(|m| m.id == id)
+    }
+
+    /// A drum map by id.
+    pub fn drum_map(&self, id: faderframe_core::DrumMapId) -> Option<&crate::drum_map::DrumMap> {
+        self.drum_maps.iter().find(|m| m.id == id)
+    }
+
+    /// The articulation map a track plays by.
+    pub fn track_articulation_map(
+        &self,
+        track: TrackId,
+    ) -> Option<&crate::articulation::ArticulationMap> {
+        self.track(track)
+            .and_then(|t| t.articulation_map)
+            .and_then(|id| self.articulation_map(id))
+    }
+
+    /// The drum map a track plays by.
+    pub fn track_drum_map(&self, track: TrackId) -> Option<&crate::drum_map::DrumMap> {
+        self.track(track)
+            .and_then(|t| t.drum_map)
+            .and_then(|id| self.drum_map(id))
+    }
+
+    /// Maps kept sane on load: repeated ids go, each map tidied, tracks
+    /// naming a map that is not there name none.
+    fn repair_maps(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        let mut seen = BTreeSet::new();
+        let before = self.articulation_maps.len();
+        self.articulation_maps.retain(|m| seen.insert(m.id));
+        let mut seen = BTreeSet::new();
+        let drums = self.drum_maps.len();
+        self.drum_maps.retain(|m| seen.insert(m.id));
+        if self.articulation_maps.len() != before || self.drum_maps.len() != drums {
+            notes.push("removed maps with repeated ids".into());
+        }
+        for m in &mut self.articulation_maps {
+            m.tidy();
+        }
+        for m in &mut self.drum_maps {
+            m.tidy();
+        }
+        let arts: BTreeSet<_> = self.articulation_maps.iter().map(|m| m.id).collect();
+        let kits: BTreeSet<_> = self.drum_maps.iter().map(|m| m.id).collect();
+        for t in &mut self.tracks {
+            if t.articulation_map.is_some_and(|m| !arts.contains(&m)) {
+                t.articulation_map = None;
+                notes.push(format!(
+                    "'{}' named an articulation map that is gone",
+                    t.name
+                ));
+            }
+            if t.drum_map.is_some_and(|m| !kits.contains(&m)) {
+                t.drum_map = None;
+                notes.push(format!("'{}' named a drum map that is gone", t.name));
+            }
         }
         notes
     }

@@ -11,17 +11,34 @@
 //! the node crossfades to it over [`SWITCH_SECONDS`] (constant power) and
 //! hands the old one back to be dropped there. The node keeps its place
 //! (and key) across graph rebuilds, so a rebuild never cuts what is heard.
+//!
+//! The listener's head (a head tracker's orientation, or one set by hand)
+//! reaches the binaural renderer through the link's [`HeadShared`]
+//! atomics every block: the renderer turns the scene the other way —
+//! beds, objects (in the bed) and ambisonic fields alike — gliding there
+//! with the smoothing set beside it. Speakers never turn.
+//!
+//! Before listening, two things may take the mix's place: the compare
+//! source (A/B, [`super::compare`]) and then the codec monitor
+//! ([`super::codec`]: the master — or what is compared with it — coded and
+//! decoded as listeners will get it). After them a file previewed from the
+//! media browser is added ([`super::file_preview`]).
 
+use super::along::{Along, AlongLink};
 use super::bass::BassManager;
+use super::codec::{Codec, CodecLink};
 use super::compare::{Compare, CompareLink};
+use super::file_preview::{FilePreview, FilePreviewLink};
 use super::strip::MatrixMix;
 use crate::context::EngineContext;
 use crate::slots::MixSlots;
 use faderframe_audio_graph::{AudioBuffer, NodeIo, ProcessContext, Processor};
 use faderframe_core::ChannelLayout;
+use faderframe_core::ambisonics::Orientation;
 use faderframe_core::surround::{self, BassManagement, Downmix, MAX_SPEAKERS, Mixing};
 use faderframe_realtime::{MailboxReceiver, MailboxSender, ParamSlot, mailbox};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Gains from each channel to each (a fold).
 type Matrix = [[f32; MAX_SPEAKERS]; MAX_SPEAKERS];
@@ -63,6 +80,62 @@ impl Listening {
     }
 }
 
+/// The listener's head as the control side last set it, read by the
+/// listening node every block (four components and the smoothing time as
+/// atomics: a read between two writes may mix two nearby orientations,
+/// which the renderer normalises and glides over).
+#[derive(Debug)]
+pub struct HeadShared {
+    quaternion: [AtomicU32; 4],
+    /// Seconds.
+    smoothing: AtomicU32,
+}
+
+/// How long the head glides to a new orientation unless told otherwise.
+pub const DEFAULT_HEAD_SMOOTHING: f32 = 0.025;
+
+impl Default for HeadShared {
+    fn default() -> Self {
+        let o = Orientation::IDENTITY;
+        Self {
+            quaternion: [o.w, o.x, o.y, o.z].map(|v| AtomicU32::new(v.to_bits())),
+            smoothing: AtomicU32::new(DEFAULT_HEAD_SMOOTHING.to_bits()),
+        }
+    }
+}
+
+impl HeadShared {
+    /// Where the head is turned (control thread).
+    pub fn set(&self, head: Orientation) {
+        let h = Orientation::from_quaternion(head.w, head.x, head.y, head.z);
+        for (a, v) in self.quaternion.iter().zip([h.w, h.x, h.y, h.z]) {
+            a.store(v.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn get(&self) -> Orientation {
+        let [w, x, y, z] = self
+            .quaternion
+            .each_ref()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)));
+        Orientation::from_quaternion(w, x, y, z)
+    }
+
+    /// The glide's time constant (seconds, 0…2).
+    pub fn set_smoothing(&self, seconds: f32) {
+        let s = if seconds.is_finite() {
+            seconds.clamp(0.0, 2.0)
+        } else {
+            DEFAULT_HEAD_SMOOTHING
+        };
+        self.smoothing.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn smoothing(&self) -> f32 {
+        f32::from_bits(self.smoothing.load(Ordering::Relaxed))
+    }
+}
+
 /// The way new [`Listening`] reaches the running node and old comes back
 /// (one per engine; the node and the controller share it).
 pub struct ListenLink {
@@ -71,6 +144,15 @@ pub struct ListenLink {
     /// The compare source heard instead of the mix (see
     /// [`super::compare`]).
     compare: Arc<CompareLink>,
+    /// The codec monitor (see [`super::codec`]).
+    codec: Arc<CodecLink>,
+    /// The listener's head.
+    head: HeadShared,
+    /// A file previewed beside the mix (see [`super::file_preview`]).
+    preview: Arc<FilePreviewLink>,
+    /// Another session's mix heard instead of this one's (Listen Along in
+    /// a live session; see [`super::along`]).
+    along: Arc<AlongLink>,
 }
 
 impl ListenLink {
@@ -79,13 +161,39 @@ impl ListenLink {
             to_audio: mailbox(),
             back: mailbox(),
             compare: CompareLink::new(),
+            codec: CodecLink::new(),
+            head: HeadShared::default(),
+            preview: FilePreviewLink::new(),
+            along: AlongLink::new(),
         })
+    }
+
+    /// The media browser's preview's way to the listening node (a file
+    /// heard beside the mix).
+    pub fn preview(&self) -> &Arc<FilePreviewLink> {
+        &self.preview
+    }
+
+    /// Listen Along's way to the listening node.
+    pub fn along(&self) -> &Arc<AlongLink> {
+        &self.along
+    }
+
+    /// The listener's head (binaural listening turns the scene by it).
+    pub fn head(&self) -> &HeadShared {
+        &self.head
     }
 
     /// The compare source's way to the listening node (A/B against the
     /// mix: the undo history auditioned, reference tracks).
     pub fn compare(&self) -> &Arc<CompareLink> {
         &self.compare
+    }
+
+    /// The codec monitor's way to the listening node (the master heard
+    /// through a lossy codec at a platform's loudness).
+    pub fn codec(&self) -> &Arc<CodecLink> {
+        &self.codec
     }
 
     /// Control thread: hand `listening` over. Drop what comes back (one
@@ -130,6 +238,12 @@ pub struct ListenOut {
     alt: AudioBuffer,
     /// What may be heard instead of the mix (before listening).
     compare: Compare,
+    /// The codec monitor (after the compare source, before listening).
+    codec: Codec,
+    /// A file previewed beside the mix (after the codec monitor).
+    preview: FilePreview,
+    /// Another session's mix in place of this one's (first of all).
+    along: Along,
 }
 
 /// What a way of listening passes after its render.
@@ -150,6 +264,9 @@ struct Block {
     downmix: Downmix,
     mono: bool,
     bass: BassManagement,
+    /// The listener's head and its glide (seconds).
+    head: Orientation,
+    smoothing: f32,
 }
 
 impl ListenOut {
@@ -205,6 +322,9 @@ impl ListenOut {
             shared,
             alt,
             compare: Compare::new(&listen.link.compare, input, rate, block),
+            codec: Codec::new(&listen.link.codec, input, rate, block),
+            preview: FilePreview::new(&listen.link.preview, input, rate, block),
+            along: Along::new(&listen.link.along, input, rate, block),
         }
     }
 
@@ -232,6 +352,7 @@ impl ListenOut {
             });
             let count = input.num_channels().min(MAX_SPEAKERS);
             let (l, rest) = scratch.split_at_mut(1);
+            r.turn(block.head, block.smoothing);
             r.process(&ins[..count], &mut l[0][..n], &mut rest[0][..n], n);
             if outs == 1 {
                 // A mono device: both ears summed.
@@ -330,6 +451,7 @@ impl Processor<EngineContext> for ListenOut {
     fn set_input_latency(&mut self, frames: u32) {
         // The compare source plays where the mix arriving here was played.
         self.compare.input_latency = frames;
+        self.preview.input_latency = frames;
     }
 
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
@@ -359,10 +481,18 @@ impl Processor<EngineContext> for ListenOut {
             downmix: self.shared.downmix(params),
             mono: params.get(self.mono) >= 0.5,
             bass: BassManagement::from_values(&self.bass_slots.map(|s| params.get(s))),
+            head: self.link.head.get(),
+            smoothing: self.link.head.smoothing(),
         };
+        // Another session's mix in place of this one's (Listen Along).
+        let input = self.along.process(input, n);
         // The mix, or what is compared with it (A/B), heard alike, each at
         // its listening gain (the only gain of the monitor path).
         let input = self.compare.process(cx, input, n);
+        // … through the codec monitor (the delivered master) when it is on.
+        let input = self.codec.process(cx, input, n);
+        // … with a file previewed from the media browser beside it.
+        let input = self.preview.process(cx, input, n);
         Self::hear(&mut self.now, &mut self.stages, block, input, out, n);
         if let Some(next) = self.next.as_mut() {
             Self::hear(next, &mut self.stages, block, input, &mut self.alt, n);

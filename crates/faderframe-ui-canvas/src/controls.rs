@@ -39,6 +39,24 @@ pub fn lock_glyph(p: &mut dyn Painter, r: Rect, color: Color) {
     p.fill_rounded(body, 1.2, &Paint::Solid(color));
 }
 
+/// A six-armed star filling `r` in `color`: the mark of a track played
+/// from its self-freeze cache (its devices rest).
+pub fn cache_glyph(p: &mut dyn Painter, r: Rect, color: Color) {
+    let c = r.center();
+    let radius = r.w.min(r.h) / 2.0;
+    let line = (radius * 0.28).clamp(1.0, 1.6);
+    for k in 0..3 {
+        let a = PI / 2.0 + k as f32 * PI / 3.0;
+        let (dx, dy) = (a.cos() * radius, a.sin() * radius);
+        p.line(
+            Point::new(c.x - dx, c.y - dy),
+            Point::new(c.x + dx, c.y + dy),
+            line,
+            color,
+        );
+    }
+}
+
 /// Normalised value change for a vertical drag of `dy` pixels.
 /// Moving up increases the value; `fine` gives 5× more resolution.
 pub fn drag_delta(dy: f32, fine: bool) -> f32 {

@@ -144,6 +144,7 @@ pub fn slip_midi(m: &MidiClip, by: MusicalTime) -> MidiClip {
                 ControllerPoint {
                     time: zero,
                     value: v,
+                    fine: None,
                 },
             );
         }
@@ -231,6 +232,7 @@ mod tests {
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }
     }
 
@@ -295,16 +297,21 @@ mod tests {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         };
         let mut lane = ControllerLane::new(MidiController::Cc { number: 1 }, 0);
         lane.points = vec![
             ControllerPoint {
                 time: q(0.0),
                 value: 10,
+                fine: None,
             },
             ControllerPoint {
                 time: q(2.0),
                 value: 90,
+                fine: None,
             },
         ];
         let m = MidiClip {

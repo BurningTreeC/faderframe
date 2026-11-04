@@ -18,6 +18,8 @@ realfft.workspace = true
 audioadapter-buffers.workspace = true
 faderframe-realtime.workspace = true
 thiserror.workspace = true
+# FLAC writing (the encoder IAMF's substreams use; already in the tree).
+flacenc = { version = "0.5.1", default-features = false }
 
 [dev-dependencies]
 serde_json.workspace = true

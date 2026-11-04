@@ -223,6 +223,7 @@ impl Session {
                 lanes[i].points.push(ControllerPoint {
                     time: musical(tick, ppq),
                     value,
+                    fine: None,
                 });
             };
             for &(tick, ref ev) in &part.events {
@@ -261,6 +262,9 @@ impl Session {
                                 channel: ch,
                                 muted: false,
                                 release,
+                                time_locked: false,
+                                articulation: None,
+                                fine: None,
                             });
                         }
                     }
@@ -312,6 +316,9 @@ impl Session {
                         channel: ch,
                         muted: false,
                         release: None,
+                        time_locked: false,
+                        articulation: None,
+                        fine: None,
                     });
                 }
             }
@@ -365,6 +372,7 @@ impl Session {
                                 data,
                             })
                             .collect(),
+                        articulations: Vec::new(),
                     }),
                 }),
             });

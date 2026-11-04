@@ -47,7 +47,12 @@
 //!   rendered there once the deep tier has rendered it (its progress). Fader
 //!   moves are heard after that much, bus devices still leave the audio
 //!   thread. The audio thread hands every sequence to both tiers and
-//!   switches when both are ready.
+//!   switches when both are ready. The shallow tier holds only a callback
+//!   and two blocks of what plays, so it renders the old sequence on (from
+//!   the deep tier's rings, which hold the lookahead's worth of it) until
+//!   the deep tier has the new one ready, then starts it — a moment's work
+//!   — and the audio thread finds the old sequence there however long the
+//!   deep tier takes to start (test `ahead_handover.rs`).
 //! * **Limits.** Changes to an anticipated track's plugins (from their
 //!   editors, inserted plugins) and to its clips are heard after the
 //!   lookahead. A track that becomes live moves to the realtime graph at
@@ -58,7 +63,7 @@ use crate::context::EngineContext;
 use crate::snapshot::TimelineSnapshot;
 use faderframe_audio_graph::{CompiledGraph, NodeIo, ProcessContext, Processor};
 use faderframe_realtime::{MailboxReceiver, MailboxSender, TryCell, WorkerPool};
-use faderframe_transport::{LoopRange, TransportCommand, TransportState};
+use faderframe_transport::{LoopPlan, TransportCommand, TransportState};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -348,15 +353,14 @@ pub(crate) struct Sequence {
     transport: TransportState,
 }
 
-/// A loop change for sequence `seq` from its frame `at` on (`None`: at
-/// once — nothing that plays depends on it, the transport is stopped or
-/// scrubbing).
+/// A loop change (the loop and the planned jumps, see [`LoopPlan`]) for
+/// sequence `seq` from its frame `at` on (`None`: at once — nothing that
+/// plays depends on it, the transport is stopped or scrubbing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Amend {
     seq: u64,
     at: Option<usize>,
-    range: Option<LoopRange>,
-    enabled: bool,
+    plan: LoopPlan,
 }
 
 /// What the audio thread hands an anticipator.
@@ -380,14 +384,14 @@ const IDLE_FRAMES: usize = (1 << PROGRESS_FRAMES) - 1;
 /// what an anticipator has rendered of it up to `primed`, past `at`
 /// (`transport` as it is there, `jumped_at`: the frame after its newest
 /// wrap or jump): the playhead ran on without a jump since `at`, and the
-/// new range would not have wrapped in between either.
+/// new range would not have wrapped in between either, nor a planned jump
+/// of the new plan have been taken.
 fn amend_late_is_equal(
     transport: &TransportState,
     primed: usize,
     jumped_at: usize,
     at: usize,
-    range: Option<LoopRange>,
-    enabled: bool,
+    plan: LoopPlan,
 ) -> bool {
     if !transport.playing() || transport.scrubbing() {
         // Stopped, or still counting in: no wrap rendered yet.
@@ -398,7 +402,9 @@ fn amend_late_is_equal(
     }
     let to = transport.position();
     let from = to - (primed - at) as i64;
-    !(enabled && range.is_some_and(|r| from < r.end && to >= r.end))
+    let wraps = plan.enabled && plan.range.is_some_and(|r| from < r.end && to >= r.end);
+    let cued = plan.cues.first().is_some_and(|c| from < c.at && to >= c.at);
+    !(wraps || cued)
 }
 
 struct Pending {
@@ -459,6 +465,58 @@ impl Resets {
     }
 }
 
+/// What the audio thread plays of a link's sequences, published for the
+/// control side ([`AheadWatch`]) at the end of every [`AheadLink::poll`].
+#[derive(Default)]
+struct Playing {
+    /// A [`progress`] word: the sequence playing and its frames played,
+    /// the last callback's included.
+    played: AtomicU64,
+    /// The sequence handed over and not switched to yet (0: none).
+    pending: AtomicU64,
+}
+
+/// The control side's view of a link and its anticipators: whether the
+/// audio thread's next callback would find what it plays from the rings
+/// rendered. The audio thread never waits for that; a device run by hand
+/// can ([`crate::EngineController::ahead_ready_for`]).
+pub(crate) struct AheadWatch {
+    playing: Arc<Playing>,
+    /// Each tier's ready sequence and progress word.
+    tiers: Vec<(Arc<AtomicU64>, Arc<AtomicU64>)>,
+}
+
+impl AheadWatch {
+    /// Whether a callback of `frames` coming now would play only audio
+    /// that is in the rings: the sequence it plays rendered through its
+    /// last frame by every tier, or — with a sequence handed over — that
+    /// one ready everywhere (the callback switches to it; the old one is
+    /// no longer rendered). Before the first sequence nothing rendered
+    /// ahead plays, and nothing is missed.
+    pub(crate) fn ready_for(&self, frames: usize) -> bool {
+        let pending = self.playing.pending.load(Ordering::Acquire);
+        let (seq, played) = unpack_progress(self.playing.played.load(Ordering::Acquire));
+        let (seq, through) = if pending != 0 {
+            if self
+                .tiers
+                .iter()
+                .any(|(ready, _)| ready.load(Ordering::Acquire) < pending)
+            {
+                return false;
+            }
+            (pending, frames)
+        } else if seq == 0 {
+            return true;
+        } else {
+            (seq, played + frames)
+        };
+        self.tiers.iter().all(|(_, progress)| {
+            let (s, f) = unpack_progress(progress.load(Ordering::Acquire));
+            f >= IDLE_FRAMES || (s == seq && f >= through)
+        })
+    }
+}
+
 /// The audio thread's side: the current sequence and transport changes on
 /// their way to the anticipators.
 pub(crate) struct AheadLink {
@@ -487,7 +545,9 @@ pub(crate) struct AheadLink {
     amend_count: usize,
     /// The loop as last commanded, while the newest sequence's state may
     /// not have it yet: what a further command starts from.
-    wanted_loop: Option<(Option<LoopRange>, bool)>,
+    wanted_loop: Option<LoopPlan>,
+    /// Where it plays, for the control side.
+    playing: Arc<Playing>,
 }
 
 /// A loop change the audio thread takes on at frame `at` of `seq`.
@@ -495,8 +555,7 @@ pub(crate) struct AheadLink {
 struct Scheduled {
     seq: u64,
     at: usize,
-    range: Option<LoopRange>,
-    enabled: bool,
+    plan: LoopPlan,
 }
 
 impl AheadLink {
@@ -517,6 +576,20 @@ impl AheadLink {
             amends: [Scheduled::default(); MAX_AMENDS],
             amend_count: 0,
             wanted_loop: None,
+            playing: Arc::default(),
+        }
+    }
+
+    /// The control side's view of this link (control thread, before the
+    /// link goes to the audio thread).
+    pub(crate) fn watch(&self) -> AheadWatch {
+        AheadWatch {
+            playing: Arc::clone(&self.playing),
+            tiers: self
+                .tiers
+                .iter()
+                .map(|t| (Arc::clone(&t.ready), Arc::clone(&t.progress)))
+                .collect(),
         }
     }
 
@@ -575,7 +648,9 @@ impl AheadLink {
         }
         if matches!(
             cmd,
-            TransportCommand::SetLoopRange(_) | TransportCommand::SetLoopEnabled(_)
+            TransportCommand::SetLoopRange(_)
+                | TransportCommand::SetLoopEnabled(_)
+                | TransportCommand::SetCues(_)
         ) && self.amend(current, &next)
         {
             return;
@@ -592,8 +667,8 @@ impl AheadLink {
             .pending
             .as_ref()
             .map_or_else(|| current.clone(), |p| p.transport.clone());
-        if let Some((range, enabled)) = self.wanted_loop {
-            t.set_loop(range, enabled);
+        if let Some(plan) = self.wanted_loop {
+            t.set_plan(plan);
         }
         t
     }
@@ -602,7 +677,7 @@ impl AheadLink {
     /// nothing that plays depends on it, else from a frame beyond every
     /// anticipator. `false`: no room to hand it over.
     fn amend(&mut self, current: &mut TransportState, next: &TransportState) -> bool {
-        let (range, enabled) = (next.loop_range(), next.loop_enabled());
+        let plan = next.plan();
         let newest = self.pending.as_ref().map_or(self.seq, |p| p.seq);
         // Single producer: room now is room for the pushes below.
         if self.tiers.iter().any(|t| t.to_ahead.slots() == 0) || self.amend_count == MAX_AMENDS {
@@ -612,15 +687,14 @@ impl AheadLink {
         let at = (next.started() && !next.scrubbing()).then(|| self.amend_frame(newest));
         match at {
             None => match self.pending.as_mut() {
-                Some(p) => p.transport.set_loop(range, enabled),
-                None => current.set_loop(range, enabled),
+                Some(p) => p.transport.set_plan(plan),
+                None => current.set_plan(plan),
             },
             Some(at) => {
                 self.amends[self.amend_count] = Scheduled {
                     seq: newest,
                     at,
-                    range,
-                    enabled,
+                    plan,
                 };
                 self.amend_count += 1;
             }
@@ -629,11 +703,10 @@ impl AheadLink {
             let _ = tier.to_ahead.push(ToAhead::Amend(Amend {
                 seq: newest,
                 at,
-                range,
-                enabled,
+                plan,
             }));
         }
-        self.wanted_loop = Some((range, enabled));
+        self.wanted_loop = Some(plan);
         true
     }
 
@@ -674,7 +747,7 @@ impl AheadLink {
                 continue;
             }
             if a.seq == self.seq && a.at <= frame {
-                current.set_loop(a.range, a.enabled);
+                current.set_plan(a.plan);
                 done += 1;
                 continue;
             }
@@ -787,6 +860,13 @@ impl AheadLink {
         if self.resetting {
             self.resetting = self.still_resetting(frames);
         }
+        self.playing
+            .played
+            .store(progress(self.seq, self.played), Ordering::Release);
+        self.playing.pending.store(
+            self.pending.as_ref().map_or(0, |p| p.seq),
+            Ordering::Release,
+        );
     }
 }
 
@@ -822,6 +902,8 @@ pub(crate) struct Anticipator {
     /// Its progress: [`progress`] packs the sequence it renders and the
     /// frames of it rendered.
     pub progress: Arc<AtomicU64>,
+    /// The newest sequence it has ready (its first blocks rendered).
+    pub ready: Arc<AtomicU64>,
     target: Arc<AtomicUsize>,
 }
 
@@ -896,6 +978,9 @@ struct Worker {
     /// The tier whose rings this one reads (it renders a block once that
     /// one has).
     upstream: Option<Arc<AtomicU64>>,
+    /// That tier's ready sequence: this one starts a new sequence only
+    /// once that one has it ready, as the audio thread switches then.
+    upstream_ready: Option<Arc<AtomicU64>>,
     /// The audio thread's scheduling, to adopt.
     scheduling: Option<Arc<Scheduling>>,
     idle: Duration,
@@ -909,8 +994,10 @@ pub(crate) struct Options {
     pub block: usize,
     pub lookahead: Duration,
     pub threads: usize,
-    /// Read the rings of the anticipator with this progress.
+    /// Read the rings of the anticipator with this progress …
     pub upstream: Option<Arc<AtomicU64>>,
+    /// … and this ready sequence.
+    pub upstream_ready: Option<Arc<AtomicU64>>,
     /// Keep pace with the audio thread: adopt its scheduling, sleep briefly.
     pub follow: Option<Arc<Scheduling>>,
     /// The epoch guarding the streamed pages its graphs read.
@@ -957,6 +1044,7 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
             .then(|| WorkerPool::new(faderframe_realtime::PoolConfig::new(options.threads))),
         progress: Arc::clone(&progress_word),
         upstream: options.upstream,
+        upstream_ready: options.upstream_ready,
         scheduling: options.follow,
         idle,
         reader: {
@@ -987,6 +1075,7 @@ pub(crate) fn start(ctx: EngineContext, rate: f64, options: Options) -> (Anticip
             lookahead,
             block,
             progress: Arc::clone(&progress_word),
+            ready: Arc::clone(&ready),
             target,
         },
         Tier {
@@ -1023,6 +1112,12 @@ impl Worker {
         let mut amends: std::collections::VecDeque<Scheduled> =
             std::collections::VecDeque::with_capacity(MAX_AMENDS);
         let mut jumped_at = 0usize;
+        // A tier reading another's rings: a new sequence waits here (with
+        // its loop changes) while this one renders the old one on, until
+        // the tier it reads has started the new one (see below).
+        let mut next: Option<Sequence> = None;
+        let mut next_amends: std::collections::VecDeque<Scheduled> =
+            std::collections::VecDeque::with_capacity(MAX_AMENDS);
         let startup = STARTUP_BLOCKS * self.block;
         let idle = self.idle;
         let mut adopted = 0u64;
@@ -1073,10 +1168,36 @@ impl Worker {
                 .map(|up| unpack_progress(up.load(Ordering::Acquire)));
             while let Ok(m) = self.sequences.pop() {
                 match m {
+                    ToAhead::Sequence(s) if self.upstream.is_some() && current.is_some() => {
+                        // The audio thread plays the old sequence until
+                        // every tier has the new one ready, and this
+                        // tier's rings hold only a callback and two
+                        // blocks of it: leaving it now would leave the
+                        // audio thread without it while the tier it reads
+                        // starts the new one.
+                        next = Some(s);
+                        next_amends.clear();
+                    }
                     ToAhead::Sequence(s) => {
                         current = Some((s.id, s.transport, 0, true));
                         amends.clear();
                         jumped_at = 0;
+                    }
+                    ToAhead::Amend(a) if next.as_ref().is_some_and(|n| n.id == a.seq) => {
+                        // For the sequence waiting: nothing rendered of it.
+                        match (a.at, next.as_mut()) {
+                            (None, Some(n)) => n.transport.set_plan(a.plan),
+                            (Some(at), _) if next_amends.len() < MAX_AMENDS => {
+                                next_amends.push_back(Scheduled {
+                                    seq: a.seq,
+                                    at,
+                                    plan: a.plan,
+                                });
+                            }
+                            _ => {
+                                self.amend_failed.fetch_max(a.seq, Ordering::AcqRel);
+                            }
+                        }
                     }
                     ToAhead::Amend(a) => {
                         let Some((seq, transport, primed, _)) = current.as_mut() else {
@@ -1090,14 +1211,13 @@ impl Worker {
                                 amends.push_back(Scheduled {
                                     seq: a.seq,
                                     at,
-                                    range: a.range,
-                                    enabled: a.enabled,
+                                    plan: a.plan,
                                 });
                             }
                             Some(at)
                                 if at > *primed
                                     || !amend_late_is_equal(
-                                        transport, *primed, jumped_at, at, a.range, a.enabled,
+                                        transport, *primed, jumped_at, at, a.plan,
                                     ) =>
                             {
                                 // What it rendered went another way: the
@@ -1107,13 +1227,32 @@ impl Worker {
                             // Now (as good as at its frame). Frames only
                             // grow from one change to the next: none
                             // waits before it.
-                            _ if amends.is_empty() => transport.set_loop(a.range, a.enabled),
+                            _ if amends.is_empty() => transport.set_plan(a.plan),
                             _ => {
                                 self.amend_failed.fetch_max(a.seq, Ordering::AcqRel);
                             }
                         }
                     }
                 }
+            }
+            // The sequence waiting starts once the tier this one reads has
+            // it ready — when the audio thread can switch to it (this
+            // tier's start is then a moment's work: that tier has rendered
+            // its first blocks). Until then the old one goes on from that
+            // tier's rings, which hold the lookahead's worth of it.
+            let up_ready = self
+                .upstream_ready
+                .as_ref()
+                .map(|r| r.load(Ordering::Acquire));
+            if let Some(n) = next.as_ref()
+                && (up_ready.is_none_or(|r| r >= n.id)
+                    || upstream.is_some_and(|(up_seq, _)| up_seq > n.id))
+                && let Some(n) = next.take()
+            {
+                current = Some((n.id, n.transport, 0, true));
+                std::mem::swap(&mut amends, &mut next_amends);
+                next_amends.clear();
+                jumped_at = 0;
             }
             // A panic: reset here (this thread's time, not the audio
             // thread's) and say from which frame on what it renders is
@@ -1138,7 +1277,7 @@ impl Worker {
                 // Nothing to render ahead: always ready; loop changes need
                 // not wait for a frame.
                 for a in amends.drain(..) {
-                    transport.set_loop(a.range, a.enabled);
+                    transport.set_plan(a.plan);
                 }
                 self.ready.fetch_max(*seq, Ordering::AcqRel);
                 self.progress
@@ -1148,7 +1287,7 @@ impl Worker {
             };
             // Loop changes due here; a block ends where the next one is.
             while let Some(a) = amends.front().filter(|a| a.at <= *primed) {
-                transport.set_loop(a.range, a.enabled);
+                transport.set_plan(a.plan);
                 amends.pop_front();
             }
             let capacity = g.rings.iter().map(|r| r.capacity()).min().unwrap_or(0);
@@ -1222,6 +1361,7 @@ impl Worker {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use faderframe_transport::{Cue, Cues, LoopRange};
 
     fn tier(block: usize) -> (Tier, Consumer<ToAhead>) {
         let (tx, rx) = RingBuffer::new(64);
@@ -1257,6 +1397,14 @@ mod tests {
         LoopRange::new(a, b)
     }
 
+    fn plan(range: Option<LoopRange>, enabled: bool) -> LoopPlan {
+        LoopPlan {
+            range,
+            enabled,
+            cues: Cues::NONE,
+        }
+    }
+
     #[test]
     fn a_loop_change_while_playing_lands_beyond_the_anticipator() {
         let (mut link, mut current, mut rx) = playing(0, 256);
@@ -1275,7 +1423,7 @@ mod tests {
         };
         assert_eq!(a.seq, 1);
         assert_eq!(a.at, Some(10_000 + 512));
-        assert_eq!(a.range, range(5_000, 20_000));
+        assert_eq!(a.plan.range, range(5_000, 20_000));
         // Not yet on the audio thread; the chunk ends at its frame.
         assert_eq!(current.loop_range(), None);
         link.poll(&mut current, 256);
@@ -1289,6 +1437,46 @@ mod tests {
             TransportCommand::SetLoopRange(range(5_000, 20_000)),
         );
         assert!(rx.pop().is_err());
+    }
+
+    #[test]
+    fn the_watch_says_when_a_callback_finds_its_audio_rendered() {
+        let (t, _rx) = tier(256);
+        let (ready, rendered) = (Arc::clone(&t.ready), Arc::clone(&t.progress));
+        let mut link = AheadLink::new(vec![t], 48_000.0, Scheduling::new());
+        let watch = link.watch();
+        let mut current = TransportState::default();
+        // Before a sequence nothing rendered ahead plays.
+        assert!(watch.ready_for(256));
+        link.begin(&current);
+        link.poll(&mut current, 256);
+        // Sequence 1 handed over and not ready: no callback would play it.
+        assert_eq!(link.seq(), 0);
+        assert!(!watch.ready_for(256));
+        ready.store(1, Ordering::Release);
+        rendered.store(progress(1, 512), Ordering::Release);
+        assert!(watch.ready_for(256));
+        link.poll(&mut current, 256);
+        assert_eq!(link.seq(), 1);
+        // 256 frames played of 512 rendered: the next 256 are there.
+        assert!(watch.ready_for(256));
+        assert!(!watch.ready_for(512));
+        link.poll(&mut current, 256);
+        assert!(!watch.ready_for(256));
+        rendered.store(progress(1, 768), Ordering::Release);
+        assert!(watch.ready_for(256));
+        // A tier with nothing to render ahead is always ready.
+        rendered.store(progress(1, usize::MAX), Ordering::Release);
+        assert!(watch.ready_for(1 << 20));
+        // A new sequence: not until it is ready, whatever the old one has.
+        link.command(&mut current, TransportCommand::Locate(48_000));
+        link.poll(&mut current, 256);
+        assert_eq!(link.seq(), 1);
+        rendered.store(progress(1, 1 << 20), Ordering::Release);
+        assert!(!watch.ready_for(256));
+        ready.store(2, Ordering::Release);
+        rendered.store(progress(2, 512), Ordering::Release);
+        assert!(watch.ready_for(256));
     }
 
     #[test]
@@ -1371,16 +1559,14 @@ mod tests {
             10_000,
             0,
             9_500,
-            range(0, 20_000),
-            true
+            plan(range(0, 20_000), true),
         ));
         assert!(amend_late_is_equal(
             &t,
             10_000,
             0,
             9_500,
-            range(0, 9_000),
-            true
+            plan(range(0, 9_000), true),
         ));
         // The new end inside what was rendered past the frame.
         assert!(!amend_late_is_equal(
@@ -1388,16 +1574,14 @@ mod tests {
             10_000,
             0,
             9_500,
-            range(0, 9_800),
-            true
+            plan(range(0, 9_800), true),
         ));
         assert!(amend_late_is_equal(
             &t,
             10_000,
             0,
             9_500,
-            range(0, 9_800),
-            false
+            plan(range(0, 9_800), false),
         ));
         // A wrap rendered after the frame.
         assert!(!amend_late_is_equal(
@@ -1405,9 +1589,20 @@ mod tests {
             10_000,
             9_700,
             9_500,
-            range(0, 20_000),
-            true
+            plan(range(0, 20_000), true),
         ));
+        // A planned jump in what was rendered past the frame: not the same
+        // path; one beyond it is.
+        let cue = |at: i64| LoopPlan {
+            cues: Cues::new(&[Cue {
+                at,
+                to: 0,
+                then_loop: None,
+            }]),
+            ..plan(None, false)
+        };
+        assert!(!amend_late_is_equal(&t, 10_000, 0, 9_500, cue(9_800)));
+        assert!(amend_late_is_equal(&t, 10_000, 0, 9_500, cue(10_200)));
         // Stopped: never.
         t.apply(TransportCommand::Stop);
         assert!(amend_late_is_equal(
@@ -1415,8 +1610,7 @@ mod tests {
             10_000,
             9_700,
             9_500,
-            range(0, 9_800),
-            true
+            plan(range(0, 9_800), true),
         ));
     }
 }

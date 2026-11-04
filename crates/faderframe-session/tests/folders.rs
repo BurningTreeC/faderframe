@@ -318,6 +318,7 @@ fn a_folder_bus_renders_as_a_stem_and_tracks_render_past_it() {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             },
         );

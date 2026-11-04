@@ -151,6 +151,14 @@ pub fn start(
     let mut project = project;
     project.loop_enabled = false;
     let plan = plan(&project);
+    // IAMF's scene-based (ambisonic) audio elements are not written yet:
+    // an ambisonic master is refused rather than taken as stereo.
+    if let Some(ChannelLayout::Ambisonic(o)) = project.master().map(|m| m.layout) {
+        return Err(RenderError::Iamf(format!(
+            "the master is {}: IAMF delivers channel-based masters (decode it into a bed first)",
+            o.name()
+        )));
+    }
     // A custom layout delivers only when every speaker has its place in
     // the IAMF layout (by label).
     if let Some(ChannelLayout::Surround(f)) = project.master().map(|m| m.layout)

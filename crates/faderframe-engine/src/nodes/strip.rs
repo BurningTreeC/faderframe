@@ -775,6 +775,9 @@ pub(crate) struct MatrixMix {
     /// The destination bed's VBAP geometry, made with the node (off the
     /// audio thread).
     vbap: Option<Box<faderframe_core::vbap::Vbap>>,
+    /// An ambisonic input's AllRAD decoder onto the destination's
+    /// speakers, made with the node.
+    decoder: Option<Box<faderframe_core::ambisonics::Decoder>>,
     /// What `matrix` was made for: the panner, the balance, the downmix.
     made_for: Option<(SurroundPan, f32, Downmix)>,
     /// Each pair's gain at the end of the last range.
@@ -794,6 +797,20 @@ impl MatrixMix {
             ChannelLayout::Surround(f) => Some(Box::new(faderframe_core::vbap::Vbap::of(f))),
             _ => None,
         };
+        let decoder = match input {
+            ChannelLayout::Ambisonic(order) if output != ChannelLayout::Mono => {
+                surround::speakers_of(output).and_then(|speakers| {
+                    let geometry = vbap
+                        .as_deref()
+                        .cloned()
+                        .or_else(|| faderframe_core::vbap::Vbap::new(speakers).ok())?;
+                    Some(Box::new(faderframe_core::ambisonics::Decoder::allrad(
+                        order, speakers, &geometry,
+                    )))
+                })
+            }
+            _ => None,
+        };
         let pan = SurroundPan::default();
         let downmix = Downmix::default();
         let mixing = Mixing {
@@ -801,12 +818,14 @@ impl MatrixMix {
             downmix,
             balance: 0.0,
             diffuse: false,
+            decoder: decoder.as_deref(),
         };
         let applies = surround::matrix(input, output, &pan, &mixing, &mut matrix);
         applies.then_some(Self {
             layouts: (input, output),
             matrix,
             vbap,
+            decoder,
             made_for: Some((pan, 0.0, downmix)),
             pairs: [[f32::NAN; MAX_SPEAKERS]; MAX_SPEAKERS],
             diffuser: None,
@@ -840,6 +859,7 @@ impl MatrixMix {
                 downmix,
                 balance,
                 diffuse: self.diffuser.is_some(),
+                decoder: self.decoder.as_deref(),
             };
             surround::matrix(
                 self.layouts.0,
@@ -961,6 +981,15 @@ fn publish(
         let l = &post.channel(0)[..n];
         let r = &post.channel(post.num_channels().min(2) - 1)[..n];
         cx.data.scope.push(track.raw(), l, r);
+    }
+    // The track shared with a live session's listeners (the master).
+    if !cx.data.preview_active
+        && cx.data.share.source() == Some(track.raw())
+        && post.num_channels() > 0
+    {
+        let l = &post.channel(0)[..n];
+        let r = &post.channel(post.num_channels().min(2) - 1)[..n];
+        cx.data.share.push(track.raw(), l, r);
     }
     let out_ch = post.num_channels().min(MAX_CHANNELS);
     for c in 0..out_ch {

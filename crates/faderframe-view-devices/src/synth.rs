@@ -31,7 +31,11 @@ impl SynthFace {
 }
 
 /// Small knobs in a row across `r` (from the top).
-fn smalls(c: &mut Vec<Ctl>, r: Rect, items: &[(u32, &'static str, Option<Scale>, bool)]) {
+pub(crate) fn smalls(
+    c: &mut Vec<Ctl>,
+    r: Rect,
+    items: &[(u32, &'static str, Option<Scale>, bool)],
+) {
     let widths: Vec<f32> = items.iter().map(|_| SMALL.0).collect();
     for (k, &(i, label, scale, bipolar)) in kit::row(Rect::new(r.x, r.y, r.w, SMALL.1), &widths)
         .iter()
@@ -50,7 +54,7 @@ fn smalls(c: &mut Vec<Ctl>, r: Rect, items: &[(u32, &'static str, Option<Scale>,
 
 /// An ADSR's shape across `r` (attack, decay, a fixed sustain stretch,
 /// release; times on a square-root scale so short ones show).
-fn adsr(
+pub(crate) fn adsr(
     p: &mut dyn Painter,
     r: Rect,
     times: [f64; 3],

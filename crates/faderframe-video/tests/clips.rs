@@ -222,6 +222,7 @@ fn avi_and_mp4_playback_keep_up_with_the_transport() {
                     size: (W, H),
                     par: (1, 1),
                     proxy,
+                    memory: false,
                 },
             );
             // Preroll at the stopped playhead before the transport starts.
@@ -454,6 +455,7 @@ fn a_frame_asked_by_its_start_is_never_the_one_before() {
                         size: (W, H),
                         par: (1, 1),
                         proxy: proxy.clone(),
+                        memory: false,
                     },
                 );
                 for n in from..from + 6u32 {
@@ -611,6 +613,7 @@ fn a_picture_starting_late_keeps_its_times_in_the_proxy() {
                 size: (W, H),
                 par: (1, 1),
                 proxy: Some((proxy.clone(), (160, 120))),
+                memory: false,
             },
         );
         let shown = |n: u32, want: Want| {
@@ -714,6 +717,7 @@ fn a_long_gop_clip_is_exact_frame_for_frame() {
                 from: ix.times[25],
                 to: Some(ix.times[50]),
                 timecode: Some((tc, FrameRate::Fps25)),
+                ..Default::default()
             },
             &cancel,
             |_| {},
@@ -767,6 +771,7 @@ fn the_service_answers_at_once_and_catches_up() {
         size: (W, H),
         par: (1, 1),
         proxy: None,
+        memory: false,
     };
     svc.set_media(7, media.clone());
     let until = |f: &mut dyn FnMut() -> bool| {

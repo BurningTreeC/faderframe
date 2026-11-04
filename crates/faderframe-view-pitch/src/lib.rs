@@ -15,6 +15,7 @@
 use faderframe_core::ClipId;
 use faderframe_project::pitch::{Edge, PitchEdit, PitchNote};
 use faderframe_project::{AudioClip, Clip};
+use faderframe_session::lyric_comp::LyricCompOp;
 use faderframe_session::pitch::PitchOp;
 use faderframe_session::{Action, Session, TransportAction};
 use faderframe_ui_canvas::{
@@ -50,6 +51,8 @@ pub enum Item {
     Reset,
     Remove,
     Info,
+    /// Hear the clip's words (the syllable under each note).
+    Words,
 }
 
 /// What a press started.
@@ -153,6 +156,19 @@ fn shown(model: &Session) -> Option<Shown<'_>> {
         rate,
         start: p.timeline.to_samples(clip.start, rate),
     })
+}
+
+/// Were the words of the clip's part of its source heard?
+fn words_heard(model: &Session, s: &Shown<'_>) -> bool {
+    let a = s.audio;
+    model
+        .project()
+        .source_words
+        .get(&a.source)
+        .is_some_and(|w| {
+            w.missing(a.source_offset, a.source_offset + a.source_span())
+                .is_empty()
+        })
 }
 
 /// Move the playhead to `seconds` into the clip shown (if any).
@@ -337,6 +353,21 @@ impl PitchView {
             false,
             98.0,
         ));
+        if let Some(sh) = &s {
+            let heard = words_heard(model, sh);
+            items.push((
+                Item::Words,
+                if model.hearing_words(sh.id).is_some() {
+                    "Hearing Words…".to_string()
+                } else if heard {
+                    "Words Heard".into()
+                } else {
+                    "Hear Words".into()
+                },
+                heard,
+                98.0,
+            ));
+        }
         if edit.is_some() {
             let keep = edit.is_some_and(|e| e.keep_formants);
             let formants = (
@@ -378,7 +409,7 @@ impl PitchView {
             .into_iter()
             .map(|(item, label, on, w)| {
                 let r = Rect::new(x, 5.0, w, TOOLBAR_H - 10.0);
-                x += w + if matches!(item, Item::Detect | Item::Drift | Item::Polyphonic) {
+                x += w + if matches!(item, Item::Words | Item::Drift | Item::Polyphonic) {
                     14.0
                 } else {
                     4.0
@@ -520,6 +551,17 @@ impl PitchView {
             Item::Remove => {
                 self.selected.clear();
                 PitchOp::Remove
+            }
+            Item::Words => {
+                if model.hearing_words(s.id).is_none() {
+                    let clip = s.id;
+                    cx.emit(Action::LyricComp(if words_heard(model, &s) {
+                        LyricCompOp::HearAgain { clip }
+                    } else {
+                        LyricCompOp::Hear { clip }
+                    }));
+                }
+                return;
             }
             Item::Amount | Item::Drift | Item::Info => return,
         };
@@ -739,6 +781,8 @@ impl PitchView {
                 Color::rgb8(t.color.r, t.color.g, t.color.b)
             });
         p.push_clip(g);
+        let syllables = model.pitch_syllables(s.id);
+        let words = TextStyle::new(th.fonts.small, th.ui.text);
         for (i, n) in e.notes.iter().enumerate() {
             let r = self.note_rect(s, n, g);
             if r.right() < g.x || r.x > g.right() {
@@ -853,6 +897,20 @@ impl PitchView {
                     Rect::new(r.x + 4.0, r.y - 13.0, r.w.max(60.0), 12.0),
                     &TextStyle::new(th.fonts.small, th.ui.text_dim),
                 );
+            }
+            // The syllable sung on it, under it (a held one: its line).
+            if let Some(Some(syl)) = syllables.get(i) {
+                let y = r.bottom() + 2.0;
+                if syl.held {
+                    p.hline(r.x, r.right(), y + 6.0, th.ui.text_faint);
+                } else {
+                    let text = if syl.hyphen {
+                        format!("{}-", syl.text)
+                    } else {
+                        syl.text.clone()
+                    };
+                    p.text(&text, Rect::new(r.x + 2.0, y, r.w.max(60.0), 12.0), &words);
+                }
             }
         }
         if let Some(Drag::Band { from, to, .. }) = &self.drag {
@@ -1556,6 +1614,9 @@ impl CanvasView<Session, Action> for PitchView {
                     }
                     Item::Reset => "The selected notes (or all) back to as sung",
                     Item::Remove => "Remove the pitch edit: the clip plays as recorded",
+                    Item::Words => {
+                        "Hear the clip's words (the speech model): the syllable sung on each note shows under it · again: hear them anew"
+                    }
                     Item::Info => return None,
                 }
                 .into(),
@@ -2116,5 +2177,69 @@ mod tests {
             p.texts()
                 .contains(&"Right-click an audio clip and choose Edit Pitch")
         );
+    }
+
+    /// With the words of the clip's source heard, each note shows the
+    /// syllable sung on it; the toolbar's Words hears them.
+    #[test]
+    fn the_syllable_sung_on_each_note_shows_under_it() {
+        use faderframe_project::lyric_comp::{SourceWords, SungWord};
+        let (mut s, clip) = session();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        let painted = |view: &mut PitchView, s: &Session| {
+            let mut p = RecordingPainter::new();
+            view.paint(&mut p, size, s, &Theme::default());
+            p.texts()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let texts = painted(&mut view, &s);
+        assert!(texts.iter().any(|t| t == "Hear Words"), "{texts:?}");
+        // The toolbar's Words asks for the clip's words.
+        let (item, r, ..) = view
+            .toolbar(size, &s)
+            .into_iter()
+            .find(|(i, ..)| *i == Item::Words)
+            .unwrap();
+        assert_eq!(item, Item::Words);
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        let mut cx = EventCx::new(&mut actions, &mut requests);
+        view.event(&down(r.center(), 1), size, &s, &mut cx);
+        assert_eq!(actions, vec![Action::LyricComp(LyricCompOp::Hear { clip })]);
+        // "Beautiful" over the first two notes, "eyes" over the third.
+        let a = s.project().clip(clip).unwrap().as_audio().unwrap().clone();
+        let off = a.source_offset;
+        let mut words = SourceWords::new(s.project().sample_rate);
+        words.add(
+            (off, off + a.source_span()),
+            vec![
+                SungWord {
+                    start: off,
+                    end: off + 45_000,
+                    text: "Beautiful".into(),
+                    line: true,
+                    confidence: 90,
+                },
+                SungWord {
+                    start: off + 48_000,
+                    end: off + 70_000,
+                    text: "eyes".into(),
+                    line: false,
+                    confidence: 90,
+                },
+            ],
+        );
+        s.dispatch(Action::Edit(Command::SetSourceWords {
+            source: a.source,
+            words: Some(Box::new(words)),
+        }))
+        .unwrap();
+        let texts = painted(&mut view, &s);
+        for want in ["Beau-", "tiful", "eyes", "Words Heard"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
     }
 }

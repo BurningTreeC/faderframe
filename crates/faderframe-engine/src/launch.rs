@@ -22,12 +22,20 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 /// Tracks the launcher follows at most.
 pub const MAX_TRACKS: usize = 256;
 
+/// The slot number that stands for the arrangement in what comes next
+/// ([`LaunchCommand::Arrangement`]): no slot has it
+/// (`SlotKey::hash` stays below it).
+pub const ARRANGEMENT: u64 = (1 << 63) - 1;
+
 /// Where a launch waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quantize {
     None,
     Beat,
     Bars(u32),
+    /// This timeline sample (at once if it has passed): an interactive
+    /// score's sync point, worked out by the session.
+    At(i64),
 }
 
 impl From<faderframe_project::launcher::LaunchQuantize> for Quantize {
@@ -73,6 +81,11 @@ pub enum LaunchCommand {
     },
     /// Every track plays the arrangement again (at once).
     BackToArrangement,
+    /// Every track that plays launched clips (or waits for one) plays the
+    /// arrangement again from the quantised position.
+    Arrangement {
+        quantize: Quantize,
+    },
     /// Play a slot's clip at once as if it had started at `start` (a clip
     /// just recorded goes on looping in time).
     Resume {
@@ -149,6 +162,7 @@ pub fn pieces(
         Some((slot, at)) if at < pos + n as i64 => {
             let split = (at - pos).clamp(0, n as i64) as usize;
             let after = match slot {
+                Some(ARRANGEMENT) => Play::Arrangement,
                 Some(slot) => Play::Clip {
                     slot,
                     start: t.start_of_next(at),
@@ -319,6 +333,19 @@ impl LaunchState {
                     t.arrangement = false;
                 }
             }
+            LaunchCommand::Arrangement { quantize } => {
+                let at = at(quantize);
+                for t in &mut self.tracks {
+                    if t.current.is_none() && t.next.is_none() && t.arrangement {
+                        continue;
+                    }
+                    t.next = Some((Some(ARRANGEMENT), at));
+                    t.followed = false;
+                    t.legato = false;
+                    t.repeat = None;
+                    t.stop_after = None;
+                }
+            }
             LaunchCommand::BackToArrangement => {
                 for t in &mut self.tracks {
                     t.current = None;
@@ -375,11 +402,11 @@ impl LaunchState {
                 && at < end
             {
                 let start = t.start_of_next(at);
-                t.current = slot.map(|s| (s, start));
+                t.arrangement = slot == Some(ARRANGEMENT);
+                t.current = slot.filter(|s| *s != ARRANGEMENT).map(|s| (s, start));
                 t.next = t.stop_after.take().map(|stop| (None, stop.max(at + 1)));
                 t.followed = false;
                 t.legato = false;
-                t.arrangement = false;
             }
         }
     }
@@ -458,7 +485,9 @@ impl LaunchState {
             if t.current.is_some_and(|(s, _)| !known(s)) {
                 t.current = None;
             }
-            if t.next.is_some_and(|(s, _)| s.is_some_and(|s| !known(s))) {
+            if t.next
+                .is_some_and(|(s, _)| s.is_some_and(|s| s != ARRANGEMENT && !known(s)))
+            {
                 t.next = None;
             }
         }
@@ -475,6 +504,8 @@ impl LaunchState {
             let (queued, at) = match t.next {
                 // A follow action is not shown as waiting.
                 _ if t.followed => (0, 0),
+                // Back to the arrangement: the launched clip stops there.
+                Some((Some(ARRANGEMENT), at)) => (1, at),
                 Some((Some(s), at)) => (s | 1 << 63, at),
                 Some((None, at)) => (1, at),
                 None => (0, 0),
@@ -492,6 +523,7 @@ pub fn next_boundary(q: Quantize, pos: i64, timeline: &Timeline, rate: f64) -> i
     let here = timeline.to_musical(pos, rate);
     let target = match q {
         Quantize::None => return pos,
+        Quantize::At(at) => return at.max(pos),
         Quantize::Beat => {
             let bar = timeline.meter.bar_at(here);
             let start = timeline.meter.bar_start(bar);
@@ -640,6 +672,48 @@ mod tests {
         assert_eq!(pieces(s.track(t), 3 * bar, 64).0[0].2, Play::Silence);
         s.command(LaunchCommand::BackToArrangement, 0, true, &tl, SR);
         assert_eq!(pieces(s.track(t), 0, 64).0[0].2, Play::Arrangement);
+        // On an exact sample, and back to the arrangement on another.
+        assert_eq!(next_boundary(Quantize::At(5_000), 10, &tl, SR), 5_000);
+        assert_eq!(next_boundary(Quantize::At(5_000), 6_000, &tl, SR), 6_000);
+        s.command(
+            LaunchCommand::Launch {
+                track: t,
+                slot: 42,
+                quantize: Quantize::At(10_007),
+                legato: false,
+                repeat: 0,
+            },
+            10_000,
+            true,
+            &tl,
+            SR,
+        );
+        let (p, _) = pieces(s.track(t), 10_000, 64);
+        assert_eq!(p[0], (0, 7, Play::Arrangement));
+        assert_eq!(
+            p[1].2,
+            Play::Clip {
+                slot: 42,
+                start: 10_007
+            }
+        );
+        s.advance(10_064);
+        s.command(
+            LaunchCommand::Arrangement {
+                quantize: Quantize::At(20_003),
+            },
+            10_064,
+            true,
+            &tl,
+            SR,
+        );
+        let (p, n) = pieces(s.track(t), 20_000, 64);
+        assert_eq!(n, 2);
+        assert_eq!(p[1], (3, 61, Play::Arrangement));
+        s.publish(&LaunchStatus::default());
+        s.advance(20_064);
+        assert!(s.track(t).unwrap().arrangement);
+        assert_eq!(s.track(t).unwrap().current, None);
         // Published.
         let status = LaunchStatus::default();
         s.publish(&status);

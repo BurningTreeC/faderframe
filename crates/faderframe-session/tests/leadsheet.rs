@@ -291,6 +291,9 @@ fn midi_clip(id: u64, track: TrackId, at: f64, length: f64, notes: &[(f64, f64, 
                         channel: 0,
                         muted: false,
                         release: None,
+                        time_locked: false,
+                        articulation: None,
+                        fine: None,
                     })
                     .collect(),
                 ..MidiClip::default()
@@ -695,5 +698,83 @@ fn recorded_chords_are_heard_as_chords_for_tab() {
         .max()
         .unwrap();
     assert!(widest >= 3, "chords, not a melody: {widest} notes at most");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A piano's MIDI part: as a lead sheet its top voice is the melody and
+/// the chords are named from the left hand under it; written as played
+/// the same part goes on a grand staff (the right hand on the treble
+/// staff, the left hand's chords on one stem on the bass staff), braced,
+/// one MusicXML part of two staves — written again from what was read,
+/// without listening.
+#[test]
+fn a_piano_part_is_a_lead_sheet_or_a_grand_staff_as_played() {
+    use faderframe_session::leadsheet::{Notation, SheetStyle};
+    let mut s = Session::new(Project::new("Keys", SR), None, EngineConfig::default()).unwrap();
+    let piano = named_track(&mut s, TrackKind::Midi, "Piano");
+    let mut notes = Vec::new();
+    // C for a bar, F for the next; half notes struck twice a bar.
+    for (bar, chord) in [[48u8, 52, 55], [41, 45, 48]].iter().enumerate() {
+        for half in [0.0, 2.0] {
+            for k in chord {
+                notes.push((4.0 * bar as f64 + half, 2.0, *k));
+            }
+        }
+    }
+    // The tune on top, quarters and two eighths.
+    for &(at, len, k) in &[
+        (0.0, 1.0, 76),
+        (1.0, 1.0, 79),
+        (2.0, 0.5, 77),
+        (2.5, 0.5, 76),
+        (3.0, 1.0, 74),
+        (4.0, 2.0, 81),
+        (6.0, 2.0, 77),
+    ] {
+        notes.push((at, len, k));
+    }
+    s.dispatch(midi_clip(1, piano, 0.0, 8.0, &notes)).unwrap();
+    s.dispatch(Action::MakeLeadSheet {
+        of: LeadSheetOf::Track(piano),
+        grid: Grid::Auto,
+    })
+    .unwrap();
+    let doc = s.lead_sheet().expect("a lead sheet");
+    assert_eq!(doc.sheet.parts.len(), 1);
+    assert_eq!(keys_of(&doc.sheet, 0), [76, 79, 77, 76, 74, 81, 77]);
+    let chords: Vec<String> = doc.sheet.parts[0]
+        .measures
+        .iter()
+        .flat_map(|m| m.chords.iter().map(|c| c.text()))
+        .collect();
+    assert_eq!(chords, ["C", "F"], "{chords:?}");
+    // The notes it was written from: the tune marked as the melody.
+    let heard = s.lead_sheet_notes();
+    assert_eq!(heard.len(), 1);
+    assert_eq!(heard[0].iter().filter(|v| v.melody).count(), 7);
+    // As played: a grand staff.
+    s.dispatch(Action::SetSheetStyle(SheetStyle {
+        notation: Notation::AsPlayed,
+        ..s.sheet_style()
+    }))
+    .unwrap();
+    assert!(!s.making_lead_sheet());
+    let doc = s.lead_sheet().unwrap();
+    let parts = &doc.sheet.parts;
+    assert_eq!(parts.len(), 2, "the hands");
+    assert!(parts[0].brace && parts[0].name == "Piano" && parts[1].name.is_empty());
+    assert_eq!((parts[0].clef, parts[1].clef), (Clef::Treble, Clef::Bass));
+    assert_eq!(keys_of(&doc.sheet, 0), [76, 79, 77, 76, 74, 81, 77]);
+    let first = &parts[1].measures[0].events[0];
+    let chord: Vec<u8> = first.pitches().map(|p| p.midi).collect();
+    assert_eq!(chord, [48, 52, 55], "the left hand's chord on one stem");
+    assert_eq!(first.duration.divisions(), 24, "a half note");
+    assert_eq!(doc.parts(), "Piano");
+    let dir = std::env::temp_dir().join(format!("ff-session-grand-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("keys.musicxml");
+    s.dispatch(Action::ExportLeadSheet(path.clone())).unwrap();
+    let xml = std::fs::read_to_string(&path).unwrap();
+    assert!(xml.contains("<staves>2</staves>") && xml.contains("<staff>2</staff>"));
     let _ = std::fs::remove_dir_all(&dir);
 }

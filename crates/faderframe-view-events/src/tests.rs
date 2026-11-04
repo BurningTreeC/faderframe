@@ -413,3 +413,188 @@ fn typed_keys_lengths_and_amounts() {
         }
     }
 }
+
+/// The padlock column: a click locks a note to time (lit, said in its
+/// tooltip and accessible name) and frees it again.
+#[test]
+fn the_padlock_column_locks_a_note_to_time() {
+    let (mut s, _) = session();
+    let mut view = EventsView::new(Theme::default());
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    let (i, row) = row_of(&view, &s, EventKind::Note);
+    assert!(!row.time_locked);
+    let cell = EventsView::cell(Column::Lock, view.row_rect(i, SIZE));
+    assert!(
+        cell.x > EventsView::cell(Column::Mute, view.row_rect(i, SIZE)).x,
+        "beside the mute"
+    );
+    let tip = view.tooltip(cell.center(), SIZE, &s).unwrap();
+    assert!(tip.starts_with("Click to lock the note to time"), "{tip}");
+    let (actions, _) = run(&mut view, down(cell.center(), 1, Modifiers::NONE), SIZE, &s);
+    assert_eq!(actions.len(), 1);
+    apply(&mut s, actions);
+    assert!(view.rows(&s)[i].time_locked);
+    let tip = view.tooltip(cell.center(), SIZE, &s).unwrap();
+    assert!(tip.starts_with("Locked to time"), "{tip}");
+    // Painted lit: the padlock's body in the time-lock colour.
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    assert!(p.ops.iter().any(
+        |o| matches!(o, faderframe_ui_canvas::DrawOp::Rounded(r) if cell.contains(r.center()))
+    ));
+    assert!(
+        view.accessible(SIZE, &s)
+            .iter()
+            .flat_map(|a| std::iter::once(a).chain(a.children.iter()))
+            .any(|a| a.label.contains("locked to time"))
+    );
+    let (actions, _) = run(&mut view, down(cell.center(), 1, Modifiers::NONE), SIZE, &s);
+    apply(&mut s, actions);
+    assert!(!view.rows(&s)[i].time_locked);
+}
+
+/// Articulations in the list: a note's by name, the articulation lane's
+/// directions as rows of their own (moved by their position, changed
+/// from the row menu among their group, deleted).
+#[test]
+fn articulations_show_and_change_in_the_list() {
+    use faderframe_session::maps::MapOp;
+    let (mut s, clip) = session();
+    let track = s.project().clip(clip).unwrap().track;
+    s.use_articulation_map_named(track, "strings").unwrap();
+    let map = s.project().track_articulation_map(track).unwrap().clone();
+    let first = s.project().clip(clip).unwrap().as_midi().unwrap().notes[0];
+    let stacc = map.find("Staccato").unwrap().id;
+    let pizz = map.find("Pizzicato").unwrap().id;
+    let trem = map.find("Tremolo").unwrap().id;
+    s.dispatch(Action::Maps(MapOp::SetNoteArticulation {
+        clip,
+        notes: vec![first.id],
+        articulation: Some(stacc),
+    }))
+    .unwrap();
+    s.dispatch(Action::Maps(MapOp::SetDirection {
+        clip,
+        at: first.start,
+        articulation: Some(pizz),
+    }))
+    .unwrap();
+    let mut view = EventsView::new(Theme::default());
+    let rows = view.rows(&s);
+    let (i, row) = row_of(&view, &s, EventKind::Articulation);
+    assert_eq!(row.articulation, Some(pizz));
+    assert_eq!(
+        rows[i + 1].event,
+        EventRef::Note(first.id),
+        "before the note"
+    );
+    assert_eq!(view.cell_text(&row, Column::Info, &s), "Pizzicato");
+    assert_eq!(view.cell_text(&rows[i + 1], Column::Info, &s), "Staccato");
+    assert_eq!(view.cell_text(&row, Column::Type, &s), "Articulation");
+    // Its menu: the others of its group.
+    let at = EventsView::cell(Column::Type, view.row_rect(i, SIZE)).center();
+    let (actions, requests) = run(
+        &mut view,
+        ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        },
+        SIZE,
+        &s,
+    );
+    apply(&mut s, actions);
+    let Some(HostRequest::ContextMenu { items, .. }) = requests
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the row menu");
+    };
+    let sub = items.iter().find(|i| i.label == "Articulation").unwrap();
+    assert!(
+        sub.children.iter().all(|c| c.label != "Staccato"),
+        "directions only"
+    );
+    let tremolo = sub.children.iter().find(|c| c.label == "Tremolo").unwrap();
+    s.dispatch(tremolo.action.clone().unwrap()).unwrap();
+    let lane = &s
+        .project()
+        .clip(clip)
+        .unwrap()
+        .as_midi()
+        .unwrap()
+        .articulations;
+    assert_eq!(lane.len(), 1);
+    assert_eq!(lane[0].articulation, trem);
+    // Deleted like any event.
+    let (_, row) = row_of(&view, &s, EventKind::Articulation);
+    s.dispatch(Action::RemoveMidiEvents {
+        clip,
+        events: vec![row.event],
+    })
+    .unwrap();
+    assert!(
+        s.project()
+            .clip(clip)
+            .unwrap()
+            .as_midi()
+            .unwrap()
+            .articulations
+            .is_empty()
+    );
+}
+
+/// Velocities with MIDI 2.0's resolution show as MIDI 1.0 steps with a
+/// fraction; a typed or dragged fraction keeps it, whole numbers are MIDI
+/// 1.0's.
+#[test]
+fn velocities_show_and_take_midi2_resolution() {
+    let (mut s, clip) = session();
+    let mut view = EventsView::new(Theme::default());
+    let first = view.rows(&s)[0].clone();
+    assert_eq!(first.fine, None);
+    let shown = |view: &EventsView, s: &Session| view.cell_text(&view.rows(s)[0], Column::Data2, s);
+    let plain = shown(&view, &s);
+    assert!(!plain.contains('.'), "{plain}");
+    // A fraction typed: the 16 bits.
+    let (_, action) = type_into(&mut view, &s, 0, Column::Data2, "100.5");
+    assert_eq!(
+        action,
+        Some(Action::EditMidiEvents {
+            clip,
+            events: vec![first.event],
+            field: EventField::Data2,
+            value: EventValue::Fine(100.5),
+        })
+    );
+    s.dispatch(action.unwrap()).unwrap();
+    assert_eq!(view.rows(&s)[0].fine, Some(100.5));
+    assert_eq!(shown(&view, &s), "100.50");
+    // Dragged up two steps: the fraction stays.
+    let actions = drag(&mut view, &mut s, 0, Column::Data2, 2.0);
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::EditMidiEvents {
+            value: EventValue::Fine(v),
+            ..
+        }] if (*v - 102.5).abs() < 1e-9
+    ));
+    apply(&mut s, actions);
+    assert_eq!(shown(&view, &s), "102.50");
+    // A whole number: MIDI 1.0 again.
+    let (_, action) = type_into(&mut view, &s, 0, Column::Data2, "90");
+    s.dispatch(action.unwrap()).unwrap();
+    assert_eq!(view.rows(&s)[0].fine, None);
+    assert_eq!(shown(&view, &s), "90");
+    // Release velocities likewise.
+    let (_, action) = type_into(&mut view, &s, 0, Column::Release, "63.25");
+    s.dispatch(action.unwrap()).unwrap();
+    assert_eq!(view.rows(&s)[0].release, Some(63));
+    assert_eq!(view.rows(&s)[0].release_fine, Some(63.25));
+    assert_eq!(
+        view.cell_text(&view.rows(&s)[0], Column::Release, &s),
+        "63.25"
+    );
+}

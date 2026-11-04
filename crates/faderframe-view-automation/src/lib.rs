@@ -16,7 +16,8 @@
 //!   the edit selection), Thin, Clear, Delete Lane.
 //!
 //! Edits go through `Command::SetAutomationLane` like the arranger's lanes
-//! (drags are one gesture, one undo step).
+//! (drags are one gesture, one undo step). Screen readers and the
+//! keyboard: see [`access`].
 
 use faderframe_automation::{
     AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, CurveShape, thin,
@@ -27,10 +28,12 @@ use faderframe_session::automation::has_automation;
 use faderframe_session::{Action, AutomationParam, Session};
 use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{
-    CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Modifiers, Paint, Painter, Path,
-    Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Modifiers,
+    Paint, Painter, Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle,
+    Theme, ViewEvent,
 };
 
+mod access;
 #[cfg(test)]
 mod tests;
 
@@ -595,6 +598,20 @@ impl AutomationView {
         let plot = self.layout(size).plot;
         let at = self.time_at(model, plot, pos.x);
         let point = self.point_at(model, plot, &lane, &param, pos);
+        let items = Self::point_items(model, track, &lane, at, point);
+        Some(HostRequest::ContextMenu { at: pos, items })
+    }
+
+    /// The editor's menu at `at`: the shape of the segment there (of
+    /// `point`'s when on one), deleting and moving the point, writing the
+    /// control's value.
+    pub(crate) fn point_items(
+        model: &Session,
+        track: TrackId,
+        lane: &AutomationLane,
+        at: MusicalTime,
+        point: Option<usize>,
+    ) -> Vec<MenuItem<Action>> {
         let index = point.or_else(|| {
             lane.curve
                 .points()
@@ -611,12 +628,28 @@ impl AutomationView {
                 items.push(MenuItem::new(label, Self::edit(track, l)).checked(p.shape == shape));
             }
         }
-        if let Some(i) = point {
+        if let Some(i) = point
+            && let Some(p) = lane.curve.points().get(i).copied()
+        {
             let mut l = lane.clone();
             l.curve.remove(i);
             items.push(MenuItem::new("Delete Point", Self::edit(track, l)).separated());
+            // A sixteenth either way (the keyboard's way to move it).
+            for (label, by) in [
+                ("Move Earlier by a Sixteenth", -SNAP_QUARTERS),
+                ("Move Later by a Sixteenth", SNAP_QUARTERS),
+            ] {
+                let time = MusicalTime::from_quarters((p.time.quarters() + by).max(0.0));
+                if time == p.time {
+                    items.push(MenuItem::disabled(label));
+                    continue;
+                }
+                let mut l = lane.clone();
+                l.curve.update(i, AutomationPoint { time, ..p });
+                items.push(MenuItem::new(label, Self::edit(track, l)));
+            }
         }
-        if let Some(l) = Self::write_value(model, track, &lane) {
+        if let Some(l) = Self::write_value(model, track, lane) {
             items.push(
                 MenuItem::new(
                     if model.selection.range.is_some_and(|r| r.end > r.start) {
@@ -629,7 +662,7 @@ impl AutomationView {
                 .separated(),
             );
         }
-        Some(HostRequest::ContextMenu { at: pos, items })
+        items
     }
 
     // --- painting ------------------------------------------------------------------
@@ -970,6 +1003,62 @@ impl AutomationView {
 impl CanvasView<Session, Action> for AutomationView {
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
+    }
+
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Automation".into())
+    }
+
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        self.press(id, press, size, model, cx)
+    }
+
+    /// The lane list scrolls up and down; the editor sideways once zoomed
+    /// in (no scrollbars: the wheel and the keyboard).
+    fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
+        let l = self.layout(size);
+        match axis {
+            ScrollAxis::Vertical => Some(ScrollInfo {
+                content: self.rows(model).len() as f32 * ROW_H,
+                viewport: l.list.h,
+                offset: self.list_scroll,
+                start: l.list.y,
+                end: 0.0,
+            }),
+            ScrollAxis::Horizontal if self.zoom > 0.0 => {
+                let end = model.project().content_end().quarters().max(8.0) * 1.05;
+                let shown = l.plot.w as f64 / self.zoom;
+                Some(ScrollInfo {
+                    content: (end.max(self.scroll_q + shown) * self.zoom) as f32,
+                    viewport: l.plot.w,
+                    offset: (self.scroll_q * self.zoom) as f32,
+                    start: l.plot.x,
+                    end: (size.w - l.plot.right()).max(0.0),
+                })
+            }
+            ScrollAxis::Horizontal => None,
+        }
+    }
+
+    fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
+        match axis {
+            ScrollAxis::Vertical => self.list_scroll = offset.max(0.0),
+            ScrollAxis::Horizontal if self.zoom > 0.0 => {
+                self.scroll_q = (f64::from(offset) / self.zoom).max(0.0);
+            }
+            ScrollAxis::Horizontal => {}
+        }
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, _theme: &Theme) {

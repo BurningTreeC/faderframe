@@ -1,5 +1,6 @@
 //! Windows: the GPU painter's frames to GTK without a readback, as shared
-//! D3D12 textures (`faderframe_ui_gpu::SharedFrame`). How depends on GTK's
+//! D3D12 textures (`faderframe_ui_gpu::SharedFrame`); video frames in D3D12
+//! textures go the same ways (`video_d3d12`). How depends on GTK's
 //! renderer:
 //!
 //! * GL (GTK's default on Windows): GTK's own D3D12 import into GL imports
@@ -14,12 +15,14 @@
 //! The first frame of either is read back both ways and compared; any
 //! difference or error and frames are read back from then on.
 
+#[cfg(feature = "gpu-painter")]
 use faderframe_ui_gpu::SharedFrame;
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use std::ffi::c_void;
 
 /// How frames reach GTK.
+#[cfg(feature = "gpu-painter")]
 pub(crate) enum Handover {
     Gl(GlImport),
     D3d12,
@@ -104,6 +107,33 @@ impl Fns {
     }
 }
 
+/// A shared texture to import: committed (dedicated), RGBA8, one mip.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shared {
+    /// Which pooled texture (imports are cached by it; a new texture never
+    /// reuses one).
+    pub slot: u64,
+    /// An NT handle to it, open while its pool keeps it.
+    pub handle: isize,
+    /// The size of its memory.
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(feature = "gpu-painter")]
+impl Shared {
+    fn of(frame: &SharedFrame) -> Self {
+        Self {
+            slot: frame.slot,
+            handle: frame.handle,
+            size: frame.size,
+            width: frame.width,
+            height: frame.height,
+        }
+    }
+}
+
 /// A pooled texture imported into GL.
 struct Imported {
     slot: u64,
@@ -119,14 +149,25 @@ pub(crate) struct GlImport {
     luid: [u8; 8],
     imported: Vec<Imported>,
     clock: u64,
+    /// Imports kept.
+    keep: usize,
 }
 
-/// Imported textures kept (the painter's pool, and sizes just left).
+/// Imported textures kept for the painter (its pool, and sizes just
+/// left).
+#[cfg(feature = "gpu-painter")]
 const KEEP: usize = 6;
 
 impl GlImport {
     /// A WGL context of GTK's display with `EXT_memory_object_win32`.
+    #[cfg(feature = "gpu-painter")]
     pub(crate) fn new() -> Result<GlImport, String> {
+        Self::keeping(KEEP)
+    }
+
+    /// [`Self::new`] keeping `keep` imported textures (the least recently
+    /// used go first).
+    pub(crate) fn keeping(keep: usize) -> Result<GlImport, String> {
         let display = gdk::Display::default().ok_or("no display")?;
         let context = display.create_gl_context().map_err(|e| e.to_string())?;
         context.realize().map_err(|e| e.to_string())?;
@@ -165,6 +206,7 @@ impl GlImport {
             luid,
             imported: Vec::new(),
             clock: 0,
+            keep: keep.max(1),
         })
     }
 
@@ -175,7 +217,7 @@ impl GlImport {
 
     /// The GL texture of `frame`'s pooled texture (imported the first
     /// time). The context is current.
-    fn gl_texture(&mut self, frame: &SharedFrame) -> Result<u32, String> {
+    fn gl_texture(&mut self, frame: &Shared) -> Result<u32, String> {
         use windows_sys::Win32::Graphics::OpenGL as gl;
         self.clock += 1;
         if let Some(i) = self.imported.iter_mut().find(|i| i.slot == frame.slot) {
@@ -184,7 +226,7 @@ impl GlImport {
         }
         // Room for it: the least recently used goes (a pooled texture of
         // a size left behind; one still in use is imported again).
-        if self.imported.len() >= KEEP
+        if self.imported.len() >= self.keep
             && let Some(old) = (0..self.imported.len()).min_by_key(|&i| self.imported[i].used)
         {
             let i = self.imported.swap_remove(old);
@@ -246,7 +288,19 @@ impl GlImport {
 
     /// `frame` as a GTK texture; its pooled texture goes back to the
     /// painter when GTK lets go of it.
+    #[cfg(feature = "gpu-painter")]
     pub(crate) fn texture(&mut self, frame: SharedFrame) -> Result<gdk::Texture, String> {
+        let shared = Shared::of(&frame);
+        self.texture_keeping(shared, frame)
+    }
+
+    /// `shared` as a GTK texture, `keep` (what keeps the texture out of
+    /// its pool) held until GTK lets go of it.
+    pub(crate) fn texture_keeping<T: Send + 'static>(
+        &mut self,
+        frame: Shared,
+        keep: T,
+    ) -> Result<gdk::Texture, String> {
         self.context.make_current();
         let id = self.gl_texture(&frame);
         // SAFETY: the context is current.
@@ -260,14 +314,20 @@ impl GlImport {
             .set_height(frame.height as i32)
             .set_format(gdk::MemoryFormat::R8g8b8a8);
         // SAFETY: the texture lives in the import cache (and its D3D12
-        // memory in the painter's pool) at least until GTK releases this
-        // texture — the closure keeps the frame until then.
-        Ok(unsafe { builder.build_with_release_func(move || drop(frame)) })
+        // memory in its pool) at least until GTK releases this texture —
+        // the closure keeps what holds it there until then.
+        Ok(unsafe { builder.build_with_release_func(move || drop(keep)) })
     }
 
     /// The pixels GL sees of `frame`'s texture (rows of `width * 4`
     /// bytes): the import's self-test.
+    #[cfg(feature = "gpu-painter")]
     pub(crate) fn read(&mut self, frame: &SharedFrame) -> Result<Vec<u8>, String> {
+        self.read_shared(&Shared::of(frame))
+    }
+
+    /// [`Self::read`] of any shared texture.
+    pub(crate) fn read_shared(&mut self, frame: &Shared) -> Result<Vec<u8>, String> {
         use windows_sys::Win32::Graphics::OpenGL as gl;
         self.context.make_current();
         let id = self.gl_texture(frame);
@@ -309,25 +369,46 @@ impl Drop for GlImport {
 
 /// `frame` as a `GdkD3D12Texture` (GTK's Vulkan renderer imports it); the
 /// frame goes back to the painter when GTK lets go of it.
+#[cfg(feature = "gpu-painter")]
 pub(crate) fn d3d12_texture(frame: SharedFrame) -> Result<gdk::Texture, String> {
+    let resource = frame.resource_ptr();
+    // SAFETY: the frame's own resource, kept alive by the frame.
+    unsafe { d3d12_texture_keeping(resource, frame) }
+}
+
+/// The `ID3D12Resource` at `resource` as a `GdkD3D12Texture`, `keep` (what
+/// keeps the resource alive and out of its pool) held until GTK lets go of
+/// it.
+///
+/// # Safety
+///
+/// `resource` is a valid `ID3D12Resource*` for as long as `keep` lives.
+pub(crate) unsafe fn d3d12_texture_keeping<T: Send + 'static>(
+    resource: *mut c_void,
+    keep: T,
+) -> Result<gdk::Texture, String> {
     use gdk4_win32::ffi;
     use glib::translate::from_glib_full;
-    unsafe extern "C" fn release(data: glib::ffi::gpointer) {
+    unsafe extern "C" fn release<T>(data: glib::ffi::gpointer) {
         // SAFETY: `data` is the box made below, released once by GTK.
-        drop(unsafe { Box::from_raw(data.cast::<SharedFrame>()) });
+        drop(unsafe { Box::from_raw(data.cast::<T>()) });
     }
-    let resource = frame.resource_ptr();
-    let data = Box::into_raw(Box::new(frame));
+    let data = Box::into_raw(Box::new(keep));
     // SAFETY: a fresh builder; the resource is a valid ID3D12Resource kept
-    // alive by the boxed frame, which GTK hands to `release` when it no
-    // longer uses the texture (or right away when it fails).
+    // alive by the boxed `keep` (the caller's promise), which GTK hands to
+    // `release` when it no longer uses the texture (or right away when it
+    // fails).
     unsafe {
         let builder = ffi::gdk_d3d12_texture_builder_new();
         ffi::gdk_d3d12_texture_builder_set_resource(builder, resource);
         ffi::gdk_d3d12_texture_builder_set_premultiplied(builder, glib::ffi::GFALSE);
         let mut error = std::ptr::null_mut();
-        let texture =
-            ffi::gdk_d3d12_texture_builder_build(builder, Some(release), data.cast(), &mut error);
+        let texture = ffi::gdk_d3d12_texture_builder_build(
+            builder,
+            Some(release::<T>),
+            data.cast(),
+            &mut error,
+        );
         glib::gobject_ffi::g_object_unref(builder.cast());
         if texture.is_null() {
             drop(Box::from_raw(data));
@@ -356,12 +437,14 @@ pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Wanted at all (`FADERFRAME_GPU_SHARE=0` turns the hand-over off).
+#[cfg(feature = "gpu-painter")]
 pub(crate) fn wanted() -> bool {
     std::env::var("FADERFRAME_GPU_SHARE").as_deref() != Ok("0")
 }
 
 /// Which kind of hand-over for GTK's renderer, and the adapter the painter
 /// should render on.
+#[cfg(feature = "gpu-painter")]
 pub(crate) fn handover(widget: &gtk::Widget) -> (Option<Handover>, Option<[u8; 8]>) {
     if !wanted() {
         return (None, None);

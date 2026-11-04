@@ -10,9 +10,11 @@
 //! [`scale_up`] / [`scale_down`] are the specification's min-centre-max
 //! value scaling, [`Midi1ToMidi2`] translates MIDI 1.0 byte messages into
 //! MIDI 2.0 channel voice messages (bank select and RPN/NRPN folded in),
-//! [`Voice2::to_midi1`] goes the other way.
+//! [`Voice2::to_midi1`] goes the other way; [`Voice2::to_midi1_fine`] and
+//! [`Voice2::of_event`] keep the full resolution beside the MIDI 1.0 form
+//! ([`Fine`]).
 
-use crate::NoteExpressionKind;
+use crate::{Fine, MidiEvent, NoteExpressionKind};
 
 /// Words in a packet of message type `mt` (0–15).
 pub const fn words_for(mt: u8) -> usize {
@@ -207,7 +209,7 @@ pub enum Utility {
 }
 
 /// A note's attribute (MIDI 2.0 note on/off).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Attribute {
     /// 0 none, 1 manufacturer, 2 profile, 3 pitch 7.9.
     pub kind: u8,
@@ -309,6 +311,107 @@ pub mod per_note {
 }
 
 impl Voice2 {
+    /// The MIDI 1.0 message of a voice message that is one (notes,
+    /// controllers, pressure, pitch bend) with its full resolution beside
+    /// it ([`Fine`]: 16-bit velocity, 32-bit value, a note's attribute but
+    /// pitch 7.9, which is the note's tuning). `None` for the others
+    /// (program changes with banks, RPN/NRPN, per-note messages).
+    pub fn to_midi1_fine(&self, channel: u8) -> Option<([u8; 3], usize, Fine)> {
+        let ch = channel & 0xF;
+        let kept = |a: Attribute| {
+            if a.kind == Attribute::PITCH_7_9 {
+                Attribute::default()
+            } else {
+                a
+            }
+        };
+        let seven = |v: u32| scale_down(v, 32, 7) as u8;
+        Some(match *self {
+            Voice2::NoteOn {
+                note,
+                velocity,
+                attribute,
+            } => {
+                let (v7, fine) = Fine::of_velocity(velocity, true);
+                (
+                    [0x90 | ch, note & 0x7F, v7],
+                    3,
+                    fine.with_attribute(kept(attribute)),
+                )
+            }
+            Voice2::NoteOff {
+                note,
+                velocity,
+                attribute,
+            } => {
+                let (v7, fine) = Fine::of_velocity(velocity, false);
+                (
+                    [0x80 | ch, note & 0x7F, v7],
+                    3,
+                    fine.with_attribute(kept(attribute)),
+                )
+            }
+            Voice2::PolyPressure { note, value } => (
+                [0xA0 | ch, note & 0x7F, seven(value)],
+                3,
+                Fine::value(value),
+            ),
+            Voice2::ControlChange { index, value } => (
+                [0xB0 | ch, index & 0x7F, seven(value)],
+                3,
+                Fine::value(value),
+            ),
+            Voice2::ChannelPressure(value) => ([0xD0 | ch, seven(value), 0], 2, Fine::value(value)),
+            Voice2::PitchBend(value) => {
+                let b = scale_down(value, 32, 14);
+                (
+                    [0xE0 | ch, (b & 0x7F) as u8, (b >> 7) as u8],
+                    3,
+                    Fine::value(value),
+                )
+            }
+            _ => return None,
+        })
+    }
+
+    /// The MIDI 2.0 message of an event at its full resolution (notes with
+    /// 16-bit velocities and their attributes; controllers, pressure and
+    /// pitch bend at 32 bits). `None` for program changes, note
+    /// expressions and SysEx, and for the controllers MIDI 2.0 folds into
+    /// other messages (bank select, RPN/NRPN numbers and data entry: see
+    /// [`Midi1ToMidi2`]).
+    pub fn of_event(event: MidiEvent, fine: Fine) -> Option<Voice2> {
+        let full = event.full_value(fine);
+        Some(match event {
+            MidiEvent::NoteOn { key, .. } => Voice2::NoteOn {
+                note: key & 0x7F,
+                velocity: full? as u16,
+                attribute: fine.attribute,
+            },
+            MidiEvent::NoteOff { key, .. } => Voice2::NoteOff {
+                note: key & 0x7F,
+                velocity: full? as u16,
+                attribute: fine.attribute,
+            },
+            MidiEvent::PolyPressure { key, .. } => Voice2::PolyPressure {
+                note: key & 0x7F,
+                value: full?,
+            },
+            MidiEvent::ControlChange { controller, .. } => {
+                if matches!(controller, 0 | 6 | 32 | 38 | 98..=101) {
+                    return None;
+                }
+                Voice2::ControlChange {
+                    index: controller & 0x7F,
+                    value: full?,
+                }
+            }
+            MidiEvent::ChannelPressure { .. } => Voice2::ChannelPressure(full?),
+            MidiEvent::PitchBend { .. } => Voice2::PitchBend(full?),
+            _ => return None,
+        })
+    }
+
     /// The MIDI 1.0 messages it becomes (bytes, how many). Per-note
     /// controllers, per-note bends and management have none.
     pub fn to_midi1(&self, channel: u8) -> ([[u8; 3]; 4], usize) {

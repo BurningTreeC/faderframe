@@ -100,6 +100,12 @@ impl Session {
         }
     }
 
+    /// A sandboxed plugin's state is on its way (changed, not yet in its
+    /// slot).
+    pub(crate) fn plugin_state_pending(&self, id: PluginInstanceId) -> bool {
+        self.plugin_care.dirty.contains(&id) || self.plugin_care.asked.contains(&id)
+    }
+
     /// The plugin stopped working (crashed, hung or failed processing).
     pub fn plugin_failed(&self, id: PluginInstanceId) -> bool {
         self.engine.plugin_failed(id)

@@ -14,7 +14,9 @@ mod delay;
 mod drums;
 pub mod eq;
 pub mod fet76;
+mod fm;
 mod gate;
+mod granular;
 pub mod guitar;
 mod hardware_insert;
 mod keys;
@@ -23,6 +25,7 @@ pub mod leveler;
 mod limiter;
 mod modulation;
 mod note_echo;
+mod poly;
 pub mod program_eq;
 mod reverb;
 mod sampler;
@@ -33,6 +36,19 @@ mod tape;
 mod tuner;
 mod utility;
 mod values;
+mod wavetable;
+// The restoration devices.
+mod declick;
+mod declip;
+mod dehum;
+mod denoise;
+mod dereverb;
+// Convolution reverb, multiband dynamics, the vocoder.
+mod convolution;
+mod multiband;
+mod vocoder;
+// Voice.
+mod pitch_correct;
 
 use faderframe_core::{PluginInstanceId, builtin};
 use faderframe_session::{Action, Session};
@@ -151,6 +167,66 @@ pub fn editor_for(
             tape::TapeFace::new(theme),
         ))),
         builtin::LEVELER_2A => Some(Box::new(leveler::LevelerView::new(plugin, theme))),
+        builtin::DENOISE => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            denoise::DenoiseFace::new(theme),
+        ))),
+        builtin::DECLICK => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            declick::DeclickFace::new(theme),
+        ))),
+        builtin::DEHUM => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            dehum::DehumFace::new(theme),
+        ))),
+        builtin::DECLIP => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            declip::DeclipFace::new(theme),
+        ))),
+        builtin::DEREVERB => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            dereverb::DereverbFace::new(theme),
+        ))),
+        builtin::CONVOLUTION_REVERB => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            convolution::ConvolutionFace::new(theme),
+        ))),
+        builtin::MULTIBAND_DYNAMICS => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            multiband::MultibandFace::new(theme),
+        ))),
+        builtin::VOCODER => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            vocoder::VocoderFace::new(theme),
+        ))),
+        builtin::WAVETABLE => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            wavetable::WavetableFace::new(theme),
+        ))),
+        builtin::FM => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            fm::FmFace::new(theme),
+        ))),
+        builtin::GRANULAR => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            granular::GranularFace::new(theme),
+        ))),
+        builtin::PITCH_CORRECT => Some(Box::new(kit::DeviceView::new(
+            plugin,
+            theme,
+            pitch_correct::PitchCorrectFace::new(theme),
+        ))),
         _ => None,
     }
 }
@@ -200,9 +276,24 @@ pub fn editor_size(plugin_id: &str) -> Option<(i32, i32)> {
             leveler::PANEL_W as i32,
             leveler::TOTAL_H as i32 + HEADER_BAR,
         )),
+        builtin::DENOISE => Some((1100, 540 + HEADER_BAR)),
+        builtin::DECLICK => Some((860, 480 + HEADER_BAR)),
+        builtin::DEHUM => Some((960, 500 + HEADER_BAR)),
+        builtin::DECLIP => Some((960, 500 + HEADER_BAR)),
+        builtin::DEREVERB => Some((1040, 520 + HEADER_BAR)),
+        builtin::CONVOLUTION_REVERB => Some((1040, 520 + HEADER_BAR)),
+        builtin::MULTIBAND_DYNAMICS => Some((1100, 540 + HEADER_BAR)),
+        builtin::VOCODER => Some((1240, 600 + HEADER_BAR)),
+        builtin::WAVETABLE | builtin::FM | builtin::GRANULAR => Some((
+            poly::MIN_SIZE.0 as i32,
+            poly::MIN_SIZE.1 as i32 + HEADER_BAR,
+        )),
+        builtin::PITCH_CORRECT => Some((1120, 520 + HEADER_BAR)),
         _ => None,
     }
 }
 
+#[cfg(test)]
+mod instruments_tests;
 #[cfg(test)]
 mod tests;

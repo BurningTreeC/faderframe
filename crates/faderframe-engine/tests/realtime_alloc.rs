@@ -2123,14 +2123,35 @@ fn varispeed_does_not_allocate() {
 #[test]
 fn rendering_ahead_does_not_allocate_on_the_audio_thread() {
     let _serial = serial();
-    render_ahead_without_allocating(false);
     // Buses too: strips rendered ahead, their meters, scope and automated
     // values echoed on the audio thread.
-    render_ahead_without_allocating(true);
+    for buses in [false, true] {
+        // Every try counts allocations. One that was late (a machine so
+        // busy that the anticipators, ordinary threads here, missed even
+        // the deep tier's lookahead or the shallow tier's few
+        // milliseconds) is tried again with a device that waits for them
+        // (as `ahead.rs`'s `on_time`): that every block arrives does not
+        // depend on the load then.
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let misses = render_ahead_without_allocating(buses, tries > 1);
+            if misses == 0 {
+                break;
+            }
+            assert!(
+                tries < 3,
+                "buses {buses}: {misses} render-ahead misses in every try"
+            );
+            eprintln!("buses {buses}, try {tries}: {misses} blocks late (a busy machine): again");
+        }
+    }
 }
 
+/// One run through the transport commands; the misses it had (the
+/// allocations are asserted).
 #[allow(clippy::unwrap_used)]
-fn render_ahead_without_allocating(buses: bool) {
+fn render_ahead_without_allocating(buses: bool, patient: bool) -> u64 {
     use faderframe_automation::{
         AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
         CurveShape,
@@ -2198,8 +2219,15 @@ fn render_ahead_without_allocating(buses: bool) {
     r.controller.scope().set_source(Some(drums.raw()));
     let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
     let pace = std::time::Duration::from_secs_f64(BLOCK as f64 / SR as f64);
+    let mut patience = common::Patience::new(std::time::Duration::from_secs(30));
+    let mut wait = |c: &faderframe_engine::EngineController| {
+        if patient {
+            patience.wait(c, BLOCK);
+        }
+    };
     // Warm up (the link arrives, the first sequence starts).
     for _ in 0..30 {
+        wait(&r.controller);
         r.processor.process_device(&mut bufs);
         std::thread::sleep(pace);
     }
@@ -2227,6 +2255,7 @@ fn render_ahead_without_allocating(buses: bool) {
     ] {
         r.controller.transport(cmd).unwrap();
         for _ in 0..callbacks {
+            wait(&r.controller);
             let (_, n) = armed(|| r.processor.process_device(&mut bufs));
             total += n;
             std::thread::sleep(pace);
@@ -2236,8 +2265,10 @@ fn render_ahead_without_allocating(buses: bool) {
     let (misses, scope) = (r.controller.ahead_misses(), r.controller.scope().written());
     let facts = format!("buses {buses}: {total} allocations/frees, {misses} misses, scope {scope}");
     assert_eq!(total, 0, "allocations/frees on the audio thread ({facts})");
-    assert_eq!(misses, 0, "render-ahead misses ({facts})");
-    assert!(scope > 0, "the drums reached the scope ({facts})");
+    if misses == 0 {
+        assert!(scope > 0, "the drums reached the scope ({facts})");
+    }
+    misses
 }
 
 #[test]
@@ -2885,6 +2916,97 @@ fn the_stock_devices_do_not_allocate() {
             2,
             (0.0, 1.0),
         ),
+        // De-noise in Quality (the lookahead's held frames), learning (the
+        // profile published every frame), its reduction automated; then
+        // Low Latency, unlinked, a learned profile, the noise listened to,
+        // its tilt automated.
+        (
+            builtin::DENOISE,
+            vec![set(9, 2.0), set(10, 1.0), set(5, 0.6)],
+            false,
+            1,
+            (0.0, 30.0),
+        ),
+        (
+            builtin::DENOISE,
+            vec![
+                set(9, 0.0),
+                set(12, 0.0),
+                set(11, 1.0),
+                set(8, 1.0),
+                set(13, 1.0),
+                set(20, -60.0),
+                set(40, -70.0),
+                set(60, -80.0),
+            ],
+            false,
+            4,
+            (-6.0, 6.0),
+        ),
+        // De-click finding crackle too (dense marks), its width automated.
+        (
+            builtin::DECLICK,
+            vec![set(0, 0.9), set(2, 0.7), set(4, 1.0)],
+            false,
+            1,
+            (0.2, 3.5),
+        ),
+        // De-hum deciding 50/60 and tracking 24 notches, their width
+        // automated; then a custom fundamental, the hum listened to, its
+        // depth automated.
+        (builtin::DEHUM, vec![set(2, 24.0)], false, 3, (1.0, 10.0)),
+        (
+            builtin::DEHUM,
+            vec![set(0, 3.0), set(1, 73.0), set(6, 1.0), set(5, 0.0)],
+            false,
+            4,
+            (0.2, 1.0),
+        ),
+        // De-clip at a set level under the bursts' peaks (runs to rebuild),
+        // Best quality, its output automated.
+        (
+            builtin::DECLIP,
+            vec![set(0, 0.0), set(1, -6.0), set(2, 3.0), set(4, 1.0)],
+            false,
+            5,
+            (-6.0, 0.0),
+        ),
+        // De-reverb estimating the tail, all the way; then unlinked, the
+        // reverb listened to, its tail automated.
+        (builtin::DEREVERB, vec![set(0, 1.0)], false, 0, (0.2, 1.0)),
+        (
+            builtin::DEREVERB,
+            vec![set(2, 0.0), set(7, 0.0), set(6, 1.0)],
+            false,
+            1,
+            (300.0, 3_000.0),
+        ),
+        // Pitch Correct pulling to every semitone, its retune speed
+        // automated; then to the key track a fifth up with the formants
+        // moving along, its natural vibrato automated; then the lowest
+        // range, the formants moved, half wet, following MIDI (none
+        // here), its formant automated.
+        (
+            builtin::PITCH_CORRECT,
+            vec![set(0, 3.0)],
+            false,
+            3,
+            (0.0, 200.0),
+        ),
+        (
+            builtin::PITCH_CORRECT,
+            vec![set(0, 0.0), set(7, 0.0), set(6, 7.0)],
+            false,
+            5,
+            (0.0, 2.0),
+        ),
+        (
+            builtin::PITCH_CORRECT,
+            vec![set(9, 3.0), set(8, -5.0), set(10, 0.5), set(0, 5.0)],
+            false,
+            8,
+            (-12.0, 12.0),
+        ),
     ];
     let mut ids = Vec::new();
     for (i, (plugin, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate() {
@@ -2957,7 +3079,9 @@ fn the_stock_devices_do_not_allocate() {
 }
 
 /// The instruments (the synth with everything on, the sampler and the drum
-/// sampler with samples), played live with editors watching.
+/// sampler with samples, the Wavetable with a user table, the FM in its
+/// free matrix and an algorithm, the Granular on a sample), played live
+/// with editors watching.
 #[test]
 fn the_instruments_do_not_allocate() {
     let _serial = serial();
@@ -3034,6 +3158,8 @@ fn the_instruments_do_not_allocate() {
     for (pad, f) in files.iter().enumerate() {
         drum_doc.set(pad, Some(f.clone()));
     }
+    let mut sliced_doc = sampler_doc.clone();
+    sliced_doc.set_slices(vec![3_000, 9_000, 15_000, 20_000]);
     use faderframe_plugin_host::PluginFactory;
     let instruments = [
         (
@@ -3164,6 +3290,114 @@ fn the_instruments_do_not_allocate() {
                 set(42, 4.0),
                 set(19, 3.0),
             ],
+        ),
+        // The Wavetable: a user table loaded into oscillator 1 (FM-warped
+        // by oscillator 2, which is synced), unison, sub, pink noise, the
+        // ladder, and the matrix moving the positions.
+        (
+            builtin::WAVETABLE,
+            Some(state(
+                builtin::WAVETABLE,
+                &{
+                    use faderframe_plugin_host::devices::poly::source;
+                    use faderframe_plugin_host::devices::wavetable::{USER, id, target, warp};
+                    vec![
+                        (id::osc(0, id::TABLE), USER as f64),
+                        (id::osc(0, id::WARP), warp::FM as f64),
+                        (id::osc(0, id::WARP_AMOUNT), 0.5),
+                        (id::osc(0, id::UNISON), 8.0),
+                        (id::osc(1, id::LEVEL), 0.6),
+                        (id::osc(1, id::TABLE), 2.0),
+                        (id::osc(1, id::WARP), warp::SYNC as f64),
+                        (id::osc(1, id::WARP_AMOUNT), 0.4),
+                        (id::osc(1, id::UNISON), 3.0),
+                        (id::SUB, 0.4),
+                        (id::NOISE, 0.2),
+                        (id::NOISE_COLOUR, 1.0),
+                        (id::FILTER_TYPE, 5.0),
+                        (id::mod_source(0), source::LFO2 as f64),
+                        (id::mod_target(0), target::POSITION[0] as f64),
+                        (id::mod_amount(0), 0.5),
+                        (id::mod_source(1), source::TIMBRE as f64),
+                        (id::mod_target(1), target::WARP[1] as f64),
+                        (id::mod_amount(1), 0.5),
+                        (id::REVERB_MIX, 0.3),
+                        (id::CHORUS_MIX, 0.3),
+                    ]
+                },
+                &sampler_doc,
+            )),
+            vec![],
+        ),
+        // The FM: the free matrix with every route, and an algorithm with
+        // its feedback loop.
+        (builtin::FM, None, {
+            use faderframe_plugin_host::devices::fm::{FREE_MATRIX, id};
+            let mut v = vec![
+                set(id::ALGORITHM, FREE_MATRIX as f64),
+                set(id::LFO_AMP, 0.5),
+                set(id::LFO_PITCH, 30.0),
+                set(id::PITCH_START, 5.0),
+                set(id::FILTER_TYPE, 2.0),
+                set(id::DELAY_MIX, 0.3),
+            ];
+            for k in 0..6 {
+                v.push(set(id::op(k, id::LEVEL), 80.0));
+                v.push(set(id::op(k, id::AMP_MOD), 0.5));
+                v.push(set(id::out(k), 0.5));
+                for t in 0..6 {
+                    v.push(set(id::matrix(k, t), 0.2));
+                }
+            }
+            v
+        }),
+        (builtin::FM, None, {
+            use faderframe_plugin_host::devices::fm::id;
+            vec![
+                set(id::ALGORITHM, 3.0),
+                set(id::FEEDBACK, 1.0),
+                set(id::op(1, id::LEVEL), 80.0),
+                set(id::op(2, id::LEVEL), 99.0),
+                set(id::op(3, id::LEVEL), 80.0),
+                set(id::op(4, id::LEVEL), 80.0),
+                set(id::op(5, id::LEVEL), 80.0),
+                set(id::op(1, id::FIXED), 1.0),
+            ]
+        }),
+        // The Granular on a loaded sample: dense, sprayed, jittered,
+        // reversed and scanning.
+        (
+            builtin::GRANULAR,
+            Some(state(
+                builtin::GRANULAR,
+                &{
+                    use faderframe_plugin_host::devices::granular::id;
+                    vec![
+                        (id::DENSITY, 150.0),
+                        (id::SIZE, 200.0),
+                        (id::SPRAY, 300.0),
+                        (id::JITTER, 1.0),
+                        (id::REVERSE, 0.5),
+                        (id::PITCH_RANDOM, 3.0),
+                        (id::SCAN, 0.7),
+                        (id::WINDOW, 3.0),
+                        (id::FILTER_TYPE, 1.0),
+                    ]
+                },
+                &sampler_doc,
+            )),
+            vec![],
+        ),
+        // Slice mode: a key a slice from key 44 (the keys past the
+        // slices play nothing), reversed.
+        (
+            builtin::SAMPLER,
+            Some(state(
+                builtin::SAMPLER,
+                &[(24, 1.0), (25, 44.0), (20, 1.0)],
+                &sliced_doc,
+            )),
+            vec![],
         ),
     ];
     let mut tracks = HashSet::new();
@@ -4328,6 +4562,8 @@ fn blocks_an_instrument_misses_do_not_allocate() {
     for i in 0..64u8 {
         let start = MusicalTime::from_quarters(f64::from(i) / 8.0);
         notes.push(MidiNote {
+            fine: Default::default(),
+            articulation: None,
             id: tp.project.ids.allocate(),
             start,
             length: MusicalTime::from_quarters(1.0 / 8.0),
@@ -4336,8 +4572,10 @@ fn blocks_an_instrument_misses_do_not_allocate() {
             channel: i % 4,
             muted: false,
             release: None,
+            time_locked: false,
         });
         points.push(ControllerPoint {
+            fine: Default::default(),
             time: start,
             value: if i % 2 == 0 { 127 } else { 0 },
         });
@@ -4353,6 +4591,7 @@ fn blocks_an_instrument_misses_do_not_allocate() {
             start: MusicalTime::ZERO,
             muted: false,
             content: ClipContent::Midi(MidiClip {
+                articulations: Vec::new(),
                 length: MusicalTime::from_quarters_i(8),
                 notes,
                 controllers: vec![ControllerLane {
@@ -4591,4 +4830,2012 @@ fn capturing_for_an_analysis_does_not_allocate() {
     assert!(heard > 1e-3, "the taps hear the music");
     assert!(taps.iter().all(|t| t.missed() == 0));
     assert!(capture.probes().iter().any(|p| p.stats().out_energy > 0.0));
+}
+
+/// The codec monitor: a chain taken from its mailbox, warmed up and
+/// crossfaded in, coding (Opus, or its identity stand-in in builds
+/// without libopus) and measuring every block, switched between codec,
+/// original and difference, its gain and bitrate moved, faded out and
+/// handed back — all without allocating on the audio thread.
+#[test]
+fn the_codec_monitor_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_codec::{CodecSettings, CoderKind};
+    use faderframe_engine::nodes::{CodecHear, CodecWanted};
+    for rate in [48_000u32, 44_100] {
+        let project = demo_project(rate);
+        let sources = render_generated_sources(&project, rate);
+        let config = EngineConfig {
+            sample_rate: rate,
+            ..EngineConfig::default()
+        };
+        let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+        let link = std::sync::Arc::clone(r.controller.listening().link.codec());
+        let shared = std::sync::Arc::clone(link.shared());
+        r.play_from(0).unwrap();
+        let mut bufs = OwnedBuffers::new(2, 2, 256);
+        for _ in 0..4 {
+            r.processor.process_device(&mut bufs);
+        }
+        let kind = if faderframe_codec::opus_available() {
+            CoderKind::Opus
+        } else {
+            CoderKind::Identity
+        };
+        // The chain is made here, on the control side.
+        link.set(Some(CodecWanted {
+            settings: CodecSettings {
+                kind,
+                kbps: 160,
+                vbr: true,
+            },
+            hear: CodecHear::Codec,
+            gain_db: -3.0,
+        }))
+        .unwrap();
+        let (_, allocs) = armed(|| {
+            for i in 0..400 {
+                match i {
+                    60 => shared.set_hear(CodecHear::Original),
+                    90 => shared.set_hear(CodecHear::Difference),
+                    120 => shared.set_gain(1.5),
+                    150 => shared.set_codec(64, false),
+                    180 => shared.reset_measurements(),
+                    210 => {
+                        let _ = r
+                            .controller
+                            .transport(TransportCommand::Locate(rate as i64 * 3));
+                    }
+                    _ => {}
+                }
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        assert_eq!(allocs, 0, "{rate} Hz: allocations while monitoring");
+        assert!(shared.installed() && shared.heard() == 1.0);
+        assert!(shared.reading().frames > 0);
+        link.set(None).unwrap();
+        let (_, allocs) = armed(|| {
+            for _ in 0..40 {
+                r.processor.process_device(&mut bufs);
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "{rate} Hz: turning the monitor off allocates nothing"
+        );
+        assert!(!shared.installed());
+        link.collect();
+    }
+}
+
+/// Mix scene glides (faders, pans, send levels moving on the audio
+/// thread): taken, run, replaced half-way by another, stopped, finished
+/// and handed back — none of it allocates.
+#[test]
+fn mix_scene_glides_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ChannelLayout, SendId};
+    use faderframe_project::{AuxSend, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let aux = tp.track(TrackKind::Aux, "Verb", ChannelLayout::Stereo);
+    let vox = tp.track(TrackKind::Audio, "Vox", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.3, 200_000);
+    tp.clip(vox, src, MusicalTime::ZERO, 200_000);
+    tp.project.track_mut(vox).unwrap().sends.push(AuxSend {
+        id: SendId(7000),
+        target: aux,
+        level_db: -12.0,
+        tap: Default::default(),
+        enabled: true,
+        pan: Some(0.0),
+    });
+    tp.project.ids.reserve_through(7000);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut target = tp.project.clone();
+    {
+        let t = target.track_mut(vox).unwrap();
+        t.volume_db = -20.0;
+        t.pan = -0.6;
+        t.sends[0].level_db = 0.0;
+        t.sends[0].pan = Some(0.8);
+    }
+    let mut allocs = 0;
+    // One glide, replaced half-way by another back, that one stopped,
+    // then a third run to its end.
+    let first = r.controller.glide_mix(&target, 0.1).unwrap();
+    assert!(first.is_some());
+    allocs += armed(|| {
+        for _ in 0..10 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    let back = r.controller.glide_mix(&tp.project, 0.1).unwrap();
+    assert!(back.is_some());
+    allocs += armed(|| {
+        for _ in 0..5 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    r.controller.release_glide(true).unwrap();
+    allocs += armed(|| {
+        for _ in 0..3 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    let third = r.controller.glide_mix(&target, 0.05).unwrap().unwrap();
+    allocs += armed(|| {
+        for _ in 0..20 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    assert!(r.controller.glide_done(third));
+    r.controller.collect_garbage();
+    assert_eq!(allocs, 0, "allocations while gliding");
+}
+
+#[test]
+fn self_frozen_tracks_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_files::{WavFormat, write_wav};
+    use faderframe_core::{ChannelLayout, builtin};
+    use faderframe_engine::cache::{CacheState, CachedChain};
+    use faderframe_project::{Impact, PluginRef, PluginSlot, TrackKind};
+    use faderframe_realtime::Reclaimer;
+
+    const SR: u32 = 48_000;
+    let n = 4 * SR as usize;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(TrackKind::Audio, "Cached", ChannelLayout::Stereo);
+    let src = tp.dc(2, 0.25, n);
+    tp.clip(t, src, faderframe_timeline::MusicalTime::ZERO, n as i64);
+    for id in [builtin::ECHO, builtin::SATURATOR] {
+        let slot = PluginSlot {
+            id: tp.project.ids.allocate(),
+            plugin: PluginRef::builtin(id, id),
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+        };
+        tp.project.track_mut(t).unwrap().inserts.push(slot);
+    }
+    // A cache file (its content does not matter here).
+    let path = std::env::temp_dir().join(format!("ff-rt-cached-{}.wav", std::process::id()));
+    let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+    write_wav(&path, &[data.clone(), data], SR, WavFormat::Float32, false).unwrap();
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let latency = r.controller.track_latency(t);
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+        r.controller.collect_garbage();
+    }
+    let load = |r: &mut OfflineRenderer| {
+        let plan = r.controller.stream_plan();
+        let shared = r.controller.shared();
+        plan.ensure(
+            &[(0, n as i64)],
+            &shared.epoch,
+            &mut Reclaimer::default(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    };
+    let chain = CachedChain {
+        source: faderframe_engine::Source::Stream(
+            faderframe_audio_files::StreamSource::open(&path).unwrap(),
+        ),
+        start: 0,
+        file_latency: latency,
+        latency,
+        key: 1,
+    };
+    // To the cache: the handover graph's install (adoption, delay lines
+    // carried over), the fade.
+    r.controller.set_cached(t, Some(chain));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    load(&mut r);
+    let (_, allocs) = armed(|| {
+        for _ in 0..40 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations handing a track over to its cache");
+    r.controller.collect_garbage();
+    assert!(r.controller.settle_cache());
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    assert_eq!(r.controller.cache_state(t), Some(CacheState::Cached));
+    load(&mut r);
+    // Cached: playing, a locate, a stop (the fade out), playing again.
+    let (_, allocs) = armed(|| {
+        for i in 0..120 {
+            match i {
+                30 => {
+                    let _ = r.controller.transport(TransportCommand::Locate(SR as i64));
+                }
+                60 => {
+                    let _ = r.controller.transport(TransportCommand::Stop);
+                }
+                90 => {
+                    let _ = r.controller.transport(TransportCommand::Play);
+                }
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations playing from a cache");
+    r.controller.collect_garbage();
+    // Back to the chain: its devices reset on the audio thread.
+    r.controller.release_cache(&tp.project, t);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    load(&mut r);
+    let (_, allocs) = armed(|| {
+        for _ in 0..40 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations bringing a chain back");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Articulation switches (played, chased on locates and loop wraps, a
+/// one-frame block keeping keyswitch note-offs for the next) and drum
+/// maps (clips and live input mapped, a sound sent to a port of its own)
+/// do not allocate.
+#[test]
+fn articulation_and_drum_maps_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::{ArticulationMapId, ChannelLayout, DrumMapId};
+    use faderframe_project::articulation::{ArticulationEvent, ArticulationMap};
+    use faderframe_project::drum_map::DrumMap;
+    use faderframe_project::{
+        Clip, ClipContent, Impact, MidiClip, MidiNote, MidiOutputRouting, MusicalRange, TrackColor,
+        TrackKind,
+    };
+    use faderframe_timeline::MusicalTime;
+    use std::collections::{HashMap, HashSet};
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let strings = tp.track(TrackKind::Midi, "Strings", ChannelLayout::Stereo);
+    let drums = tp.track(TrackKind::Midi, "Drums", ChannelLayout::Stereo);
+    let art_id: ArticulationMapId = tp.project.ids.allocate();
+    let map = ArticulationMap::template(art_id, "strings").unwrap();
+    let ids: Vec<_> = map.articulations.iter().map(|a| a.id).collect();
+    let attribute = map.find("Staccato").unwrap().id;
+    let drum_id: DrumMapId = tp.project.ids.allocate();
+    let mut kit = DrumMap::gm(drum_id);
+    kit.sound_mut(36).unwrap().output_note = Some(24);
+    kit.sound_mut(38).unwrap().channel = Some(3);
+    kit.sound_mut(42).unwrap().port = Some("Other".into());
+    let clip = |tp: &mut common::TestProject, track, keys: &[u8], every: f64, art: bool| {
+        let notes: Vec<MidiNote> = (0..64u32)
+            .map(|i| MidiNote {
+                fine: Default::default(),
+                time_locked: false,
+                id: tp.project.ids.allocate(),
+                start: MusicalTime::from_quarters(f64::from(i) * every),
+                length: MusicalTime::from_quarters(every * 0.8),
+                key: keys[i as usize % keys.len()],
+                velocity: 90,
+                channel: 0,
+                muted: false,
+                release: None,
+                articulation: (art && i % 3 == 0).then_some(attribute),
+            })
+            .collect();
+        let articulations = if art {
+            (0..16u32)
+                .map(|i| ArticulationEvent {
+                    time: MusicalTime::from_quarters(f64::from(i)),
+                    articulation: ids[i as usize % ids.len()],
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let id = tp.project.ids.allocate();
+        tp.project.clips.insert(
+            id,
+            Clip {
+                id,
+                track,
+                name: "Notes".into(),
+                color: Some(TrackColor::palette(1)),
+                start: MusicalTime::ZERO,
+                muted: false,
+                content: ClipContent::Midi(MidiClip {
+                    length: MusicalTime::from_quarters_i(16),
+                    notes,
+                    articulations,
+                    ..MidiClip::default()
+                }),
+            },
+        );
+        tp.project.track_mut(track).unwrap().clips.push(id);
+    };
+    clip(&mut tp, strings, &[60, 64, 67], 0.25, true);
+    clip(&mut tp, drums, &[36, 38, 42, 46], 0.125, false);
+    for (t, port) in [(strings, "Synth"), (drums, "Synth")] {
+        tp.project.track_mut(t).unwrap().midi_output = Some(MidiOutputRouting {
+            port: port.into(),
+            channel: None,
+        });
+    }
+    tp.project.articulation_maps.push(map);
+    tp.project.drum_maps.push(kit);
+    tp.project.track_mut(strings).unwrap().articulation_map = Some(art_id);
+    tp.project.track_mut(drums).unwrap().drum_map = Some(drum_id);
+    tp.project.loop_range = MusicalRange::new(
+        MusicalTime::from_quarters(1.3),
+        MusicalTime::from_quarters(3.1),
+    );
+    tp.project.loop_enabled = true;
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.controller.set_midi_output_ports(HashMap::from([
+        ("Synth".to_string(), 1),
+        ("Other".to_string(), 2),
+    ]));
+    r.controller.set_midi_live(HashSet::from([drums]));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    let clock = tx.clock();
+    r.controller.set_midi_input(q).unwrap();
+    let (oq, mut orx) = faderframe_midi::midi_output_queue(8192, clock);
+    r.controller.set_midi_output(oq).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    let mut one = OwnedBuffers::new(2, 2, 1);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut allocs = 0;
+    let (mut switches, mut elsewhere) = (0, 0);
+    for round in 0..12i64 {
+        tx.send(0, &[0x90, 36 + (round % 8) as u8, 100]);
+        allocs += armed(|| {
+            for _ in 0..30 {
+                r.processor.process_device(&mut bufs);
+            }
+            // A block one frame long right after a jump's chase.
+            r.processor.process_device(&mut one);
+        })
+        .1;
+        tx.send(0, &[0x80, 36 + (round % 8) as u8, 0]);
+        r.controller
+            .transport(TransportCommand::Locate(round * 7_919 % 192_000))
+            .unwrap();
+        allocs += armed(|| {
+            r.processor.process_device(&mut one);
+            r.processor.process_device(&mut bufs);
+        })
+        .1;
+        while let Ok(e) = orx.pop() {
+            // The Strings template's keyswitches (C0…E0) and the hi-hat
+            // on its own port.
+            switches += usize::from(e.bytes()[0] == 0x90 && (24..=28).contains(&e.bytes()[1]));
+            elsewhere += usize::from(e.port == 2);
+        }
+    }
+    assert!(
+        switches > 10 && elsewhere > 10,
+        "{switches} switches, {elsewhere} elsewhere"
+    );
+    r.controller.transport(TransportCommand::Stop).unwrap();
+    allocs += armed(|| {
+        for _ in 0..4 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    assert_eq!(allocs, 0, "allocations with articulation and drum maps");
+}
+
+/// A device input tapped for the control side (A/V calibration hears its
+/// beeps through it): every callback's input copied with its stamp, a
+/// full ring counted as lost, the tap replaced and taken away — nothing
+/// allocates on the audio thread.
+#[test]
+fn tapping_an_input_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio::{AudioCallback, StreamInfo};
+    use faderframe_project::Impact;
+
+    const SR: u32 = 48_000;
+    let tp = common::TestProject::new(SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let (mut c, mut p) = faderframe_engine::create(config);
+    AudioCallback::prepare(
+        &mut p,
+        &StreamInfo {
+            backend: "test",
+            device: "two".into(),
+            sample_rate: SR,
+            buffer_size: 256,
+            input_channels: 2,
+            output_channels: 2,
+            input_latency: 0,
+            output_latency: 0,
+        },
+    );
+    c.sync(&tp.project, &tp.sources, Impact::Graph).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    // Room for a quarter of a second: the 400 callbacks below overflow it.
+    let mut tap = c.tap_input(1, 0.25).unwrap();
+    for _ in 0..4 {
+        p.process_device(&mut bufs);
+        c.collect_garbage();
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..400 {
+            p.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations tapping an input");
+    let (samples, stamps) = tap.drain();
+    assert!(!samples.is_empty() && !stamps.is_empty());
+    // Replaced, then taken away: the old ends go back as garbage.
+    let _next = c.tap_input(0, 0.25).unwrap();
+    let (_, allocs) = armed(|| p.process_device(&mut bufs));
+    assert_eq!(allocs, 0, "allocations replacing the tap");
+    c.collect_garbage();
+    c.untap_input().unwrap();
+    let (_, allocs) = armed(|| p.process_device(&mut bufs));
+    assert_eq!(allocs, 0, "allocations taking the tap away");
+    c.collect_garbage();
+    assert!(tap.is_finished());
+}
+
+/// An ARA insert (the mock ARA plug-in) rendering its track's clip, with a
+/// latent plugin before it (its transport set back), through a locate,
+/// a stop and a moved clip (the region updated in an edit cycle).
+#[test]
+fn an_ara_renderer_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_plugin_host::ara_mock::{self, AraMockFactory};
+    use faderframe_project::{Impact, PluginFormat, PluginRef, PluginSlot, SavedParameter};
+    faderframe_plugin_host::set_default_registry(|| {
+        let mut r = faderframe_plugin_host::PluginRegistry::with_builtins();
+        r.add_factory(Box::new(AraMockFactory));
+        r
+    });
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let mut tp = common::TestProject::new(SR);
+    let t = tp.track(
+        faderframe_project::TrackKind::Audio,
+        "Vocals",
+        faderframe_core::ChannelLayout::Stereo,
+    );
+    let src = tp.dc(2, 0.25, SR as usize);
+    tp.clip(
+        t,
+        src,
+        faderframe_timeline::MusicalTime::from_quarters(1.0),
+        SR as i64,
+    );
+    let clip = *tp.project.track(t).unwrap().clips.last().unwrap();
+    let latency = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(faderframe_core::builtin::LATENCY_PROBE, "Latency"),
+        bypass: false,
+        parameters: vec![SavedParameter {
+            id: faderframe_core::ParameterId(0),
+            value: 300.0,
+        }],
+        state: None,
+        sidechain: None,
+    };
+    let ara = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef {
+            format: PluginFormat::Clap,
+            id: ara_mock::ID.into(),
+            name: ara_mock::NAME.into(),
+        },
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    tp.project.ara.slots.insert(ara.id);
+    tp.project.track_mut(t).unwrap().inserts = vec![latency, ara];
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    r.play_from(0).unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for i in 0..400 {
+            match i {
+                150 => {
+                    let _ = r
+                        .controller
+                        .transport(TransportCommand::Locate(SR as i64 / 4));
+                }
+                250 => {
+                    let _ = r.controller.transport(TransportCommand::Stop);
+                }
+                300 => {
+                    let _ = r.controller.transport(TransportCommand::Play);
+                }
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations rendering through ARA");
+    // The clip moves: its region's properties change in an edit cycle on
+    // the control thread; the renderer keeps playing.
+    tp.project.clips.get_mut(&clip).unwrap().start =
+        faderframe_timeline::MusicalTime::from_quarters(2.0);
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Timeline)
+        .unwrap();
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    r.controller.collect_garbage();
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations after the move");
+}
+
+#[test]
+fn ambisonics_and_head_tracking_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::ambisonics::Orientation;
+    use faderframe_core::surround::StereoSource;
+    use faderframe_core::{AmbiOrder, ChannelLayout, SurroundFormat, SurroundPan, SurroundParam};
+    use faderframe_project::{OutputRouting, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let master = tp.master();
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Surround(SurroundFormat::S714);
+    // A third-order field (decoded into the 7.1.4 master), a mono track
+    // and a stereo image encoded into it with their directions automated,
+    // a 5.1 bed encoded into it too.
+    let field = tp.track(
+        TrackKind::Bus,
+        "Field",
+        ChannelLayout::Ambisonic(AmbiOrder::Third),
+    );
+    let mono = tp.track(TrackKind::Audio, "Mono", ChannelLayout::Mono);
+    let image = tp.track(TrackKind::Audio, "Image", ChannelLayout::Stereo);
+    let bed = tp.track(
+        TrackKind::Audio,
+        "Bed",
+        ChannelLayout::Surround(SurroundFormat::S51),
+    );
+    for (t, channels) in [(mono, 1), (image, 2), (bed, 6)] {
+        let src = tp.dc(channels, 0.3, 200_000);
+        tp.clip(t, src, MusicalTime::ZERO, 200_000);
+        tp.project.track_mut(t).unwrap().output = OutputRouting::Track { track: field };
+    }
+    tp.project.track_mut(image).unwrap().surround = SurroundPan {
+        stereo: StereoSource::Image,
+        width: 0.7,
+        spread: 0.3,
+        ..SurroundPan::default()
+    };
+    let sweep = |centre: f64, span: f64| {
+        AutomationCurve::from_points(
+            (0..20)
+                .map(|i| AutomationPoint {
+                    time: MusicalTime::from_quarters(i as f64 * 0.25),
+                    value: centre + if i % 2 == 0 { -span } else { span },
+                    shape: CurveShape::Linear,
+                })
+                .collect(),
+        )
+    };
+    // (The distance 0.1 … 1.9: inside the reference and beyond it.)
+    for (t, p, centre, span) in [
+        (mono, SurroundParam::Azimuth, 0.0, 170.0),
+        (mono, SurroundParam::Elevation, 0.0, 60.0),
+        (image, SurroundParam::Azimuth, 0.0, 120.0),
+        (image, SurroundParam::Distance, 1.0, 0.9),
+    ] {
+        let id = tp.project.ids.allocate();
+        let curve = sweep(centre, span);
+        tp.project
+            .track_mut(t)
+            .unwrap()
+            .automation
+            .lanes
+            .push(AutomationLane {
+                id,
+                target: AutomationTarget::Surround(p),
+                curve,
+                mode: AutomationMode::Read,
+                visible: true,
+            });
+    }
+    // The Ambisonic Rotator on the field, its yaw automated.
+    let rotator = tp.project.ids.allocate();
+    let lane = tp.project.ids.allocate();
+    {
+        let track = tp.project.track_mut(field).unwrap();
+        track.inserts.push(faderframe_project::PluginSlot {
+            id: rotator,
+            plugin: faderframe_project::PluginRef::builtin(
+                faderframe_core::builtin::AMBI_ROTATOR,
+                faderframe_core::builtin::AMBI_ROTATOR,
+            ),
+            bypass: false,
+            parameters: vec![faderframe_project::SavedParameter {
+                id: faderframe_core::ParameterId(1),
+                value: 20.0,
+            }],
+            state: None,
+            sidechain: None,
+        });
+        track.automation.lanes.push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::PluginParameter {
+                plugin: rotator,
+                parameter: faderframe_core::ParameterId(0),
+            },
+            curve: sweep(0.0, 150.0),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 12).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 12, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut allocs = armed(|| {
+        for _ in 0..120 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    // Headphones: the head turned every block (as a tracker would),
+    // gliding and straight.
+    r.controller
+        .set_binaural(Some(faderframe_binaural::Room::Mid));
+    r.controller.relisten(&tp.project);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    r.controller.set_head_smoothing(0.02);
+    allocs += armed(|| {
+        for i in 0..120 {
+            let a = i as f32 * 3.0;
+            r.controller
+                .set_head_orientation(Orientation::from_ypr(a, 0.3 * a, -0.2 * a));
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::None)
+        .unwrap();
+    // An ambisonic master heard on headphones, the field turned.
+    tp.project.track_mut(master).unwrap().layout = ChannelLayout::Ambisonic(AmbiOrder::Second);
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    // On the speakers first: a stereo device decodes the field.
+    allocs += armed(|| {
+        for _ in 0..60 {
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    r.controller
+        .set_binaural(Some(faderframe_binaural::Room::Near));
+    r.controller.relisten(&tp.project);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    allocs += armed(|| {
+        for i in 0..120 {
+            r.controller
+                .set_head_orientation(Orientation::from_ypr(-(i as f32) * 2.0, 10.0, 0.0));
+            r.processor.process_device(&mut bufs);
+        }
+    })
+    .1;
+    assert_eq!(
+        allocs, 0,
+        "allocations encoding, decoding and turning fields"
+    );
+    r.controller
+        .sync(&tp.project, &tp.sources, faderframe_project::Impact::None)
+        .unwrap();
+}
+
+/// Retuning plays without allocating: a built-in synth reading the table,
+/// hosted instruments given tuning expressions, MTS SysEx (a bulk dump,
+/// then real-time changes when the tuning changes while playing) and MPE
+/// bends, and a MIDI track's external output.
+#[test]
+fn retuning_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_graph::NodeIo;
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_midi::tuning::Tuning;
+    use faderframe_plugin_host::{
+        AudioPortInfo, ParameterInfo, PluginCategory, PluginDescriptor, PluginError, PluginFactory,
+        PluginFormat, PluginInstance, PluginProcessContext, PluginProcessor, PluginRegistry,
+        ProcessConfig, ProcessStatus, TailLength,
+    };
+    use faderframe_project::{
+        Clip, ClipContent, Impact, MidiClip, MidiNote, MidiOutputRouting, MpeConfig, PluginRef,
+        PluginSlot, TrackKind,
+    };
+    use faderframe_timeline::MusicalTime;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+
+    /// SysEx messages and tuning expressions that reached the listeners.
+    static SYSEX: AtomicU64 = AtomicU64::new(0);
+    static EXPRESSIONS: AtomicU64 = AtomicU64::new(0);
+
+    struct Factory;
+    struct Instance(PluginDescriptor);
+    struct Listener;
+
+    impl PluginFactory for Factory {
+        fn format(&self) -> PluginFormat {
+            PluginFormat::Clap
+        }
+        fn scan(&self) -> Vec<PluginDescriptor> {
+            Vec::new()
+        }
+        fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
+            Ok(Box::new(Instance(PluginDescriptor {
+                format: PluginFormat::Clap,
+                id: id.into(),
+                name: "Listener".into(),
+                vendor: "FaderFrame".into(),
+                version: "1".into(),
+                category: PluginCategory::Instrument,
+                audio_inputs: Vec::new(),
+                audio_outputs: vec![AudioPortInfo {
+                    channels: 2,
+                    is_main: true,
+                }],
+                note_inputs: 1,
+                note_outputs: 0,
+            })))
+        }
+    }
+
+    impl PluginInstance for Instance {
+        fn descriptor(&self) -> &PluginDescriptor {
+            &self.0
+        }
+        fn parameters(&self) -> &[ParameterInfo] {
+            &[]
+        }
+        fn parameter(&mut self, _id: ParameterId) -> Option<f64> {
+            None
+        }
+        fn set_parameter(&mut self, id: ParameterId, _v: f64) -> Result<(), PluginError> {
+            Err(PluginError::UnknownParameter(id))
+        }
+        fn latency_samples(&self) -> u32 {
+            0
+        }
+        fn tail(&self) -> TailLength {
+            TailLength::None
+        }
+        fn save_state(&mut self) -> Result<Vec<u8>, PluginError> {
+            Ok(Vec::new())
+        }
+        fn load_state(&mut self, _data: &[u8]) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn note_expressions(&self) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
+            self.0.id.ends_with("mts").then(Vec::new)
+        }
+        fn create_processor(
+            &mut self,
+            _c: &ProcessConfig,
+        ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+            Ok(Box::new(Listener))
+        }
+    }
+
+    impl PluginProcessor for Listener {
+        fn process(
+            &mut self,
+            _ctx: &PluginProcessContext<'_>,
+            io: &mut NodeIo<'_>,
+        ) -> ProcessStatus {
+            for out in io.audio_out.iter_mut() {
+                out.clear();
+            }
+            if let Some(midi) = io.events_in.first() {
+                for e in midi.iter() {
+                    match e.event {
+                        faderframe_midi::MidiEvent::SysEx(_) => {
+                            SYSEX.fetch_add(1, Ordering::Relaxed);
+                        }
+                        faderframe_midi::MidiEvent::NoteExpression { .. } => {
+                            EXPRESSIONS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ProcessStatus::Continue
+        }
+        fn reset(&mut self) {}
+    }
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let slot = |tp: &mut common::TestProject, plugin: PluginRef| PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin,
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    let listener = |id: &str| PluginRef {
+        format: faderframe_project::PluginFormat::Clap,
+        id: id.into(),
+        name: "Listener".into(),
+    };
+    let mut tracks = Vec::new();
+    for (name, plugin, mpe) in [
+        ("Synth", PluginRef::builtin(builtin::SYNTH, "Synth"), None),
+        ("Expression", listener("test.retune.expression"), None),
+        ("MTS", listener("test.retune.mts"), None),
+        (
+            "MPE",
+            listener("test.retune.mpe"),
+            Some(MpeConfig::default()),
+        ),
+    ] {
+        let t = tp.track(TrackKind::Instrument, name, ChannelLayout::Stereo);
+        let s = slot(&mut tp, plugin);
+        let track = tp.project.track_mut(t).unwrap();
+        track.inserts = vec![s];
+        track.mpe = mpe;
+        tracks.push(t);
+    }
+    let ext = tp.track(TrackKind::Midi, "External", ChannelLayout::Stereo);
+    tp.project.track_mut(ext).unwrap().midi_output = Some(MidiOutputRouting {
+        port: "Synth:Synth In".into(),
+        channel: None,
+    });
+    tracks.push(ext);
+    // Sixteenths over two octaves on every track.
+    for &t in &tracks {
+        let mut notes = Vec::new();
+        for i in 0..32u8 {
+            notes.push(MidiNote {
+                fine: Default::default(),
+                articulation: None,
+                id: tp.project.ids.allocate(),
+                start: MusicalTime::from_quarters(f64::from(i) / 4.0),
+                length: MusicalTime::from_quarters(0.2),
+                key: 48 + i % 24,
+                velocity: 100,
+                channel: 0,
+                muted: false,
+                release: None,
+                time_locked: false,
+            });
+        }
+        let id = tp.project.ids.allocate();
+        tp.project.clips.insert(
+            id,
+            Clip {
+                id,
+                track: t,
+                name: "Notes".into(),
+                color: None,
+                start: MusicalTime::ZERO,
+                muted: false,
+                content: ClipContent::Midi(MidiClip {
+                    articulations: Vec::new(),
+                    length: MusicalTime::from_quarters_i(8),
+                    notes,
+                    controllers: Vec::new(),
+                    expressions: Vec::new(),
+                    sysex: Vec::new(),
+                }),
+            },
+        );
+        tp.project.track_mut(t).unwrap().clips.push(id);
+    }
+    tp.project.tuning = Some(Tuning::equal(19));
+    tp.project.reference_pitch = 432.0;
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let mut registry = PluginRegistry::with_builtins();
+    registry.add_factory(Box::new(Factory));
+    *r.controller.plugins() = faderframe_engine::PluginHost::new(registry);
+    r.controller
+        .set_midi_output_ports(HashMap::from([("Synth:Synth In".to_string(), 2)]));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(64);
+    r.controller.set_midi_input(q).unwrap();
+    let (oq, mut orx) = faderframe_midi::midi_output_queue(1 << 14, tx.clock());
+    r.controller.set_midi_output(oq).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    let (_, n) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations retuning");
+    // Another tuning while playing (made on the control side): real-time
+    // MTS changes, the synth given the new table.
+    tp.project.tuning = Some(Tuning::equal(31));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Timeline)
+        .unwrap();
+    let (_, n) = armed(|| {
+        for _ in 0..200 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations after a new tuning");
+    r.controller.collect_garbage();
+    assert_eq!(
+        SYSEX.load(Ordering::Relaxed),
+        1 + 2,
+        "a dump, then two changes"
+    );
+    assert!(
+        EXPRESSIONS.load(Ordering::Relaxed) >= 8,
+        "tuning expressions"
+    );
+    let out: Vec<_> = std::iter::from_fn(|| orx.pop().ok())
+        .filter(|e| e.port == 2)
+        .collect();
+    assert!(
+        out.iter().any(|e| e.expression.is_some()),
+        "per-note pitch on the output"
+    );
+}
+
+/// Clips at MIDI 2.0's resolution (16-bit velocities, 32-bit controller
+/// lanes, chased on every jump) and live MIDI 2.0 input played to a MIDI
+/// output and the built-in synth: the resolution rides beside the events,
+/// nothing allocates.
+#[test]
+fn midi2_resolution_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_core::ChannelLayout;
+    use faderframe_midi::ump::{Attribute, Message, Voice2};
+    use faderframe_project::{
+        Clip, ClipContent, ControllerLane, ControllerPoint, Impact, MidiClip, MidiController,
+        MidiNote, MidiOutputRouting, MusicalRange, PluginRef, PluginSlot, TrackColor, TrackKind,
+    };
+    use faderframe_timeline::MusicalTime;
+    use std::collections::{HashMap, HashSet};
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    let out = tp.track(TrackKind::Midi, "Out", ChannelLayout::Stereo);
+    let synth = tp.track(TrackKind::Instrument, "Synth", ChannelLayout::Stereo);
+    let synth_slot = PluginSlot {
+        id: tp.project.ids.allocate(),
+        plugin: PluginRef::builtin(faderframe_core::builtin::SYNTH, "Synth"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    };
+    tp.project.track_mut(synth).unwrap().inserts = vec![synth_slot];
+    for t in [out, synth] {
+        let notes: Vec<MidiNote> = (0..64u32)
+            .map(|i| {
+                let mut n = MidiNote {
+                    id: tp.project.ids.allocate(),
+                    start: MusicalTime::from_quarters(f64::from(i) * 0.25),
+                    length: MusicalTime::from_quarters(0.2),
+                    key: 48 + (i % 24) as u8,
+                    velocity: 90,
+                    channel: 0,
+                    muted: false,
+                    release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
+                };
+                n.set_velocity16(0x1000 + i as u16 * 0x0321);
+                n.set_release16(Some(0x0123 + i as u16));
+                n
+            })
+            .collect();
+        let mut wheel = ControllerLane::new(MidiController::MOD_WHEEL, 0);
+        let mut bend = ControllerLane::new(MidiController::PitchBend, 0);
+        for i in 0..64u32 {
+            let at = MusicalTime::from_quarters(f64::from(i) * 0.25 + 0.1);
+            wheel.points.push(ControllerPoint::at32(
+                at,
+                MidiController::MOD_WHEEL,
+                i.wrapping_mul(0x0400_1003),
+            ));
+            bend.points.push(ControllerPoint::at32(
+                at,
+                MidiController::PitchBend,
+                0x8000_0000u32.wrapping_add(i * 0x0001_0101),
+            ));
+        }
+        let id = tp.project.ids.allocate();
+        tp.project.clips.insert(
+            id,
+            Clip {
+                id,
+                track: t,
+                name: "Fine".into(),
+                color: Some(TrackColor::palette(1)),
+                start: MusicalTime::ZERO,
+                muted: false,
+                content: ClipContent::Midi(MidiClip {
+                    length: MusicalTime::from_quarters_i(16),
+                    notes,
+                    controllers: vec![wheel, bend],
+                    ..MidiClip::default()
+                }),
+            },
+        );
+        tp.project.track_mut(t).unwrap().clips.push(id);
+    }
+    tp.project.track_mut(out).unwrap().midi_output = Some(MidiOutputRouting {
+        port: "Synth 2".into(),
+        channel: None,
+    });
+    tp.project.loop_range = MusicalRange::new(
+        MusicalTime::from_quarters(1.3),
+        MusicalTime::from_quarters(5.1),
+    );
+    tp.project.loop_enabled = true;
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.controller
+        .set_midi_output_ports(HashMap::from([("Synth 2".to_string(), 1)]));
+    r.controller.set_midi_live(HashSet::from([synth]));
+    r.controller
+        .sync(&tp.project, &tp.sources, Impact::Graph)
+        .unwrap();
+    let (tx, q, _feed) = faderframe_midi::midi_input_queue(256);
+    let clock = tx.clock();
+    r.controller.set_midi_input(q).unwrap();
+    let (oq, mut orx) = faderframe_midi::midi_output_queue(8192, clock);
+    r.controller.set_midi_output(oq).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let mut state = faderframe_midi::UmpInput::default();
+    let mut ump = |voice| {
+        let p = Message::Midi2 {
+            group: 0,
+            channel: 0,
+            voice,
+        }
+        .to_ump();
+        tx.send_ump(0, &p, &mut state);
+    };
+    let (mut allocs, mut fine) = (0, 0);
+    for round in 0..12u32 {
+        ump(Voice2::NoteOn {
+            note: 72 + (round % 8) as u8,
+            velocity: 0x4321 + round as u16,
+            attribute: Attribute::default(),
+        });
+        ump(Voice2::ControlChange {
+            index: 74,
+            value: round.wrapping_mul(0x1357_9BDF),
+        });
+        allocs += armed(|| {
+            for _ in 0..30 {
+                r.processor.process_device(&mut bufs);
+            }
+        })
+        .1;
+        ump(Voice2::NoteOff {
+            note: 72 + (round % 8) as u8,
+            velocity: 0x0042,
+            attribute: Attribute::default(),
+        });
+        r.controller
+            .transport(TransportCommand::Locate(i64::from(round) * 7_919 % 192_000))
+            .unwrap();
+        allocs += armed(|| {
+            r.processor.process_device(&mut bufs);
+        })
+        .1;
+        while let Ok(e) = orx.pop() {
+            fine += usize::from(e.fine.value.is_some());
+        }
+    }
+    assert!(fine > 50, "{fine} events left with their 16 or 32 bits");
+    assert_eq!(allocs, 0, "allocations at MIDI 2.0's resolution");
+}
+
+/// The Convolution Reverb (a true-stereo impulse file and a built-in space,
+/// its pre-delay automated), Multiband Dynamics (minimum and linear phase,
+/// keyed, a crossover and a threshold automated) and the Vocoder (the
+/// synth's chord, following the voice, the sidechain carrying): nothing
+/// allocates — not even when new responses and crossovers come in from
+/// the designers' threads (kernels crossfaded in, an engine replaced, the
+/// old handed back).
+#[test]
+fn the_convolution_multiband_and_vocoder_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio_files::AudioData;
+    use faderframe_automation::{
+        AutomationCurve, AutomationLane, AutomationMode, AutomationPoint, AutomationTarget,
+        CurveShape,
+    };
+    use faderframe_core::{ChannelLayout, ParameterId, builtin};
+    use faderframe_plugin_host::devices::samples::{SampleDoc, pack};
+    use faderframe_plugin_host::devices::{convolution as conv, multiband as mb, vocoder as voc};
+    use faderframe_plugin_host::{ParamValues, PluginFactory};
+    use faderframe_project::{PluginRef, PluginSlot, SavedParameter, TrackKind};
+    use faderframe_timeline::MusicalTime;
+
+    const SR: u32 = 48_000;
+    let dir = std::env::temp_dir().join(format!("ff-alloc-impulse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ir = dir.join("hall.wav");
+    let mut seed = 7u32;
+    let channels: Vec<Vec<f32>> = (0..4)
+        .map(|_| {
+            (0..60_000)
+                .map(|n| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    (seed as f32 / u32::MAX as f32 - 0.5) * (-(n as f32) / 9_000.0).exp()
+                })
+                .collect()
+        })
+        .collect();
+    faderframe_audio_files::write_wav(
+        &ir,
+        &channels,
+        44_100,
+        faderframe_audio_files::WavFormat::Float32,
+        false,
+    )
+    .unwrap();
+    let mut doc = SampleDoc::default();
+    doc.set(0, Some(ir.to_string_lossy().into_owned()));
+    let state = |id: &str, set: &[(u32, f64)]| {
+        let params = ParamValues::new(
+            faderframe_plugin_host::builtin::BuiltinFactory
+                .instantiate(id)
+                .unwrap()
+                .parameters()
+                .to_vec(),
+        );
+        for (k, v) in set {
+            params.set_by_id(ParameterId(*k), *v).unwrap();
+        }
+        faderframe_engine::encode_state(&pack(&params.save(), &doc))
+    };
+    let set = |id: u32, value: f64| SavedParameter {
+        id: ParameterId(id),
+        value,
+    };
+    let mut tp = common::TestProject::new(SR);
+    let frames = 200_000;
+    let voice = |f: f64, amp: f64| -> Vec<f32> {
+        (0..frames)
+            .map(|n| {
+                let t = n as f64 / f64::from(SR);
+                let on = (n / 9_000) % 3 != 2;
+                let v: f64 = (1..8)
+                    .map(|h| (std::f64::consts::TAU * f * h as f64 * t).sin() / h as f64)
+                    .sum();
+                if on { (amp * v) as f32 } else { 0.0 }
+            })
+            .collect()
+    };
+    let key_track = tp.track(TrackKind::Audio, "Key", ChannelLayout::Stereo);
+    let key = tp.source(AudioData::from_channels(
+        SR,
+        vec![voice(55.0, 0.5), voice(55.0, 0.5)],
+    ));
+    tp.clip(key_track, key, MusicalTime::ZERO, frames as i64);
+    // A device, its saved state, explicit parameters, whether keyed, an
+    // automated parameter and its range.
+    type Device = (
+        &'static str,
+        Option<String>,
+        Vec<SavedParameter>,
+        bool,
+        u32,
+        (f64, f64),
+    );
+    let devices: Vec<Device> = vec![
+        (
+            builtin::CONVOLUTION_REVERB,
+            Some(state(
+                builtin::CONVOLUTION_REVERB,
+                &[(conv::id::SPACE, 0.0)],
+            )),
+            vec![set(conv::id::MIX, 0.5)],
+            false,
+            conv::id::MIX,
+            (0.2, 0.8),
+        ),
+        (
+            builtin::CONVOLUTION_REVERB,
+            None,
+            vec![
+                set(conv::id::SPACE, 7.0),
+                set(conv::id::LOW_CUT, 200.0),
+                set(conv::id::HIGH_CUT, 6_000.0),
+            ],
+            false,
+            conv::id::PRE_DELAY,
+            (0.0, 120.0),
+        ),
+        (
+            builtin::MULTIBAND_DYNAMICS,
+            None,
+            vec![
+                set(mb::id::BANDS, 6.0),
+                set(mb::id::LOOKAHEAD, 3.0),
+                set(mb::id::band(0, mb::id::MODE), 1.0),
+                set(mb::id::band(2, mb::id::MODE), 2.0),
+                set(mb::id::band(4, mb::id::MODE), 3.0),
+            ],
+            true,
+            mb::id::CROSSOVER + 1,
+            (300.0, 900.0),
+        ),
+        (
+            builtin::MULTIBAND_DYNAMICS,
+            None,
+            vec![set(mb::id::PHASE, 1.0), set(mb::id::DETECTOR, 1.0)],
+            false,
+            mb::id::band(1, mb::id::THRESHOLD),
+            (-40.0, -10.0),
+        ),
+        (
+            builtin::VOCODER,
+            None,
+            vec![set(voc::id::BANDS, 6.0), set(voc::id::ENHANCE, 0.0)],
+            false,
+            voc::id::FORMANT,
+            (-6.0, 6.0),
+        ),
+        (
+            builtin::VOCODER,
+            None,
+            vec![set(voc::id::PITCH, 2.0), set(voc::id::NOISE, 0.3)],
+            false,
+            voc::id::RELEASE,
+            (20.0, 200.0),
+        ),
+        (
+            builtin::VOCODER,
+            None,
+            vec![set(voc::id::CARRIER, 2.0), set(voc::id::SPACING, 1.0)],
+            true,
+            voc::id::UNVOICED,
+            (0.0, 1.0),
+        ),
+    ];
+    let mut ids = Vec::new();
+    for (i, (plugin, state, parameters, keyed, target, (lo, hi))) in devices.into_iter().enumerate()
+    {
+        let t = tp.track(TrackKind::Audio, &format!("T{i}"), ChannelLayout::Stereo);
+        let src = tp.source(AudioData::from_channels(
+            SR,
+            vec![voice(220.0, 0.3), voice(330.0, 0.3)],
+        ));
+        tp.clip(t, src, MusicalTime::ZERO, frames as i64);
+        let id = tp.project.ids.allocate();
+        let lane = tp.project.ids.allocate();
+        let track = tp.project.track_mut(t).unwrap();
+        track.inserts.push(PluginSlot {
+            id,
+            plugin: PluginRef::builtin(plugin, plugin),
+            bypass: false,
+            parameters,
+            state,
+            sidechain: keyed.then_some(key_track),
+        });
+        track.automation.lanes.push(AutomationLane {
+            id: lane,
+            target: AutomationTarget::PluginParameter {
+                plugin: id,
+                parameter: ParameterId(target),
+            },
+            curve: AutomationCurve::from_points(
+                (0..20)
+                    .map(|i| AutomationPoint {
+                        time: MusicalTime::from_quarters(i as f64 * 0.25),
+                        value: if i % 2 == 0 { lo } else { hi },
+                        shape: CurveShape::Smooth,
+                    })
+                    .collect(),
+            ),
+            mode: AutomationMode::Read,
+            visible: true,
+        });
+        ids.push(id);
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    let taps: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            r.controller
+                .plugin_tap(*id)
+                .expect("a stock device has a tap")
+        })
+        .collect();
+    // The file's response plays: four channels.
+    assert_eq!(taps[0].value(conv::value::CHANNELS), 4.0);
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        taps.iter().for_each(|t| t.watch());
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            taps.iter().for_each(|t| t.watch());
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations in the devices");
+    // New shapes from the designers: the file's response shortened (new
+    // kernels), the built-in space changed (a new engine), the linear-phase
+    // crossovers moved (new FIR kernels).
+    let set_param = |t: &faderframe_plugin_host::tap::AnalysisTap, id: u32, v: f64| {
+        t.params.set_by_id(ParameterId(id), v).unwrap();
+    };
+    set_param(&taps[0], conv::id::LENGTH, 0.4);
+    set_param(&taps[1], conv::id::SPACE, 8.0);
+    set_param(&taps[3], mb::id::CROSSOVER + 2, 3_500.0);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let (_, allocs) = armed(|| {
+        for _ in 0..400 {
+            taps.iter().for_each(|t| t.watch());
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations taking new responses in");
+    let seconds = taps[0].value(conv::value::SECONDS);
+    assert!(
+        (seconds - 0.4 * 60_000.0 / 44_100.0).abs() < 0.02,
+        "{seconds}"
+    );
+    for t in &taps {
+        assert!(t.input.written() > 0, "an editor's rings were fed");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The engine joined to devices that follow the master's clock: a 44.1 kHz
+/// interface whose inputs a track monitors, and one playing the outputs, both drifting, both through their rings and
+/// resamplers — then each coming back with a new link, taken by the
+/// master's callback and the old one handed back.
+#[test]
+fn joining_followers_to_the_engine_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio::follow::{Direction, FollowerEnd, FollowerSpec, Place, join};
+    use faderframe_audio::{AudioCallback, StreamInfo};
+    use faderframe_project::Impact;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    // A stereo track monitoring the follower's two inputs.
+    let t = tp.track(
+        faderframe_project::TrackKind::Audio,
+        "Box",
+        faderframe_core::ChannelLayout::Stereo,
+    );
+    {
+        let track = tp.project.track_mut(t).unwrap();
+        track.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
+        track.monitor = faderframe_project::MonitorMode::Input;
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let (mut c, p) = faderframe_engine::create(config);
+    let info = StreamInfo {
+        backend: "test",
+        device: "desk".into(),
+        sample_rate: SR,
+        buffer_size: 256,
+        input_channels: 1,
+        output_channels: 2,
+        input_latency: 0,
+        output_latency: 0,
+    };
+    let spec = |direction| FollowerSpec {
+        device: "box".into(),
+        name: "Box".into(),
+        direction,
+        channels: 2,
+        sample_rate: 44_100,
+        block: 441,
+    };
+    let follower = |channel| Place::Follower {
+        follower: 0,
+        channel,
+    };
+    let out = |channel| Place::Follower {
+        follower: 1,
+        channel,
+    };
+    let (mut joined, mut followers, ends) = join(
+        Box::new(p),
+        &info,
+        vec![follower(0), follower(1), Place::Master(0)],
+        vec![Place::Master(0), Place::Master(1), out(0), out(1)],
+        vec![spec(Direction::Input), spec(Direction::Output)],
+    );
+    joined.prepare(&info);
+    c.sync(&tp.project, &tp.sources, Impact::Graph).unwrap();
+    let mut ends = ends.into_iter();
+    let (Some(FollowerEnd::Input(mut input)), Some(FollowerEnd::Output(mut output))) =
+        (ends.next(), ends.next())
+    else {
+        panic!("the device ends");
+    };
+    let mut bufs = OwnedBuffers::new(1, 2, 256);
+    let rate = 44_100.0 * (1.0 + 120e-6);
+    let mut next = 0.0f64;
+    let mut played = [0.0f32; 441 * 2];
+    let mut run = |from: usize,
+                   to: usize,
+                   input: &mut faderframe_audio::follow::FollowerInput,
+                   output: &mut faderframe_audio::follow::FollowerOutput,
+                   joined: &mut faderframe_audio::follow::Joined,
+                   next: &mut f64| {
+        for k in from..to {
+            let t = k as f64 * 256.0 / f64::from(SR);
+            while *next <= t {
+                let ns = (*next * 1e9) as u64;
+                input.capture_with(441, ns, |i, ch| ((i * 2 + ch) as f32 * 0.003).sin() * 0.5);
+                output.play_with(441, ns, |i, ch, v| played[i * 2 + ch] = v);
+                *next += 441.0 / rate;
+            }
+            joined.process_at(&mut bufs, (t * 1e9) as u64);
+        }
+    };
+    run(0, 64, &mut input, &mut output, &mut joined, &mut next);
+    c.collect_garbage();
+    let (_, allocs) = armed(|| run(64, 1200, &mut input, &mut output, &mut joined, &mut next));
+    assert_eq!(allocs, 0, "allocations joining followers to the engine");
+    let Some(FollowerEnd::Input(mut input)) = followers.attach(0, 44_100, 441) else {
+        panic!("attached");
+    };
+    let Some(FollowerEnd::Output(mut output)) = followers.attach(1, 44_100, 441) else {
+        panic!("attached");
+    };
+    let (_, allocs) = armed(|| run(1200, 1600, &mut input, &mut output, &mut joined, &mut next));
+    assert_eq!(allocs, 0, "allocations taking the followers back");
+    followers.collect();
+    let state = followers.state(0).unwrap();
+    assert!(state.present && state.attached == 2, "{state:?}");
+}
+
+#[test]
+fn clip_envelopes_do_not_allocate() {
+    use faderframe_core::ChannelLayout;
+    use faderframe_project::clip_envelope::{ClipEnvelope, EnvelopePoint};
+    use faderframe_project::{ClipContent, TrackKind};
+    let mut tp = common::TestProject::new(48_000);
+    // Plain, warped (varispeed) and stretched clips, mono and stereo.
+    for (k, layout) in [ChannelLayout::Stereo, ChannelLayout::Mono]
+        .into_iter()
+        .enumerate()
+    {
+        let t = tp.track(TrackKind::Audio, &format!("t{k}"), layout);
+        let src = tp.dc(2, 0.25, 96_000);
+        for q in [0.0, 2.0, 4.0] {
+            tp.clip(
+                t,
+                src,
+                faderframe_timeline::MusicalTime::from_quarters(q),
+                40_000,
+            );
+            let id = *tp.project.track(t).unwrap().clips.last().unwrap();
+            if let Some(ClipContent::Audio(a)) =
+                tp.project.clips.get_mut(&id).map(|c| &mut c.content)
+            {
+                a.envelope = ClipEnvelope {
+                    volume: (0..40)
+                        .map(|i| EnvelopePoint::new(i * 1_000, -(i % 7) as f64 * 3.0))
+                        .collect(),
+                    pan: vec![EnvelopePoint::new(0, -1.0), EnvelopePoint::new(30_000, 1.0)],
+                }
+                .boxed();
+                if q == 2.0 {
+                    a.warp = Some(faderframe_project::Warp::uniform(40_000).scaled(40_000, 30_000));
+                    a.length = 30_000;
+                }
+            }
+        }
+    }
+    let config = EngineConfig {
+        sample_rate: 48_000,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..600 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations playing clip envelopes");
+}
+
+/// Capture Audio: the inputs kept while stopped and while playing round a
+/// loop, a ring running full (blocks lost in place), the capture replaced
+/// by another and ended (the old ends go back as garbage).
+#[test]
+fn capturing_inputs_for_capture_audio_does_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio::{AudioCallback, StreamInfo};
+    use faderframe_project::Impact;
+    use faderframe_transport::LoopRange;
+
+    const SR: u32 = 48_000;
+    let tp = common::TestProject::new(SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let (mut c, mut p) = faderframe_engine::create(config);
+    AudioCallback::prepare(
+        &mut p,
+        &StreamInfo {
+            backend: "test",
+            device: "two".into(),
+            sample_rate: SR,
+            buffer_size: 256,
+            input_channels: 2,
+            output_channels: 2,
+            input_latency: 0,
+            output_latency: 0,
+        },
+    );
+    c.sync(&tp.project, &tp.sources, Impact::Graph).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    // Room for a quarter of a second: the callbacks below overflow it.
+    let mut cap = c.capture_inputs(vec![0, 1, 7], 0.25).unwrap();
+    for _ in 0..4 {
+        p.process_device(&mut bufs);
+        c.collect_garbage();
+    }
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            p.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations keeping the inputs while stopped");
+    c.transport(TransportCommand::SetLoopRange(LoopRange::new(0, 4_800)))
+        .unwrap();
+    c.transport(TransportCommand::SetLoopEnabled(true)).unwrap();
+    c.transport(TransportCommand::Play).unwrap();
+    let (_, allocs) = armed(|| {
+        for _ in 0..200 {
+            p.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations keeping the inputs while playing");
+    assert!(cap.headers.pop().is_ok(), "blocks were kept");
+    // Replaced, then ended: the old ends go back as garbage.
+    let mut next = c.capture_inputs(vec![1], 0.25).unwrap();
+    let (_, allocs) = armed(|| p.process_device(&mut bufs));
+    assert_eq!(allocs, 0, "allocations replacing the capture");
+    c.collect_garbage();
+    c.end_input_capture().unwrap();
+    let (_, allocs) = armed(|| p.process_device(&mut bufs));
+    assert_eq!(allocs, 0, "allocations ending the capture");
+    c.collect_garbage();
+    while cap.headers.pop().is_ok() {}
+    while next.headers.pop().is_ok() {}
+    assert!(cap.is_finished() && next.is_finished());
+}
+
+#[test]
+fn the_media_browser_previews_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_engine::midi_preview::MidiPreview;
+    use faderframe_engine::nodes::{PreviewAudio, PreviewSound, PreviewStart};
+    const SR: u32 = 48_000;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    let link = std::sync::Arc::clone(r.controller.listening().link.preview());
+    let shared = std::sync::Arc::clone(link.shared());
+    // The demo's first instrument plays the MIDI previews.
+    let keys = project
+        .tracks
+        .iter()
+        .find(|t| t.kind == faderframe_project::TrackKind::Instrument)
+        .unwrap()
+        .id;
+    r.controller
+        .midi_shared()
+        .audition_track
+        .store(keys.raw(), std::sync::atomic::Ordering::Relaxed);
+    let x: Vec<f32> = (0..SR as usize * 2)
+        .map(|i| (i as f32 * 0.02).sin() * 0.3)
+        .collect();
+    // Published while it plays (a partial last chunk, then the rest).
+    let (audio, mut writer) = PreviewAudio::new(SR, 2, x.len());
+    writer.push(&[&x[..40_000], &x[..40_000]], 40_000);
+    let loop_bar = |start| PreviewSound {
+        audio: std::sync::Arc::clone(&audio),
+        start,
+        looped: true,
+        loop_frames: 24_000,
+    };
+    let notes = |start| MidiPreview {
+        events: (0..32)
+            .flat_map(|i| {
+                let at = i * 6_000;
+                [
+                    (at, [0x90, 48 + i as u8, 100]),
+                    (at + 4_000, [0x80, 48 + i as u8, 0]),
+                ]
+            })
+            .collect(),
+        length: 96_000,
+        looped: true,
+        start: Some(start),
+    };
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    link.set(Some(loop_bar(PreviewStart::Now)));
+    r.controller
+        .set_midi_preview(Some(notes(PreviewStart::Now)))
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for i in 0..300 {
+            match i {
+                40 => shared.set_gain(0.5),
+                80 => {
+                    let _ = r.controller.transport(TransportCommand::Locate(30_000));
+                }
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations previewing at once");
+    writer.push(&[&x[40_000..], &x[40_000..]], x.len() - 40_000);
+    writer.finish();
+    // From the next bar, in step with the transport; then stopped.
+    let here = r.controller.transport_snapshot().position;
+    link.set(Some(loop_bar(PreviewStart::At(here + 10_000))));
+    r.controller
+        .set_midi_preview(Some(notes(PreviewStart::At(here + 10_000))))
+        .unwrap();
+    let (_, allocs) = armed(|| {
+        for i in 0..250 {
+            if i == 150 {
+                let _ = r
+                    .controller
+                    .transport(TransportCommand::Locate(here + 50_000));
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(
+        allocs, 0,
+        "allocations previewing in step with the transport"
+    );
+    link.set(None);
+    let (_, allocs) = armed(|| {
+        for _ in 0..100 {
+            r.processor.process_device(&mut bufs);
+        }
+        let _ = r.controller.transport(TransportCommand::Stop);
+        for _ in 0..50 {
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations previewing in step and stopping");
+    r.controller.set_midi_preview(None).unwrap();
+    r.controller.collect_garbage();
+    link.collect();
+}
+
+#[test]
+fn aes67_streams_to_the_engine_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_audio::StreamInfo;
+    use faderframe_audio_aes67::backend::Clocked;
+    use faderframe_audio_aes67::ring::MediaRing;
+    use faderframe_audio_aes67::stream::RxStats;
+    use faderframe_project::Impact;
+    use std::sync::Arc;
+
+    const SR: u32 = 48_000;
+    let mut tp = common::TestProject::new(SR);
+    // A stereo track monitoring the received stream's two channels.
+    let t = tp.track(
+        faderframe_project::TrackKind::Audio,
+        "Stage",
+        faderframe_core::ChannelLayout::Stereo,
+    );
+    {
+        let track = tp.project.track_mut(t).unwrap();
+        track.input = faderframe_project::InputRouting::Hardware { first_channel: 0 };
+        track.monitor = faderframe_project::MonitorMode::Input;
+    }
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let (mut c, p) = faderframe_engine::create(config);
+    let info = StreamInfo {
+        backend: "aes67",
+        device: "AES67 network".into(),
+        sample_rate: SR,
+        buffer_size: 128,
+        input_channels: 2,
+        output_channels: 2,
+        input_latency: 96,
+        output_latency: 96,
+    };
+    let rx = Arc::new(MediaRing::new(2, 65_536));
+    let tx = Arc::new(MediaRing::new(2, 65_536));
+    let stats = Arc::new(RxStats::default());
+    let mut clocked = Clocked::new(
+        Box::new(p),
+        info,
+        vec![(Arc::clone(&rx), Arc::clone(&stats))],
+        vec![Arc::clone(&tx)],
+        96,
+    );
+    clocked.prepare();
+    c.sync(&tp.project, &tp.sources, Impact::Graph).unwrap();
+    let start = 81_600_000_000_000u64;
+    let mut now = start + 96 + 128;
+    let mut written = start;
+    let mut run = |blocks: usize, clocked: &mut Clocked, now: &mut u64| {
+        for _ in 0..blocks {
+            // The network side keeps a little ahead (skipping a packet
+            // now and then: missing frames read as silence).
+            while written < *now {
+                if (written / 48) % 17 != 3 {
+                    rx.write(written, 48, |i, ch| {
+                        ((i * 2 + ch) as f32 * 0.003).sin() * 0.5
+                    });
+                }
+                written += 48;
+            }
+            clocked.block(*now);
+            *now += 128;
+        }
+    };
+    run(64, &mut clocked, &mut now);
+    c.collect_garbage();
+    let (_, allocs) = armed(|| run(1_000, &mut clocked, &mut now));
+    assert_eq!(
+        allocs, 0,
+        "allocations running the engine from AES67 streams"
+    );
+    // The last block's output, stamped a block ahead of it.
+    assert!(tx.has(now), "the engine's output was sent");
+    assert!(stats.missing.load(Ordering::Relaxed) > 0);
+}
+
+/// Listen Along: a stream taken from its mailbox, primed, heard, run dry,
+/// switched off; the shared master written to the share ring.
+#[test]
+fn listening_along_does_not_allocate() {
+    let _serial = serial();
+    let rate = 48_000u32;
+    let project = demo_project(rate);
+    let sources = render_generated_sources(&project, rate);
+    let config = EngineConfig {
+        sample_rate: rate,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&project, &sources, config, 256, 2).unwrap();
+    let link = std::sync::Arc::clone(r.controller.listening().link.along());
+    let shared = std::sync::Arc::clone(link.shared());
+    r.play_from(0).unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, 256);
+    for _ in 0..4 {
+        r.processor.process_device(&mut bufs);
+    }
+    r.controller.set_share_source(project.master_id());
+    shared.set_prime(2048);
+    // Made here, on the control side.
+    let mut feed = link.open(rate as usize);
+    let tone: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+    let (_, allocs) = armed(|| {
+        for i in 0..300 {
+            if i == 10 {
+                shared.set_hear(true);
+            }
+            if i < 200 {
+                feed.push(&tone, &tone);
+            }
+            if i == 260 {
+                shared.set_hear(false);
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(allocs, 0, "allocations while listening along");
+    assert!(shared.underruns() >= 1, "it ran dry");
+    assert!(r.controller.share().written() > 0);
+    link.collect();
+}
+
+#[test]
+fn interactive_score_transitions_do_not_allocate() {
+    let _serial = serial();
+    use faderframe_engine::launch::{LaunchCommand, Quantize};
+    use faderframe_engine::transition::TransitionFade;
+    use faderframe_transport::{Cue, Cues, LoopRange};
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let project = demo_project(SR);
+    let sources = render_generated_sources(&project, SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    // With render-ahead too: planned jumps are loop changes the tiers take
+    // on at a frame.
+    let mut r = OfflineRenderer::new(&project, &sources, config, BLOCK, 2).unwrap();
+    r.controller
+        .set_render_ahead(Some(std::time::Duration::from_millis(100)), 1);
+    r.controller
+        .sync(&project, &sources, faderframe_project::Impact::Graph)
+        .unwrap();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    let _ = r
+        .controller
+        .transport(TransportCommand::SetLoopRange(LoopRange::new(0, 96_000)));
+    let _ = r
+        .controller
+        .transport(TransportCommand::SetLoopEnabled(true));
+    r.play_from(0).unwrap();
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    // Jumps on the loop's end and later, fades around them, a quantised
+    // return to the arrangement, layers' trims written between callbacks.
+    let (_, n) = armed(|| {
+        for i in 0..900 {
+            match i {
+                10 => {
+                    let _ = r.controller.set_cues(Cues::new(&[
+                        Cue {
+                            at: 96_000,
+                            to: 192_000,
+                            then_loop: Some((LoopRange::new(192_000, 288_000), true)),
+                        },
+                        Cue {
+                            at: 250_000,
+                            to: 20_000,
+                            then_loop: Some((LoopRange::new(0, 96_000), true)),
+                        },
+                    ]));
+                    let _ = r.controller.transition_fade(Some(TransitionFade {
+                        at: 96_000,
+                        out_frames: 4_800,
+                        in_frames: 9_600,
+                        cue: true,
+                    }));
+                }
+                400 => {
+                    let _ = r.controller.launch(LaunchCommand::Arrangement {
+                        quantize: Quantize::At(SR as i64 * 2),
+                    });
+                    let _ = r.controller.transition_fade(Some(TransitionFade {
+                        at: SR as i64 * 3,
+                        out_frames: 2_400,
+                        in_frames: 2_400,
+                        cue: false,
+                    }));
+                }
+                600 => {
+                    let _ = r.controller.set_cues(Cues::NONE);
+                    let _ = r.controller.transition_fade(None);
+                }
+                _ => {}
+            }
+            r.processor.process_device(&mut bufs);
+        }
+    });
+    assert_eq!(n, 0, "allocations/frees while a score's transitions play");
 }

@@ -110,7 +110,11 @@ impl crate::Session {
         for v in stored.video.sources.values_mut() {
             v.path = media::to_stored(&v.path, Some(&project_dir));
         }
-        file::save(&path, &stored, Some(&self.workspace_to_save()))?;
+        // Stamped as a state of the project's line (see
+        // [`crate::version_merge`]): the project goes on from it.
+        let extras = self.stamp_for_save(&project_dir);
+        file::save_with(&path, &stored, Some(&self.workspace_to_save()), &extras)?;
+        self.note_saved_version(&extras);
         self.notify(
             NoticeLevel::Info,
             format!("saved version {number} ‘{name}’"),
@@ -125,23 +129,9 @@ impl crate::Session {
 
     /// A version's project, its media found in the project folder.
     fn load_version(&self, path: &Path) -> Result<Project> {
-        let dir = self.project_dir();
-        let loaded = file::load(path)?;
-        let mut project = loaded.project;
-        for s in project.sources.values_mut() {
-            if let SourceSpec::File { path: p, .. } = &mut s.spec {
-                *p = media::resolve(p, dir.as_deref());
-            }
-        }
-        samples::map_states(&mut project, |p| media::resolve(p, dir.as_deref()));
-        for v in project.video.sources.values_mut() {
-            v.path = media::resolve(&v.path, dir.as_deref());
-        }
-        for t in &mut project.tracks {
-            // Older versions may keep an instrument apart (see `open`).
-            let _ = self.adopt_instrument(t);
-        }
-        Ok(project)
+        // Older versions may keep an instrument apart (see `open`): adopted
+        // there.
+        Ok(self.load_version_with(path)?.0)
     }
 
     /// What the project has changed since the version at `path`.
@@ -159,12 +149,20 @@ impl crate::Session {
     pub(crate) fn restore_version(&mut self, path: &Path) -> Result<()> {
         let name =
             parse(path).map_or_else(|| "a version".into(), |(n, name)| format!("{n} ‘{name}’"));
-        let project = self.load_version(path)?;
+        let (mut project, extras) = self.load_version_with(path)?;
         self.save_version(&format!(
             "Before restoring {}",
             parse(path).map_or(0, |v| v.0)
         ))?;
+        // New ids go past the present's: the line set aside merges back
+        // without its ids meaning two things.
+        project
+            .ids
+            .reserve_through(self.project.ids.peek().saturating_sub(1));
         self.replace_project(project, None)?;
+        // The project goes on from the version (unknown when it was saved
+        // before stamps).
+        self.merging.set_lineage(extras.lineage);
         // Restored, not saved: the project file changes on saving.
         self.saved_revision = u64::MAX;
         self.notify(NoticeLevel::Info, format!("restored version {name}"));

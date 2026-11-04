@@ -21,6 +21,65 @@ pub struct ProbeInfo {
     pub frames: Option<u64>,
 }
 
+/// What a file is, read from its container without decoding the audio
+/// (a browser's columns).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileFacts {
+    pub channels: usize,
+    pub sample_rate: u32,
+    /// Playable frames, when the container says (most do; a stream
+    /// without a header may not).
+    pub frames: Option<u64>,
+    /// Bits a sample as stored (PCM, FLAC, ALAC; `None` for lossy codecs).
+    pub bits: Option<u32>,
+    /// The codec's short name ("pcm_s24le", "flac", "mp3").
+    pub codec: String,
+}
+
+/// Read what `path` holds from its container (no audio decoded).
+pub fn probe(path: &Path) -> Result<FileFacts, ImportError> {
+    let file = File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| ImportError::Unsupported(format!("{}: {e}", path.display())))?;
+    let track = format.default_track(TrackType::Audio).ok_or_else(|| {
+        ImportError::Unsupported(format!("{} has no audio track", path.display()))
+    })?;
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| {
+            ImportError::Unsupported(format!("{}: unknown codec parameters", path.display()))
+        })?;
+    let codec = symphonia::default::get_codecs()
+        .get_audio_decoder(params.codec)
+        .map_or_else(String::new, |d| d.codec.info.short_name.to_string());
+    let lossless = params.bits_per_sample.is_some()
+        && (codec.starts_with("pcm") || matches!(codec.as_str(), "flac" | "alac"));
+    Ok(FileFacts {
+        channels: params.channels.as_ref().map_or(0, |c| c.count()),
+        sample_rate: params.sample_rate.unwrap_or(0),
+        frames: track.num_frames,
+        bits: if lossless {
+            params.bits_per_coded_sample.or(params.bits_per_sample)
+        } else {
+            None
+        },
+        codec,
+    })
+}
+
 /// File extensions accepted by the importer (lower case).
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "wav", "wave", "aif", "aiff", "aifc", "caf", "flac", "mp3", "ogg", "oga", "m4a", "mp4", "aac",
@@ -197,4 +256,38 @@ pub fn decode_at_rate(
         r.finish(&mut |p: &[&[f32]], n| append(p, n))?;
     }
     Ok(out.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn a_probe_reads_the_container_without_decoding() {
+        let dir = std::env::temp_dir().join(format!("ff-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tone.wav");
+        let x: Vec<f32> = (0..44_100).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
+        crate::write_wav(
+            &path,
+            &[x.clone(), x],
+            44_100,
+            crate::WavFormat::Pcm24,
+            false,
+        )
+        .unwrap();
+        let facts = probe(&path).unwrap();
+        assert_eq!(facts.channels, 2);
+        assert_eq!(facts.sample_rate, 44_100);
+        assert_eq!(facts.frames, Some(44_100));
+        assert_eq!(facts.bits, Some(24));
+        assert!(facts.codec.starts_with("pcm"), "{}", facts.codec);
+        // Not audio at all: an error, not a panic.
+        let junk = dir.join("junk.wav");
+        std::fs::write(&junk, b"not a wave file").unwrap();
+        assert!(probe(&junk).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

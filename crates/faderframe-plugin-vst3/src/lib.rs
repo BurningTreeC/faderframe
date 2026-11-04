@@ -13,6 +13,7 @@
 // i32 on Windows): casts that are no-ops here are needed there.
 #![allow(clippy::unnecessary_cast)]
 
+pub mod ara;
 pub mod com;
 mod instance;
 pub mod module;
@@ -97,4 +98,16 @@ impl PluginFactory for Vst3Factory {
         let m = module::load(&p.bundle).map_err(|e| PluginError::Failed(e.to_string()))?;
         Ok(Box::new(Vst3Instance::new(m, p)?))
     }
+
+    fn ara_plugins(&self) -> Vec<String> {
+        catalog()
+            .into_iter()
+            .filter(|p| p.features.iter().any(|f| f == ARA_FEATURE))
+            .map(|p| p.id)
+            .collect()
+    }
 }
+
+/// The feature tag of ARA plugins (CLAP's vocabulary, which the rest of
+/// FaderFrame uses for every format).
+pub const ARA_FEATURE: &str = "ara:supported";

@@ -243,3 +243,56 @@ fn stopped_audio_is_explained() {
     assert!(p.texts().iter().any(|t| t.starts_with("Audio is stopped")));
     assert!(!view.wants_frames(&s));
 }
+
+/// The summary's self-freeze line and a cached track's note.
+#[test]
+fn self_freezing_is_summed_up() {
+    let s = Session::new(Project::new("P", 48_000), None, EngineConfig::default()).unwrap();
+    let off = SelfFreezeSummary::default();
+    assert_eq!(
+        self_freeze_line(&off, &s),
+        ("self-freeze off".to_string(), false)
+    );
+    // When Needed (the default) on a machine that copes: all live.
+    let copes = SelfFreezeSummary {
+        on: true,
+        limit: 4 * 1024 * 1024 * 1024,
+        ..SelfFreezeSummary::default()
+    };
+    let (text, news) = self_freeze_line(&copes, &s);
+    assert!(
+        text.starts_with("self-freeze when needed: the machine copes"),
+        "{text}"
+    );
+    assert!(!news);
+    let needed = SelfFreezeSummary {
+        needed: true,
+        ..copes.clone()
+    };
+    let (text, _) = self_freeze_line(&needed, &s);
+    assert!(
+        text.starts_with("self-freeze when needed (needed now): no track cached"),
+        "{text}"
+    );
+    let on = SelfFreezeSummary {
+        mode: faderframe_session::self_freeze::SelfFreezeMode::Always,
+        ..copes
+    };
+    let (text, news) = self_freeze_line(&on, &s);
+    assert!(text.starts_with("self-freeze: no track cached"), "{text}");
+    assert!(!news);
+    let t = s.project().tracks[0].id;
+    let busy = SelfFreezeSummary {
+        cached: vec![t, t],
+        saved: 0.25,
+        ..on
+    };
+    let (text, news) = self_freeze_line(&busy, &s);
+    assert!(text.contains("2 tracks cached"), "{text}");
+    assert!(news);
+    assert_eq!(
+        cache_note(TrackCache::Cached { cost: 0.1 }).map(|n| n.starts_with("cached")),
+        Some(true)
+    );
+    assert_eq!(cache_note(TrackCache::Waiting), None);
+}

@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// The parts of a project that time edits change.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Arrangement {
     pub timeline: Timeline,
     pub clips: BTreeMap<ClipId, Clip>,
@@ -795,6 +795,7 @@ pub fn insert_span(p: &mut Project, at: MusicalTime, slice: &TimeSlice, keep_ids
             id,
             position: at + m.position,
             name: m.name.clone(),
+            time_base: m.time_base,
         });
     }
     p.markers.sort_by_key(|m| m.position);
@@ -1197,6 +1198,9 @@ mod tests {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         }
     }
 
@@ -1258,6 +1262,7 @@ mod tests {
                 start: bars(i as i64),
                 end: bars(i as i64 + 1),
                 color: GREY,
+                time_base: Default::default(),
             });
             ids.push(id);
         }
@@ -1523,6 +1528,7 @@ mod harmony_tests {
                 start: bars(i as i64),
                 end: bars(i as i64 + 1),
                 color: crate::TrackColor::palette(i),
+                time_base: Default::default(),
             });
             p.chords.push(ChordEvent {
                 start: bars(i as i64),

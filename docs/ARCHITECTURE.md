@@ -31,13 +31,18 @@ faderframe-app            binary: CLI parsing, logging, starts the GTK app
        └─ faderframe-session          control-world hub (GTK-free)
             ├─ faderframe-analysis     loudness (EBU R128), true peak, levels, phase, FFT spectrum
             ├─ faderframe-disc         Red Book CD masters: DDP 2.00 filesets, CD-Text, cue sheets, ISRC/UPC
+            ├─ faderframe-qc           delivery QC: spec checks, stems' null tests, the QC report (JSON, PDF), SHA-256
+            ├─ faderframe-interchange  DAWproject files (written and read), MusicXML scores (read, .mxl too), zip
             ├─ faderframe-conform      new picture cuts: CMX3600 EDLs, OpenTimelineIO, cut-to-cut changes, shot matching
+            ├─ faderframe-aaf          AAF interchange: compound files, the object model, compositions written and read
             ├─ faderframe-adm          object-based masters: ADM (BS.2076) axml/chna, Dolby Atmos master profile
             ├─ faderframe-iamf         IAMF masters: OBUs, MP4 (iamf/iacb), LPCM/FLAC/Opus substreams
+            ├─ faderframe-collab       live collaboration's network: invite codes, Noise-encrypted TCP, ordered entries, media by content
             ├─ faderframe-engine       project→graph compiler, RT processor, controller, offline render
             │    ├─ faderframe-binaural     headphone listening: beds through measured HRIRs (SADIE II KU100), rooms
             │    ├─ faderframe-audio-graph   generic DSP graph: ports, edges, PDC, compile, executor
             │    ├─ faderframe-plugin-host   plugin abstraction + built-in plugins
+            │    │    └─ faderframe-ara       ARA 2 hosting: the C API, host interfaces, document model
             │    ├─ faderframe-transport     RT transport state, TransportInfo
             │    ├─ faderframe-realtime      atomics, mailbox, meters, param table, metrics
             │    ├─ faderframe-stretch       time stretching (vendored Signalsmith Stretch, C shim)
@@ -119,6 +124,10 @@ the standard plugin folders.
 * **State adoption**: when a new graph is installed, processors whose
   `NodeKey` matches a node of the old graph are swapped in, so filter
   states, synth voices, echo tails and smoothing survive routing edits.
+  The delay lines compensating an adopted node's inputs go along where
+  the same source (by key and port) arrives through one just as long, so
+  a rebuild while playing leaves no gap on a delayed path
+  (`compensation_delays_carry_over_into_a_rebuilt_graph`).
 
 The realtime path never allocates, frees, locks, logs or does I/O. This is
 enforced by `crates/faderframe-engine/tests/realtime_alloc.rs`, which runs the
@@ -449,6 +458,51 @@ it, and `SetTrackVca` refuses VCA loops.
 and repeated setters on the same target inside a gesture are coalesced.
 ID allocations are deliberately not rolled back, so IDs stay unique.
 
+The history is a tree (`faderframe_project::history`). Every step is a
+node holding the commands that join it to its parent; the root
+(`History::ROOT`) is the state the history starts from. A node's commands
+point one way at a time: while it is *done* (on the way from the root to
+the current node) they take it back, otherwise they do it again, and
+replaying them turns them into the opposite. An edit made after undoing
+becomes a new child of the current node — a branch beside the steps
+undone, which stay. Undo goes to the parent; redo goes to the child last
+made or visited (`next`), so undo/redo follow the current branch as they
+did when the history was a list. `History::go_to` reaches any node: undo
+to the common ancestor, then redo down the other branch (setting `next`
+on the way); `project_at_node` makes the same state on a copy.
+
+* **Ids.** A step's id is given when it is committed (1, 2, 3 … in the
+  order made, kept through undo, redo and moves). `last_step` is the
+  current node, `is_done` asks whether a node is on the current path,
+  `knows` whether the tree still holds it, `inverse_of` (done steps) and
+  `again_of` (steps not done: undone, or on another branch) give a step's
+  commands as a batch to apply as a new step.
+* **Gestures.** The open gesture is recorded apart from the tree and
+  becomes one node when it ends; while it has changes, redo is off (the
+  steps it would redo stay; a cancel brings redo back). `mark`/`rewind`
+  (ripple drags) and coalescing work inside it as before; moving anywhere
+  closes it first, as undo does. `apply_amending` (Record to Arrangement)
+  amends the current node only while it is a leaf.
+* **A failed replay** (a command that cannot be applied any more) takes
+  back what it applied before failing: the project and the node stay as
+  they were and the error is returned.
+* **Memory.** At most `limit` steps (500) are kept, branches included. Over
+  it, the oldest branch tip off the current line goes first; a history
+  that is one line forgets its oldest step (the root becomes the state
+  after it, `forgot_older`).
+* **Branches** are numbered as they are made (the first line is branch 1;
+  a node is its parent's branch when it was the first child). `tree` lays
+  the tree out as rows: depth first, each branch right after the step it
+  starts from, one level in, before the line it left goes on.
+
+The session moves through it with `Action::HistoryToNode(id)` (the engine
+synced once), `Action::HistoryBranch(n)` (the newest step of branch n)
+and `Action::HistoryTo(n)` (a place on the current line); the History view
+(`faderframe-view-history`) shows the rows from `Session::history_tree`.
+Tests: `history::tree_tests` (branching, moves, copies, gestures, mark and
+rewind, amending, ids across branches, the limit, a failed undo),
+`session/tests/undo_tree.rs`.
+
 ### File format
 
 `faderframe_project::file`: versioned JSON (`format`, `version`, `project`,
@@ -459,6 +513,262 @@ temporary file and renames it. A file always holds the song in place: with
 a scratch pad shown, `to_string` writes `Project::song()` and names the pad
 in `ScratchPads::open`, which loading shows again (older versions open the
 song and leave the pads out; files without pads have no such field).
+
+### Project versions and merging them
+
+Versions are numbered project files in the project's `Versions` folder
+(`session::versions`; media paths relative to the project folder, so the
+folder moves with them). Compare names what changed since one
+(`faderframe_project::compare::differences`); restoring one keeps the
+project as it is as a version first ("Before restoring n"), and moves the
+id allocator past the present's, so the line set aside can be merged back
+without its ids meaning two things.
+
+**Where a saved state comes from.** Every save stamps the file with a
+`Lineage` (`faderframe_project::lineage`, in the file beside the project
+with the media's content hashes: `file::FileExtras`, ignored by older
+readers): a random id, the id allocator's next value, a generation, and the
+states it descends from, newest first (at most 256). The project file, each
+version and a hidden copy of each saved state (`Versions/.bases/<id>.ffproj`,
+the newest eight, hard links where the file system has them — a save writes
+a new file, so the link keeps the old content) are stamped. The session
+keeps the stamp of the state it descends from; the next save is its child.
+
+**The merge** (`faderframe_project::merge`) is three-way: a base both sides
+descend from, ours (the project as it is) and theirs (a version, or a copy
+someone else worked on). It works on the projects' JSON form, so every part
+of the model — side tables like mix scenes, articulation and drum maps,
+ARA archives, source words, tunings — merges without being named:
+
+* objects merge field by field; maps by id and lists of things with ids
+  (tracks, plug-in slots, sends, automation lanes, notes, markers,
+  sections, scenes…) thing by thing, their order merged too (one side's
+  reordering taken with the other's additions in place; both reordering
+  is a conflict);
+* lists of things placed in time (automation points, tempo and meter
+  changes, keys, chords, lyrics, SysEx) merge by the stretches each side
+  changed: stretches of one side are taken from it; where both changed an
+  overlapping stretch, that is a conflict over the list's owner;
+* taken whole: another enum variant, a thing replaced by another (a new
+  id), a range (start and end move together), a plug-in's settings once
+  either side loaded a new state (the blob and its values; otherwise
+  values merge by parameter), take folders (comps name takes by place) and
+  clip edits whose parts depend on each other (warp, pitch, spectral edits,
+  clip effects);
+* a change only one side made is taken, the same change on both sides
+  once. A conflict — both changed the same thing differently, or one
+  removed what the other changed — is resolved for the thing it is in (a
+  track, a clip, a note, a plug-in; a project field otherwise): ours by
+  default, theirs, or for clips, notes, markers and sections both (a copy
+  of theirs beside ours with ids of its own). Conflicts are keyed by the
+  thing's path of ids, stable between merges of the same versions, so a
+  merge again with `MergeOptions::resolutions` makes the project for other
+  choices.
+
+**Ids.** Every kind is allocated from one counter, so two lines hand out
+the same numbers for different things. Theirs is read with its own new
+ids — from the point the lines branched (`Lineage::branch_point`: the
+newest state both reach on their own lines; without stamps, the base's
+allocator) — moved past ours: every id type reads and writes through
+`faderframe_core::id::translate` (a thread-local flag, otherwise plain
+numbers), so ids move wherever they sit, references and side tables
+included. The merged state's stamp records the move (`IdShift`: the state
+merged, the merge, the range and offset), and states taken in through a
+merge are ancestors marked `merged`: a later merge with the same line, or
+one the other side made with ours, reads the ids an earlier merge moved
+as the things they already are (`Lineage::known_ranges`, forward and
+back). Plug-in parameters that hold ids (an EQ Match reference) are values
+and do not move.
+
+**Checks.** The merged JSON is built back into types track by track and
+clip by clip; one that will not read is taken whole from a side (listed as
+a conflict that does not combine), then a top-level field that keeps the
+project from reading. Each track's clip list is made again from the clips
+(ours' order kept), the allocator set past both sides, and
+`Project::repair` makes the cross references consistent (a clip kept on a
+track the other side removed goes, and the notes say so).
+
+**The session** (`session::version_merge`): `Action::MergeVersion {
+theirs, base }` (base `None`: the newest common ancestor whose content is
+here — a base copy, a version or the project file) and
+`Action::MergeProjectFile` (someone else's copy: its media resolved
+against its own folder, then each found here by content hash — the
+project's media and its media folders, by the hashes stamped in their
+file or computed — else used where it is, else reported missing; the copy
+is kept as a base, its ids as merged, for their next file). The result is
+applied as one undo step, `Command::ReplaceProject` ("Merge Version n
+‘…’"), and left unsaved; `Action::ResolveMergeConflict` merges again with
+the choice and replaces the step's result in place
+(`History::apply_amending`) while it is still the last step;
+`Action::AuditionMergeConflict` renders the merge with the conflict's other
+choice through the A/B compare stage (`Comparing::MergeChoice`) against the
+merge as applied. `Session::merge_status` gives the views the conflicts
+(in words, `Conflict::summary`), the changes, the notes and the media
+report. Content hashes (`version_merge::content_hash`) are the length and
+SHA-256 of the file, of 64 blocks of 64 KiB spread over it past 4 MiB (at
+most 4 MiB read a file, remembered for the session); a file found by its
+hash is compared byte for byte when theirs is here. Where theirs is not, a
+copy changed only between the blocks (a sample redraw's copy) can be taken
+for the original.
+
+UI: the Versions window's Merge buttons and "Merge from" choice, File →
+Merge Project File…, and the Merge window (`faderframe-ui/src/version_merge.rs`:
+a row per conflict with its choices and Hear Other, what changed, media).
+Tests: `merge::tests` (disjoint edits, same-field conflicts, delete vs
+edit, moved vs edited clips, notes, automation stretches, both sides
+adding things, plug-in settings, order, tempo and markers, ranges known
+from an earlier merge), `lineage::tests`, `id::translate::tests`,
+`session/tests/version_merge.rs` (a version set aside merged back,
+conflicts resolved in the step and auditioned, a copy from another folder
+with media found by content and its next file, stamps and bases).
+
+### Live collaboration
+
+Several people work in one project at once, over a local network or the
+internet (`faderframe-collab` is the network, `session::collab` the rest;
+File → Collaborate…). One session **hosts**: it holds the authoritative
+order of edits. Others **join** with its address and invite code and get
+its project; from then on every edit anyone makes reaches everyone in the
+host's order.
+
+**The command stream.** Every change of a project is a `Command` applied
+by `Command::apply` — edits, undo and redo, history moves, auditions
+applied and taken back, a merge replacing the project whole. While a
+project is shared, its **journal** (`faderframe_project::journal`, a field
+of `Project` that files and clones never carry) writes each one down with
+its inverse; commands inside a batch are written as the batch, once, and a
+`ReplaceProject` keeps the journal where it was. Each tick the session
+takes what was written as one *step* (neighbouring setters of one thing —
+a fader drag — coalesced to the first inverse and the last value):
+
+* the host gives it the next place in its log and sends it as an `Entry`;
+* a peer keeps it as *pending* — already applied, so the person sees it at
+  once — and proposes it. The host applies it where it falls in its order
+  (all or none) and sends it back like any entry, or refuses it when it no
+  longer applies (the clip was removed meanwhile).
+
+**Rebasing.** A peer's project is the host's order so far plus its pending
+steps. An entry from someone else takes the pending steps back (newest
+first, by their inverses), applies the entry, and does them again on top
+with fresh inverses; one that no longer applies is dropped and the person
+told — the host refuses it too, since it sees the same project. Its own
+entry coming back confirms the oldest pending step (commands alike:
+nothing to do; else the entry as the host applied it takes its place). So
+every session applies the same commands in the same order to the same
+project. When edits pause, the host sends the SHA-256 of its project's
+canonical form (media by content key, maps in key order, the id counter
+left out: `collab::project_hash`); a peer with nothing pending whose own
+differs asks for the whole project (`Resync`), its pending steps redone on
+top.
+
+**Last writer wins** on values: commands carry values, not differences,
+so of two people setting the same thing the one ordered later wins, and
+whoever set it in the half minute before is told who changed it since
+(by coalescing key, or for setters without one by setter and target).
+Structural clashes do not merge: the later edit refuses. (The three-way
+merge of *Project versions and merging them* is for lines that went apart;
+a live session never does.)
+
+**Each undoes their own.** Remote entries never enter the local undo
+history: undo takes back the person's own steps, applying their inverses
+as a new step for everyone; what others changed since stays unless they
+changed the same thing (then the undo sets it back to what it was before
+the person's own edit — last writer wins again).
+
+**Ids.** Every kind of id comes from one counter, so two sessions would
+hand out the same numbers. Each session draws from ranges set aside for it
+alone (`IdAllocator`'s `IdLease`, shared by the allocator's clones, never
+in files nor compared): the host sets a range aside as a `Grant` entry of
+its log (2²⁰ ids), so every copy's counter moves alike, gives a joining
+peer its first range in the Welcome, and a session asks for more below
+2¹⁸ left. After every entry each session sets its counter past every range
+granted (`SetArrangement` and `ReplaceProject` set the allocator wholesale);
+a project replaced whole (a merge, another project the host opened) may
+hold ids in old ranges, so everyone's leases are dropped and granted anew.
+
+**Media by content** (`collab::form`). A path means nothing on another
+machine: on the way out every string that is an absolute path of a regular
+file becomes `ff-media:<len>:<sha-256>/<name>` — found by walking the
+serialised step, so any command that carries a path is covered — and so do
+the files named inside samplers' states (`FFSD` blobs). Keys are SHA-256 of
+whole files, hashed on a thread of their own (a step naming a file not
+hashed yet waits, holding up the steps after it). On the way in a token
+becomes the file with that key here, or the place in the media folder it
+is fetched to (a name of its own when another file has it). Fetches run in
+the background between everything else on the connection (edits and
+presence first; 256 KiB chunks), resume from a `.part` kept from a lost
+connection, and only a file whose SHA-256 is the sender's takes its name;
+sources being fetched are not reported offline and open when their file
+arrives (samplers naming it are reloaded). Peers fetch from the host; the
+host fetches what a peer brought in (an import, a recording) from that
+peer, answering others' requests once it has it.
+
+**The wire** (`faderframe-collab`). TCP, `Noise_NNpsk0_25519_ChaChaPoly_SHA256`
+with the invite code as the pre-shared key (`snow`, no `std` feature —
+that would pull in ring): fresh ephemeral keys per connection, nobody
+without the code gets past the first message, nobody between can read or
+pose. Invite codes are 15 random bytes in Crockford base 32
+(`K7QF-M2ZP-…`, read forgivingly). Messages are MessagePack
+(`rmp-serde`, fields by name, exact floats — commands serialise with
+`serde` like the project); a frame carries at most 65 518 bytes of a
+message, larger ones are cut and joined. A connection's writer takes, in order:
+messages that must arrive in order, the newest presence of each person
+(older ones dropped), the host's mix (a few packets, the oldest dropped on
+a slow link), a media chunk. Pings every 4 s; 20 s of silence ends a
+connection. No relay server: over the internet the host forwards its port
+(TCP 47400 unless chosen) on its router, or everyone joins one VPN.
+
+**Coming back.** A peer that loses its connection keeps working (its steps
+wait) and tries again every 2–10 s, saying who it was (`Resume`: its id, a
+secret token from its Welcome, the last entry it applied). The host sends
+the entries it missed (it keeps 64 MB of log) or, when the log no longer
+reaches back, the project, and which proposal it answered last; proposals
+answered but never seen applied were refused meanwhile, the rest are sent
+again in order. A peer that leaves says goodbye; the host ending the
+session ends it for all, each keeping their copy (unsaved).
+
+**Presence and chat.** Each session sends its playhead, selection (tracks,
+clips, edit range) and the clip open in an editor whenever they change (at
+most ten times a second); the arranger draws the others' playheads as
+named lines, their selected tracks edged and clips outlined, each in their
+colour (`view-arranger/src/presence.rs`). Chat lines go through the host
+to everyone, in its order.
+
+**Plug-ins.** Slots and their state cross with the project whatever is
+installed; a session lacking a plug-in keeps the slot and its blob
+untouched (so it goes back to the others as it came) and is told once.
+Plug-in window edits reach the project as steps where the device's own
+history watches the window (*A/B compare and a device's own undo*).
+
+**Listen Along** plays the host's mix on a peer — for missing media or
+plug-ins. While a peer listens, the host's engine writes the master's
+post-fader audio into a second scope ring (`EngineContext::share`,
+`EngineController::{share, set_share_source}`); the host codes it each tick
+as stereo Opus (`faderframe_codec::stream`, 128 kbit/s, 20 ms frames,
+resampled with the codec monitor's filters) and sends numbered packets.
+The peer decodes at its engine's rate (a missing number concealed by
+Opus) into a wait-free ring read by `nodes::along` in the listening node,
+first of all (before the compare source and the codec monitor): heard in
+place of the own mix once 150 ms wait, faded over 30 ms; a ring that runs
+dry is silence until primed again; one holding more than twice that (the
+host's clock running faster) drops the surplus. Monitoring only, like the
+other stages there.
+
+Tests: the crate's units (codes, the handshake with a wrong code, frames of
+any size, media resume and damaged parts, messages), `tests/link.rs` (a
+host and clients on loopback: hello and welcome, a 1 MB step, presence,
+goodbye, a wrong code refused, a file fetched and resumed), project
+`journal::tests`, core `a_lease_hands_out_its_ranges_and_then_the_counter`,
+session lib `collab::form::tests` (the demo project crossing exactly,
+tokens, samplers, hashes alike across folders) and `collab::tests`,
+`session/tests/collab.rs` (sessions in one process on loopback: joining,
+concurrent edits ending alike with new ids from both sides and the
+override told, per-user undo and redo, an edit of something removed
+refused, media both ways and to a third session through the host, a lost
+connection coming back with work done on both sides meanwhile, the host
+ending the session, a wrong code, Listen Along packets flowing on a running
+device), engine `tests/listen_along.rs`, `listening_along_does_not_allocate`,
+codec `stream::tests`, arranger `presence_tests`.
 
 ## 4. Time
 
@@ -658,6 +968,11 @@ processed and plays along: takes move back by the device's input and
 output latency, the user's offset **and the graph's output latency**
 (`session/tests/pdc.rs`: a take of the playback through a patch cable
 lands on the same sample with 6400 frames of plugin latency as without).
+The input latency is the take's own channels' (`Session::input_latency_of`):
+on a stream that joins several devices, one following the master's clock
+comes a few milliseconds later (its ring and resampler, see "Several audio
+interfaces"), and only its takes move back by that more
+(`ActiveRecording::later`).
 
 **Offline renders** run the same graph through `OfflineRenderer` (one
 engine, the same compensation and history) and drop `output_latency`
@@ -885,6 +1200,44 @@ device buffer and spikes are absorbed by the lookahead.
   with buses rendered ahead and latency reaching them, no late blocks,
   faders reaching buses answering within milliseconds), `realtime_alloc.rs` (the audio thread's side does not
   allocate), `session/tests/render_ahead.rs`.
+* **Paced tests on a busy machine.** Those tests play the device
+  themselves, at its pace, with the anticipators beside them — but in a
+  test the audio thread they follow is an ordinary thread, so they are
+  ordinary threads too, and a machine loaded with builds keeps them from
+  the shallow tier's few milliseconds (or, rarely, the deep tier's
+  lookahead) once in a few seconds: a block of silence, a counted miss,
+  where nothing is wrong. Each paced comparison is therefore tried again
+  when late (`on_time`), and the tries after a late one — and
+  `rendering_ahead_does_not_allocate_on_the_audio_thread`'s, which used to
+  fail on such a miss — play a device that waits, before a callback,
+  until every tier has rendered what it plays
+  (`EngineController::ahead_ready_for`: the link publishes the sequence it
+  plays, the frames played and the sequence pending (`AheadWatch`); a
+  pending one is waited for until ready everywhere, since the tiers have
+  left the old one; the tests' `common::Patience`, 30 s a run at most).
+  Every try still counts allocations and asserts the audio bit for bit,
+  and a patient one still counts misses: audio that never arrives — a
+  sequence rendered the wrong way, an empty ring — is a miss there after
+  the budget. What the patience gives up is only the proof that this
+  machine kept the deadline, which no test under a load can give. The
+  audio thread itself never waits.
+* **A new sequence with buses rendered ahead.** The shallow tier holds
+  only a device callback and two small blocks of what plays, while the
+  deep tier may take a while to start a new sequence (a millisecond's
+  sleep, then two of its blocks of the heaviest chains) — and the audio
+  thread plays the old sequence until every tier has the new one ready.
+  So the shallow tier keeps a new sequence waiting (`next`, with the loop
+  changes handed over for it) and renders the old one on from the deep
+  tier's rings, which still hold the lookahead's worth of it, until the
+  deep tier has the new one *ready* (`Options::upstream_ready`: its first
+  blocks rendered — not merely started, or the shallow tier would leave
+  the old sequence while the audio thread still waited for the deep
+  one); then it starts it, two of its small blocks from what the deep
+  tier has rendered. The first try left both tiers at once, and the rest
+  of a slow start played silence: `tests/ahead_handover.rs` keeps the
+  deep tier from a locate's first blocks for 100 ms with a stalling
+  plugin and finds no block missing and no callback silent (it found 14
+  misses and 7 silent callbacks before).
 
 ### Engine graph per track
 
@@ -1482,6 +1835,197 @@ the node's as last built.
   `recreate_engine` carries it (and headphones, head, correction, the
   mono check) over to a new engine. Dev action
   `bass-management:<on|off>[@<Hz>]`.
+
+### Ambisonics and head-tracked listening
+
+Besides speaker beds, a track, bus, aux or the master can carry an
+ambisonic sound field: `ChannelLayout::Ambisonic(AmbiOrder)`, first to
+third order (4, 9 or 16 channels — the engine's 16 at most), AmbiX
+throughout (ACN channel order, SN3D normalisation, the AmbiX frame: `x`
+front, `y` left, `z` up; directions as everywhere else, azimuth positive
+to the left). The project file writes the order (`{"ambisonic": 3}`);
+nothing else changed in the format. `faderframe_core::ambisonics` holds
+the mathematics, pure and allocation-free once made:
+
+* **Harmonics** (`harmonics`, `encode`): the real spherical harmonics up
+  to third order in closed form from the direction's unit vector. Held by
+  tests to their definition in angles, to SN3D (each order's channels
+  have unit power in every direction) and to orthogonality over the
+  sphere.
+* **Rotation** (`Rotator`, `Orientation`): an orientation is a unit
+  quaternion; yaw, pitch and roll compose as `Rz(yaw)·Ry(−pitch)·Rx(roll)`
+  (yaw left, pitch up, roll towards the right shoulder). A field's
+  rotation matrix is block-diagonal per order and is found by sampling:
+  the harmonics of 24 fixed probe directions, turned, times the
+  pseudo-inverse of the unturned ones (worked out once in f64 when the
+  `Rotator` is made). It is exact for any turn and consistent with
+  `harmonics` by construction — no sign conventions to get wrong — and
+  making one costs 24 evaluations and about 2000 multiplications, no
+  allocation. Tests: a turned plane wave is the plane wave from the
+  turned direction (every order, arbitrary turns), turns compose, power
+  is kept, nothing leaks between orders.
+* **Decoding** (`Decoder::allrad`): AllRAD (Zotter and Frank, JAES 2012)
+  — the field sampled, max-rE weighted (`max_re`: `Pₙ(rE)` with `rE` the
+  largest root of `P_{N+1}`), at a 1200-point Fibonacci grid of virtual
+  speakers, each panned onto the real ones by their VBAP geometry,
+  normalised so a plane wave plays at unit power on average over the
+  sphere. Below ear level a layout without speakers there plays at ear
+  level (VBAP clamps the elevation), so nothing coming from below is
+  lost. A 2D layout takes each virtual speaker by its azimuth. Into mono
+  a field is its W (the omnidirectional pressure); into discrete channels
+  one to one; between fields the shared orders pass and the rest is
+  silent. `Decoder::sampling` is the geometry-free fallback `matrix` uses
+  where no decoder was made. Near-field compensation is not done
+  (speakers have no distance here).
+* **Spread and distance**: a source's spread tapers the higher orders by
+  `(1 − s)ⁿ` (at full spread only W is left: every direction alike),
+  scaled to keep the power a max-rE decode plays (`spread_gains`). The
+  distance (`SurroundPan::distance`, `SurroundParam::Distance`, 0…20, 1
+  the reference) lowers the level as `1/d` beyond the reference and,
+  inside it, opens the source up towards W (spread `1 − d` at unity) —
+  at the listener a source is everywhere (`distance_effect`).
+* **FuMa** (`FUMA_TO_AMBIX`): first-order B-format `W X Y Z` (W at
+  −3 dB) to AmbiX.
+
+**Panning and routing.** A mono or stereo track feeding a field
+(`Project::ambisonic_panned`; `Project::spatially_panned` answers for
+beds and fields alike) is encoded by the surround panner's values — the
+direction, never the room's place: azimuth, elevation (over the whole
+sphere, `SurroundParam::range_into`), spread, a stereo image's width
+(`azimuth ± 30° × width`), balance (left at 30°, right at −30°, by the
+strip's balance) or dual pan (each channel at its own azimuth), and the
+distance; there is no LFE send. `SurroundParam::applies_into(source,
+dest, pan)` says what applies, so the automation lanes, MIDI learn and
+the panner's knobs are those of the surround panner. `surround::matrix`
+computes every case through the strip's and the sends' `MatrixMix`
+(made off the audio thread with the destination's AllRAD decoder,
+`Mixing::decoder`): a bed into a field encodes each speaker at its
+direction (the LFE is left out of the field), a field into a bed or
+stereo decodes, a field into a field passes its shared orders. A
+pre-FX or pre-fader send of a mono or stereo track into a field follows
+the track's panner as into a bed. Node keys tell a field from a bed or
+discrete channels of the same width. Hosted plugins on a field see its
+channels one to one (an IEM or SPARTA plugin on a third-order track gets
+16 channels in ACN order).
+
+**Monitoring and delivery.** A field that fits the device's outputs
+passes to them as it is (for an outboard decoder); one that does not —
+and the master on any device it does not fit — is decoded to the largest
+built-in format the outputs hold (`fold_into`), stereo on a stereo
+interface. Rendering an ambisonic master "as the master is" writes its
+channels as AmbiX (plain WAV, no speaker mask: they are not speakers);
+Stereo decodes it (AllRAD onto L/R at ±30°: a source behind crossfades
+between them by angle), Mono writes W, Headphones renders it binaurally.
+UHJ stereo is not written. IAMF refuses an ambisonic master (its
+scene-based audio elements are not written yet); ADM writes no HOA.
+A/B loudness matching weighs a field by its W.
+
+**Import.** File → Import Ambisonic Audio (AmbiX)… brings each file onto
+a new track of its order as it is; File → Import First-Order B-Format
+(FuMa)… converts on the import thread (`session::ambix::fuma_to_ambix`,
+in place in the media folder, waveforms made again). A file whose
+channels are no ambisonic order is refused with a notice
+(`Action::ImportAmbisonic`, `Session::import_ambisonic`).
+
+**The Ambisonic Rotator** (`builtin::AMBI_ROTATOR`,
+`plugin_host::devices::ambi_rotate`): a field turned by yaw, pitch and
+roll (degrees, automatable and modulatable; the generic editor), the
+matrix from the `Rotator` remade when an angle moves and every entry
+ramped across the block. The order comes from the track's channels;
+other counts pass. No latency.
+
+**Binaural rendering of fields and turning heads.** The binaural renderer
+(`faderframe_binaural::Renderer`) works through its fifteen measured
+directions: every input channel has a weight per direction — a speaker
+at a measured direction is that direction alone, one between them a VBAP
+blend over the measured ones, an ambisonic field its AllRAD decode onto
+them — each direction's feed (its channels by their weights) is
+convolved with its pair. A speaker bed sounds exactly as before (the
+same arithmetic in another order; `each_speaker_reaches_the_ears_through_its_own_direction`
+holds). Directions no channel feeds are skipped once their history is
+silent, so a stereo master costs two convolutions as it did.
+
+`Renderer::turn(head, smoothing)` turns the listener's head: the scene is
+turned the other way relative to the head — each speaker's direction is
+turned by the head's inverse and panned over the measured directions
+(below ear level heard at ear level, as for custom speakers), a field is
+rotated (`Rotator`) before its fixed decode — so only the weights
+change, never the measured filters. The head glides to its target by
+slerp with the smoothing time constant (25 ms by default), the weights
+are made at most once a block and ramped linearly across it: no click,
+no allocation. The room's feed (a bed's mains summed, a field's W) does
+not turn. Objects are in the master's bed by then, so beds, objects and
+fields all turn. Speakers never turn, renders never hear the head (their
+engine has its own `ListenLink`).
+
+**The head in the engine.** `ListenLink::head()` (`nodes::HeadShared`:
+the quaternion's four components and the smoothing as atomics; a read
+between two writes mixes two nearby orientations, which the renderer
+normalises and glides over); `ListenOut` hands it to the renderer every
+block. `EngineController::{set_head_orientation, head_orientation,
+set_head_smoothing}`: no rebuild, no new renderer. `recreate_engine`
+carries the head over (`Session::reapply_head`).
+
+**Head tracking** (`session::headtrack`, `faderframe_control::headtrack`):
+`HeadTrackingSettings` (on, UDP port — 8001 by default —, smoothing, the
+axes a tracker counts the other way, angles in radians; in the
+preferences, never the project) and the per-session head: set by hand
+(`HeadOp::Turn`, `Straight`), or by a tracker's OSC messages relative to
+where it pointed when recentred (`HeadOp::Recentre`; `wanted` =
+reference⁻¹ · tracked). Messages read: `/SceneRotator/ypr f f f` and
+`/ypr f f f` (yaw, pitch, roll — IEM's SceneRotator and SPARTA's
+rotator/binaural decoders), `/SceneRotator/{yaw,pitch,roll}`,
+`/{yaw,pitch,roll}` (one angle, the others kept),
+`/SceneRotator/quaternions f f f f` and `/quaternion f f f f` (`w x y
+z`, in the ambisonic frame), `/SceneRotator/{qw,qx,qy,qz}`; bundles are
+opened. Inverting an axis negates its angle, or for quaternions the
+component of that axis (z for yaw, y for pitch, x for roll), as
+SceneRotator's flips do. Any app that can send one of these addresses —
+phone apps that send their orientation over OSC usually let the address
+be chosen — works as a tracker. The tracker listens on a socket of its
+own; when an OSC control surface listens on the same port, the surface's
+socket hands the packets over (`HeadState::feed_packet`; packets made
+only of head-tracker messages do not make the tracker the surface's
+peer), and a surface set up later takes the port from the tracker's
+socket (`release_head_port_for`). `tick_head` reads the socket and tells
+the engine only when the head moved. UI: Audio → Listen → Head Tracking
+(the toggle `app.toggle-head-tracking`, a row in `toggles`), Recentre
+Head, Straighten Head, Head Tracking Settings… (`head_tracking.rs`: port,
+smoothing, inverts, radians, a live status line).
+
+**UI.** The Channel Format menus offer AmbiX1–3 (`Session::format_choices`).
+The Surround Panner and the mixer strip draw a track panned into a field
+on the circle of directions with no speakers (`room::Room::dest`,
+`by_direction_into`, `stereo_mode_into`, `format_place_into`): no
+Room/VBAP or Diffuse buttons, dual pan always on offer, the Distance
+knob (0…1 on its first half, then logarithmic to 20); inside the
+reference distance the puck sits nearer the middle. A field's own strip
+reads its order and FIELD; the inspector says "into AmbiX n".
+
+**Tests.** `faderframe-core` `ambisonics::tests` (harmonics, SN3D,
+orthogonality, orientations, slerp, rotation identities, spread power,
+AllRAD placement and power round the horizon, stereo/mono decodes, the
+fallback, FuMa) and `surround::ambisonic` (the matrix: encoding by
+direction, stereo modes, distance, a 7.1.4 bed through a third-order
+field and back, fields between orders, mono, discrete, what applies,
+files); `faderframe-binaural` `turning_the_head_turns_the_scene`,
+`a_field_is_heard_where_it_comes_from_and_turns_with_the_head` (turning
+the head by an angle equals turning the field the other way, sample for
+sample), `the_head_glides_to_where_it_is_turned`; `faderframe-control`
+`headtrack::tests`; the rotator's `devices::ambi_rotate::tests`;
+`engine/tests/ambisonics.rs` (encoding through the engine, beds encoded,
+a field decoded into 7.1.4, a field master on a stereo device, azimuth
+and distance lanes, a pre-fader send following the panner, binaural
+listening turning with the head for a bed and a field while speakers do
+not); `ambisonics_and_head_tracking_do_not_allocate` (encoding with
+automated directions and distance, the rotator automated, decoding,
+binaural with the head turned every block, a field master on
+headphones); `session/tests/ambisonics.rs` (the format menu and files,
+panning lanes and undo, a field bus into a bed, the head by hand, a
+tracker on its own port with recentring, quaternions and an inverted
+axis, a tracker sharing an OSC surface's port, AmbiX and FuMa imports, an
+ambisonic master rendered as AmbiX and decoded to stereo); the surround
+view's `a_track_into_a_field_is_turned_round_the_listener`.
 
 ### Folders and folder buses
 
@@ -2250,6 +2794,295 @@ handles RPN 0 bend range, the MPE zone message, pressure and CC 74).
   format 1 at 960 PPQ: a conductor track (tempo, meter) and one track per
   instrument/MIDI track, or only the selected MIDI clips.
 
+### Articulation maps and drum maps
+
+**Articulation (expression) maps**, as in Cubase
+(`faderframe_project::articulation`): a map lists an instrument's
+articulations — name, the symbol notes show, a group (up to four), and
+whether it is an *attribute* (set on a note: that note only) or a
+*direction* (set in the clip's articulation lane: from there on until the
+next of its group) — and what switching to each sends: keyswitch notes, a
+program change, controller values, a channel the notes go out on, and
+changes to the notes (transpose, velocity and length in percent). One
+articulation of each group is in effect at a time; before any direction a
+group plays its first articulation (the default). What a state sends is
+each group's articulation's output together, unless the map has a
+`Combination` for exactly those articulations (Cubase's sound slots naming
+several). Projects keep their maps (`Project::articulation_maps`,
+`Command::SetArticulationMap`, refused for a map a track names); a track
+names one (`Track::articulation_map`, `Command::SetTrackArticulationMap`;
+instrument and MIDI tracks; both `Impact::Timeline`). A note carries its
+attribute (`MidiNote::articulation` — keep `articulation: None` in new
+`MidiNote` literals; copies, splits and moves carry it), a clip its
+directions (`MidiClip::articulations`, sorted; splits and time-scaling
+carry them).
+
+*Playback.* The timeline snapshot works out every note's state — the
+directions in effect where it starts along the track's clips in time order
+(`Directions`: a direction carries from clip to clip; a launcher clip's are
+its own), its attribute over its group's — applies the state's note
+changes, and notes a switch wherever a note needs another state than the
+note before it (`engine::articulation::SwitchBuilder` →
+`Lane::articulation`: `Switch { at, state }` and per state the events,
+built on the control side). The MIDI clip player sends a switch's
+controllers, program and keyswitch note-ons one sample before its note
+(`SWITCH_LEAD`) and the keyswitches' note-offs on the note's sample —
+note-offs sort first there, so the note-on follows. Starting or jumping
+mid-clip *chases*: the state playback from the start would have left the
+instrument in (the last switch whose note-ons went out before the
+position) goes first, after the controllers, its note-offs a sample later
+(kept for the next block when a block is one frame long); a launched clip
+gets its first note's state each time round. Everything the audio thread
+reads is built ahead; it indexes and copies. MPE tracks leave maps out (the
+member channels are the snapshot's).
+
+*Session* (`session::maps`, `Action::Maps(MapOp)`): new maps from
+templates (`ArticulationMap::TEMPLATES`: Strings, Brass) or empty, edits
+replacing a map whole, removal taking it from the tracks in the same step,
+use by a track, import of FaderFrame's own JSON maps and of Cubase
+`.expressionmap` files (`maps::cubase`, read with `roxmltree`: slot
+visuals → articulations, a sound slot's output messages and note changer
+→ its articulation's output, slots naming several → combinations, a slot
+naming none → an articulation of its own, the first of group 1 when it is
+the first slot), user files in the data folder's `articulation-maps`
+(`maps::user_dir`, `set_user_dir` for tests). `SetNoteArticulation` gives
+notes an attribute — a direction chosen for notes goes into the lane where
+the first of them starts — and `SetDirection`/`RemoveDirection` edit the
+lane (a direction replaces the one of its group at its time). Track menus
+(arranger, mixer) have an Articulation Map submenu
+(`Session::articulation_map_choices`); notes' menus an Articulation
+submenu (`articulation_choices`).
+
+**Drum maps** (`faderframe_project::drum_map`): a track's drum sounds by the
+key they are written on — name, place in the list (the map's order), a grid
+for drawing on its row, and where it plays: an output note, a channel, an
+external MIDI output of its own. `Project::drum_maps`,
+`Command::{SetDrumMap, SetTrackDrumMap}` (`Impact::Graph`), `Track::drum_map`.
+Notes stay written on the map's pitches; the snapshot plays each on its
+sound's note and channel (before an articulation's changes), the track's
+`MidiInputNode` maps live input and auditioning the same way
+(`midi::NoteMap`, its fingerprint in the node key), and a MIDI track with an
+external output gets one more output node per port the map's sounds name:
+each takes only its sounds' notes by the note and channel they play on
+(`midi::KeyFilter`), the track's own output everything else. Maps come
+from the General MIDI key map (`DrumMap::gm`; names in
+`faderframe_midi::gm::DRUMS`), from the track's Drum Sampler (`pads`: its
+first note and its samples' names), or from user files (`drum-maps`). A
+track with a drum map is a drum track: the piano roll's drum mode lists the
+sounds by name in the map's order instead of a keyboard (only those played
+with Fold to Used Keys; keys the map lacks below), and drawing on a sound
+with a grid of its own keeps to it (start and length).
+
+*Views.* The piano roll's lane menu has Articulations
+(`PianoRollSettings::articulations`): a row per articulation, names in the
+header column; directions as bars to the next of their group (the group's
+default faint before any), attributes under their notes; a click in a
+direction's row sets it on the grid (or removes the one there), in an
+attribute's row gives it to the notes sounding there (or takes it back);
+right-click: the articulations for the selected notes. Notes show their
+articulation's symbol. The MIDI event list shows directions as rows of
+their own (before the notes at their time; moved by position, changed
+among their group from the row menu, deleted) and articulations by name in
+the last column; notes' row menus have the Articulation submenu.
+
+*The map editor* (`faderframe-view-maps`, `ViewKind::Maps` "Map Editor",
+`ViewId::maps()`, a dock view: View → Map Editor, `app.show-maps`) edits a
+map's contents row by row. An articulation map is a table of its
+articulations — name, symbol, group, type (a click switches attribute ⇄
+direction) and what each sends (keyswitches typed as "C0, D0@90", a program,
+controller values "1=64, 68=127", the channel, transpose, velocity and length
+in percent) — and under a line of its own its combinations, whose
+articulations are chosen per group from a menu (a combination keeps at least
+two). A drum map is a table of its sounds in the map's order: pitch (typed
+or dragged; a sound already on that key swaps with it, `DrumMap::set_pitch`),
+name, the note it plays, channel, port (the MIDI outputs), grid, and Learn.
+A double-click types a cell, a vertical drag changes a number (shown at
+once, committed on release, like the event list), a click opens a choice's
+menu; rows move by their handle (previewed, committed on release) or
+Alt+Up/Down, are added after the selected row (+, the toolbar, a row's menu;
+new articulations take a fresh id within the map, new sounds the first free
+key, `DrumMap::free_pitch`), duplicated and deleted. Every change is one
+undo step and the whole map replaced (`MapOp::EditArticulationMap`,
+`EditDrumMap`); an edit that removes articulations also takes them off the
+notes and lanes of the clips of the tracks using the map in the same step
+(`Session::articulations_removed`), so an id the map gives again never
+reaches an old note. The toolbar chooses the map (the project's maps, New ▸
+templates/General MIDI/the Drum Sampler's pads/empty, `new_map_choices`,
+Delete), renames it, imports a file (FaderFrame's JSON or a Cubase
+`.expressionmap`, for the track edited for), exports JSON and saves a user
+map. What it shows is the session's (`session::maps::editor`:
+`MapRef`/`MapKind`, `Session::{map_editor, map_editor_track, map_users,
+has_map, map_name}`): the map it was opened on — `MapOp::OpenEditor` from the
+track menus' "Edit Map…" and the piano roll's articulation lane menu,
+`MapOp::EditTrackMap` (making an empty articulation map or the General MIDI
+drum map first), any map made or imported — until the track selection
+changes and a selected track has a map (it then follows the selection like
+the Inspector); a map gone from the project falls back to the track's. Learn
+(`MapOp::LearnDrumPitch { map, pitch }`, `CancelLearn`, Escape) waits for the
+next note-on from a MIDI input (`Session::map_learn_event` in `tick_midi`;
+the audition port never counts) and puts the sound on that key in one step
+("Learn Drum Sound Pitch"). For the keyboard and screen readers the toolbar
+is buttons, each row a table row read as a whole with its menu, and each
+editable cell a control: names and lists typed with Enter, numbers spin
+buttons the arrows step (an optional one steps down to unset), choices
+menus (group and channel step too), the type and Learn switched with Enter;
+the map shown changing is said. Dev action `edit-map:<articulation|drum>=<track>`.
+Tests: view `faderframe-view-maps` (`tests.rs`: typed cells one step each,
+drags committed on release, menus, handle and Alt+arrow moves, rows added
+after the selection, combinations, drum sounds, Learn, toolbar requests,
+every theme, the keyboard through `access::press_key`; `text::tests`),
+session `tests/maps_editor.rs`, project
+`a_sound_moved_to_a_taken_pitch_swaps_with_the_sound_there`, piano roll
+`the_articulation_lane_sets_directions_and_attributes`.
+
+Dev actions `articulation-map:<track>=<name|template|file|none>`,
+`drum-map:<track>=<gm|pads|name|file|none>`, `piano-lane:articulations`.
+Tests: project `articulation::tests`, `drum_map::tests`; session
+`maps::cubase::tests`, `tests/maps.rs` (attributes and the lane, files and
+removal in one step, pads, keyswitches before their notes and chased in a
+running session); engine `articulation::tests`, `tests/maps.rs`
+(keyswitches a sample ahead, chasing, drum notes/channels/ports, live
+drums), `articulation_and_drum_maps_do_not_allocate`; piano roll
+`a_drum_map_lists_its_sounds_by_name_and_draws_on_their_grids`,
+`the_articulation_lane_sets_directions_and_attributes`; event list
+`articulations_show_and_change_in_the_list`; arranger
+`the_track_menu_chooses_articulation_and_drum_maps`.
+
+### Microtonal tuning
+
+A project has a tuning (`Project::tuning`; `None` = twelve-tone equal
+temperament) and a reference pitch (`Project::reference_pitch`, A4 in Hz,
+200–1000); a track may play a tuning of its own (`Track::tuning`, `None` =
+the project's). `Command::SetTuning { track, tuning }` and
+`SetReferencePitch` are `Impact::Timeline` (the reference pitch coalesces);
+`SetTrackRetune` is `Impact::Graph`. Nothing is migrated: the fields are
+left out of files while they are at their defaults.
+
+* **Tunings** (`faderframe_midi::tuning`, pure; re-exported by
+  `faderframe_project::tuning`). `ScalaScale` reads Scala `.scl` files
+  (comment lines, a description line that may be empty, the number of
+  notes, pitches in cents when they have a period, else ratios or whole
+  numbers; text after a pitch ignored; errors name the line); `KeyboardMap`
+  reads `.kbm` files (pattern size, 0 = linear; first and last key
+  retuned; middle key = degree 0; reference key and frequency; formal
+  octave degree; entries or `x` for unmapped keys, missing entries
+  unmapped). `Tuning { name, scale: ScaleSource::{Equal, Scala}, mapping }`
+  keeps the degrees themselves, never a path (projects stay portable);
+  `Tuning::check` refuses a mapping whose reference key plays nothing.
+  Without a mapping, degree 0 sits on middle C at its equal-tempered
+  frequency at the reference pitch, the next keys play the next degrees
+  (Scala's convention). A mapping's reference frequency is taken as given
+  at A4 = 440 Hz and moves with the reference pitch, so 432 Hz lowers every
+  tuning alike. Keys outside a mapping's range stay equal-tempered.
+* **The key table** (`TuningTable`): per key a fractional MIDI note number
+  in equal temperament at 440 Hz (69.5 = a quarter tone above A4), NaN for
+  an unmapped key. One representation serves every destination: built-ins
+  play its pitch, MTS encodes it directly, MPE and note expressions carry
+  `pitch − key` (the *offset*), MIDI 2.0 per-note pitch too. `Copy`, 1 KiB,
+  allocation-free; `fingerprint()` tells tables apart.
+* **The engine** (`faderframe_engine::tuning`). The timeline snapshot holds
+  a `Retuning` per retuned track (`Tunings::build`: the table, its
+  fingerprint, the table as an MTS bulk dump and as real-time single note
+  changes, the track's MPE zone — all made on the control thread) and a
+  shared standard one (`TimelineSnapshot::{tuning, standard_tuning}`).
+  Every node that takes notes has a `Retuner` whose `Method` was chosen
+  when the graph was built (`method_for`; part of the node key):
+  `Builtin` — the processor gets the table (`PluginProcessor::set_tuning`,
+  default no-op; `SharedProcessor` keeps a table it could not hand over
+  while another graph held the processor; `Modulated` forwards) whenever
+  its fingerprint changes; `Mts` — a bulk dump at offset 0 before the first
+  notes, the 128 keys as two real-time single note changes when the tuning
+  changes; what the instance was told is the instance's (`TunedPlugin` in
+  `ActivatedPlugin`, beside `MissedReleases`), so a rebuilt graph does not
+  tell it again and a plugin switched to another method (or retuning Off)
+  is told equal temperament once; `Expression` — a tuning note expression
+  (the offset) after each note-on, the offset added to the note's own
+  tuning expressions; `Mpe` — each member channel's bends carry the offset
+  of its key: a bend before a note-on looks ahead for that note-on (bends
+  sort before note-ons at one offset), a note-on with no bend gets one, a
+  later bend uses the channel's key; the master channel is left alone.
+  Unmapped keys' note-ons are dropped (MTS cannot silence a key: they go
+  out at their own pitch there). The rewriting happens in the plugin
+  node's merged event buffer (`PluginNode::with_retune`) with a scratch
+  buffer made with the node: copies and arithmetic only
+  (`retuning_does_not_allocate`).
+* **Which method.** `Track::retune` (`Retune::{Auto, Mts, Expression, Mpe,
+  Off}`; Automatic by default). Built-ins always read the table (they have
+  no tuning of their own). Hosted plugins in Automatic: MPE on tracks with
+  `Track::mpe`; else note expressions for plugins that take tuning per
+  note — CLAP (its note dialect carries `CLAP_NOTE_EXPRESSION_TUNING`; it
+  lists nothing) and VST3 instruments listing the tuning type — else MTS
+  (VST3 without it, LV2, Audio Units). Off leaves hosted plugins in their
+  own tuning. MIDI effects pass keys on; the instrument after them is
+  retuned. A MIDI track playing an instrument track is retuned by the
+  instrument track's tuning at the instrument.
+* **Built-in instruments.** The synth starts each voice at the table's
+  pitch (glide, key tracking, sub key tracking and the Key modulation
+  source follow the tuned pitch; note expression tuning and bends add to
+  it); the sampler chooses zones by key as before and plays them at the
+  key's tuned pitch relative to their root (key tracking scales the
+  distance; samples at their root sound at the reference pitch's root).
+  Unmapped keys start nothing. The Drum Sampler is left alone: its pads
+  are triggers, not pitches (a tuning would detune a kit by where its pads
+  sit). The Guitar Station plays a guitar, not notes, and the Tuner keeps
+  its own reference parameter.
+* **External MIDI outputs.** `MidiOutputSink::with_retune` (`output_method`):
+  MPE bends on MPE tracks, else tuning expressions after each note-on — a
+  MIDI 2.0 port sends them as per-note pitch bends (`per_note_message`,
+  ±48 semitones), MIDI 1.0 ports drop them. MIDI 1.0 devices get MTS from
+  the session (`session::tuning::tick_tuning`, in `tick_midi`): a bulk dump
+  to program 0 and the keyboard as real-time changes, straight out
+  (`MidiOutputs::send_now`), when the table a MIDI track plays changes or
+  its port connects (`MidiOutputs::is_ump` keeps MIDI 2.0 ports out).
+* **Session and UI.** `session::tuning`: `Action::{LoadTuning,
+  LoadKeyboardMapping, PromptTuning}` (Scala files read whatever their
+  encoding; a loaded tuning is named after its files, "ptolemy (white)";
+  a broken file is a notice naming the line), `UiRequest::ChooseTuning` →
+  `faderframe-ui/src/tuning.rs` file choosers; menus from
+  `Session::{tuning_choices, more_tuning_choices, retune_choices,
+  reference_choices}` (Audio → Tuning for the project — `app.tuning`,
+  `app.tuning-ref`, Reference Pitch → Other… —, a Tuning submenu with
+  Retune Plugins in the arranger's and mixer's track menus for instrument
+  and MIDI tracks). Freezing keeps a track's own tuning in its audio
+  (track tuning and retune edits on a frozen track are refused); a
+  self-freeze cache key holds the fingerprint of each closure track's
+  table and its retune setting.
+* **The piano roll.** `Session::piano_tuning(clip)` (scales other than
+  twelve-tone equal temperament, at any reference pitch): the keyboard
+  labels rows with the degree and its cents ("3 · 386¢"; the tonic's row
+  always, the others with room), shades keys the mapping leaves out and
+  marks degree 0 with a period line; notes carry the same label; "Scale
+  keys only" folds to the keys the tuning plays (and those holding notes).
+  The key and chord track stay twelve-tone: keys and chords name keys of
+  the MIDI keyboard, not pitches, so a tuned clip's rows are not lit by
+  them, and MIDI effects that follow them (arpeggiator, chord, scale)
+  produce keys that the tuning then retunes.
+* **MTS-ESP** (ODDSound's tuning sharing between a master and client
+  plugins) is not used. Its client and master glue (`libMTSClient.cpp`,
+  `libMTSMaster.cpp`) is 0BSD, but a master works only through ODDSound's
+  `libMTS` dynamic library, a closed binary the user installs; one master
+  per machine holds one global table (per-track tunings fit only its
+  multi-channel tables), and its clients would take FaderFrame's per-note
+  retuning on top (no API tells a host which plugins are clients). A
+  dlopened master in a crate allowed `unsafe` (the UI crate) remains
+  possible: register when `MTS_CanRegisterMaster`, send the project table
+  with `MTS_SetNoteTunings`, filter unmapped keys, and set Off for the
+  hosted plugins it reaches.
+* **Tests.** `faderframe_midi::tuning::tests` (Scala and `.kbm` files
+  written for the tests: ratios, cents, labels, comments, errors with
+  lines; mappings with unmapped keys and a just-intonation reference; MTS
+  frequency data against the specification's examples, bulk dumps with
+  checksums, real-time changes); project `tuning::tests` (commands,
+  coalescing, files); plugin-host
+  `notes_play_the_tuning_and_unmapped_keys_stay_silent`,
+  `a_sample_plays_at_the_pitch_the_tuning_gives_its_key`; engine
+  `tuning::tests` and `tests/tuning.rs` (expressions, MTS once/changes/
+  rebuild/back to 12-TET, MPE bends, the synth at 432 Hz, MIDI outputs),
+  `retuning_does_not_allocate`; session `tests/tuning.rs` (files, undo,
+  menus, piano-roll labels, MTS to a MIDI 1.0 port, per-note pitch on a
+  MIDI 2.0 port); piano roll
+  `a_tuned_track_labels_rows_with_degrees_and_folds_to_its_keys`.
+
 ## 8. Plugins
 
 `faderframe_plugin_host` mirrors how CLAP/VST3 split a plugin:
@@ -2653,6 +3486,21 @@ covered by `the_stock_devices_do_not_allocate`.
   the device level after the render) and kept as the insert's Round Trip,
   which the graph compensates; the session opens the device with the
   channels the project wants (`wanted_channels`, `UiRequest::ReopenAudio`).
+  It is as wide as the track where it sits (a stereo track: two outputs and
+  two inputs from the channels chosen). Channels = Mono → Stereo (`id::
+  CHANNELS` 7, not automatable) is for stereo gear fed from a mono source:
+  a mono track goes out on two outputs alike (the graph duplicates it into
+  the send) and comes back as a pair, so the track is stereo from the
+  insert on — `PluginSlot::{widens_mono, output_layout}` decide it from the
+  slot's saved parameters (beside the devices that always widen,
+  `builtin::widens_mono`), so `Track::chain_layout`, `Track::layout_into`,
+  the graph and `required_channels` agree; the setting is part of the
+  insert's `shape`, so changing it rebuilds the graph. Mono gear on a mono
+  track keeps one output and one input: sending it to both would tie up an
+  output and, cabled into a stereo unit, feed two paths that differ by the
+  unit's tolerances. Test `mono_to_stereo_sends_both_outputs_and_returns_a_pair`
+  (the gear halves the right channel; the master hears the pair as a pair),
+  session `mono_to_stereo_takes_a_pair_each_way`.
 * **Limiter** (`devices::limiter`): a lookahead limiter that guarantees
   its ceiling — per channel the minimum needed gain over the lookahead
   window, averaged over an attack window no longer than the lookahead
@@ -2872,8 +3720,9 @@ covered by `the_stock_devices_do_not_allocate`.
   dropped on the control thread) and handed to the editor through
   `AnalysisTap::set_assets`. Sampler: one sample across the keys (root,
   loop off/forward/while held with a crossfade, start, reverse, key
-  tracking) or an SFZ; ADSR, filter with envelope, velocity, up to 64
-  voices. Drum sampler: 16 pads from a first note, each with level, pan,
+  tracking), the sample cut into slices played a key each (slice mode,
+  see *Slicing* in section 10) or an SFZ; ADSR, filter with envelope,
+  velocity, up to 64 voices. Drum sampler: 16 pads from a first note, each with level, pan,
   tune, attack, decay, start, choke group, reverse, one-shot or gate, low
   pass and velocity, four layers a pad. Editors: waveform with draggable
   start/loop markers and a keyboard with the zones; the pad grid (lit on
@@ -2897,6 +3746,133 @@ covered by `the_stock_devices_do_not_allocate`.
   them relative to itself (`samples::map_states` in `save_as`/`open`), and
   the first save moves the scratch folder's samples with the media
   (`media_moves`, also applied to states brought back by undo).
+* **Wavetable**, **FM** and **Granular** (`devices::{wavetable, fm,
+  granular}`, ids `faderframe.wavetable`, `faderframe.fm`,
+  `faderframe.granular`): three instruments rather than one with three
+  engines — each engine's parameters (the FM's six operators and free
+  matrix alone are 167) would otherwise crowd every automation and learn
+  menu, preset and generic editor with values that do nothing for the
+  engine in use, and each would carry the others' memory (tables, a
+  sample). What they share lives in `devices::poly` so they play alike
+  and like the Synth: the first 82 parameters of each (`poly::id`, `id ==
+  position`; then the instrument's own from `poly::COMMON`) are volume,
+  the amplifier envelope, the Synth's six filters or none (`VoiceFilter`
+  wraps its SVF and ladder), the filter and mod envelopes, LFO 1 (one for
+  all voices, free or synced) and LFO 2 (per voice, retriggered, faded
+  in), voicing (poly up to 32 with oldest/quietest stealing, mono, legato,
+  glide always or legato only, bend range), the three mod-wheel slots, an
+  eight-slot matrix and the Synth's chorus, delay and reverb (`synth::Fx`,
+  made with the processor). The matrix's sources are the Synth's plus
+  Timbre (CC 74 and the brightness expression) and Pitch Bend
+  (`poly::SOURCES`); targets are the shared ten (`COMMON_TARGETS`, the
+  Synth's scales) and then each instrument's own. `Chassis` holds the
+  voices (allocated with the processor), the MIDI channels — pedal, bend
+  with RPN 0 and MPE zones, pressure, CC 74, per-note expressions
+  (`Expr`) — held keys, glide and the tuning (`set_tuning`: every key
+  sounds the track's tuning; unmapped keys play nothing); a voice is a
+  `Head` (envelopes, key, pitch, expressions, LFO 2, filter state) and its
+  engine's parts. A block's MIDI events and per-note modulations are taken
+  in time order (`Steps`). **Per-note modulation**: the three answer
+  `modulatable_per_note` for every continuous per-voice parameter
+  (`per_voice`: not LFO 1, the voicing, the effects or a choice); a
+  `NoteParamMod` sets a share on the voices of its key (`NoteMods`, eight
+  parameters a voice), and such a voice reads its settings for itself
+  through `ParamValues::shifted` (the share in the parameter's own scale)
+  whenever they change — the others share the block's. Published values:
+  the Synth's nine, then each instrument's (positions, operator envelopes,
+  grains).
+  *Wavetable*: two oscillators reading tables of up to 256 frames
+  (`table::Table`): each frame kept as eleven band-limited copies an
+  octave apart (harmonics 1023, 512 … 1), each sixteen samples a period
+  of its top harmonic (at least 256, so linear interpolation's images
+  stay 70 dB down), built from the frames' spectra off the audio thread;
+  `Mip::for_increment` picks two copies for a pitch and crossfades across
+  the octave so a copy's top harmonic stays under 0.47 of the rate while
+  it is heard and a glide never steps; frames are interpolated by the
+  position. Thirteen factory tables are made by code (`table::FACTORY`:
+  basic shapes, pulse width, a synced saw, harmonic and odd builds,
+  formants, two FM ratios, a wavefolder, bit steps, drawbars, a resonant
+  saw, random spectra; 32 frames each, made once per process). User
+  tables are the oscillator's sample slot (`SampleHost::with_prepare(
+  wavetable::prepare)`): the loaded audio cut into frames of the size the
+  document gives (`SampleDoc::cycles`, `Action::SetWavetableCycle`, one
+  undo step), else the file's `clm ` chunk, else guessed (a short file is
+  one cycle; else 2048, 1024, 512, 256 or 4096 as the length divides);
+  `SampleSet::tables`. Warps: Sync, Bend + / Bend − (a half of the cycle
+  squeezed), Mirror (forwards then back, blended in), FM (the other
+  oscillator in its phase); the copies are picked for the warp's speed-up.
+  Up to eight unison copies per oscillator (detune in cents across them,
+  spread across the field, start phase and its randomness), a sub (sine,
+  square or triangle an octave or two down) and white or pink noise.
+  *FM*: six sine operators (`fm::sine_table`, 4096 points) wired by one of
+  the 32 classic algorithms (`fm::algorithms`, written from their
+  published diagrams: modulators always above what they modulate, so
+  computing 6 down to 1 has every input ready; the feedback loop is a
+  sample late and takes the mean of the last two outputs, a quarter cycle
+  at full) or a free matrix (any into any, the diagonal each one's
+  feedback, the others' last outputs for upward routes, an output level
+  each). Operators: ratio (½, 1–31 × 1 + fine) or a fixed frequency,
+  detune, level 0–99 at ¾ dB a step (a full-level modulator moves the
+  phase a cycle), velocity sensitivity, LFO amplitude sensitivity, an
+  envelope run every control tick (attack linear to the peak, then decay,
+  slope and release in dB at the rate the times between their levels set;
+  equal levels pass at once), keyboard rate scaling and level scaling
+  either side of a break key (±24 dB an octave at full). A voice ends when
+  its carriers have released (the shared amplifier envelope defaults to
+  out of the way). Pitch envelope, transpose, LFO 1 to pitch and
+  amplitude, key sync, carriers spread across the field. **DX7 voices**
+  (`fm::dx7`, from the published SysEx format: 32-voice packed bulk dumps
+  and single unpacked voices, with or without their headers; checksums not
+  required) become complete parameter sets: rates by the original's
+  timing (a level falls at a rate doubling every 6¼ steps, an attack about
+  eight times faster), levels kept, keyboard depths of 99 = ±24 dB an
+  octave, the pitch envelope in two segments, LFO speed/shape/depths. The
+  session keeps a file's bank per instance (`session::instruments`:
+  `Action::{ImportDx7, LoadDx7Voice}`, `Session::dx7_bank`; a voice loads
+  as one undo step, its whole state replaced after the old one is
+  captured).
+  *Granular*: per voice up to 48 grains started at a density (evenly or
+  jittered), from a position (sprayed either side, scanning on through the
+  sample at a speed unless frozen), each with a size, a window (Hann,
+  triangle, Tukey, Gauss, decay, swell — tables made once), the key's
+  pitch from a root (or the sample's), a transpose and a random spread, a
+  place in the field, a chance of playing backwards and a random level;
+  grains are scaled by the square root of their expected overlap, so the
+  density does not change the level. The sample is slot 0 (the samplers'
+  loading, read through the `TryCell`; a block that misses the lock is
+  silent, events still taken); with none it granulates a pad of its own
+  (`granular::builtin_source`). Live input is not granulated.
+  Editors (`view-devices::{wavetable, fm, granular}` on `view-devices::
+  poly`): two pages switched by tabs in the display — the instrument's own
+  sound, and its modulation (LFOs, mod envelope, wheels, matrix, effects)
+  — both ending with the filter, its envelope, the amplifier envelope,
+  voicing and the output. Wavetable: each oscillator's table as a stack of
+  frames, the one the newest voice reads bold; Load… copies a file into
+  the slot and switches the oscillator to it (`Action::Several`), right
+  click chooses the frame size or clears it, files drop on an oscillator.
+  FM: the algorithm drawn (click an operator to put it on the deck) or the
+  matrix as a grid (drag a cell), the operator's envelope with operator
+  tabs, the DX7 bank (Import DX7…, click a voice). Granular: the sample
+  with the position, the spray, the grains sounding, a drag sets the
+  position; the window's shape. Presets (`presets::instruments`, twelve
+  each) are levelled like the Synth's (`the_new_instruments_presets_are_
+  balanced`: −18 LUFS momentary, a decibel of headroom). Tests: the
+  devices' (pitch, aliasing up to C8 below −70 dB with the copies'
+  crossfade continuous, warps, user tables by `clm `, per-note modulation,
+  tuning; every algorithm's routing — each carrier heard, each modulator
+  moving exactly the carriers drawn — feedback and the matrix, scaling,
+  voices ending, DX7 dumps; grain density within a grain, level by
+  density, position, scan and freeze), `poly::tests`, the presets',
+  `the_instruments_do_not_allocate` (a user table with FM/sync warps, the
+  FM's full matrix and a feedback algorithm, the Granular on a sample),
+  `session/tests/instruments.rs`, the faces' (`instruments_tests`). Cost
+  per voice (ignored `wavetable_cost`, `fm_cost`, `granular_cost`,
+  release, 16 voices at 48 kHz): the Wavetable 0.3 % of a core with one
+  copy, 1.3 % with two oscillators of eight copies through a filter; the
+  FM 0.5–0.7 %, 1.3 % with every matrix route; the Granular 0.5 % at 25
+  grains a second of 90 ms, 2.2 % at its 48 grains (grain positions are
+  kept inside the sample as they move, not wrapped per read: that was
+  five times the cost).
 
 * **Automation from plugin editors.** Formats report the user's moves in a
   plugin's own GUI as `EditorEdit`s (begin, value, end): CLAP from the
@@ -2973,6 +3949,322 @@ Opt-in tests run installed plugins end to end:
 tracks audible, instruments play a clip) and the same with
 `-p faderframe-session` (live session: inserting while playing with the
 editor opening, instruments playing live MIDI as instrument and insert).
+
+### Restoration devices
+
+Five built-ins repair recordings: De-noise, De-click, De-hum, De-clip and
+De-reverb (`builtin::{DENOISE, DECLICK, DEHUM, DECLIP, DEREVERB}`, devices
+in `plugin_host::devices::{denoise, declick, dehum, declip, dereverb}`,
+faces in `faderframe-view-devices`). Their DSP is the pure crate
+`faderframe-restore`, which the spectral editor's "Learn Noise and Remove"
+uses too, so a profile heard in one place sounds the same in the other.
+Everything in it is allocation free once made (the devices run it on the
+audio thread; `engine/tests/realtime_alloc.rs` covers every device in its
+heavier modes).
+
+* **Framing.** `restore::stft::Streaming` is a streaming STFT —
+  square-root Hann on both sides at 75 % overlap, so unity gains give the
+  input back exactly, a frame of latency, all of a frame's work on its last
+  sample. Bin powers are kept per sample (divided by the window's energy):
+  white noise of variance σ² reads σ² in every bin at any frame size.
+  `restore::blocks::Blocks` frames the time-domain repairs: a window is
+  `margin` samples already processed, `hop` new ones and `margin` ahead,
+  the repairs written into a work copy that travels with the input as it
+  came (so "listen to what is taken" is a subtraction, and a repair that
+  reaches into the samples ahead is not made twice). Latency `hop + margin`.
+* **De-noise** (`restore::denoise`): a Wiener gain on the
+  decision-directed a priori SNR (Ephraim and Malah) against the noise
+  (times Threshold), floored by Reduction (tilted across the spectrum by
+  Tilt), smoothed across up to half an octave (Spectral Smoothing — bins
+  with a gain near one keep it), opened by onsets (Transients), closing at
+  a release time (Smoothing sets it and the decision-directed weight).
+  The noise is a learned profile or `NoiseTracker` (minima-controlled
+  recursive averaging, held under 2.5 times the 1.5 s minimum of the
+  smoothed power; a sound held unchanged longer than that looks like noise
+  to it — that is what learning is for). Profiles (`restore::profile`)
+  are 64 bands a sixth of an octave wide, 20 Hz–24 kHz, in dB per sample,
+  so any frame size and rate reads them. Modes: Low Latency (~11 ms
+  frames), Balanced (~43 ms), Quality (~85 ms and three hops of lookahead:
+  the most open gain of the frame and the three after it, so attacks are
+  not dulled); the mode is `fixed` (it is the latency). Learn: while on, the
+  processor averages the input's power (channels together), plays through
+  what it has learned and publishes it (`value::NOISE`, 64 values); the
+  face's Learn button pressed again writes it into the profile parameters
+  (`id::profile(b)` = 14 + b, `PROFILE_SET`, not automatable) with Learn
+  off and Source Learned, as one gesture ("Learn Noise Profile";
+  `denoise::learned_profile`). Factory presets keep the profile, the
+  source and Learn (`presets::kept`, `factory_preset_values` leaves them
+  out); `denoise::hidden` names the profile for lists of settings.
+* **De-click** (`restore::declick` on `restore::ar`): per window an AR
+  model (order ≈ rate/1500) is fitted (autocorrelation method,
+  Levinson–Durbin, Hann window, a tiny ridge), its prediction error passed
+  through the model again backwards — the matched filter of an impulse in
+  an AR process, which puts a click back where it is — and samples over
+  `K` times the statistic's robust spread (median, floored for perfectly
+  predictable tones) are clicks, `K` from 13.5 to 3.5 by Sensitivity; only
+  what reaches half the local peak counts (the matched filter rings for
+  the model's order). Crackle is taken at a lower threshold in runs no
+  longer than 0.3 ms. Runs are widened by 0.1 ms, joined across half a
+  click width, and continued while the sound after them stays away from
+  the model's extrapolation from before the click (a click's decay is
+  quieter than its edge and smooth enough to pass for music; the
+  allowance grows with the k-step prediction error, held within twice the
+  one-step one). Gaps are filled by least-squares AR interpolation: the
+  errors the gap takes part in, minimised — a symmetric Toeplitz system
+  (the model's autocorrelation) solved by Levinson's recursion in O(m²).
+  Two passes: the second fits the model to the repaired window and refills
+  everything with it. Linked, marks are shared by the channels. Windows of
+  ~21 ms with context either side: about 32 ms of latency at 48 kHz.
+* **De-hum** (`restore::dehum`): RBJ notches of a constant width in Hz at
+  the fundamental and its harmonics (up to 32, below 0.45 fs), Depth
+  mixing the notched signal with the input. The mains is followed by
+  complex demodulation of the first four harmonics (three one-pole
+  stages at 6 Hz; the phase step between readings 32 samples apart is the
+  offset), weighed by how tonal each is and by its smoothed power (an
+  instantaneous weight correlates with the low pass's image ripple and
+  biases the mean), smoothed over half a second, held within ±3 %. Auto
+  compares the 50 and 60 Hz families with 3 dB of hysteresis. No latency.
+* **De-clip** (`restore::declip`): runs of two or more samples at or
+  beyond the threshold (the clip level less Tolerance) on one side, up to
+  Max Length; the level is the loudest the input has been lately (falling
+  1 dB/s) or set. A run is filled by the same LS AR interpolation,
+  constrained by an active set to stay at or beyond what was recorded on
+  its side (pinned samples become known, the stretches between solved
+  again, Gauss–Seidel); Best fits the model a second time on the rebuilt
+  window and rebuilds from the clipped samples. Output trims the level
+  (rebuilt peaks go over the old ceiling). About 32 ms at 48 kHz.
+* **De-reverb** (`restore::dereverb`): per bin the smoothed power is
+  split into its reverberant part, followed recursively (the last frame's
+  decayed by a hop, plus what the direct part excites at the room's share
+  of a held sound, which grows with Amount), so a free decay is followed
+  exactly and a held note settles at that share; the late part is the
+  reverberation `early` ms before decayed by that much (RT60 = Tail,
+  shorter towards the highs by Damping), taken out by power subtraction
+  from the smoothed power (over-subtraction and the floor — up to 30 dB —
+  by Amount; no decision-directed bias against held notes). Auto Tail:
+  `DecayEstimator` finds free decays in seven octave bands (the level
+  falling steadily, the first 5 dB skipped), fits them, and takes the
+  median of each band's recent decays and of the bands. ~21 ms frames.
+
+Reset follows the panic rules: the STFT ring and the trackers are
+forgotten (a `fresh` count, `live` flags that restart them with the next
+frame), small accumulators cleared. Latencies are reported from the
+parameters and the rate (`latency(params, rate)`): only De-noise's mode
+changes it. Tests: the crate's own (Levinson against elimination, gaps in
+tones filled, clicks found and filled, clipped sines rebuilt, the tracker
+finding noise under a melody, drifting hum followed to 0.005 Hz and
+notched, reverb tails estimated and taken down, the STFT's identity and
+scaling); the devices on `devices::rig` (SNR raised for hissy melodies
+adaptively and with a learned profile, clicks of 4–28 samples repaired with
+the music kept and nothing touched in clean music, buzz notched by 30 dB
+with the tone within 0.3 dB, clipped peaks rebuilt, tails between bursts
+taken down by over 8 dB with the bursts kept, every mode delaying by its
+reported latency, listen modes); presets (ten or eleven each, in
+`presets::restoration`, the usual checks); faces (`faderframe-view-devices`
+tests: controls in their sections, every theme, De-noise's Learn and
+Forget as single undo steps); `session/tests/restoration.rs` (Learn Noise
+and Remove in one step, the devices' latencies through a rebuild).
+
+### Convolution reverb, multiband dynamics and the vocoder
+
+Three stock effects on the `plugin_host::dsp` toolkit, with kit faces in
+`faderframe-view-devices` (`convolution`, `multiband`, `vocoder`):
+Convolution Reverb (`builtin::CONVOLUTION_REVERB`, `devices::convolution`),
+Multiband Dynamics (`builtin::MULTIBAND_DYNAMICS`, `devices::multiband`) and
+Vocoder (`builtin::VOCODER`, `devices::vocoder`).
+
+* **Convolution without latency** (`dsp::convolve`). A response is cut the
+  way Gardner proposed: its first 64 taps convolved directly (a dot product
+  with the input history per sample), the rest in stages of partitions
+  32, 256, 2048 and 16 384 long, each stage a uniformly partitioned
+  overlap-save convolution starting two of its partitions into the
+  response (`64 + 14·32 = 512 = 2·256`, …; the last stage takes any number).
+  Starting two partitions in is what lets a stage spread its work: the
+  output a block of input makes is not due before another block has
+  passed, so the block's transform, its products with every partition and
+  the inverse transforms run as units over the next block's samples (at
+  most one large transform in a callback; no burst at a boundary). An
+  `Engine` convolves any `Routing` of paths (an input into an output) up
+  to a capacity fixed when made (its frequency-domain delay lines hold
+  that much history); it runs in pieces of at most 32 frames
+  (`room`/`input_mut`/`run`/`output`, or `convolve::run` over buffers).
+  New `Kernels` for the same paths go in without losing the history: each
+  stage computes its next block with the old and the new kernels and
+  crossfades over the block after (the head over 32 samples), then the
+  old set comes back from `take_retired` to be freed elsewhere. Kernels
+  are made off the audio thread (`Kernels::new`); a `Designer` thread
+  (15 ms) makes them for a processor and sends them through a mailbox,
+  freeing what the audio thread hands back through a ring. Reset forgets
+  (history counts as silence, outputs as not computed) and clears
+  nothing large.
+* **Convolution Reverb.** The response is a file kept like a sampler's
+  sample (its state's `SampleDoc` slot 0: copied into `<media>/Samples`,
+  decoded in the background in a live session, relative in the project
+  file; `session::samples::is_sampler` names it, and a file loaded sets
+  Space to the file in the same step, "Load Impulse Response",
+  `samples::plays_the_file`) or a built-in space (`convolution::spaces`:
+  made here, never recorded — rooms are a shoebox image-source model for
+  the early part, walls' reflection from Eyring for the middle RT60,
+  higher orders low-passed, and a three-band noise tail at Sabine's
+  diffuse level faded in over the mixing time; a plate is the tail alone;
+  true stereo, the paths' tails decorrelated). Files may be mono, stereo
+  or true stereo (four channels: LL, LR, RL, RR; `Sample::extra` keeps the
+  third and fourth). Start, Length, Fade In/Out, Reverse, Stretch
+  (resampled: the room scaled) and Normalise (the outputs' energy made
+  one) shape the response on the designer (`convolution::shape`, one
+  windowed-sinc resampling to the engine's rate); they are not
+  automatable. A new shape of the same source is new kernels; a new
+  source or one longer than the engine holds (capacity = the source at
+  twice its length) is a new engine, crossfaded over 4096 samples
+  (`ENGINE_FADE`). Kernels name the engine they were made for (`tagged`,
+  the processor publishes the engine it plays), so none reach an engine
+  about to be replaced. After the convolution: Pre-Delay (a gliding delay
+  line before it), Low/High Cut (12 dB/oct), Width, Output and Mix. No
+  latency; the editor reads the response through the tap's assets
+  (`ImpulseView`: envelope, energy to come, RT60 by Schroeder's T20,
+  what is wrong). In a live session the first response is made in the
+  background (the wet signal comes in when ready); offline it is made with
+  the processor, so renders repeat exactly. Undoing the first file loaded
+  (a slot whose state goes back to none) puts the device back as it was
+  made: the engine keeps every built-in's state from when it was made
+  (`plugins::Hosted::initial`) and loads it then (samplers alike).
+* **Multiband Dynamics.** One to six bands. Minimum phase: Linkwitz–Riley
+  crossovers (24 dB/oct) in a tree, each band through the all passes of
+  the crossovers above it (`x − 2√2·band` of a state variable filter at the
+  crossover) so the bands sum to one all pass at any count; no latency.
+  Linear phase: per band a symmetric FIR (about 85 ms, `fir_taps`) whose
+  magnitude is the Linkwitz–Riley band's (`band_magnitude`: they add up to
+  one, and the same Hann window on each keeps their sum an impulse), run
+  as twelve paths on the convolution engine, new crossovers designed on a
+  thread and crossfaded in; latency half the FIR (`fixed` parameter). Per
+  band: the key's band (the input's, or a sidechain split alike and, in
+  linear phase, delayed by the FIR's half), peak or RMS, linked; the gain
+  computer (`multiband::curve`) — Compress takes `1 − 1/ratio` of what is
+  over, Expand `ratio − 1` times what is under, Upward Compress lifts
+  `1 − 1/ratio` of what is under, Upward Expand `ratio − 1` times what is
+  over, soft knee, Range caps every change; Attack moves away from 0 dB,
+  Release back. Lookahead delays the bands; solo, mute and bypass per
+  band; Mix blends with the unprocessed bands (in phase with the wet).
+  Parameter ids: globals 0–12, band `b`'s fields at `13 + 11 b + field`
+  (`id::band`, `id::field_of`; `parameter_group` names the band).
+  Published: per band its gain change and level, the deepest cut
+  (`devices::reduction_value`: the mixer's gain-reduction meter).
+* **Vocoder.** The modulator (the input or the sidechain, mono) through a
+  bank of 8–40 fourth-order band passes (two state variable filters each)
+  between Low and High, spaced in octaves, mels or hertz, as wide as
+  Bandwidth times their spacing; each band's envelope followed. The
+  carrier (the synth, noise, the sidechain or the input) through the same
+  bank moved by Formant, each band turned to the modulator's envelope:
+  divided by its own envelope with Enhance (the carrier's tilt flattened;
+  a −80 dB floor so a carrier fading out is not lifted back), by the
+  carrier's overall envelope without. The synth: two PolyBLEP oscillators
+  per voice (saw to pulse, detuned), breath noise with the voices, pitches
+  from a held chord on Root, the notes played (the vocoder takes notes:
+  on an instrument track, or from a MIDI track playing it; eight voices,
+  gliding), or the modulator's own pitch through the Voice-to-MIDI tracker
+  (`faderframe_analysis::voice::VoiceTracker`, notes and bends). The
+  unvoiced detector compares the modulator's highs (over 3 kHz) with all
+  of it; consonants' highs pass straight through, as loud as Unvoiced. No
+  latency.
+
+Presets (`presets::{convolution, multiband, vocoder}`, thirteen or twelve
+each; the usual checks render them all). Cost (release, one core, 48 kHz,
+ignored `device_costs`): the Convolution Reverb about 1 % (a small room)
+to 1.2 % (the cathedral's 7.6 s, true stereo), Multiband Dynamics 3 % (six
+bands) or 4 % (linear phase), the Vocoder 1.6 % (16 bands) to 3.2 % (40). Real-time safety:
+`the_convolution_multiband_and_vocoder_do_not_allocate` in
+`engine/tests/realtime_alloc.rs` (a true-stereo file and a built-in space
+with pre-delay automated, both multiband phases keyed and automated, the
+vocoder's chord, follow and sidechain carriers, then new responses,
+engines and crossovers taken in while armed). Tests: `dsp::convolve`
+(exact against direct convolution at lengths across every stage, true
+stereo, kernels crossfaded in with the history kept and a steady input
+gliding, reset, refusals), `convolution::{shape, spaces, tests}`
+(resampling, trimming/fades/stretch/normalising, every space's RT60 and
+decorrelation, no latency, a four-channel file's paths, pre-delay, cuts,
+width, shaping while playing, a new engine, background first build,
+reset), `multiband::tests` (bands sum flat at every count, linear phase
+returns the input exactly a half FIR later, a loud band compressed by its
+curve and the others left, the static curves, upward compression, solo/
+mute/bypass, an external key, lookahead latency), `vocoder::tests`
+(the modulator's spectrum on the carrier, silence, formant, sidechain as
+carrier and as voice, follow, MIDI voices, consonants), views
+`the_convolution_multiband_and_vocoder_faces_hold_their_controls`,
+`the_multiband_face_picks_bands_and_drags_crossovers`,
+`the_convolution_face_loads_and_uses_a_file`, session
+`tests/convolution.rs` (copied in, one step that also picks the file,
+undo, saved relative, opened elsewhere and played).
+
+### Pitch Correct
+
+Pitch Correct (`builtin::PITCH_CORRECT`, `plugin_host::devices::pitch_correct`,
+face `view-devices::pitch_correct`) is a live, monophonic pitch corrector,
+written fresh. It takes notes (`note_inputs` 1) and is an ordinary effect
+otherwise.
+
+* **Detection** (`pitch_correct::detect`): YIN on the input low-passed and
+  decimated to about 8 kHz, every 2 ms, over a window as long as the
+  lowest period of the Range; the first dip of the cumulative mean
+  normalised difference under 0.15 is the period (no octave too low), a
+  parabola places it, and it is refined on the full-rate signal over the
+  same span (to a cent). While a note sounds, a jump by an octave or a
+  twelfth is taken only when the lag near the old period repeats clearly
+  worse (a strong second harmonic or a formant on it holds no sway).
+  Quieter than −50 dBFS or an aperiodicity over 0.35 is unvoiced; two
+  unvoiced frames in a row end the note.
+* **Targets**: the nearest allowed key to the pitch followed over 12 ms —
+  the key track's key where the voice is (or the key set here when there
+  is none), the chord track's chord (else the key), the key set here,
+  every semitone, the notes ticked (Custom), or the keys a MIDI track
+  playing the track holds (MIDI; none held: the voice is left alone).
+  Keys are tuned by the track's tuning (`set_tuning`: the processor's
+  `TuningTable`), so a 19-EDO project pulls to its own steps and the
+  reference pitch counts. A note is left only once the voice is 0.2
+  semitones nearer another (0.45 with the natural vibrato kept).
+* **Correction**: on the error against the target, its 80 ms average
+  (started afresh where a note starts) is the intonation and is taken
+  out; the rest — vibrato, scoops — is kept by Natural Vibrato (100 %:
+  as sung; 0: flattened onto the note). The shift glides there at the
+  Retune Speed (95 % of the way in that time; 0 = at once, the hard-tuned
+  sound), more slowly on notes held longer with Humanize (up to 400 ms
+  more after 0.7 s). Transpose moves the result by semitones.
+* **Shifting** (`pitch_correct::shift`): TD-PSOLA at a fixed latency.
+  Marks are laid on the input a sung period apart (5 ms unvoiced), each
+  with the ratio and formant factor wanted where the analysis frame
+  nearest it was centred; output grains one target period apart are cut
+  around the mark nearest their place less the latency, two periods long
+  under a Hann window, so the formants stay (Formant moves them; with
+  Preserve Formants off they move with the pitch). Formants down read
+  less than two periods into the same span, formants up squeeze two
+  periods into less, so a grain never reaches more than a period either
+  side and the latency is 2.5 of the Range's lowest period (Soprano
+  150 Hz ≈ 17 ms, Alto/Tenor 95 Hz ≈ 26 ms, Low Male 62 Hz ≈ 40 ms,
+  Instrument 40 Hz ≈ 63 ms at 48 kHz; Range is `fixed`, a change rebuilds).
+  The grain grid is locked to the marks plus the latency (and drawn back
+  to them, at most 0.1 % of a spacing per grain, after a shift moved it),
+  so a voice left alone comes out exactly the latency later — the Mix
+  with the dry voice never combs. Stereo inputs are shifted alike from
+  the mono sum's marks. Published: the pitch sung, the target, the pitch
+  played, the correction, the clarity and the pitch classes allowed
+  (`value::*`), which the face draws as a four-second history over the
+  semitones.
+
+A MIDI track may play an audio track too (the project's routing check
+allows it), devices that take notes on audio tracks get the notes of the
+MIDI tracks playing them (`build::devices_take_notes`: instrument and
+audio tracks; such a track is fed, so it is not rendered ahead), and a
+MIDI track's "Plays" menu lists audio tracks holding such a device
+(`Session::midi_instrument_choices`): a melody in a MIDI track is Pitch
+Correct's target. Channels past the second (a wider track) pass as they
+came. Fifteen factory presets (`presets::voice`).
+Tests: `devices::pitch_correct::tests` (a detuned tone pulled within the
+retune time, hard tune with the vowel kept, vibrato kept or flattened,
+key/chord/custom/MIDI targets, the tuning, transpose with and without
+formants, latency exact and identity when in tune), `detect::tests`,
+`engine/tests/pitch_correct.rs` (a MIDI track's note reaching it on an
+audio track), `the_stock_devices_do_not_allocate`,
+`session/tests/pitch_correct.rs`, view-devices
+`pitch_correct_shows_the_pitch_and_holds_its_controls`.
 
 ### Sandboxed plugins
 
@@ -3248,6 +4540,174 @@ reached through it too.
   sample-accurate cutoff automation, a state round trip and notes into the
   synth.
 
+### ARA (Audio Random Access)
+
+ARA 2 plug-ins — Melodyne, SpectraLayers, VocAlign, RePitch — read the
+host's audio whenever they like and edit it as a whole; they come as VST3
+or CLAP plug-ins with an ARA extension. FaderFrame hosts them through the
+ARA C API (ARA SDK 2.3.0, Apache-2.0), translated by hand in
+`faderframe-ara` (`ffi.rs`: the header packs its structs to one byte on
+x86 and naturally on ARM, so structs whose fields the packing moves are
+`repr(C, packed)` there, pointer tables plain `repr(C)`; everything a
+plug-in hands over is copied with `read_unaligned`; layouts are checked
+against offsets worked out from the header).
+
+* **The crate.** `Factory` (a plug-in's static factory: name, archive IDs,
+  stretching, analysable content; initialised once per process at the
+  newest generation both sides know, at least 2.0 Final — region
+  sequences and partial persistency are needed), `Document` (the host's
+  five interfaces and the plug-in's document controller), `Model` (what a
+  document should hold, by key), `Renderer`/`Assignment` (a bound
+  instance's playback regions and previewed sequences), `Extension` (what
+  binding hands back), `Samples` (where audio readers read). The host's
+  interfaces: audio readers (one thread each, several at once, 32 or 64
+  bit, silence outside the source; never the plug-in's render thread, by
+  ARA's rules, so they may do file I/O), archive readers and writers
+  (positional writes, zero-filled gaps, reads checked against the size),
+  the musical context's content (tempo sync points, bar signatures, keys,
+  chords — what the plug-in asks for from its calls), model updates
+  (recorded during `notifyModelUpdates`: analysis progress, sources,
+  modifications and regions changed, document data) and playback requests
+  (from any non-render thread). Host references are pointers to boxes the
+  document owns until after the plug-in's controller is destroyed.
+* **One edit cycle per change.** `Document::sync(model, assignments,
+  archive)` compares the model with a mirror of what the plug-in holds and,
+  when anything differs, runs one cycle in ARA's order: document name,
+  musical context, sequences, sources (access enabled after creation,
+  disabled around a change of length, rate or channels), modifications,
+  regions, the archive (restored once every object exists), renderers
+  (removals first — no region is destroyed while a renderer holds it —,
+  then additions), then regions and sequences no longer wanted are
+  destroyed, and modifications and sources deactivated for the undo
+  history: they come back with their edits when the model has them again
+  (an undone delete). The store leaves deactivated objects out. A region
+  never changes its modification under the same key (the key names it).
+* **The model from the project** (`faderframe_engine::ara`): one document
+  per factory (`AraHost` in the `PluginHost`, after its instances so they
+  go first); a region sequence per track with an ARA insert (its name,
+  colour, place); an audio source per media file (persistent ID
+  `src:<source id>`; files are read through a `WavFile` of their own —
+  never the live `StreamSource`s —, generated material from memory); an
+  audio modification per track and file (`mod:<track>:<source>`: splits,
+  trims and moves keep the plug-in's edits; copies on one track share
+  them); a playback region per clip piece (`r:<clip>.<piece>@<mod>`: a
+  plain clip is one piece, a take folder's comp one per piece), in song
+  seconds and source seconds (a warped clip asks for stretching when the
+  factory supports it). Muted clips and frozen tracks have none. The
+  musical context is the tempo map (sync points at every change and every
+  quarter of a ramp, one at quarter 0), the bar signatures, the key changes
+  and the chord track (a gap after a chord is ARA's "no chord").
+* **Binding.** `Project::ara` (`faderframe_project::ara`) lists the inserts
+  bound to ARA (a side table: `PluginSlot` literals stay as they are;
+  `Command::SetAraSlot`, Graph) and keeps each factory's archive (base64,
+  with the plug-in's name, vendor and version to say what is missing). An
+  ARA insert is instantiated in process (`PluginFactory::instantiate_in_
+  process`: the sandbox would put it in a helper, but the plug-in reads
+  FaderFrame's audio and model through pointers, so ARA plug-ins never
+  run sandboxed) and bound in `PluginHost::ensure` before its state loads,
+  it activates or its editor opens (VST3: the component's
+  `IPlugInEntryPoint2::bindToDocumentControllerWithRoles`, else ARA 1's
+  `bindToDocumentController`; CLAP: the `org.ara-audio.ara.
+  pluginextension/2` extension, or its draft ID). It takes all three roles:
+  it renders its track's regions (its input is ignored), previews edits
+  (its track's sequence) and its editor shows the document. The first
+  instance of a factory makes the document, whose first cycle creates
+  every object of every track using the plug-in and restores the project's
+  archive. A plug-in that is no ARA plug-in after all plays as an ordinary
+  insert (remembered, not tried again while its slot stays).
+* **Keeping in step.** `EngineController::sync` runs `PluginHost::sync_ara`
+  for Timeline and Graph impacts: instances whose binding no longer
+  matches their slot go (made again by the build); a document whose
+  project archive it never restored or stored belongs to another project
+  (one opened, a version restored) and goes with its instances; renderers
+  whose regions change (a clip added or removed on their track) are
+  deactivated first — ARA lets a playback renderer change its regions only
+  while inactive — and the sync escalates to a graph rebuild, which
+  activates them again (a short gap on that track). Moves and trims change
+  only region properties and keep playing. A document nothing uses any
+  more is parked (its archive kept in memory with the archives it knew):
+  made again for the same project, it starts from there, so undoing and
+  redoing "Open with ARA" keeps the edits.
+* **Playback.** The snapshot leaves out the audio clips of tracks an ARA
+  insert renders (`TimelineSnapshot::drop_audio_of`; not when it is
+  bypassed: then the clips play as they are). The plug-in renders at the
+  transport position it is given; a plug-in node marked
+  `rendering_the_timeline` behind latency gets the transport set back by
+  its input latency, so what it renders lines up with the other tracks
+  through PDC (`an_ara_insert_behind_latency_lines_up`: the track nulls
+  against an inverted copy of the clip on another track). Render-ahead
+  and renders work as for any plugin: renders make their own engine, whose
+  document restores the archive the session captured just before.
+* **Archives and saving.** `Session::capture_plugin_states` (before saving,
+  rendering, engine rebuilds and edits that remove plugins or unbind one)
+  stores every document's archive in the project (bookkeeping, no undo
+  step). Edits made in the plug-in are reported through model updates
+  (polled with the plugins every tick) and keep the project dirty
+  (`Session::is_dirty` asks `EngineController::ara_unsaved`) until the
+  next capture.
+* **The session** (`session::ara`): `Action::OpenWithAra { clip, plugin }`
+  puts the plug-in first on the clip's audio track and binds it (one undo
+  step "Open with <plug-in>": `InsertPlugin` + `SetAraSlot`), or with
+  `plugin: None` uses the track's own; either way the editor opens
+  (`UiRequest::PluginEditor`) with the clip selected
+  (`notifySelection`). `Action::AraNotesToMidi` reads the notes the plug-in
+  found in the clip's regions (song time) into a MIDI clip on a new
+  instrument track (the FaderFrame Synth) under it. The plug-in's play,
+  stop, locate and cycle requests drive the transport (`tick_ara`).
+  `Session::{ara_plugins, ara_menu, ara_rendered_tracks, ara_analysis}`.
+  Self-freezing keeps ARA tracks live (`Live::Ara`: a cache would not
+  follow the plug-in's edits). Not mapped: clip gain, fades and reversing
+  (an ARA plug-in reads the files; with one renderer per track there is
+  nowhere to apply them), ARA audio file chunks, processing algorithm
+  choice, plug-in content (tempo, key) read back other than notes.
+* **Discovery.** VST3 modules pair an ARA plugin's processor class with
+  an "ARA Main Factory Class" class of the same name; the scan also asks
+  each component for `IPlugInEntryPoint`. CLAP plugins advertise
+  `ara:supported`/`ara:required`; the scan also reads the entry's
+  `org.ara-audio.ara.factory/2`. Both end up as the `ara:supported`
+  feature in the scan cache; `PluginFactory::ara_plugins` lists them.
+* **UI.** The arranger's audio clip menu has the session's `ara_menu`
+  ("Open with <plug-in> (ARA)" per installed ARA plug-in, a submenu when
+  there are several; on an ARA track "Edit in <plug-in> (ARA)" and "Notes
+  Found by <plug-in> to MIDI"). A mixer insert that is an ARA plug-in (or
+  bound) has "Render the Track's Clips (ARA)" in its menu, checked while
+  bound (`Command::SetAraSlot` either way: the instance is made anew). The
+  editor is the ordinary plugin window.
+  Dev actions `ara-open:<track>=<plugin id>` (its first clip; no id: the
+  track's own), `ara-notes:<track>`.
+* **Tests.** `faderframe-ara`'s mock plug-in (feature `mock`, a plug-in
+  side written in Rust: factory, document controller, renderers, editor
+  view; it analyses sources through the host's readers, finds notes, keeps
+  a gain per modification as its "edit", archives it, renders its regions,
+  and lists every breach of ARA's rules it sees) drives the crate's tests
+  (model held and rendered, a moved region while playing, a delete and its
+  undo keeping the edits, archives into a new document and refused from
+  another plug-in, notes in song time, reports and requests, a reshaped
+  source, the selection, a document emptied before its controller goes, a
+  region handed between renderers, readers and archives at the C level).
+  `plugin-clap/tests/ara_clap.rs` puts it behind a `clack-plugin` CLAP
+  plugin carrying the ARA extension: found as ARA, bound before activation
+  (a second binding refused), rendering at the song position CLAP's
+  transport gives it.
+  `faderframe-plugin-host`'s `ara_mock` (feature `ara-mock`) hosts it as a
+  CLAP-format plugin for `engine/tests/ara.rs` (renders like the clip
+  player would, moves and removals, edits through the archive into a
+  render, bypass, behind latency, notes) and `session/tests/ara.rs` (open
+  and undo/redo, saved and reopened, notes to MIDI, the transport);
+  `an_ara_renderer_does_not_allocate` in `realtime_alloc.rs`; arranger
+  `ara_tests.rs`, mixer `an_inserts_menu_shows_its_ara_binding`. Renders
+  wait (at most two minutes) while a plug-in still analyses a source
+  (`Document::analysing`, `OfflineRenderer` after its first sync). Against a
+  real plug-in (the ARA SDK's ARATestPlugIn built with the VST3 or CLAP
+  SDK, or an installed one; none of the user's installed plug-ins is an
+  ARA plug-in, and building ARATestPlugIn was not possible here):
+  `FADERFRAME_TEST_ARA=<bundle>[:<bundle>…] cargo test -p
+  faderframe-session --test ara_installed -- --ignored --nocapture` —
+  listed as ARA, bound, the clip audible through it, archived on saving,
+  bound again on opening, and no ARA asserts (`faderframe_ara::
+  assert_count`: ARA's assert function counts programming errors either
+  side reports).
+
 ### Multi-output plugins
 
 A plugin's output buses are listed main first
@@ -3414,7 +4874,8 @@ headers). The plugin is driven directly, without lilv.
 placement, positions saved per instance, resize requests, closing, fd and
 timer sources, the generic window, the editor header shared by every
 editor window: name over vendor · track, Bypass following changes made
-elsewhere, Presets, Outputs, Parameters) apart from three backends with the
+elsewhere, Presets, Outputs, the device's own undo and its A/B compare
+(below), Parameters) apart from three backends with the
 same `Parents` API: `x11.rs` (XWayland windows, RandR monitor geometry, the
 screenshot capture), `win32.rs` (plain top-level Win32
 windows with `WS_CLIPCHILDREN`; GTK's main loop dispatches their messages,
@@ -3475,6 +4936,69 @@ plugin's own resize with another). Frames are moved to their stored place
 once shown (GTK cannot place windows; the backends can). The plugin
 closes its GUI before its window and the frame go.
 `FADERFRAME_EDITOR_HEADER=0` keeps the plain windows.
+
+### A/B compare and a device's own undo
+
+Every editor window's header — the built-in devices' canvases, the EQ,
+the generic window, hosted plugins' framed editors — carries the device's
+own Undo and Redo, A and B, Copy (A → B or B → A) and Match
+(`faderframe-ui/src/device_states.rs`, following `Session::device_status`
+every 200 ms; `Action::Device(DeviceOp)`, `session::device_states`). A
+clip effect's own window has none (its settings are its card's).
+
+**A/B.** The two sides are complete settings of the slot — its state and
+the explicit parameter values applied over it (`DeviceSettings`). The
+side heard is the slot's own; the other side and which side is heard are
+a side table in the project (`Project::device_compare`, by slot,
+`faderframe_project::device_compare`, so `PluginSlot` literals stay as
+they are; written only when used; entries of slots that are gone are
+kept while the session runs — undoing a removal brings the B back — and
+dropped by `Project::repair` on opening). A switch is one undoable step:
+the slot gets the other side's settings (`Command::SetPluginState`) and
+the compare keeps those it had (`Command::SetDeviceCompare`, Impact
+None), so undo, redo, saving and opening keep slot and compare together
+— chosen over switching unrecorded, which would leave the inverses of
+earlier parameter edits pointing at the other side's values; the cost is
+a step per switch ("Compare B (EQ 1)"). The first switch makes B a copy
+of A (nothing changes but the compare). A hosted plugin's live state is
+taken into its slot first (`capture_plugin_state`: its own window may
+have changed it unseen). Built-ins keep everything in the slot; a side
+whose state is `None` (how the device was made) switches back exactly
+because the engine loads a built-in's initial state when its slot's
+state goes back to none (`plugins::Hosted::initial`), then the explicit
+values.
+
+**Match** (listening only): while the transport plays, the RMS level at
+the device's track output is followed for the side heard
+(`LEVEL_SECONDS` 3 s averaging, passages under −60 dBFS left out,
+`SETTLE_SECONDS` 0.4 s after a switch ignored); once both sides are
+measured for a second, side B is heard brought to A's level through the
+monitor path's mix-side listening gain (`set_listening_mix_gain`, ±24 dB;
+a Mix Intelligence audition keeps that gain for itself while it runs).
+Meters and renders never see it.
+
+**A device's own undo.** While an editor window shows a device
+(`DeviceOp::Watch`, counted per window) the session keeps its history:
+a snapshot of its settings and compare each time they change outside a
+gesture — after every sync of the project (`follow_device_histories`)
+and when a gesture ends — labelled by the step that made it, and, for a
+hosted plugin, after moves in the plugin's own window end
+(`EditorEdit::End`, or `EDITOR_IDLE` 400 ms after the last move: its live
+state taken into the slot, "Plugin Window Edit"). A change equal to the
+snapshot before or after the present is a move back or on (the project's
+own undo and redo of device steps), anything else a new step (up to
+`MAX_DEVICE_STEPS` 64). The device's Undo and Redo apply the snapshot
+before or after as one step of the project's history ("Undo in EQ 1:
+Change Plugin Parameter"), whatever was done elsewhere since; undo in the
+project takes that back like any step. Window moves not taken in yet are
+taken in first.
+
+Tests: `session/tests/device_states.rs` (a built-in's explicit values,
+a sampler's states, a CLAP plugin built with clack whose own window
+changed it — each side back exactly, undo of a switch; Copy; the
+device's undo beside the project's, a drag as one step, a switch undone
+with its compare; a plugin whose window reports its moves; level
+matching on and off), project `device_compare::tests`.
 
 ## 9. Audio backends
 
@@ -3558,8 +5082,12 @@ sentence for a notice.
   from the device asked for, else from the output device itself where it
   records (one clock), else the system's default input. Latencies come
   from cpal's callback timestamps (playback − callback beyond the buffer;
-  callback − capture plus the ring's fill for inputs). The streams live on
-  a control thread, so the stream handle is `Send` everywhere. With the
+  callback − capture plus the ring's fill for inputs). More devices — a
+  second output, an input other than the output device — join the stream
+  as followers of the output device's clock (see "Several audio
+  interfaces"). The streams live on a control thread, so the stream
+  handle is `Send` everywhere; it also watches the followers and opens
+  one again when its device is back. With the
   `asio` feature (Windows) the same backend drives ASIO drivers
   (`Api::Asio`, `Capabilities::input_devices == 0`: capture from the
   driver itself). It is opt-in because it compiles Steinberg's ASIO SDK,
@@ -3570,7 +5098,21 @@ sentence for a notice.
   and in CI. `DummyBackend::with_devices(DummyDevices)` stands in for a
   machine's interfaces in tests (`mock_device`: rates, buffer range,
   channels; `unplug`/`plug` — a stream on an unplugged device shuts down
-  like a pulled USB interface).
+  like a pulled USB interface). Pretend devices join like the system
+  API's: the first output device is the clock master, the others follow
+  on threads of their own with clocks of their own
+  (`DummyDevices::set_clock(id, PretendClock { ppm, jitter, block })`);
+  an unplugged follower only falls silent and is attached again when it
+  is plugged back. `DummyBackend::simulated(speed)` runs master and
+  followers on a simulated clock (the followers' callbacks between the
+  master's, on its thread, jitter from a seeded generator): minutes in
+  seconds, the same result on a loaded machine. `with_input_pulses(s)`
+  feeds 2 ms raised-cosine pulses every `s` seconds of each device's own
+  clock — captured at the same moments by master and followers on the
+  simulated clock, which is how per-channel latency is checked.
+* `Aes67Backend` (`faderframe-audio-aes67`) — AES67 network streams on a
+  PTP clock, as the audio system or beside another one's device (see
+  "AES67 network audio" below). Never chosen by *Automatic*.
 
 *Automatic* tries PipeWire, JACK, ALSA, then the dummy device on Linux, and
 ASIO (where built in), the system API, then the dummy device elsewhere.
@@ -3630,8 +5172,10 @@ note on what the audio system decides (PipeWire's allowed rates and
 quantum limits from its `settings` metadata) and on devices of different
 clocks. Apply says beforehand whether it applies live or reopens. *Running*
 shows the stream, what was asked for against what runs, the latencies (in,
-out, heard, recording compensation), where each channel goes (device port
-names) and a device that is missing or being reconnected. Settings persist
+out, heard, recording compensation), a line per device of a joined stream
+(the clock master; each follower's rate, drift, latency and gaps, or that
+it is not connected — `joined_lines`), where each channel goes (device
+port names) and a device that is missing or being reconnected. Settings persist
 in `Preferences::{backend, sample_rate, buffer_size, threads,
 audio_devices, audio_input_channels, audio_output_channels,
 audio_force_format}`; a chosen device not connected now stays chosen and is
@@ -3657,29 +5201,319 @@ shown as "(not connected)". `preferences-page:audio@0.5` scrolls the page
   resample — FaderFrame connects to their ports like any other);
   pipewire-jack exposes every PipeWire device, kept in step by PipeWire as
   above.
-* **System APIs (WASAPI, CoreAudio, ALSA)**: one output device; the input
-  may be another device, but then it runs on another clock and nothing
-  resamples between them: the capture ring fills or empties slowly and
-  each overflow or gap is counted as an xrun (Preferences says so). Input
-  defaults to the output device itself where it records. No aggregate
-  device is built here; macOS users can make one in Audio MIDI Setup (it
-  appears as one CoreAudio device), Windows has no system equivalent.
-  ASIO is one driver = one device.
-* **What a native multi-device design needs** (not built): a clock master
-  (one device's callback drives the engine); per follower device a stream
-  on its own thread feeding a ring; a drift estimator per follower (a DLL
-  on the ring's fill or the devices' timestamps, as PipeWire's ALSA nodes
-  do) steering an adaptive resampler (rubato's `SincFixedOut` or a polyphase
-  FIR with a slowly varying ratio, RT-safe, allocation-free after
-  creation) between the ring and the engine's buffers; latency accounting
-  per device (each follower adds the ring target and the resampler's
-  delay, so recording compensation becomes per input channel); xrun and
-  underrun handling per device (a follower's dropout must not stop the
-  master); hot-plug of followers without restarting the master; rate
-  checks (followers at another nominal rate resample by the ratio). The
-  engine already takes any channel count and a single callback; the
-  pieces missing are the follower streams, the drift-steered resampler and
-  per-channel latency in recording.
+* **System APIs (WASAPI, CoreAudio, ALSA) and the dummy device**: any
+  number of devices, joined natively (below). Preferences offers two per
+  direction (the backend takes four). Input defaults to the output device
+  itself where it records. macOS users can still make an aggregate device
+  in Audio MIDI Setup (one CoreAudio device to us). ASIO is one driver =
+  one device.
+
+**Joined streams** (`faderframe_audio::follow`). One device is the clock
+master: the first output device; its playback callback drives the engine,
+and its own capture (same clock) comes through the plain capture ring as
+before. Every other device — further outputs, inputs on other devices — is
+a *follower*: one direction of one device (a device used both ways is two
+followers, two loops measuring one clock), a stream of its own on its own
+thread (cpal's callback thread, or the dummy's), at the master's rate where
+it runs at it, else at its own. `follow::join` wraps the engine's callback
+in a `Joined` callback the master drives; the stream's channels are the
+master's and the followers' in the order the devices were asked for
+(`Place::{Master, Follower}`), and the engine sees one device.
+
+* **The ring and the stamp.** A follower's callback pushes its frames into
+  an `rtrb` ring (recording; or takes them, playing) and publishes how many
+  it has moved by when (`link::Stamp`: a sequence lock over atomics, the
+  process's monotonic clock `follow::now_ns`). The master's callback
+  estimates the fill *at its own moment* — the follower's count
+  extrapolated from its stamp at its nominal rate, less what the master
+  has taken, plus what the resampler holds past its read position — so
+  the follower's block size and phase do not saw the estimate up and
+  down; only the callbacks' timing jitter is left in it.
+* **The drift loop** (`follow::drift::DriftLoop`): the fill error against
+  the target, smoothed over 50 ms, through a critically damped
+  proportional-integral loop whose integral part settles on the drift
+  itself (so the fill settles on the target with no error left); the
+  correction scales the resampler's step. Bandwidth 0.128 Hz for the first
+  4 s (locking), then narrowing to 0.016 Hz over 10 s (PipeWire's ALSA
+  followers use the same two): once settled, a callback whose timing is
+  10 frames off moves the read position by a hundredth of a frame. The
+  error is also averaged over 2 s (jitter out): that average is how far
+  the fill is off its target (the latency reported counts it) and whether
+  the loop has settled (`locked`: the fill within a few frames). The
+  drift found carries over when the follower comes back. The correction
+  is capped at 0.5 %.
+* **The resampler** (`follow::resample::Resampler`): a polyphase
+  Kaiser-windowed sinc (β 10, 40 taps a side at a ratio of one, more going
+  down in rate, the cut-off at 92 % and the passband to 84 % of the lower
+  Nyquist frequency), tabled at 512 fractional offsets and interpolated
+  between the two nearest, each row normalised to unity gain; read at a
+  fractional position advancing by the step. Worst error against an ideal
+  sine read at the same positions, the step wobbling by 0.05 %: −114 dB at
+  1 kHz (1:1, +150 ppm, 44.1 → 48, 96 → 48, 48 → 44.1 kHz), −97 dB at
+  18 kHz. Allocated when made; `push`/`read` allocate nothing.
+* **The target** is what both sides' blocks need with the resampler's
+  look-ahead and a safety margin: recording, the follower's largest block,
+  the master's block in follower frames, the resampler's 40 frames, 2 ms
+  and a quarter block more; playing, the same without the look-ahead.
+  The follower's largest block is measured as it runs (the spec gives a
+  first guess).
+* **Gaps, never stops.** A ring that runs dry (or over), and a follower
+  whose stamp is older than 150 ms (or four of its blocks), silence only
+  that follower's channels; the link waits for it, drops what is beyond
+  the target, starts again with a 256-frame fade-in and keeps 2 ms more
+  fill from then on (up to 50 ms). Gaps are counted per follower
+  (`DeviceStatus::gaps`). The master is never stopped or reopened for a
+  follower.
+* **Hot-plug.** The stream's control side (`follow::Followers`) attaches a
+  new link for a follower whose device is back (`Followers::attach`: new
+  ring, resampler and loop seeded with the drift found; its device end for
+  the new stream); the link travels to the master's callback through a
+  small queue and the old one comes back through another, dropped on the
+  control side (`collect`). The cpal backend's control thread notices a
+  follower's stream failing (its error callback), drops it, looks for the
+  device every second and opens it again; the dummy device's watch thread
+  does the same for pretend devices plugged back. The session says once
+  that a follower went away and that it is back (`tick_audio_device`).
+* **Latency per device and channel.** A follower's input frame read in a
+  master callback was captured `fill + device latency` follower frames
+  before it (the fill counted from the resampler's read position, so it
+  includes the look-ahead), while the master's own input is a buffer old:
+  its channels' latency beyond the buffer is `(fill + device) ·
+  master rate / follower rate − buffer`. Outputs alike, plus the
+  resampler's delay. `AudioStream::devices()` → `DeviceStatus` per device
+  (master first: channels, rate, latencies, drift, settled, gaps);
+  `faderframe_audio::channel_input_latency` picks a channel's; the session
+  compensates each take by its own channels' (`Session::input_latency_of`;
+  also the A/V calibration's input). Outputs are not aligned across
+  devices: a follower's outputs sound its output latency after the
+  master's (Preferences shows it); the heard position and recording
+  compensation follow the master's output.
+* **Realtime.** `Joined::process`, `FollowerInput::capture_with` and
+  `FollowerOutput::play_with` take no locks and allocate nothing (rings,
+  resamplers and scratch made with the link); follower threads follow
+  the audio thread a step below (`priority::follow_audio(Helper::Near)`),
+  cpal's map their stacks on the first callback. The sequence lock's
+  reader retries a few times and keeps its last stamp if a write keeps
+  getting in the way.
+
+Tests: `follow::tests` (the resampler's noise floor at five ratios and
+18 kHz; frames in = frames out × step; a follower 120 ppm fast with
+±0.5 ms jitter for ten simulated minutes — no slip in the three-term
+recurrence of its sine, no gap, the drift found within 1 ppm; 44.1 kHz
+and 96 kHz followers; the reported latency against a pulse's centroid
+within a frame; a playing follower 50 ppm slow; a follower unplugged
+for two seconds and attached again — the master's callbacks never stop,
+its channels silent meanwhile, the drift carried over; devices
+described with their channels), `tests/follow_alloc.rs` (master and
+follower callbacks, links taken and handed back, a ring running dry
+again and again: no allocation), engine
+`joining_followers_to_the_engine_does_not_allocate`, dummy
+`a_pretend_follower_records_and_comes_back_after_unplugging`,
+`a_simulated_stream_runs_ahead_of_the_wall_clock`, session
+`tests/multi_device.rs` (three simulated minutes of a 180 ppm fast
+follower recorded through the session: no slip, no gap, its drift found
+within 2 ppm; pulses captured at the same moments by the master's own
+input and a 44.1 kHz follower 90 ppm slow land within 1.5 samples of each
+other in their takes — rounding included; a follower unplugged while
+playing: the master plays on, the notice, back without a reopen), ui
+`the_joined_devices_are_told_one_a_line`. Preferences → Audio says which
+device drives and shows a line per device under *Running* (rate,
+drift, latency, gaps, not connected). Not done: aligning the outputs of
+several devices to each other (a follower's outputs sound its latency
+later), a follower missing when the stream opens (resolved to the
+default as before; the session reopens when it is back and playback is
+stopped), and devices joined under JACK (its own bridges do it).
+
+### AES67 network audio
+
+`faderframe-audio-aes67`: PCM streams over RTP on a PTPv2 clock — what
+Dante devices exchange in their AES67 mode, and RAVENNA, Livewire+ and
+most broadcast equipment natively. It is an audio system of its own
+(`Aes67Backend`, "AES67 network audio" on the Audio page: the engine's
+callback runs on a timer locked to the PTP media clock) or joins the device
+of any other audio system (`Alongside`: the streams are followers of
+`faderframe_audio::follow`, resampled onto that device's clock).
+Everything is plain sockets (`socket2` for address reuse, the multicast
+interface and DSCP; no `unsafe`), so it is the same on Linux, Windows and
+macOS.
+
+* **The clock** (`ptp`). Messages of IEEE 1588-2008 (`message`: header,
+  Announce, Sync, Follow_Up, Delay_Req, Delay_Resp; others recognised and
+  ignored). `port::Port` is one ordinary clock's port as a state machine
+  without I/O — messages and timer ticks go in with local timestamps,
+  messages to send come out — so the same code runs on sockets and in
+  simulated networks. Best master (one port's 9.3): foreign masters kept
+  while they announce (qualified after two Announces within four
+  intervals, dropped after `announceReceiptTimeout`), the best by the data
+  set comparison followed; a clock that may lead (`PtpSettings::lead`,
+  priorities 250 so that any real grandmaster wins) leads when nobody
+  better has announced for the timeout, and steps down when one does.
+  Following: two-step Syncs matched with their Follow_Ups in either order
+  (they arrive on different sockets), end-to-end delay requests at the
+  master's `logMinDelayReqInterval` (randomised within twice it), the path
+  delay the median of the last eight. Leading: Announce and two-step
+  Sync/Follow_Up at the profile's intervals, a Delay_Resp for every
+  Delay_Req. Profiles: the default (Sync every second) and AES67's media
+  profile (every 125 ms; Announce every 2 s, timeout 3), on any domain.
+  The time kept is a software clock over the process's monotonic clock
+  (`clock::VirtualClock`: an anchor and a rate; nothing touches the system
+  clock and nothing needs privileges but ports 319/320), published to
+  other threads in a `clock::ClockMap` — two copies behind sequence locks,
+  the writer filling the one readers are not directed to, so a writer
+  interrupted half way never holds up the audio thread. `servo::Servo` is
+  ptp4l's PI servo adapted to software timestamps: the first second of
+  offsets is fitted with a line (frequency and phase; two samples are too
+  rough), the clock steps once onto the master's time, then the loop
+  steers the rate alone (wide for 16 s, then narrow; gains per second, so
+  the Sync interval does not change its dynamics); lone offsets far
+  outside the recent noise are late wake-ups and left out, unless they
+  keep coming; an offset past 2 ms starts over (a new grandmaster). A
+  clock that starts leading keeps the frequency it found (the integral,
+  not the momentary correction), so followers see no jump. `steps`
+  counts deliberate jumps; readers that count samples start again. The
+  media clock is the PTP time in samples (`mediaclk:direct=0`;
+  `media_frame`, `frame_ns`, RTP timestamps the low 32 bits,
+  `unwrap_timestamp`). `service::PtpService` runs the port: a thread
+  receiving event messages (timestamps taken the moment `recv` returns;
+  it follows the audio thread a step below), one for general messages,
+  one for the timers. Where the ports cannot be opened (an unprivileged
+  program on Linux; another PTP daemon) the clock runs free on the system
+  time and the status says how to allow it (`setcap
+  cap_net_bind_service`, `net.ipv4.ip_unprivileged_port_start`). With
+  `ClockSource::System` the same servo follows the system clock instead
+  (TAI = UTC + 37 s), for machines where linuxptp's ptp4l and phc2sys keep
+  it on PTP with the network card's hardware timestamps — more precise
+  than any software timestamp.
+* **Streams** (`rtp`, `sdp`, `sap`, `stream`, `ring`). L16/L24 at 44.1,
+  48 or 96 kHz, packet times 125 µs, 250 µs, 333 µs, 1 ms (default) and
+  4 ms, at most 1440 payload bytes a packet. `sdp::StreamDescription`
+  reads what Dante's AES67 mode, RAVENNA and others write (session- or
+  media-level `c=`, `ts-refclk` with grandmaster and domain or
+  `traceable`, `mediaclk` offsets, `source-filter`, `clock-domain`,
+  `framecount`, the first audio stream of several) and writes them back;
+  `key()` (origin host and session id) follows one stream across
+  versions. `sap` reads and writes announcements and keeps a `Directory`
+  (a stream forgotten when deleted or silent for ten of its intervals);
+  `discovery::Discovery` listens on 239.255.255.255:9875 and announces
+  FaderFrame's streams every 30 s, a deletion when one ends. The audio
+  side and the network side meet in a `ring::MediaRing`: frames indexed
+  by media frame, each slot tagged with the frame it holds, so a receiver
+  writes a packet where its timestamp says and the audio side reads the
+  frames whose time has come — a lost packet, or a frame from a lap ago,
+  reads as silence and is counted; neither side waits for the other.
+  `stream::Receiver` (a thread per stream: joined on the interface — on
+  Linux bound to its group with `IP_MULTICAST_ALL` off, elsewhere
+  checking the sender — packets placed within a window around now; lost,
+  late and outside packets and the latest/worst arrival counted) and
+  `stream::Sender` (a thread per stream sending a packet once its last
+  frame's time has passed, at the media clock's pace; frames the audio
+  side did not write go out as silence and are counted). Both follow the
+  audio thread a step below (`Helper::Near`).
+* **As the audio system** (`backend`). Callback k runs when the media
+  clock reaches `N` (advancing exactly one buffer `B` a callback): its
+  inputs are the frames stamped `[N − L − B, N − L)` (`L` the link
+  offset), so every frame is played `L` after its timestamp as AES67
+  receivers do, whatever the jitter within `L`; its outputs are stamped
+  `[N + B, N + 2B)` — the block's deadline is `N + B` — so senders pace
+  packets evenly and never send a frame before it was computed.
+  Receivers elsewhere play them their own link offset later; the stream
+  reports `L` both ways (`StreamInfo::{input_latency, output_latency}`;
+  the network's receivers are taken to use the same). A loop of our own
+  stream comes back `2B + L` later, frame for frame. The timer thread is
+  the audio thread (made realtime, it sleeps until the next callback's
+  media time; `Clocked::block` reads the rings, runs the engine and fills
+  the send rings — no allocation, no locks); a clock step starts the count
+  again (an xrun), as does falling far behind. The stream's channels are
+  the received streams in order, then as many silent ones as asked for;
+  outputs likewise. `AudioStream::devices` lists the PTP clock first (the
+  master) and every stream (present = packets arriving; gaps = lost and
+  late packets), so the session's notices say when a stream goes away
+  and comes back; `routing` names channels "stream · n"; `maintain`
+  announces again under a new grandmaster and follows a received stream
+  whose announcement moved it (another group or port).
+* **Beside another device** (`alongside`). `Alongside::wrap_all` wraps
+  every backend of a choice when `Aes67Settings::alongside` is on. The
+  inner stream opens first with a `Forward` callback (silence until the
+  joined callback arrives through a queue: `follow::join` needs the
+  device's real rate and buffer); the streams' channels follow the
+  device's. One pacer thread on the media clock hands each received
+  stream's frames to its follower input when their playout time comes,
+  stamped with the local time that frame boundary was reached — the drift
+  loop measures the PTP clock against the device's without the pacer's
+  wake-up jitter — and takes each sent stream's frames from its follower
+  output 2 ms ahead of the media clock into its send ring. Device
+  latencies: the link offset (receiving), the lead plus the receivers'
+  link offset (sending); `follow` adds its own ring and resampler, so
+  `devices()` reports each stream's latency and drift like any follower's.
+  When the device's rate changes while running, `maintain` re-attaches
+  every follower at the new rate (`Followers::set_master`, added for it;
+  `follow::tests::a_master_whose_rate_changes_takes_its_followers_along`).
+* **Settings** (`settings::Aes67Settings`, `Preferences::aes67`):
+  interface (`None`: the route to 239.69.0.0/16, found by connecting a UDP
+  socket — nothing is sent), PTP domain/profile/lead/clock source, rate,
+  link offset, packet time and format of what is sent, send streams
+  (name, channels, a group or 239.69.x.y chosen from the interface's
+  address — `net::default_group`), receive streams (by key, with their
+  description kept so they open without hearing the announcement again;
+  a newer announced description wins), alongside, announce, and the
+  standard ports/groups (`NetSettings`, moved only by tests). The shell
+  hands them over with `faderframe_audio_aes67::configure` (in
+  `AppState::start_audio`); the PTP service and discovery are shared by
+  everything in the process with equal settings and run while something
+  holds them (`services`, `discovery_for`: a stream, the Preferences page);
+  a clock its last stream let go of runs on for `LINGER_SECONDS` (30), so
+  a reopened stream finds it still locked.
+
+Preferences → Network Audio (`faderframe-ui/src/aes67_prefs.rs`):
+interface, rate, link offset, packet time and format; the clock (source,
+domain, profile, lead) and its state (grandmaster, offset, path delay,
+drift, why the ports are closed); the streams to send (name, channels,
+group); the streams announced on the network to receive (ticked = the
+engine's inputs, in order) and one added from a pasted description; "beside
+the audio system" and announcing. Apply saves and reopens the audio stream
+when the streams are in use. `--backend aes67` on the command line.
+
+Not done: RAVENNA's own discovery (mDNS/DNS-SD and RTSP for the
+description) — RAVENNA devices that announce with SAP (most do, for AES67)
+are found; unicast PTP and peer-to-peer delay; kernel or hardware
+timestamps in FaderFrame's own clock (the system-clock source covers
+hardware timestamps through linuxptp); RTCP; aligning several senders'
+outputs (each receiver plays its own link offset); AM824 (AES3
+transparent) payloads; SMPTE ST 2110-30 conformance was not checked. NDI
+is out: its SDK comes only under the vendor's proprietary licence
+agreement, which an MIT program cannot take in (as MPEG-H, above). Dante
+itself is proprietary (Audinate's); Dante devices take part through their
+AES67 mode.
+
+Tests: `ptp::message` (round trips, a captured Sync, refused packets),
+`ptp::clock` (continuity, the shared clock, media frames and RTP
+timestamps), `ptp::servo` (the delay median; a clock 80 ppm fast and 3 ms
+off with 20 µs of noise and late wake-ups: one step, the drift within
+0.5 ppm, within 30 µs), `ptp::port::tests` on simulated networks (150 µs
+paths with 40 µs of jitter, software timestamps late 10–60 µs and 2 % of
+them 0.9 ms: a follower 60 ppm fast locks within 60 µs of the master and
+finds its drift within 1 ppm; in the default profile one 35 ppm slow; the best clock leads, a
+real grandmaster takes over, the fallback leads again when it goes, each
+follower stepping once; a lone follower listens; other domains are not
+heard), `ptp::service` (two clocks on the loopback interface lock; the
+system clock followed), `rtp`, `sdp` (Dante, RAVENNA and a plain unicast
+description, written and read back, refusals), `sap` (packets, the
+directory), `discovery` (one service hears what another announces, a new
+version, a withdrawal), `ring`, `net` (multicast on loopback, two
+listeners), `settings`; `tests/loopback.rs` (on the loopback interface
+with TTL 0, nothing leaves the machine: a sent stream comes back as a
+received one frame for frame `2B + L` later with AES67 as the audio
+system; joined beside a realtime test device the stream comes back
+through two followers at full level with no frame lost or repeated),
+`tests/rt_alloc.rs` (the audio thread's block: rings read and written,
+frames missing, a buffer size change — no allocation), engine
+`aes67_streams_to_the_engine_do_not_allocate`, ui
+`scripts_change_the_settings`, `stream_lines_say_what_and_where`.
+Checked by hand against hardware: nothing yet (no AES67 device here) —
+`aes67:status` logs the clock and the streams heard; a Dante device in
+AES67 mode or `ptp4l -i <if> -m` (as master, `-S` software stamps) on
+another machine with an AES67 receiver (Merging's ALSA RAVENNA driver,
+`aes67-linux-daemon`) is the way to check.
 
 ## 10. Session
 
@@ -3952,6 +5786,140 @@ adds to a song through `PluginTarget::Song`, the details form is
 `UiRequest::AlbumDetails`); file and folder choosers are a
 `HostRequest::ChooseFiles` the GTK host answers with `gtk::FileDialog`.
 
+### Delivery QC: null-tested stems and the QC report
+
+A delivery is checked as it was written: every file of a render or an
+album export is read back once (`render::stats`), and the same reading
+that measures the levels (`faderframe_analysis::levels::FileMeter`, now
+also where the sample and true peaks are, each channel's DC offset and
+the reconstructed overs — runs of the 4× interpolated signal past 0 dBFS)
+feeds `faderframe_analysis::qc::QcMeter`: silence at the head and the tail
+and gaps of digital silence of a second or more inside (silence is every
+channel within the dither floor, `qc::silence_floor` — 16 LSB of a
+fixed-point file, as noise-shaped dither peaks at about 10; −120 dBFS in
+floating point), runs of three samples at full scale with where they are,
+and for the first two channels the correlation over the file and in
+400 ms windows louder than −50 dBFS, the share of those leaning out of
+phase, and the BS.1770 loudness of the mono fold-down ((L + R) / 2 on both
+sides) against the stereo's. `FileStats::qc` keeps it, so a report for
+any spec needs no second reading.
+
+**Checks** (`faderframe-qc`, pure): `spec::SPECS` are the presets — EBU
+R128 (and s1 for short form), ATSC A/85, Netflix, streaming (Spotify,
+YouTube, Tidal at −14 LUFS), Apple Music, Amazon Music, CD Red Book,
+ARIB TR-B32, OP-59, and general checks only — each rule saying whether
+missing it fails or warns (broadcast loudness fails; a streaming target
+warns: the service turns the file). `check::checks(facts, levels, spec,
+role)` gives every check a verdict (pass, warn, fail, or info: measured,
+nothing asked) with the measured value and the requirement. A *programme*
+(a master render, an album's songs and album file, a null test's mix) is
+judged on the spec's loudness and ceiling; a *stem* or a *part* (a vinyl
+side, the nulling stem) lists them as information. Every file also gets
+clipping (runs fail), inter-sample overs (warn), DC offset (warns above
+−50 dBFS), silence (a silent programme fails), gaps (warn) and phase and
+mono compatibility (correlation under 0 or a fold-down 9 LU down fails,
+a 400 ms window under −0.5 or 4.5 LU down warns). Netflix's loudness is
+dialogue-gated; FaderFrame measures programme loudness (BS.1770-4 gated)
+without dialogue gating, so that check warns but never fails and the
+report says so.
+
+**The null test** (`render::null`, `StemOptions::null_test`). The stems
+that make up the mix are those of tracks no other track with audio feeds
+(`stems_summed`): a bus's, a return's or a folder bus's stem is soloed in
+place with its sources and holds them again, so it is left out of the sum
+and named with the reason. The render job renders the mix first — the same
+range and settings, every solo off — and writes it beside the stems as
+they are written (a staged file never moved into place), then reads the
+stems and the mix back in pieces: `qc::NullMeter` measures the residual of
+their sum (in double precision) against the mix — peak, RMS, how far under
+the mix, where it first rises above what rounding allows and where it is
+worst, in the range and in the tail. The outcome (`null::outcome`) is
+against what the files' format leaves of a perfect null
+(`Precision::bound`: half an LSB per file, an LSB more with TPDF dither,
+about ten with noise shaping, never under the −100 dBFS of floating-point
+arithmetic through a chain): *exact*, *to the dither* (both pass), *near*
+(under −60 dBFS: inaudible within the mix, a warning) or *fails*. Causes
+come from the project before the render — the Render window shows them as
+soon as Stems is chosen — and from the residual after it
+(`render::null::causes`, `NullTest::new`): a non-linear built-in several
+stems pass through (`null::nonlinearity`: compressors, limiters, gates,
+de-essers, the channel strip, saturation, tape, the 2A and 76, preamps
+and console buses, the Program EQ's valve stage; linear ones — EQ, delay,
+reverb, modulation, utility — sum like their parts), a plug-in there
+(FaderFrame cannot see into it), a device keyed by a bus or return (a key
+is taken before its track's fader, mute and solo, so a track playing its
+own clips keys a stem as it keys the mix, while a bus's sources are
+silenced by the solo), per-stem normalisation or loudness finishing, a
+track fed by others that plays clips of its own, an offset in time
+(`qc::best_lag` over a 16 384-frame excerpt round the worst place,
+±2048 frames, taken when it removes three quarters of the residual), a
+difference only in the tail, and each file's dither as a note. Nothing
+else to blame is said as such (something renders differently each time).
+The job hands the test over in `RenderProgress::null_test`
+(`RenderJob::null_test`). A stems render made without the test can be
+tested later (`Action::NullTestStems`): the delivery keeps the project
+copy the stems were rendered from and the stem files by track, and
+`null::test_written` renders the mix from that copy and compares it with
+the files as they are.
+
+**Stems that null** (`StemOptions::shared_stem`): only the stems that make
+up the mix are written; the mix's level processing (normalisation, the
+finish's loudness gain) is worked out on the mix and its gain applied to
+every stem alike (`finish_linked`), and what still differs — the shared
+processing's doing and the finish's limiting — is written as one more
+stem, `"<project> - Shared Processing.wav"`: the mix as written less the
+stems' sum, in the format's codes without dither
+(`WavWriter::write_codes`), so the files sum to the mix to the last bit
+where the codes fit (`stems_made_to_null_sum_to_a_master_render_of_the_same_settings`
+holds them against a master render of the same settings within half an
+LSB at 24 bits). Detectors keyed by the full mix — the master's limiter
+acting on each stem as it acts on the sum — would leave the shared stem
+smaller but need the whole mix beside every stem in one graph; the
+difference stem is exact whatever the processing (saturation too) and
+keeps the stems free of each other.
+
+**The report** (`faderframe_qc::report::QcReport`, schema
+`faderframe.qc/1`): the project (name, file, program version, file
+format), the date (UTC), the spec with its source and notes, the render's
+settings, the verdict and counts, per file its facts, levels, checks,
+notes and SHA-256 (`faderframe_qc::sha256`, FIPS 180-4 — the render
+receipt, as `sha256sum` prints it), the delivery's other files as receipts
+(an album's cue sheet, its DDP fileset's files, the vinyl cutting sheet),
+the null test with the mix checked as the programme, and how everything
+was measured. Levels that do not exist are `null`, never a number. The
+PDF (`faderframe_qc::pdf`) lays it out on A4 pages for the lead sheet's
+writer (`faderframe_leadsheet::pdf::write` — generic enough: filled
+outlines, lines and text in the standard fonts; the lead sheet's output is
+untouched): an overview, the null test, a section per file with its check
+table, receipts and the method; characters WinAnsi lacks are spelt out
+(`pdf::safe`). In the session (`session::qc`) the last delivery is kept
+(`Session::delivered`, noted by the shell as a render's report opens; an
+album export notes its own), `Session::qc_report(spec)` is the report as
+it reads now (no receipts) and `Action::SaveQcReport { path, spec }`
+hashes the files on a worker (reading any the delivery did not measure),
+then writes the PDF and the JSON beside each other through the exports'
+staging (asked before replacing; a save dialog's answer is kept for when
+it is written). An album with a spec (`AlbumSettings::qc_spec`) writes its
+report into the export folder with every export.
+
+UI: the Render window's Stems row ("Null-test them against the mix",
+"Make them null") with the causes it foresees; the render report window's
+Spec choice, verdict, null test section, Null Test (untested stems) and
+Save QC Report…; the album view's QC button (the export's spec, the last
+export's report). Dev actions `qc-report:<path>[@<spec id>]`,
+`null-test:<x|nulling|off>`. Tests: `faderframe-qc` (SHA-256 vectors,
+dates, every spec's checks, the null outcomes and causes, the JSON values,
+the PDF's structure), `faderframe_analysis::{levels, qc}` (positions,
+reconstructed overs, silence and gaps, clipped runs, phase and fold-down,
+residuals, an offset found), `session/tests/qc.rs` (stems that null in
+float and to 16-bit dither; a bus left out of the sum; a master limiter
+named before and after; a key from a track of its own nulls, from a bus
+not; stems made to null against a master render; a
+later null test; the report's JSON — receipts, levels, verdicts — and a PDF
+`pdftotext` reads), the album view's QC menu. `FADERFRAME_QC_OUT=<dir>`
+(the crate) and `FADERFRAME_QC_SESSION_OUT=<dir>` (the session test) keep
+sample reports.
+
 ### Harmony: the key and the chord track
 
 `faderframe_midi::theory` is the music theory everything shares: pitch
@@ -4019,6 +5987,131 @@ alone keeps the latency in its file (`RenderSettings::keep_latency`,
 track (time-varying devices on buses, automation) sees the audio exactly
 as before, so freezing is bit-exact (`renders_take_the_latency_off_the_front`,
 `freezing_keeps_the_sound_and_blocks_edits_until_unfrozen`).
+
+### Self-freezing
+
+Tracks nobody touches play from a disk cache of their chain's output, so
+a heavy project plays on a small machine. It is a freeze made
+automatically and invisibly: nothing in the project changes, any edit
+sends the track back to its chain instead of being refused, and the
+plugins stay loaded.
+
+* **What is cached.** A track's chain — clips, MIDI effects, instrument,
+  inserts — up to its strip; fader, pan, sends, mute and polarity stay
+  live. `self_freeze::job::trimmed` renders the track and what reaches its
+  chain alone (the MIDI tracks playing it as muted as they are, the
+  tracks keying its sidechains or followed by its modulators muted: they
+  still key) at unity into a plain master (mono for a mono chain), at the
+  engine's rate and callback size, the graph's latency kept at the front,
+  streamed into a float WAV. The render goes on until the chain has been
+  silent for half a second after its last clip; a chain that never falls
+  silent (a generator, hiss) is never cached — a file could not stand for
+  it outside its span.
+* **Playing it** (`faderframe_engine::cache`). `EngineController::
+  set_cached` gives a track a `CachedChain`; the graph builds a
+  `nodes::CachedPlayer` in place of its sources and chain (in the
+  render-ahead graph too, where the chain would be). It reports the
+  latency the chain has *live* (`track_latency`, buffered devices
+  included), so delay compensation and everything downstream are as
+  before, and reads the file the way a chain's output follows its input:
+  at output frame `t` what the chain made of the input played at
+  `history(t − latency)` — the play history — so loop wraps, locates and
+  stops behind latency land exactly as they do behind the chain. The
+  timeline snapshot carries the files' regions, so the disk loader keeps
+  their pages resident (and a cached track's clips too: it may go back any
+  moment).
+* **Switching never jumps.** A track going to its cache, or back, passes
+  through a handover graph holding both, the chain and the player into a
+  `nodes::Handover` that crossfades in 20 ms (`FADE_SECONDS`): exactly one
+  side at either end, `live + g · (cached − live)` between, so exactly
+  either wherever both agree — a cache of a deterministic chain taken over
+  while playing on is sample-exact. The fade to the cache waits for a
+  block with every page resident; `settle_cache` then lets the next graph
+  drop the side no longer heard. A chain coming back resets its plugins
+  before its first block (`NoteLedger::mark_stale` → `PluginNode::reset`:
+  they held whatever they had when it left) and fades in once its latency
+  is filled; coming back *gently* (`release_cache`: nothing changed — an
+  editor opened, the track armed) it first plays through its devices'
+  tails (up to `MAX_WARM_SECONDS`) while the cache, still right, is
+  heard, so a reset delay line's first repeat never sounds.
+* **Exactly what the chain makes** (`self_freeze::key`). A cache is
+  played only while the project still makes what it was made from: every
+  `Session::sync` compares each cached track's `ChainView` with the
+  project in place (clips, media, devices and their state blobs, the
+  automation and modulators driving them, the MIDI tracks playing it with
+  their effective mute, sidechain and follower sources recursively, tempo,
+  key and chords, project and engine rate) and a difference sends the
+  track back in that very sync, before the edit is heard. The view's key
+  (a hash) names the cache file, so undo, or reopening the project, finds
+  the old file again without rendering. The comparisons destructure
+  `Track` and `Clip` field by field: a new field must be placed on one
+  side before this compiles.
+* **Live touches** (`Live`): an editor open, automation being written (or
+  a lane in Write), record arm, input monitoring, live MIDI, an audition,
+  a take auditioned, a live key or followed track; never cached: frozen
+  tracks, surround chains, a track delay (it plays before the devices),
+  pre-FX sends, MIDI outputs, launcher clips, plugin outputs, outboard
+  gear, tracks fed by others' audio, modulated faders or pans, the user's
+  Keep Live (`Track::no_self_freeze`, `Command::SetTrackSelfFreeze`) and
+  plugins kept live (`SelfFreezeSettings::never`, the insert menu). A
+  third-party plugin's state is part of the key; a sandboxed one whose
+  state is on its way is not rendered yet; one that reads the room, rolls
+  dice or follows the clock is rendered as one performance of it, as a
+  freeze would be. A track whose devices' saved state changes when
+  nothing was edited (its cache falls stale on its own `CHURN` times)
+  stays live for the session.
+* **When Needed** (`SelfFreezeMode`, the default; Always and Off in
+  Preferences → Audio). A machine that copes hears every chain live:
+  caches are made only while it struggles — the audio load (the
+  performance figures' smoothed total, measured whether or not anyone
+  looks) at `NEED_LOAD` 60 % or more for `NEED_FOR` 3 s, or a dropout
+  (xrun or late callback) while playing — and for `NEED_HOLD` 30 s after
+  (one track renders at a time, costliest first; then the load is read
+  again with what was cached, so it caches about as much as the machine
+  needs). Caches made stay while they are right when the load falls:
+  releasing them would raise it again, and tracks would flip between
+  their caches and their chains. Not needed, a track reads `Live::
+  NotNeeded`; `self_freeze_now` counts as needed (the dev action,
+  tests); `Session::simulate_self_freeze_load` stands in for the load in
+  tests, where the dummy device's load is whatever the machine gives it.
+* **When.** The tick (`tick_self_freeze`) looks every 250 ms once the
+  undo history has been quiet for `SETTLE` (2 s): caches in the folder for
+  a track's key are played at once; otherwise one track is rendered at a
+  time on a thread below the UI's priority (`priority::lower_this_thread`)
+  — tracks playing round the playhead first while playing, then the
+  costliest. The render measures its devices' cost (node timing) and
+  drops chains cheaper than `min_cost_percent`, judged early on a probe.
+  No fade to a cache starts within `STOP_QUIET` of a stop (tails still
+  ring); without a device nothing would move a fade, so they end at once.
+* **Storage** (`self_freeze::store`). `<project>/Cache` (a never-saved
+  project's scratch folder until the first save moves it; Save As moves
+  it along), `<key>.wav` and `index.json` (start, latencies, cost, last
+  use). Over `max_megabytes` the least recently used go first, never one
+  being played; files no track would play go with the unused media when a
+  project closes.
+* **Known differences from the chain.** Stopping fades a cached track out
+  in `STOP_FADE_SECONDS` (10 ms) where the chain would ring on; after a
+  locate or loop wrap a cached track plays as if played through from the
+  start (the chain's tail of what came before is not there), as a freeze
+  does; a linear-phase device's pre-ringing before the first frame after
+  starting playback is not there; parameter ramps (`AUTOMATION_STEP`) fall
+  on the live engine's block boundaries, so automated chains match to
+  within those ramps' timing rather than bit for bit.
+
+Status: the Performance view's summary line (tracks cached, CPU saved,
+the render going on, the folder's size) and its tracks' notes, the star
+before a cached track's name in the arranger and "INSERTS · CACHED" on
+its strip, the Self-Freeze submenu of both track menus; Preferences →
+Audio → Self-freeze (on, size, minimum chain cost). Dev actions
+`self-freeze:<on|off|when-needed|always|now|status|clean|keep-live=<track>|auto=<track>|never=<plugin id>|allow=<plugin id>>`;
+`faderframe-bench --self-freeze` measures the CPU saved. Tests:
+`engine/tests/self_freeze.rs` (a switch while playing and a cache from
+the start bit-identical, the way back, loops/locates/stops behind
+latency, a gentle return), `self_frozen_tracks_do_not_allocate`,
+`session/tests/self_freeze.rs` (a heavy track cached after its render, an
+edit back at once and undo finding the cache, the session's cache played
+by an engine of its own bit-identical, live touches, cheap chains and the
+folder, a fade while a device plays), the views'.
 
 ### Groups and multi-track edits
 
@@ -4092,6 +6185,73 @@ its file is done, dropping it if the clip changed meanwhile); the arranger
 keeps drawing released strokes until then (`Session::pending_redraws`),
 and saving waits for them (the media folder may move).
 
+### Slicing (REX-style)
+
+Audio is cut where it hits and played back from a sampler, the slices in
+the original rhythm (`session::slicing`, `Action::Slice { source, by,
+target, midi }`). The source is a span of an audio track — the edit
+selection on it, else the selected clips, else the clip under the
+pointer, rendered as the clips play it (gain, fades, warp; no devices,
+fader or pan: `Session::render_span`, shared with *samples made of a
+selection*) — or the sample a Sampler or a Drum Sampler pad plays. The
+cuts (`SliceBy`) go at the transients (detected on the material itself
+with `onsets::detect`, at the editor's transient sensitivity; nothing
+closer than `MIN_SLICE_SECONDS` 20 ms to the start or another cut, the
+stronger kept), on the grid (every step from the span's start, worked out
+in the session through the tempo map, so the cuts fall where the grid
+lines are), into n equal parts, or where clips on the track start inside
+the span (cut by hand with Separate). The first slice always starts at
+the material's start, so the slices end to end are the material.
+
+The targets (`SliceTarget`): a new instrument track with a Drum Sampler
+(a pad and a float WAV in `<media>/Samples` per slice, the cuts faded over
+1 ms only where they go through sound), the free pads of a kit (slicing a
+pad's own sample: that pad keeps the first slice), a new instrument track
+with a Sampler in slice mode (the material as its one sample, the cuts in
+its document), or the Sampler's own sample in place. Pads take one slice
+each (16, or the free pads): slicing at transients keeps the strongest
+that fit and says how many were left out; the grid, the clips and equal
+parts that make more slices than fit are refused before anything is
+rendered. A Sampler takes up to `MAX_SAMPLER_SLICES` (64). With `midi`
+the slicing writes a MIDI clip on the instrument's track at the
+material's place (a sample: the playhead, or the edit selection's start):
+one note per slice where its slice began, as long as it, velocity 127 (a
+pad plays its slice at its recorded level), on the kit's key for that pad
+or the Sampler's key for that slice; MusicalTime's resolution places the
+notes on their samples. The clips the span covers whole are muted (the
+MIDI clip plays them now). The render, detection and the files run on a
+worker thread; the tick (`poll_slicings`) places the result as one undo
+step ("Slice to Drum Sampler", "Slice to Pads", "Slice to Sampler",
+"Slice Sample"); pads taken meanwhile are never overwritten.
+
+The Sampler's **slice mode** (`sampler::id::SLICES` 24, `SLICE_KEY` 25,
+appended so older states load): its `SampleDoc` carries `slices` (cut
+frames of the sample at its own rate; `#[serde(default)]`, written only
+when set) and the loaded `SampleSet` the regions (`slice_regions`); a key
+from the first slice key plays its slice as recorded — no key tracking,
+no loop, the device's transpose, tune, envelope, filter and reverse on
+top; keys past the slices play nothing (`slice_of_key`). Cuts by hand go
+through `Action::SetSampleSlices` ("Slice Points"; a drag of a cut is one
+gesture), and `Action::SlicesToMidi` writes the slices one after another
+at the playhead. Faces: the Sampler's waveform numbers its slices and the
+keyboard shows the slice keys; its right-click menu slices, adds a cut
+there or removes the one there, turns slice mode on and sends the slices
+to a MIDI clip or a new kit (`Session::sample_slice_choices`); a Drum
+Sampler pad's menu slices its sample onto the free pads. The arranger's
+clip and track menus have "Slice to Pads or Keys"
+(`Session::slice_choices`).
+
+Tests: `session/tests/slicing.rs` (a drum bar cut at its hits, the
+slices end to end are the bar, the notes where the slices were, and the
+kit played back against the drums before slicing: correlation 0.9999 at
+the kit's −3 dB; the grid onto a Sampler; a kit's free pads; a pad and a
+Sampler's sample sliced), `slicing::tests`, plugin-host
+`slices_play_a_key_each_as_recorded` and
+`slices_cut_the_first_sample_from_its_start`, the sliced sampler in
+`the_instruments_do_not_allocate`, view-devices
+`the_samplers_slice_their_samples_from_their_faces`, arranger
+`slice_tests`.
+
 ### Media: import and disk streaming
 
 Imported files are decoded once with Symphonia (`faderframe-audio-files::
@@ -4143,6 +6303,440 @@ offline renderer is its own loader: before each block it synchronously
 loads the pages that block needs, so bounces never drop out. Renders open
 their own `StreamSource`s (page tables are never shared with the live
 engine).
+
+### The media browser
+
+The Browser (`faderframe-view-browser`, `ViewKind::Browser`, the left dock
+area beside the Inspector; View → Browser, Ctrl+Shift+B) finds sounds and
+MIDI files, lets them be heard in the song's tempo and key, and takes them
+where they are used. Its state is the session's (`session::browser`,
+`Action::Browser(BrowserOp)`); nothing in it edits the project except
+placing files.
+
+* **Places and listings.** Project Media (the project's media folder),
+  Samples (`<media>/Samples`), Recent (files heard or placed lately), Home,
+  and folders the user adds (a folder dropped on the view is added). A
+  worker thread (`browser::scan::Scanner`, below the UI's priority, started
+  the first time the browser is used) lists the folder looked in — and,
+  while searching, the folders inside it (Subfolders; at most
+  `MAX_LISTED` 20 000 files, symlinked folders never followed, hidden files
+  left out). A search matches every word against the path and the tags;
+  the filters (type — audio, MIDI, loops, one-shots —, length, key: the
+  project's (the same notes or a fifth apart) or one, tempo: the project's
+  within 6 % or doubled/halved, or a range, tag, least rating) and the sort
+  (name, kind, length, tempo, key, rating) apply to what is known.
+* **The index.** What a file is comes from its container
+  (`faderframe_audio_files::decode::probe`: format, bits, channels, rate,
+  length; MIDI files from `midly`: format, channels, length at their own
+  tempo) and then from its audio, decoded once on the worker
+  (`scan::analyse`: tempo by `faderframe_analysis::tempo` kept at
+  confidence ≥ 0.1 — a sound of 1.5 to 8 s, shorter than the detector
+  needs, is heard round for it and keeps the tempo only when its length is
+  then an even number of beats with an onset at least every other beat
+  (`scan::tempo_of`: a held pad heard round has a "beat" where it wraps) —,
+  key by `chroma` + `detect_key` kept when the pitch
+  classes are tonal enough — 1 − entropy/ln 12 ≥ 0.08, so drums have
+  none —, a 128-point waveform thumbnail, a `SoundPrint` from the first
+  30 s; MIDI files: their tempo, the key of their notes, a note-density
+  thumbnail). Files of the listing the search passes are read and analysed
+  first (at most `MAX_QUEUED` 1000 by themselves; "Read and Analyse
+  Everything Here" takes a whole tree). The index (`browser::index`,
+  `<data>/browser/index.json`, `INDEX_VERSION`) keeps an entry for as long
+  as the file's size and modification time are those it was made from — a
+  file changed on disk is read again — and drops the longest unseen past
+  `MAX_ENTRIES`; it is written a few seconds after a change. Tags, ratings,
+  recent files, the user's folders and the preview settings are
+  `user.json` beside it: the index can be thrown away without losing them.
+  A loop is audio whose length is an even number of beats at its tempo
+  (within 3 %).
+* **Similar sounds.** `faderframe_analysis::sound_print` (pure,
+  deterministic): mean power in 30 third-octave bands (25 Hz–20 kHz) over
+  the frames within 40 dB of the loudest (so a quieter copy prints the
+  same), the spectral centroid in octaves, onsets a second (the level in
+  23 ms windows rising 9 dB from its low since the last one fell 6 dB — a
+  chord's beating is not an onset), the frame levels' spread and the
+  length; `distance` weighs them so that 1 is a clearly different sound.
+  Find Similar lists the 100 nearest analysed sounds of the whole index
+  (missing files left out), the file asked about analysed first.
+* **Previews** play beside the mix through the monitor path
+  (`engine::nodes::file_preview`, in `ListenOut` after the compare source
+  and the codec monitor, before listening: heard on headphones and in the
+  mono check, never coded, compared, metered or rendered). A worker
+  (`browser::preview`) decodes the file, resamples it to the stream's rate
+  and — matched to the project at the playhead (`Session::browser_fit`) —
+  stretches a loop to the project's tempo (its tempo doubled or halved to
+  the nearest; speed within ½–2) and transposes it into the project's key
+  (by the keys' relative major, −5…+6 semitones) with Signalsmith Stretch
+  offline (`OfflineStretch`: the stretcher primed and its latencies taken
+  out, so output frame u is input u · speed; Rhythmic for material with
+  more than two onsets a second), publishing the audio chunk by chunk
+  (`PreviewAudio`: `OnceLock` chunks of 16384 frames and a `ready` count,
+  read wait-free; at most `MAX_PREVIEW_SECONDS` 600). A preview starts at
+  once, waiting at the edge of what is decoded rather than skipping it; a
+  synced loop started while the transport plays waits for the next bar
+  (`PreviewStart::At`, the timeline frame read from the play history at
+  the node's arrival, so in step with the mix as heard) and loops in phase
+  with the bars (`loop_frames` = whole bars at the project's tempo) through
+  loop wraps and locates; a stop ends it. Starts from the first frame are
+  unfaded (a drum's attack is kept); joining late, stopping and replacing
+  fade over 5 ms. The volume is an atomic gain (−40…+6 dB). MIDI files play
+  the selected instrument (or MIDI) track, else the first instrument track,
+  through the audition port (`engine::midi_preview`: events in frames —
+  the project's tempo map when synced, the file's own tempos otherwise —,
+  injected into the callback's live MIDI at their offsets, keys transposed
+  except on channel 10, loops wrapping with the notes cut there ended,
+  everything sounding released when it stops or is replaced). Auto hears a
+  file when it is selected.
+* **Placing.** A drag out of the list carries `browser:` and a path a line
+  (`browser::payload`): the arranger places the files where they drop
+  (`BrowserOp::Place`), a launcher slot takes them from there down
+  (`BrowserOp::ToLauncher`); any other view that takes files (a sampler's
+  slots, the Reference view) gets them as files, through the canvas host
+  (`CanvasWidget::take_payload`; the payload also travels as text between
+  windows). Files are imported as any file is (`ImportJob`), then placed
+  in one step ("Place from Browser", "Browser to Launcher") with the
+  preview's match: on the arranger a loop is warped to the project's tempo
+  (`Warp::uniform`, its length the source's / speed), in a launcher slot it
+  follows the tempo itself (`ClipLaunch::tempo`), and the key is a
+  transposition of the clip (`StretchSettings::Pitch { semitones }`: the
+  clip plays through a stretcher voice, its time kept — the engine's
+  warped-region path, `WarpedRegion::transpose` × the pitch factor; not
+  with Varispeed). MIDI files go onto the arranger as MIDI imports do.
+
+Tests: `faderframe-audio-files` `a_probe_reads_the_container_without_decoding`;
+analysis `sound_print::tests`; engine `tests/file_preview.rs` (beside the
+mix at once and unfaded, volume ramp, played out, stopped with a 5 ms fade;
+from the next bar in phase through a locate and a loop wrap, a stop ends
+it; waits for decoding; a MIDI file plays the auditioned instrument and
+its notes end; a one-shot ends with its length),
+`the_media_browser_previews_do_not_allocate`,
+`warp::a_transposed_clip_keeps_its_time_and_moves_its_pitch`; project
+`a_transposition_keeps_in_the_file_and_off_is_written_as_before`; session
+lib `browser::{tests, index::tests, scan::tests, smf::tests,
+preview::tests}`, `session/tests/browser.rs` (analysis and the index kept
+until a file changes, filters/search/tags/ratings/Find Similar, previews
+stretched and transposed, placing on the arranger and in a launcher slot);
+views `faderframe-view-browser` tests, arranger
+`files_from_the_browser_are_placed_where_they_are_dropped`, launcher
+`sounds_dropped_from_the_browser_land_in_the_slot`.
+
+### Batch processing
+
+File → Batch Processing… takes a list of files through a chain of steps
+and writes each anew into an output folder; nothing of it is a project
+edit, so it never reaches the undo history and works without a project's
+media. `faderframe_session::batch` holds the model and the work, the GTK
+window is `faderframe-ui/src/batch.rs`.
+
+* **The chain.** A `BatchChain` is a list of `BatchStep`s and a
+  `BatchOutput`. Steps: `Plugin` (a `PluginRef` with an optional state and
+  explicit values, as an insert slot stores them, plus seconds of tail),
+  `Normalize` (sample or true peak to a ceiling), `Loudness` (BS.1770
+  integrated loudness to a target with a true-peak ceiling:
+  `faderframe_analysis::delivery::normalize_loudness`, limiting the peaks
+  or, asked, using less gain), `Convert` (sample rate with the importer's
+  resampler, channels to mono — the average — or stereo — mono doubled, a
+  wider file's first two), `TrimSilence` (what lies before the first and
+  after the last sound `faderframe_analysis::silence::regions` finds, with
+  pads and a shortest sound) and `Fade` (lengths and `FadeShape`s). Steps
+  run in order on the file's audio held in memory as 32-bit float at its
+  own rate. The output is WAV (`Bw64Writer`: plain RIFF, RF64 past
+  4 GiB) or FLAC (`faderframe_audio_files::flac::FlacWriter`: flacenc,
+  16/24 bits, up to eight channels, streamed frame by frame with the
+  stream information — length, MD5 — written over the first one at the
+  end), 16/24-bit or float with `Dither`, and a name pattern
+  (`batch::TOKENS`: `{name}`, `{ext}`, `{folder}`, `{n}`/`{n:3}`,
+  `{preset}`, `{date}`, `{time}` — the shell's local time —, `{rate}`,
+  `{bits}`, `{channels}`, `{format}`). `BatchChain::check` refuses what
+  cannot work before anything starts (an unknown name part, float FLAC, a
+  rate out of range).
+* **Plugins offline.** A plugin step plays the audio through the engine's
+  `OfflineRenderer` exactly as an insert would: a one-track project with
+  the file's audio as an in-memory source (never opened from disk, never
+  the live engine's) and the plugin on its master, mono through a mono
+  master, stereo through a stereo one, at unity. Its latency comes off the
+  front; its tail is kept up to the step's seconds, cut where it falls
+  silent. A plugin that cannot be loaded or stops working fails that file
+  only; more than two channels are refused (a Convert step before it
+  helps), and so are devices that work only on a track — the Hardware
+  Insert, containers, input-stage devices (`batch::batchable`). Each
+  renderer runs on its batch worker alone (no DSP pool: the batch runs
+  files side by side). Built-ins take their factory presets
+  (`PluginStep::use_factory_preset`); the window also edits any plugin's
+  values by number (`Session::clip_fx_parameters`) and takes over the
+  state and values of one of the project's inserts of the same plugin, so
+  a third-party plugin set up with its own editor on a track can join a
+  chain.
+* **Running.** `batch::start(BatchRequest)` checks, makes the folder and
+  starts up to `MAX_WORKERS` threads (`default_workers`: half the cores,
+  at most four) at a lowered priority (`priority::lower_this_thread`;
+  never the UI's or the audio's, never realtime). Workers take the files in
+  turn: decode (Symphonia, any format the importer reads), name, the steps,
+  a measurement (`delivery::measure` and the true peak of every channel),
+  and the file written under a temporary name beside its destination and
+  moved into place (`render::files::StagedFile`, `Staged::commit`). A
+  memory budget (`batch::MEMORY_BUDGET`, 3 GiB counting a file three times
+  its decoded size) holds workers back while the files in hand would pass
+  it; one larger than the budget runs alone. `BatchRun::status` gives
+  every file's `FileState` (waiting, working with the step and a fraction,
+  done with its `FileResult` — rate, channels, length, loudness, peaks and
+  notes such as the gain applied or a clip in an integer format —, skipped,
+  failed with the reason, cancelled); `cancel` stops at the next look
+  (decode packets, 16 384-frame pieces), and a dropped run is cancelled.
+  A file that fails or panics fails alone.
+* **Names and inputs.** A file is named before its steps run (the rate and
+  channel count it will have are known from the chain), so a skipped file
+  costs nothing. Names are claimed under a lock: two files of a batch never
+  take one name (the later one is numbered, " 2", " 3" …), and the batch's
+  inputs (canonical paths) count as taken, so an input is never a
+  destination whatever `IfExists` says (`Number` the new file — the
+  default —, `Replace` an existing one, `Skip` the input). A destination
+  that appears while a file is processed is left alone and that file
+  fails.
+* **Presets.** `BatchPreset`s are JSON files in the data folder's
+  `batch-presets` (`batch::presets_dir`, through `media::data_dir`, so
+  portable mode keeps them in its folder): `{"format":
+  "faderframe.batch-preset", "version": 1, "name", "chain"}`, written aside
+  and renamed into place. Factory presets ("Normalise to −1 dBTP",
+  "Podcast −16 LUFS", "Streaming −14 LUFS", "Broadcast −23 LUFS (EBU R
+  128)", "CD 44.1/16", "Trim Silence and Fade", "FLAC Archive (24-bit)")
+  cannot be replaced or deleted; names match whatever their case. The
+  `_in(dir)` variants take another folder (tests).
+* **The window.** Files (chooser, a folder searched through, drag and
+  drop), the step cards (add, remove, reorder, each step's settings, a
+  plugin chosen from the installed and built-in effects with search), the
+  output, presets (load, save, delete) and Run/Cancel with every file's
+  progress and result; what it holds is kept while the program runs.
+  Closing it while a batch runs asks first. Dev action
+  `batch:<preset>=<file>[|<file>…]` runs a preset into a "Batch" folder
+  beside the first file and logs each file's result.
+
+Tests: `session/tests/batch.rs` (generated files: normalising to a sample
+and a true peak, loudness within 0.5 LU under its ceiling, rate, depth and
+channels in WAV and FLAC, trimming with pads, fade shapes, the utility's
+gain on mono and stereo, refusals and failures that leave the others
+alone, names, numbering, inputs never written, replace and skip, eight
+files side by side, a cancel leaving no temporaries, presets, a factory
+preset), the session lib's `batch::{tests, naming::tests, steps::tests,
+presets::tests}`, and audio-files `flac::tests` (bit-exact read-back, the
+header's length and MD5, refusals).
+
+### Scripts and macros
+
+Scripts are Lua 5.4 (the reference interpreter, vendored by `mlua`'s
+`lua-src`, MIT) over the session; docs/SCRIPTING.md is the API's reference.
+Three layers: the pure crate `faderframe-script` (the sandboxed state:
+libraries, limits, errors, `--!` headers, Lua literals; no session), the
+session's `script` module (the `ff` table bound to the session, runs,
+prompts, timers, the console, the library of scripts and macros, the macro
+recorder) and the shell's `faderframe-ui/src/scripts.rs` (the Scripts menu,
+console window, prompt dialog, Macros window, development aids).
+
+* **One state, a run at a time.** The session keeps one Lua state (made on
+  first use) with the `ff` table frozen in it. Its functions are made once;
+  each reaches the session through a scoped userdata the run puts in the
+  registry (`Lua::scope` + `create_any_userdata_ref_mut`), so they work only
+  while a run is under way and never outlive the borrow. A script runs as
+  a coroutine on the UI thread; scripts never run on the audio thread and
+  never start one another (`ff.run` calls another script's chunk inside
+  the run instead). Each run gets its own global environment over the
+  shared libraries.
+* **One undo step.** A run is a gesture named after the script; every API
+  call is an existing session action or command (`Session::edit`,
+  `Session::dispatch`), so groups, ripple, time-locked material, aliases
+  and the engine's sync behave as for the editors. Edits a script makes are
+  internal: they reach what they name, not other selected tracks or group
+  members. Drag-style actions (`MoveClips`, `TrimClips`, `ClipGain`) are
+  worked out from the gesture's first sight of a clip; inside a script's one
+  gesture each call is a drag of its own, so before every call the run
+  forgets the drag bases and the ripple mark (`History::unmark`) while the
+  changes stay in the step. A failing run cancels its gesture: the project
+  is as it was.
+* **Prompts wait without blocking.** `ff.prompt` stores the question and
+  yields the coroutine; the run commits what it did so far and the session
+  sends `UiRequest::ScriptPrompt`. The answer (`ScriptOp::Answer`) resumes
+  the coroutine in a gesture marked with `History::amend_on_end(token)`:
+  when it ends, its changes join the step before the question while that
+  is still the last one (nothing done, undone or redone since); otherwise
+  they make a step of their own with the same name. A failure after a
+  prompt also takes back the part before it when that is still the last
+  step. A modal nested main loop was avoided: the session lives in a
+  `RefCell` the dialog's callbacks need.
+* **The sandbox.** No `dofile`/`loadfile`/`string.dump`, `load` in text
+  mode into the caller's environment, `os` cut to the clock and dates, an
+  `io` whose `open`/`lines` reach only the allowed folders (the saved
+  project's folder and the user's scripts folder; links resolved before the
+  check; a script run from a file also its own folder), `require` only for
+  Lua text from the scripts folders, `print`/`io.write` to the console,
+  `collectgarbage` only counting and collecting. Every run has a time limit
+  (10 s by default; a global count hook every 1000 instructions): past it
+  the hook yields the coroutine out of wherever it is (a `pcall` cannot
+  catch a yield), and inside a C function that cannot yield it fails after
+  a 0.5 s grace; the sandbox's `pcall`, `xpcall` and `coroutine.resume`/
+  `wrap` re-raise once a run is over its time, so no Lua code catches the
+  stop. `Lua::set_memory_limit` bounds the state (256 MB). Errors carry the
+  chunk and line (from the message, else the traceback's first Lua frame).
+* **Timers.** `ff.after`/`ff.every` keep functions in the session; the
+  session's tick calls those due (at most 8 a tick, never while a gesture
+  is open or a run is under way), each as a run of its own named after the
+  script that set it. Renders started by scripts are polled there too.
+* **The library.** `script::library` reads `<settings>/scripts` (the shell
+  sets it with `set_user_dir`), `<project>/Scripts` and
+  `<settings>/scripts/macros` (top-level `.lua` files; every 2 s from the
+  tick); entries have stable keys (`user/<file>`, `project/<file>`,
+  `macro/<number>`) that the menu's `app.script::<key>` items and the
+  shortcuts the user gives them keep.
+* **Macros.** While recording, `Session::dispatch` hands the outermost
+  user action to `dispatch_heard`, which notes what the project held,
+  dispatches it and writes it as Lua (`script::record`): tracks by name or
+  by the variable a track the macro made was made in, clip lists that were
+  the selection as `ff.selected_clips()`, drags as their last motion
+  (lines with one key in an open gesture replace each other; a cancelled
+  gesture drops its lines), view-only actions left out silently, the rest
+  listed as not recorded. Stopping writes "Macro n" with a `--! macro: n`
+  header; n is what `MappingTarget::RunMacro`, `SurfaceCommand::RunMacro`
+  (Mackie/HUI Control + F1…F8, OSC `/macro/run i`, `/macro/N`) and
+  `ScriptOp::RunMacro` run. Actions of a script being run are never heard.
+
+Tests: the crate's (`nothing_runs_programs_or_reads_the_machine`,
+`files_open_only_inside_the_allowed_folders`,
+`a_run_over_its_time_is_stopped_whatever_catches_it`,
+`errors_say_where_they_happened`, …), the session's `tests/scripts.rs`
+(one undo step, a failure taken back with its line, sandbox refusals,
+prompts joining the step, timers, the console, a recorded macro replayed
+on a fresh project and from a MIDI button, the library and `require`),
+the history's `amend_tests`, the OSC surface's `macros_are_run_by_number`
+and the UI's `the_scripts_menu_lists_its_commands_for_the_palette`.
+
+### AAF interchange
+
+Post-production hands sound between Pro Tools, Media Composer, Premiere
+and Resolve as AAF; FaderFrame writes and reads the part of it those
+programs use for audio. The pure crate `faderframe-aaf` holds the
+format in four layers, written from the AMWA AAF Object Specification
+and Edit Protocol (not from the AAF SDK, whose licence we do not take):
+
+* **The container** (`cfb`): Microsoft's Compound File Binary. The
+  writer streams: large streams go to disk sector by sector as they are
+  filled (an export holding gigabytes of embedded audio holds one buffer
+  of it), streams under 4096 bytes into the mini stream, then the
+  directory (each storage's children as a balanced tree whose deepest
+  level is red — a valid red-black tree), the FAT and, past 109 FAT
+  sectors, the DIFAT, the header last. Version 4 (4096-byte sectors, as
+  AAF's "4K" files and pyaaf2 write) by default, version 3 on request;
+  the reader takes both, chains checked against loops.
+* **The stored form** (`store`): an object is a storage whose class id
+  is its class; its properties a `properties` stream (local id, stored
+  form, size, then the values); strongly referenced objects child
+  storages named like the AAF SDK names them (`Header-2`,
+  `Mobs-1901{3}`), vectors and sets of them with an `index` stream (sets
+  keyed by a property: mob ids, definition ids); weak references a key
+  and a tag into the root's `referenced properties`, the property paths
+  from the root to the sets they point into; data streams child streams.
+  `Object`/`Value` hold one object whole, `StoreWriter`/`StoreReader`
+  move trees in and out, `dump` outlines one for golden tests.
+* **The model** (`model`, `meta`): every class with its properties
+  (local ids, types, optional or not) and every type, generated into
+  `model/baseline.rs` by `scripts/aaf_model.py` from pyaaf2's tables (MIT;
+  the AAF baseline plus the Avid extensions Avid applications write,
+  dynamic local ids as pyaaf2 gives them — regenerate, never edit).
+  Files carry the whole meta dictionary, like the AAF SDK's and pyaaf2's
+  do, so a reader needs nothing of its own to know any property;
+  `model::{cls, pid, ty}` name what the crate uses and a test holds them
+  to the tables. Reading, classes a file defines itself are known by the
+  parents its meta dictionary gives them and extension properties by the
+  local ids it gives them.
+* **The composition** (`timeline`, `write`, `read`): what AAF says
+  about sound without its machinery — mono tracks of clips (position,
+  length, a medium's channel, offset into it, clip gain, a level
+  envelope, fades of five curves), the timecode at position 0, markers,
+  media (where each channel's sound is). `write` lays it out as the Edit
+  Protocol does: a top-level CompositionMob (a timecode slot "TC1", a
+  sound slot per track, an event slot of DescriptiveMarkers with Avid's
+  comment colour), a MasterMob per medium with a slot per channel, each
+  pointing at a mono file SourceMob — embedded (PCMDescriptor, 16 or
+  24-bit samples in an EssenceData stream, converted as they are
+  written) or linked (WAVEDescriptor with the file's header as Summary
+  and a NetworkLocator URL). Fades are Transitions (Mono Audio Dissolve)
+  against Filler — a filler wholly under a fade-out and a fade-in when
+  clips abut —, crossfades Transitions between the clips (only where the
+  overlap is exactly the one's fade-out and the other's fade-in; other
+  overlapping clips go to a second slot of the track's name, "Dia (2)",
+  which sums the same), the curve drawn into the dissolve's Level as
+  nine points. Clip gain is a Mono Audio Gain OperationGroup around the
+  clip (ConstantValue Amplitude, or a VaryingValue when there is an
+  envelope). `read` takes the top-level composition (the one marked so,
+  else one no other composition uses, the one with the most sound slots)
+  and flattens its sound slots: sequences, fillers, transitions → fades
+  and crossfades (the curve the nearest of the five to the Level drawn),
+  gain operations → gain and envelopes (nested ones multiplied), other
+  operations → their first input and a note, selectors, essence groups,
+  nested scopes and nested compositions followed (cut to the window the
+  clip shows), the AAF 1.0 SourceClip fade properties; each source clip
+  followed through master mobs to the file source mob that holds the
+  sound, edit rates converted on the way (a 25 fps sequence over 48 kHz
+  master clips). Embedded essence is told as PCM (raw, its format from
+  the descriptor) or as a whole WAVE or AIFF file (sniffed); `wave` puts
+  a header round raw PCM so a decoder opens it. OMF is neither read nor
+  written: OMF 2.0 files are Bento containers with an object model of
+  their own, sharing no layer here; `read::is_omf` recognises one and
+  the import says so.
+
+The session (`session::aaf`) maps projects onto that and back.
+`Action::ExportAaf { path, media: AafMedia::{Embed, Link} }`: every
+track holding audio becomes one AAF track per channel ("Gtr.L",
+"Gtr.R", "Bed.1"…); each clip plays its source's channel there as the
+clip player routes it (a mono source on every channel), with its fades
+(shapes kept; drawn bends not), gain and envelope — volume and, on
+stereo tracks, the pan's balance folded into one level envelope per
+side, points added where a straight line in amplitude would stray more
+than a tenth of a dB from the curve (`channel_envelope`). Take folders
+go as their comp's pieces. What AAF cannot say — warped, pitch-edited or
+reversed clips, generated sources, sources at another rate, a stereo
+source on a mono track — is rendered as it plays on a plain one-track
+project (its gain, fades and envelope taken off and written natively,
+so they stay editable). Markers and sections go as markers, the
+project's timecode (25 fps from zero when unset) as the timecode slot;
+MIDI tracks and muted clips are left out with a notice. A worker
+renders, writes linked media as mono 24-bit WAVE files into "<name>
+Media" beside the AAF, and writes the AAF into a staged temporary;
+it is placed through the exports' question flow (`export_to`,
+`commit_export`). `Action::ImportAaf(path)` reads the top-level
+composition at the project rate in a worker, copies embedded essence
+out or finds linked files (at their URL, by name in the AAF's folder
+two levels down, in the folder the user names four levels down,
+`locate`), decodes each through the media import into the project's
+Audio folder and splits multichannel files into the mono channels the
+tracks play. When linked files are missing, `UiRequest::RelinkAaf`
+asks (Look in a Folder… / Import Without Them); `Action::RelinkAaf(Some
+(folder))` looks once more, `None` keeps them as offline sources at
+their linked paths. Then one "Import AAF" step: a mono track per AAF
+track, clips on exact samples (`Timeline::at_sample`), fades with their
+shapes, gain, envelopes as volume points straight in dB
+(`volume_points`), markers; placed by timecode — a project with a
+timecode puts the AAF's start where it counts that timecode, one
+without takes the AAF's.
+
+Tests: the crate's (compound files of both versions and past the DIFAT,
+names and trees; stored objects round trip; model constants held to the
+tables; lanes, transitions and fades laid out; a composition written and
+read back at its rate and another; linked media; cancelling; the
+golden outline `tests/golden/sample.txt` (`FADERFRAME_AAF_BLESS=1`);
+OMF told apart), `session/tests/aaf.rs` (a project out and back,
+embedded and linked, the audio bit for bit at 24 bits, a reversed clip
+rendered, missing media relinked from a folder or left offline) and the
+session's `aaf::tests` (envelopes per side, dB vs amplitude). Outside
+checks: `FADERFRAME_AAF_OUT=<dir> cargo test -p faderframe-aaf --test
+sample` writes sample AAFs that pyaaf2 (MIT) and olefile read
+(`uv run --no-project --with pyaaf2==1.7.1 --with olefile`); files from
+other writers go through `FADERFRAME_TEST_AAF=<file>[:…] cargo test -p
+faderframe-aaf --test foreign -- --ignored --nocapture` (an Avid-style
+file made with pyaaf2 — a 25 fps sequence over 48 kHz master clips with
+pyaaf2's own PCM essence, a fade, a crossfade, gain, a nested sequence
+— reads exactly). Not done: stereo AAF tracks paired back into stereo
+tracks on import (they come in as mono pairs), track volume/pan
+automation and plug-ins (AAF carries clip-level sound only here),
+picture tracks, OMF.
 
 ### Recording, takes and comping
 
@@ -4304,6 +6898,106 @@ the project changes, and a change to the folder's comp or takes (an edit,
 undo), clicking again or another project ends it.
 While recording, armed tracks show a growing red region; the punch range is
 drawn in the ruler.
+
+### Capture Audio (retrospective recording)
+
+"I played the best take while not recording": as Capture MIDI keeps
+what live tracks were played, Capture Audio keeps the input of the armed
+tracks (`AudioCaptureSettings::tracks`: armed only, armed and those
+monitoring their input — the default —, or every audio track with a
+hardware input), playing or stopped, and turns the newest phrase into
+takes afterwards.
+
+**Kept where recording would capture.** `EngineController::capture_inputs`
+gives the audio thread `input_capture::CaptureRt`: for every chunk
+`render` processes, right beside the recorder, the device input channels
+the kept tracks use (after varispeed's resampler, as the recorder's) go
+into a sample ring and a `CaptureBlock` header into another — the
+engine's frame counter (the play history's `chunk_start`, continuous
+whatever channels are kept), the timeline position while the transport
+plays (not counting in, not scrubbing), whether the recorder took frames
+of the chunk. Copy only: a full ring never blocks, the header still goes
+in marked `lost`; with no room for the header either, the keeper sees
+the counter jump. A changed set of channels is a new capture (the old
+one retires through the garbage queue); the session asks for one when
+the tracks kept change, the setting is switched, or the engine let go
+without being asked (a new engine). Tests `engine/tests/input_capture.rs`,
+`capturing_inputs_for_capture_audio_does_not_allocate`,
+`keeping_inputs_for_capture_audio_takes_no_page_faults`.
+
+**Memory, bounded.** `session::audio_capture::keeper` (a thread a step
+below the audio thread, as the recording writer: `follow_audio(Feeder)`,
+`breathe` while catching up; the rings hold `TRANSFER_SECONDS` 2 s) drains
+them into `audio_capture::store::Store`: per device channel, samples in
+chunks of `CHUNK` 16 384 frames (full chunks shared as `Arc`, the newest
+filled in place), a peak per `MARK` 256 frames with a 1 dB histogram of
+them and the loudest mark per `GROUP` of 64 (so scans pass over quiet
+minutes), and the transport's `Span`s (run = a start or stop, pass = a
+loop wrap or a locate, recorded or not). A channel keeps
+`chunks_per_channel` = what `seconds` asks (default 300, 10–600), within
+`max_megabytes` (default 1024) less one spare chunk shared by all the
+channels, at least two: memory never passes the limit
+(`the_memory_limit_holds_and_the_oldest_goes`). Lost frames are kept as
+silence in place; a new engine's counter is moved on to continue. Memory,
+not disk: nothing is written while nobody captures, and 48 kHz float is
+11.5 MB per channel and minute — the defaults hold five minutes of a
+stereo track in 115 MB and some 89 channel-minutes in all, each track
+keeping less as more are kept. Switched off, everything kept goes.
+
+**The phrase** (`audio_capture::phrase::find`). Sound is a mark over the
+channel's threshold: 15 dB over its noise floor (the histogram's 10th
+percentile), between −60 and −30 dBFS. Input frame `f` was played while
+the player heard what was processed at `f − latency`, the latency
+recording compensates (`Session::audio_take_latency`: input + output
+latency, graph latency, varispeed both ways, the user's offset — one
+helper for recording and capturing; the latency in effect is noted as it
+changes, and a run uses its own). The newest sound after what was taken
+decides: heard in a playing run, that run is taken, back to the transport
+start — its passes as they were heard, from `LEAD_IN_SECONDS` (0.2 s)
+before its first sound to `TAIL_AFTER_SECONDS` (1 s) after its last,
+passes without sound left out; heard in a stopped run, the phrase back to
+a pause of `PHRASE_GAP_SECONDS` (Capture MIDI's 8 s). Sound in a stopped
+run that carries on from the run before (a chord still ringing when Stop
+was pressed) is that run's tail when it ends within `TAIL_SECONDS` (10 s):
+the run before is taken; sound after a pause of `TAIL_QUIET_SECONDS` is a
+phrase of its own. A run the recorder took is not offered (what an
+aborted recording played is: it was never placed).
+
+**Placed as recording places takes.** Capture Audio (`Action::CaptureAudio`)
+finds the phrase, takes each sounding track's channels from the store
+(shared chunks, a copy of the partial one) and writes a float WAV per track
+("<track> Capture n", peaks too) on a thread; `poll_audio_captures` then
+places them in one "Capture Audio" step: playing, each piece at the
+timeline position it was heard at, the file read `latency` frames later
+than processed — the same frames as a recording of that run
+(`a_run_played_while_playing_is_what_recording_it_would_have_been`, through
+the dummy device's loopback with the metronome on: identical samples, the
+clicks on the beats); stopped, the first sound (to the sample) on the bar
+at or before the playhead, the lead-in before it. Takes go through
+`record::place_passes` (shared with recording): the record mode (a take
+folder over existing clips, or Replace) and the loop recording mode (passes
+as takes, the last pass, new tracks). Frozen tracks are left out with a
+notice; input before the phrase's end counts as taken. A replaced project
+leaves what was kept and captures being written behind.
+
+**Using it.** Transport → Capture Audio (`app.capture-audio`, Ctrl+Alt+C,
+rebindable), Transport → Keep Input for Capture Audio (the toggle,
+`app.toggle-audio-capture`), Preferences → Recording (on/off, minutes per
+track, memory limit, which tracks, what is kept now);
+`Preferences::audio_capture`. `Session::{audio_capture_settings,
+set_audio_capture, audio_capture_status, can_capture_audio,
+capturing_audio, wait_for_audio_captures}`. Dev actions `capture-audio`,
+`audio-capture:<on|off|seconds=<n>|limit=<MB>|tracks=<armed|monitored|all>|status>`.
+Tests: the store's and the finder's (`session/src/audio_capture/`),
+`session/tests/capture_audio.rs` (stopped phrase on the bar, the run as
+recorded, loop passes in place, the memory limit, the tracks kept, not
+while recording).
+
+Inputs on a device that follows another's clock (see *Several audio
+interfaces*) reach the store later by their ring and resampler: a capture
+reads such a track's channels that much later (`channel_input_latency`
+less the stream's), as recording moves those takes back
+(`ActiveRecording::later`).
 
 ### Automation
 
@@ -4658,6 +7352,106 @@ has rested 300 ms — its state, and every value it moved as an explicit
 one, since explicit values are applied after the state — and rendered at
 once. A bar dragged in the view keeps the device's state.
 
+### Clip envelopes
+
+An audio clip can carry volume and pan envelopes that belong to it and
+move with it (`faderframe_project::clip_envelope`: `AudioClip::envelope`,
+an `Option<Box<ClipEnvelope>>` — `None` in every literal and in files
+that have none —, `ClipEnvelope { volume, pan }` of `EnvelopePoint { at,
+value, shape }`). Points are in clip-relative output frames at the
+project rate, so the envelope stays with the clip's audio: a start trim
+shifts it by what came off (`warping::trim_audio_start`; points left
+outside the clip are kept, so a trim back finds them again), a split
+gives each piece its part with a point at the cut holding the value
+there (`ClipEnvelope::slice`, in `Clip::split_at`, so every edit built on
+splits — Separate, Strip Silence, slices, ripple cuts, range copies —
+keeps it), a time-stretch trim scales it (`scale`), a slip leaves it
+where it is (like the fades and the gain). Segments have track
+automation's shapes (`faderframe_automation::CurveShape`, `interpolate`);
+volume is in dB, silent at or below `FLOOR_DB` (−96), at most `MAX_DB`
+(+24); pan is −1…1 and a balance — the far side fades out, the near one
+stays at unity — on stereo outputs only (mono and surround tracks leave
+pan out). `Command::SetClipEnvelope { clip, envelope }` replaces it
+(sorted and clamped on apply; refused on MIDI clips and take folders;
+label "Clip Envelope", `CoalesceKey::ClipEnvelope`, Impact Timeline);
+aliases mirror it and frozen tracks refuse it like any content edit.
+
+The engine applies it as the clip plays, sample by sample: the snapshot
+places the points at engine frames (`snapshot::RegionEnvelope` on the
+`AudioRegion`), and the clip player works out a region's gains once per
+chunk of 128 samples on the stack (`clip_player::Gains`: clip gain ×
+fades × volume, per side × the pan's balance) instead of per channel and
+sample — the same numbers as before for clips without an envelope, and
+the same whatever the block size. Every path uses them: plain, streamed,
+resampled and reversed regions, varispeed warps and the stretcher and
+PSOLA voices. It comes after clip effects and spectral edits (they are
+rendered into the source the clip plays), so a ride never waits for a
+render. ARA-rendered tracks leave it out like clip gain and fades (the
+plug-in reads the files; with one renderer per track there is nowhere to
+apply them). Self-freezing's chain key holds the clip content whole, so
+an envelope edit makes a cache stale. Tests: `engine/tests/
+clip_envelope.rs` (a ride sample by sample, the block size, balance,
+moving with the clip), `clip_envelopes_do_not_allocate`, `session/tests/
+clip_envelope.rs` (one undo step per drag, trims/splits/stretch, copies,
+save and open, MIDI refused), project `clip_envelope::tests`.
+
+**Arranger.** `EditorSettings::clip_envelope` is the lane shown
+(`Action::ShowClipEnvelope(Option<EnvelopeLane>)`: Edit → Clip
+Envelopes, the clip menu's "Clip Envelope" submenu). While shown, audio
+clips draw it over their waveform in the theme's automation colour
+(volume on a fader law with 0 dB three quarters up, `EnvelopeLane::
+{to_unit, from_unit}`; pan with the centre in the middle) and their body
+is `ClipZone::Envelope` for the Smart, Selector and Grabber tools (edges
+still trim, the name strip still moves): a click adds a point on the
+grid (Alt: free) and drags it, a drag moves a point between its
+neighbours (Shift keeps its time, Ctrl fine), a double-click removes it,
+a right-click sets its segment's shape or removes it — each one
+`Action::SetClipEnvelope { clip, lane, points }` inside a gesture, one
+undo step (`view-arranger/src/clip_envelope.rs`). The clip menu also
+clears a lane or all of the selected clips' envelopes
+(`Action::ClearClipEnvelope`). Clip-effect parameters are not enveloped
+(they are rendered into the audio; an envelope there would mean a render
+per point). Dev action `clip-envelope:<track>=[pan:]<t>/<value>[|…]`
+(seconds from the first audio clip's start). Test arranger
+`clip_envelope_tests.rs`.
+
+### Strip Silence
+
+`faderframe_analysis::silence` finds the sound between silences: a
+signal is measured once into `Levels` (every channel's peak per `HOP` =
+64 frames) and `regions(levels, rate, &SilenceSettings { threshold_db,
+min_length, pre_pad, post_pad, min_gap })` then gives the `Span`s with
+sound at once — blocks at or above the threshold are sound, gaps shorter
+than the minimum gap are bridged, spans shorter than the minimum length
+go, and what is left is padded (spans the padding joins become one).
+`session::strip_silence` (`Action::StripSilence(StripSilenceOp::{Open {
+clips }, Settings, Apply(StripMode), Close})`) measures each source of
+the dialog's clips once on a helper thread (kept for the session,
+`poll_strip_silence` in the tick) and reads a clip's levels through what
+it plays (`clip_levels`: the warp map, backwards when reversed), so a
+turn of a setting previews at once: `Session::strip_silence_preview()`
+(regions per clip in clip frames) is what the arranger shades and
+outlines (`paint_strip_preview`). Opened with an edit range (no clips named),
+it takes the selected tracks' audio clips in the range, and only silence
+inside the range goes (`within_range`: what lies outside is sound). Apply is one undo step: `Strip` takes
+the silence out (each region a clip of its own, sliced with
+`Clip::slice`, so gain, fades at the outer edges and envelopes carry
+over; a clip with no sound goes), `Separate` splits at every region edge
+and keeps everything, `NewClips` ("Strip Silence to New Clips", for
+dialogue lines and drum hits) puts the regions as numbered clips
+("<clip> 01", …) on a new audio track under each clip's track and mutes
+the clips themselves. The pieces become the selection and the dialog
+looks at them next. The dialog (`faderframe-ui/src/strip_silence.rs`,
+Edit → Strip Silence…, the audio clip menu) has the threshold, minimum
+length, pads and minimum gap, a summary line and the three buttons. Dev
+actions `strip-silence:<track>@<dB>/<ms>` (the track's audio clips,
+threshold and minimum length), `strip-silence:apply[=strip|separate|
+new-clips]`, `strip-silence:close`. Tests `analysis::silence::tests`,
+`session/tests/strip_silence.rs` (synthetic hits: preview, each mode
+and its undo, an envelope carried into the pieces), session lib
+`strip_silence::tests` (warped and reversed clips), arranger
+`the_strip_silence_preview_shades_the_silences`.
+
 ### Speech and lyrics
 
 `faderframe-speech` is OpenAI's Whisper in plain Rust (no runtime, no
@@ -4675,7 +7469,23 @@ together than any text token), segments from consecutive timestamps, and
 the next window from the last complete segment. Tokens become text
 through GPT-2's byte-level vocabulary. The JFK test clip comes out word
 for word with whisper-tiny in about a second (opt-in test
-`faderframe-speech/tests/jfk.rs`).
+`faderframe-speech/tests/jfk.rs`). **Word timings**
+(`Options::word_timestamps`, `Segment::words`, `speech::timing`) follow
+the reference's `find_alignment`: the window's text read again by the
+decoder (prompt, no-timestamps token, text, end) while the checkpoint's
+alignment heads (`generation_config.json`'s `alignment_heads`; else every
+head of the upper half of the decoder) give their cross-attention scores
+(`Model::cross_scores`, the decoder's `forward` hook); each head a softmax
+over the window's audio, standardised along the tokens, median-filtered
+(7 frames) along time; their mean, negated, is warped through the text
+(`timing::dtw`), and where the path enters a token row is where the token
+starts (20 ms frames). Tokens join into words at spaces (every character
+for zh/ja/th/lo/my/yue), punctuation joins the neighbouring word as in
+`merge_punctuations`, a word's probability is the mean of its tokens' from
+the greedy decode. The reference's truncation of long words is left out
+(sung words are long); the session moves the edges to the voice instead.
+whisper-base times "Americans" over 1.8 s as the reference's test wants
+(`the_words_are_timed`).
 
 The checkpoint is not shipped: `session::speech` downloads `whisper-base`
 (290 MB, Apache-2.0 on Hugging Face) on request (Audio → Download Speech
@@ -4691,13 +7501,224 @@ the next line). The arranger's
 Lyrics lane (shown once there are lyrics) draws the lines (lit while
 playing), a click goes there, a double-click edits, right-click deletes;
 `arrange` moves, copies and cuts them with sections; `Session::
-lyrics_text` writes LRC or SRT.
+lyrics_text` writes LRC or SRT. A transcription also keeps the words
+heard in the clip's part of its source (`Project::source_words`, below),
+so the pitch editor shows their syllables.
+
+### Comping by lyric
+
+Whisper's word timings on every take of a take folder; the comp chosen
+word by word.
+
+**Words by source.** `faderframe_project::lyric_comp::SourceWords` holds
+what was heard in a source: `SungWord`s (source frames at `rate`, the
+project's; text; `line` = first word of a stretch the model heard as one;
+`confidence`) and the source spans heard so far (`heard`; `missing`, `add`
+replaces the words starting inside a span heard again). They live in
+`Project::source_words` by source (serde default, skipped when empty: no
+format change), edited whole by `Command::SetSourceWords` (`Impact::None`,
+"Hear Words"/"Forget Words"); templates drop them. By source because a
+loop recording's passes share one file: each part is heard once,
+whichever takes use it.
+
+**Lining up the takes** (`lyric_comp::align`, pure). `take_words` maps
+each take's source words into folder frames (those whose middle lies in
+the take's material, cut to it). The take with the most words makes the
+first columns; each other take is aligned to the columns by
+Needleman–Wunsch on the normalised text (equal +2, different −1, left out
+−1); its exact matches are anchors, and between two anchors — where the
+text differs: misheard, sung differently, left out — the words are paired
+by a dynamic time warping of their onsets measured from the anchor before
+(so a take sung late all along still pairs), a pair only where both are
+each other's cheapest cell on the path and within `PAIR_REACH` 0.5 s; the
+rest become columns of their own, in order. A column's text is the
+majority's (one take's spelling), `line` the majority's. `LyricAlignment`
+answers `span(c, take)`, `chosen(c, folder)` (the take whose word plays
+whole, else the one playing at its middle), `shown_span`, `line(c)`,
+`lines()`.
+
+**Comping by words.** `plan_comp(alignment, folder, columns, take)` gives
+the stretch's edges: the start goes after both takes' words before it
+(the comped take's and the one heard there now) and before both takes'
+first word of the stretch, at most `EDGE_REACH` 0.5 s from the word, the
+crossfade's half inside the gap where it fits (words that run together:
+right at the word's edge); the end mirrored; a comp boundary already in a
+gap is used again (no sliver of a third take between two words); no edge
+where the take already plays on that side. The session
+(`Session::place_edge`) puts each edge at the quietest point of its gap in
+both takes (`analysis::sung::quiet_point`: summed 5 ms energy, nearest the
+word among the candidates within 1 dB of the least), then on the comped
+take's zero crossing within `ZERO_CROSSING_REACH`; `apply_comp` is one
+`TakeFolder::set_comp`, so the folder's invariants hold, and the engine
+plays its crossfades (centred, `crossfade`) at the new boundaries. Every
+comp is one `SetClipContent` step ("Comp “light” from Take 2").
+
+**Hearing** (`session::lyric_comp`, `Action::LyricComp(LyricCompOp::Hear
+| HearAgain | Comp | CompLine | UseBest | Forget)`). A request runs in a
+thread, one at a time (Whisper uses every core): per source the folder
+uses, its mono mix, the parts not heard yet at 16 kHz through the
+`Transcriber` (`WhisperTranscriber` on the downloaded checkpoint, with
+word timings; `Session::set_transcriber` gives tests a stand-in), the
+words' edges moved to where the voice is (`sung::refine`: from the first
+to the last 10 ms frame within 30 dB of the word's loudest and 8 dB over
+the floor around it; the start looked for from 150 ms before to the end of
+the span heard — the model often has a word start in the pause before it,
+and sound before a `PAUSE_SECONDS` 0.15 s pause inside the span is the
+last word's tail —, the end at most 150 ms past, never into a
+neighbour; three takes of the JFK clip, one 120 ms late, come out with
+their words 120 ms apart), and every word
+measured (`sung::measure` with the part's pitch track). The words go in as
+one "Hear Words" step; the measurements stay in the session
+(`LyricCompState::sounds` by source and word span) — a project opened
+again is measured again from the tick for open folders whose sources have
+words (`poll_lyric_comp`, once per source). A project replaced while a job
+runs drops its result (`project_serial`). Hear Again forgets the folder's
+spans first. `Session::lyric_comp(clip)` → `LyricComp { alignment,
+judged, best }`, kept in a memo keyed by the takes, their words, the
+measurements' revision and the tempo map.
+
+**Suggestions** (`sung::judge`, deterministic, never applied unasked).
+Per word, each take that sings it: tuning (share of the voiced middle 70 %
+within `IN_TUNE_CENTS` 25 of a semitone) and steadiness (RMS cents round
+its median) when any take is voiced; the start's distance from the
+sixteenth-note grid; level against the other takes' median (quieter than
+3 dB, louder than 4 dB costs); level over the floor around it; clipped
+samples (−3, −4 past 20); a plosive pop (the loudest 10 ms below 120 Hz
+at the start, 6 dB over the other takes' and within 10 dB of the word).
+The best score wins (ties: the first take); every take keeps its
+`Reason`s, strongest first, as text ("in tune (94 %)", "late (45 ms)",
+"plosive pop (9 dB more low end)").
+
+**Arranger** (`view-arranger/src/lyric_lane.rs`). Open take folders with
+words show each take's words in a strip at the bottom of its lane (the
+chosen take's word lit, the suggested one outlined): a click uses that
+take for the word (`Hit::TakeWord`), Shift+click for the words from the
+last one clicked (`word_anchor`), a double-click for the line; right-click
+offers the word, the line, the reasons. Under the lanes the lyrics comp
+row (`LYRIC_ROW_H` 22 px, `Hit::LyricWord`/`LyricRow`) lists the line word
+by word in the chosen take's shade with its number, ★ where another take
+is suggested; a click uses the suggestion, right-click lists every take
+with its reasons (the chosen one checked) and the line's suggestions;
+while hearing it shows the progress. The folder's clip menu has "Comp by
+Lyrics" (it opens the lanes), the lane menus Use All Suggested Takes /
+Hear the Words Again / Forget the Words. The row sits between the take
+lanes and the automation lanes (`lyric_row_h` in `update_rows` and
+`lane_geoms`).
+
+**Pitch editor.** `Session::pitch_syllables(clip)` pairs the clip's pitch
+notes (source frames) with its source's words: a note belongs to the word
+its start is in (from 50 ms before it); the word's syllables
+(`leadsheet::build::syllables_in`, the language by `Language::of`) are
+dealt over its notes — extra notes hold the last syllable (a line under
+them), too few notes take the rest on the last. The view draws each under
+its note ("Beau-", "ti-", "ful"); its toolbar's Hear Words asks for the
+clip's words.
+
+Dev actions `comp-lyrics:<track>`, `comp-word:<track>=<word>[-<word>]@<take
+n>` (words from 0, takes from 1), `comp-line:<track>=<word>@<take n>`,
+`comp-best:<track>[=<a>-<b>]`, `log-lyric-comp:<track>`. Tests:
+`project/src/lyric_comp/tests.rs` (spans, mapping, the alignment with a
+misheard and a missing word, a late take, phrases, the gaps, reuse of a
+boundary, invariants after word comps, the file), `analysis::sung` tests
+(edges, measurements, the judge, quiet point and crossing),
+`speech::timing` tests (median filter, DTW, token starts, words),
+`session/tests/lyric_comp.rs` (three synthetic takes heard by a stand-in
+transcriber: words, edges, suggestions with reasons, comps with
+boundaries in the gaps on zero crossings, the line, undo, hearing again,
+no model, saved and measured again, the pitch editor's syllables; opt-in
+`whisper_hears_the_takes` with `FADERFRAME_TEST_WHISPER` /
+`FADERFRAME_TEST_SPEECH`), arranger `lyric_tests.rs`, pitch view
+`the_syllable_sung_on_each_note_shows_under_it`.
+
+### Stem separation
+
+`faderframe-separate` splits a stereo recording into vocals, drums, bass
+and the rest with Sony's CrossNet-Open-Unmix (X-UMX; Sawata, Uhlich,
+Takahashi and Mitsufuji, ICASSP 2021), in plain Rust, as asteroid's X-UMX
+recipe does it (`egs/musdb18/X-UMX/eval.py`). The mixture's STFT
+(`stft::forward` = `torch.stft`: 4096-point periodic Hann frames every
+1024 samples, centred, reflected at the ends) gives magnitudes; per
+source the bins up to `max_bin` (16 kHz) are shifted, scaled and encoded
+(linear, batch norm, tanh) to 512 features, the sources' encodings are
+averaged (the first bridge), each source's three-layer bidirectional LSTM
+runs over the average, each source's encoding and LSTM output are
+averaged again (the second bridge) and decoded into a ReLU mask for every
+bin and channel (`xumx`). The estimates (mask × magnitude) go through
+norbert's multichannel Wiener filter (`wiener`: the mixture's phase first,
+then EM iterations — per bin a spatial covariance per source from the
+frames, `v·R·C⁻¹·x` per frame — in double precision, the spectra scaled
+to a tenth of the loudest bin; one iteration by default) and the inverse
+STFT (`stft::Inverse` = `scipy.signal.istft`). Matrix products run four
+rows per weight pass on all threads, the eight LSTM recurrences (four
+sources, two directions) side by side; the filter keeps nothing between
+iterations but the covariances (a frame's estimate depends only on its
+own mixture, its magnitudes and the earlier covariances, so they are
+recomputed), and frames are separated and inverse-transformed in runs
+into buffers of their own. Recordings longer than 34 s go in 30 s
+segments with 2 s of context either side, crossfaded (sin²/cos²) over
+1 s around each boundary; up to that a recording is separated exactly as
+the reference does it. With at least one EM iteration the stems add up
+to the mixture but for what the filter's regularisation keeps back where
+every estimate is silent (below −60 dB).
+
+The weights are read from the published PyTorch checkpoint itself
+(`torch`): its zip directory (ZIP64 too, stored entries only, each
+entry's data after its own local header, which `torch.save` pads for
+alignment) and a pickle machine that knows the opcodes `torch.save`
+writes and builds plain values — tensors as descriptions of their
+storages, every other class a named object holding its arguments;
+nothing a pickle names is called, so a checkpoint is data only. Batch
+norms fold into affine maps, the output scale and mean into the last one.
+`scripts/separation_reference.py` (asteroid's model definition cut to
+inference, norbert, scipy; `torch.load(weights_only=True)`) writes a tiny
+X-UMX with random weights (`tests/data/tiny-xumx.pth`) and what it gives
+for a synthetic test signal the Rust tests make as well
+(`tests/reference-tiny.json`: sampled estimates, frame sums, sampled
+stems and block RMS after 0, 1 and 2 iterations), and with the published
+checkpoint `tests/reference-xumxl.json` for the opt-in test: X-UMXL's
+estimates agree to 4·10⁻⁵ (relative) and its stems to 4·10⁻⁶ of the
+peak; its 3 s separate in 0.3–0.7 s on 16 threads here.
+
+The model (`models::X_UMXL`: Zenodo record 7128659, 142 MB, CC BY 4.0,
+trained on 1505 of Sony's own songs, no MUSDB18) is not shipped:
+`session::separate` downloads it on request into the data folder's
+`models/x-umxl` (the system's `curl`, a `.part` file checked against
+Zenodo's MD5 before it takes its name; the status bar and Preferences →
+Stems show its progress by the part file's size) and checks it again
+before loading. Asking to separate before it is there downloads it
+first and starts the separation when it arrives. The model catalogue
+carries each model's licence, attribution, training data and any
+caveat, listed in About and in `THIRD_PARTY_LICENSES.md` (models
+downloaded on request).
+
+`Action::SeparateStems { target: StemTarget::{Clip, Track}, model, stems
+}` renders what it separates as it plays (the clips with gain, fades,
+warps and takes on a track of their own without devices, as Merge Clips
+does; a clip asked for by name even when muted, a track's unmuted audio
+clips over their span), then in the worker takes it to the model's rate,
+separates it (all but one core), brings each stem back to the project's
+rate (exactly as long) and writes it as a float WAV into the media folder.
+"Other" takes what the rest leave of the mix — what the model cannot hear
+above its band at higher project rates included — so the stems add up to
+what was separated exactly; `Stem::Instrumental` is the mix less the
+vocals. A mono track gets mono stems. When it is done the stems arrive in
+one undo step ("Separate Stems", "Extract Vocals", "Remove Vocals"):
+several on new tracks in a folder "<name> Stems" right after the track
+they came from (inside that track's folder), one on a track of its own,
+each track sent where that track goes, each stem a clip where the audio
+was — and the separated clips muted. A separation whose clips were all
+deleted meanwhile drops its files. `StemSeparator` is what the session
+separates with: the model, or a stand-in (`Session::set_stem_separator`;
+the session tests use one). Separations show in the status bar (stage
+and progress, a stop button: `Action::CancelSeparations`). Settings
+(`SeparationSettings`: model, Wiener iterations 0–3) live in Preferences
+→ Stems with the model's licence and its download.
 
 ### Lead sheets
 
 A clip's melody with its chords and words, written out as notation — or
-several tracks' lines as a score, a staff each, one below the other
-(`faderframe-leadsheet`, pure; `session::leadsheet`; view
+several tracks' lines as a score, a staff each, one below the other, or a
+part as played (`faderframe-leadsheet`, pure; `session::leadsheet`; view
 `faderframe-view-leadsheet`, `ViewKind::LeadSheet`):
 
 * **Hearing.** `LeadSheetOf::{Clip, Track, Clips, Tracks}`: a staff a
@@ -4705,27 +7726,36 @@ several tracks' lines as a score, a staff each, one below the other
   arranger's folder order; `Tracks`: in the order given; a track's unmuted
   clips). A staff's clips make one line on one timeline — gaps are rests,
   where clips overlap the later one (on top) is written, MIDI notes past a
-  clip's end are left out. Audio clips' melody comes from the pitch
-  analysis (`to_midi::melody`, in a thread; kept by clip, so writing it
-  again with another grid does not listen again), take folders' as their
-  comp plays (piece by piece, `TakeFolder::pieces`), MIDI clips' notes are
-  read (afresh each time). Bars come from the meter map over the clips,
-  the chords from the chord track — or, with none there, from what the
-  other tracks' MIDI plays (`harmony::detect_chords`, half a bar at a
-  time), or, with no MIDI either, from what the other audio tracks play,
-  heard by basic-pitch in the same thread (tracks named like drums left
-  out), or, for a score with none of those, from what its staves play
-  together —, the key from the key track (else detected from all the
-  staves and the chords, which keep a tune from leaning on its fifth's
-  key), words from the lyrics lane, under the first staff whose track is
-  named like a voice (else the top one). Each staff's clef follows its
-  middle note (treble; treble 8vb for a tenor or a guitar; bass for a bass
-  line).
+  clip's end are left out. Audio clips are heard polyphonically (see
+  below; in a thread, kept by clip with the melody marked, so writing them
+  again with another grid or style does not listen again), take folders
+  as their comp plays (piece by piece, `TakeFolder::pieces`), MIDI clips'
+  notes are read (afresh each time) and their melody picked out the same
+  way. Bars come from the meter map over the clips, the chords from the
+  chord track — or, with none there, named from the notes under the
+  staves' melodies and what the other tracks play (their MIDI, or with no
+  MIDI their audio, heard the same way in the same thread; tracks named
+  like drums left out), the melodies counting a little
+  (`MELODY_WEIGHT`); a single line with nothing under or around it gets
+  none, a score with nothing else goes by what its staves play together —,
+  the key from the key track (else detected from all the staves and the
+  chords, which keep a tune from leaning on its fifth's key), words from
+  the lyrics lane, under the first staff whose track is named like a voice
+  (else the top one). Each staff's clef follows its middle note (treble;
+  treble 8vb for a tenor or a guitar; bass for a bass line).
 * **Writing** (`build`, `Input::staves` → `LeadSheet::parts`, the same
-  bars in each, chord symbols on the top part): one voice a staff; per
-  beat sixteenths or eighth
-  triplets, whichever fits the onsets (`Grid::{Auto, Straight,
-  Triplets}`), short gaps closed; notes cut at bar lines with ties and
+  bars in each, chord symbols on the top part): one voice a staff (a staff
+  written as played, `Staff::chords`, keeps notes starting together as one
+  chord); each beat's grid chosen by cost from its onsets — the coarsest
+  of quarter, eighth, eighth triplet and sixteenth (`grids`: compound
+  beats dotted quarter, eighth, sixteenth; `Grid::{Auto, Straight,
+  Triplets}` limit the choice) that keeps every onset within 50 ms at the
+  tempo (`tolerance`, 0.8–1.6 divisions), a finer one only when its
+  squared distances plus its reading cost come out lower (`grid_for`: a
+  dotted rhythm stays sixteenths, a swing becomes triplets); no note
+  shorter than its beat's grid, ends on the grid, short gaps closed
+  (legato), so rests are the grid's and come merged; notes cut at bar
+  lines with ties and
   split into the values a reader expects (nothing crosses a beat unless it
   starts on one, nor the middle of a 4/4 bar unless it starts the bar;
   compound metres count dotted quarters); spelt in the key with
@@ -4767,6 +7797,115 @@ several tracks' lines as a score, a staff each, one below the other
   tracks:<a>|<b>…|selected[@straight|triplets]`,
   `export-lead-sheet:<path>`.
 
+**Polyphonic first.** Every audio clip is heard as the Pitch editor's
+polyphonic detection hears it — one function for both,
+`session::polypitch::hear_notes` (basic-pitch, overtones of louder notes
+dropped, notes under 60 ms dropped, each note followed every 5 ms by
+`faderframe_polypitch::follow`, which gives its pitch exactly as
+`pitch_tracks` and how strongly its harmonics are heard; notes never
+followed left out; the editor's notes are bit for bit what they were).
+`session::leadsheet::hear_part` turns them into
+`faderframe_leadsheet::heard::Heard` notes and `heard` cleans them:
+notes followed in under a quarter of their frames go; each is written at
+its followed pitch (a sung note a little off, or named a semitone off,
+lands on the note sung); a note struck again while it still sounded (its
+level falling well under its usual level and jumping back) is split; a
+louder note's overtones and subharmonics heard as notes (octave, twelfth
+… above, an octave or two below, sounding mostly with it — or with its
+pieces struck again — at under 65 % of its activation) go; fragments of one note (the same key, a gap under
+35 ms — or 100 ms where a piece is short —, no new attack: the second's
+first 60 ms under 1.6 times the quietest of the first's last 100 ms) are
+joined; ghosts (20 dB under the loudest note round them, or 3 dB and
+shorter than 250 ms and weakly activated) go.
+
+**The melody** (`heard::melody`) is a dynamic-programming skyline: time
+is cut wherever a note starts or ends, and in each piece the melody is a
+note sounding or a rest. A note's salience is its level against the
+loudest note sounding (over 24 dB), its height among them, a voice's
+marks — vibrato (the pitch's wobble about its 250 ms mean, level-gated,
+counted when its autocorrelation peaks at 4–8 Hz; a vibrato borrowed from
+a note it shares partials with left out, `voices`) and a glide into the
+note (its first 60 ms clearly heard, all on one side) — and a little its
+length. The line enters a note only at its onset, pays for leaps (past a
+whole tone, more past an octave) and for leaving a sounding note into
+silence; a rest costs less than a weak note where notes sound together
+and a full note's worth where one sounds alone (a solo line keeps every
+note); a second pass also pays for straying from the register the first
+pass sang in. `heard::octave_suspects` finds melody notes an octave off
+both close neighbours; `hear_part` weighs that note's octave below, its
+own and its octave above with `follow` (a note named an octave high hears
+its octave below more strongly than itself — its fundamental's odd
+harmonics sit there; one named low hears its octave above more), and
+`fix_octaves` moves it. `heard::voiced` marks the melody's notes; every
+note is kept (`Voiced { start, end, key, level, melody }`).
+
+**Chords** (`faderframe_leadsheet::harmony::chords`): each beat's
+pitch-class profile (every note weighted by its overlap and level, the
+lowest notes also into a bass profile) scored against templates (major,
+minor, the three sevenths, diminished, half-diminished, sus4, sus2,
+augmented: the share on the chord's tones, root and third full, the fifth
+less, minus the share off them and a price per missing tone, rarer
+qualities paying more, the key's diatonic chords — a minor key's major
+dominant too — preferred, roots outside the key less likely), then a
+Viterbi path that changes chord on a bar line cheaply, in the middle of a
+bar at a price and on other beats only when the evidence is strong, so
+the harmonic rhythm keeps to the bar or the half bar and passing notes do
+not flicker; silent beats keep the chord before; a chord whose bass stays
+on another of its tones (70 % of the bass profile) is written over it.
+
+**As played** (`Notation::AsPlayed`, the strip's "As Played"): every
+note, notes starting together on one stem; a part named like a keyboard,
+or one that plays chords and reaches well below and above middle C
+(`build::wants_grand_staff`), goes on a grand staff — `build::hands`
+splits it (E4 up right, below G3 left, between to the hand nearer to
+where it has been playing, the hand that took the last such note keeping
+the next — hysteresis —, no hand past a tenth in one chord) into two
+`Staff`s, the upper with `brace` (treble), the lower nameless (bass).
+`Part::brace` / `LeadSheet::{instruments, lower_staff}`: the engraver
+draws the brace (`brace`, two Bézier halves) left of the system line,
+names the instrument once between its staves and runs the bar lines
+through both (unless words are sung under the upper); a score's bracket
+moves out past it. MusicXML writes the pair as one part of two staves
+(`<staves>2</staves>`, numbered clefs, the right hand, a `<backup>`, the
+left hand on staff 2 in voice 5). Changing the style rewrites the sheet
+from what was heard (`Kept` no longer depends on it).
+
+**Measured** (`session/tests/leadsheet_hearing.rs`: synthetic recordings
+whose every note is known — an inharmonic, decaying piano-like tone with
+block chords a half bar and a tune on top; a voice-like line, a glottal
+saw through "ah" formants, scooped, with vibrato, up to 12 cents off, over
+an organ-like pad; a plucked arpeggio left ringing — each heard, written,
+scored against what was played; old = the monophonic pipeline this
+replaced):
+
+| | piano | voice | guitar |
+|---|---|---|---|
+| note F1 heard, all notes (old: monophonic / raw basic-pitch) | 0.97 (0.11 / 0.72) | 0.95 (0.00 / 0.71) | 0.96 (0.04 / 0.44) |
+| melody F1 heard (old) | 1.00 (0.14) | 1.00 (0.00) | – |
+| melody written right / written notes right (old) | 1.00 / 1.00 (0.21 / 0.10) | 1.00 / 1.00 (0.00 / 0.00) | – |
+| beats with the right chord, root and major/minor (old) | 0.94 (0.00) | 1.00 (0.00) | 1.00 (0.00) |
+| values shorter than the music (old) | 0 (71) | 0 (29) | 0 (11) |
+| as played: notes written where played | 0.97 (grand staff) | 0.95 | 0.96 |
+
+The test asserts thresholds the old pipeline fails (heard F1 ≥ 0.8 and
+above the raw transcription's, chords ≥ 0.85, melody ≥ 0.9 / 0.85, no
+value shorter than the music, at most two ties a bar, a quarter of an
+accidental a bar; as played ≥ 0.75, the piano on two staves).
+Unit tests: `heard::tests` (a solo line, the top voice over block chords,
+a sung line over a pad's higher top, fragments/re-attacks/partials/ghosts,
+pitch and voice marks, octave slips), `harmony::tests` (a bar each, half
+bars and passing notes, an arpeggio and silence, slash chords),
+`build::tests::{each_beat_is_written_on_the_coarsest_grid_that_fits,
+a_piano_part_is_split_between_the_hands}`,
+`musicxml::tests::a_grand_staff_is_one_part_of_two_staves`,
+`engrave::tests::a_grand_staff_is_braced_and_barred_through`,
+`faderframe-polypitch` `followed_notes_carry_their_levels_and_octaves`,
+session `a_piano_part_is_a_lead_sheet_or_a_grand_staff_as_played`, the
+view's `the_strip_switches_to_tab_and_offers_tunings` (As Played) and
+`the_strip_fits_beside_its_title`. Not yet: several voices on one staff
+(a held note under a moving line is cut at the next onset), pedal marks,
+rolled chords, ornaments.
+
 **Words a syllable a note.** `build::lay_words` sings each line's words
 on the notes starting in it: cut into syllables (`syllables_in`: between
 vowel groups, English or German rules by `Language::of` the lyrics —
@@ -4801,15 +7940,16 @@ beams, flags, dots and threes under it; staves have their own heights
 (`staff_height`). MusicXML: `<chord/>` notes, a TAB clef with
 `staff-details` (`staff-tuning` from the bottom line, `capo`) and
 `technical` string/fret. The session's `SheetStyle` (`Notation::{Standard,
-WithTab, Tab}`, tuning, capo; `Action::SetSheetStyle` rewrites the sheet
-made, `Action::MakeTab` = notes with tab) applies tab to every staff, or
-in a score to those named like fretted instruments (`fretted`; a bass
-part on a bass tuning, `Tuning::for_part`); their audio is heard as
-chords (basic-pitch `harmony`), the others' as a melody (`Kept::tab`
-remembers which). Arranger clip/track menus: Guitar Tab…; the Lead Sheet
-view's strip: Notes / Notes + Tab / Tab, the tuning and capo menu, Export
-Tab… (`.txt`). Dev actions `guitar-tab:<track>`,
-`sheet-style:<notes|notes-tab|tab>[@<tuning n>][/<capo>]`. Tests:
+WithTab, Tab, AsPlayed}`, tuning, capo; `Action::SetSheetStyle` rewrites
+the sheet made from what was heard, `Action::MakeTab` = notes with tab)
+applies tab to every staff, or in a score to those named like fretted
+instruments (`fretted`; a bass part on a bass tuning, `Tuning::for_part`);
+those staves are written as played (every note heard, chords kept), the
+others as the style says. Arranger clip/track menus: Guitar Tab…; the
+Lead Sheet view's strip: Melody / As Played / Notes + Tab / Tab, the
+tuning and capo menu, Export Tab… (`.txt`). Dev actions
+`guitar-tab:<track>`,
+`sheet-style:<notes|as-played|notes-tab|tab>[@<tuning n>][/<capo>]`. Tests:
 `tab::tests` (open C and G shapes, a run in one position, capo, octaves,
 basses), `build::tab_tests` (syllables in both languages, chords kept,
 engraving, MusicXML, text), session
@@ -4818,6 +7958,260 @@ engraving, MusicXML, text), session
 `the_strip_switches_to_tab_and_offers_tunings`. The tab clefs and the bass
 8vb clef were added to `scripts/notation_assets.py` (Bravura 1.482; the
 regenerated assets otherwise byte-identical).
+
+### The score editor
+
+MIDI clips edited as notation (`faderframe_leadsheet::notate`,
+`faderframe_project::notation`, `session::score`, view
+`faderframe-view-score`, `ViewKind::Score`). The score and the piano roll
+are one model: the score writes the clips' notes and every edit in it is
+an edit of those notes, so neither keeps a copy of the other.
+
+* **What it shows** (`ScoreOf`): the clip open in the piano roll (else the
+  first selected MIDI clip), a clip, or tracks' MIDI clips (not the
+  launcher's), a staff each in folder order; a keyboard's part (named so,
+  or `build::wants_grand_staff`) on a grand staff split by `hand_of` (the
+  lead sheet's `hands`, note by note). Bars from the meter over the clips
+  (in note input one more after the last, to go on writing); unmuted notes
+  inside their clip; the key from the key track, chords from the chord
+  track.
+* **Writing** (`notate`, beside the lead sheet's `build` and on its
+  pieces): each beat's grid by cost as the lead sheet's, but an end written
+  on a grid counts as an onset (an entered rest after a dotted eighth stays
+  a sixteenth's rest) and a played end, off every grid, does not; a
+  staccato note is read at its written value (twice what it plays). Notes
+  starting and ending together are a chord; a chord sounding while another
+  starts — by more than legato playing's overlap (half the note or half a
+  beat, whichever is less) — goes to the second voice; where the voices
+  sound against each other the higher line is the first (the whole
+  overlapping run turned over when the second sits higher), a note given
+  a voice keeps it, a third line is cut where its voice's next note
+  starts. In each voice notes starting together are merged, overlaps cut,
+  a played note's short gap closed when the clip reads legato
+  (`Display::legato`; a rest written on the grid always stays). Then bars,
+  values, ties across bar lines, beams and triplets as the lead sheet's —
+  three quarter triplets fill a pair of beats under one bracket rather
+  than tying eighth triplets across the beat — and accidentals by key over
+  both voices in the order they sound. The second voice is only written in
+  bars where it has notes. Every event carries the notes it was written
+  from (`Event::sources`, a note a pitch), and `Notated::written` says
+  where each note went (part, voice, start and end on the grid).
+* **Engraving.** The lead sheet's engraver with a second voice (`Measure::
+  under`; stems up and down, rests raised and lowered, ties bowing by
+  voice, the bar plan counting both), articulations (Bravura's glyphs
+  opposite the stem, at the voice's side with two voices) and dynamics
+  under the staff, a strip layout (`Layout::continuous`: one system of
+  every bar at its own width on one page as large as it, no heading), and
+  a map of what went where (`engrave_mapped` → `Map`: each system's page,
+  staves and bars with the x of every time drawn, each event's notehead
+  centres with their ink and their accidentals'): `Map::event_at` finds
+  the note or rest under a point, `place_at` the staff, bar, time and line,
+  `x_of` the x of a time. The PDF and MusicXML writers are the lead
+  sheet's (a second voice after a `<backup>`, articulations, dynamics as
+  directions).
+* **What MIDI does not say** lives beside the clips
+  (`Project::notation`: `ClipNotation { grid: ScoreGrid, legato, notes:
+  NoteNotation { voice, step, lyric, marks, dynamic } }` by clip and note,
+  `Command::SetClipNotation`, Impact None): the voice a note is written in,
+  the letter it is spelt on, the syllable sung on it (a trailing `-`: the
+  word goes on, `_`: held), its articulations and dynamic; the clip's
+  display quantise. Entries of notes that are gone stay while the session
+  runs (an undone delete brings the note back as written) and are dropped
+  on opening (`repair_notation`).
+* **The score in the session** (`Session::score()` → `Arc<ScoreDoc>`: the
+  sheet, pages, map, bar starts, where each note went and its clip) is
+  made again only when what it reads changes — its clips' notes and
+  notation, the meter, keys, chords, the layout — hashed each time it is
+  asked (cheap; a fader move keeps the same document). Paint and events
+  ask freely.
+* **Editing** (`Action::Score(ScoreOp)`, each edit one step of the clips'
+  `SetClipContent` and `SetClipNotation`). Entry puts notes of the chosen
+  value (`ScoreSettings`: value, dots, triplet, voice) at the cursor
+  (`ScoreCursor { part, at }`) in the chosen voice, replacing what that
+  voice had there (notes starting inside go, one sounding into it is cut),
+  played as loud as the dynamic in effect (else the note before); letters
+  (`ScoreKey::Letter`) take the key's accidental and the octave whose place
+  on the staff is nearest the note before (a fourth up beats a fifth down,
+  as MuseScore does; an empty staff from its middle line), Shift adds to
+  the chord entered last above its top note, `0` writes a rest, `+` ties
+  (lengthens the note), a click on the staff in note input enters the
+  line or space there (`EnterAt`, the time snapped to the value). A note
+  past its clip lengthens the clip to the end of the bar. Outside note
+  input, values and voices go to the selection (`SetDuration` replaces what
+  the voice had inside the new length). Transposition spells by direction
+  (a semitone up sharp, down flat, the key's own notes as the key has
+  them; octaves keep the spelling; steps go by the key), accidentals keep
+  the letter, respelling cycles a note's enharmonics (`notate::spellings`).
+  Dynamics set the velocity (`Dynamic::velocity`) of the marked note and
+  the notes after it on its track until the next dynamic; staccato plays
+  half the written value (`STACCATO_LENGTH`), accents (+20) and marcato
+  (+30) play louder, tenuto plays the whole value, and a track with an
+  articulation map gets the attribute named like the mark too. Words are
+  typed a line at a time from a note on (`Lyrics`: a syllable a note of
+  its line, hyphens join syllables, `_` holds the word before); chord
+  symbols go to the chord track until the next chord (`ChordSymbol`).
+  Quantize to the Score moves notes to where the score writes them (a
+  note locked to time stays); display quantise is per clip and leaves the
+  MIDI alone. Step input from a MIDI keyboard is the piano roll's
+  (`StepInput`), at the score's cursor with the score's value.
+* **The view** keeps only its scroll, zoom and pointer: pages (fitted to
+  the width) or a strip scrolled sideways, paper and ink from the theme's
+  keyboard colours, selected noteheads drawn again in the accent from the
+  map's ink, the cursor and step input's cursor, a ghost note under the
+  pointer in note input; the palette (note input, values, dot, triplet,
+  rest, tie, accidentals, voices, dynamics, articulations, words, chord
+  symbol, display, pages/strip, step input, PDF/MusicXML export) wraps
+  with the width; MuseScore's keys where they exist (A–G, 3–7, `.`, T, 0,
+  `+`, arrows with Ctrl for octaves and Alt for steps, J, Alt+1/2, N,
+  Ctrl+L words, Ctrl+K chord, Ctrl+A/C/X/V); a note's menu holds the rest.
+  Arranger menus: "Edit as Notation" (a MIDI clip), "Edit This Track as
+  Notation" (and the selected tracks); View → Score (Notation Editor).
+
+Not done yet: a voice-level rest or note entry inside an existing chord
+of another length (a chord's notes share one length), 32nd notes and
+other tuplets than triplets, cross-staff notes and a grand staff's notes
+kept on the staff they were entered on (the hands are split by pitch),
+percussion staves (drum maps' notes are written as pitches), slurs,
+hairpins, repeats and text, engraving only the systems an edit touched
+(the document is rebuilt as a whole when its notes change), and screen
+reader nodes for the score.
+
+Tests: `notate::tests` (quarters from their notes, a held note under a
+moving line is a second voice either way up, legato overlaps stay one
+voice, a tie across the bar line selects one note, accidentals by key and
+bar, a letter given, staccato read at its value, written rests stay and
+played gaps close, triplets and quarter triplets, syllables, a voice
+given, chords, marks and dynamics on the first piece, MusicXML's
+backup), `engrave::tests::{the_map_finds_what_was_drawn,
+a_strip_is_one_system_as_wide_as_its_bars, two_voices_share_a_staff}`,
+project `notation::tests`, session `score::tests` and `tests/score.rs`
+(typed lines, values/dots/rests/ties, chords above, letters by key and
+arrows spelling by direction with respelling, entry replacing its voice,
+a second voice, value keys on the selection, dynamics until the next,
+articulations played and written, words, chord symbols, quantising to the
+score, the piano roll's edits and the score's on the same notes, pointed
+entry, tracks and a grand staff, the document kept until its notes
+change, step input's value, PDF/MusicXML export and the strip), view
+`faderframe-view-score` tests (a click selects and places the cursor,
+selected heads drawn in the accent, note input clicks, typed keys, the
+palette's values and words and Ctrl+K, a note's menu, a piano roll edit
+redrawn, the strip scrolling, the empty view). The articulation and
+dynamic glyphs were added to `scripts/notation_assets.py` (the
+regenerated assets otherwise byte-identical).
+
+### DAWproject files and MusicXML scores
+
+Projects travel to and from other programs as DAWproject files (Bitwig's
+open format, version 1.0, MIT); scores come in as MusicXML. The formats
+live in the pure crate `faderframe-interchange`: `zip` (stored and
+deflated entries, ZIP64, CRC-checked reads, a stub in front tolerated;
+large entries streamed stored with their CRC patched into the local
+header, which Java's stream readers need), `xml` (an element tree written
+indented and escaped), `dawproject` (a model mirroring `Project.xsd`,
+written in the schema's element order — an extension's elements after its
+base's, the lower-case `markers` where timelines nest, no empty
+`Markers` — and read leniently: unknown elements and unreadable
+attributes are noted once each, never fatal; `file` = the container),
+`presets` (`.clap-preset` = `clap`, a big-endian id length, the id, the
+state; `.vstpreset` with its `Comp`/`Cont` chunks; VST3 class ids as
+`FUID::toString` writes them, the COM byte order swapped on Windows) and
+`musicxml` (the score reader). The schemas are vendored under
+`data/dawproject` for the tests only.
+
+Export (`session::dawproject`, File → Export DAWproject…): plug-in states
+are taken on the control thread, the documents built there
+(`dawproject::export`), and a job writes the container beside its
+destination — media copied in as they are, generated sources rendered at
+the project's rate, states in their own files — before it moves into
+place as every export does. Tracks nest as folders do (a folder bus is a
+`tracks` track with a submix channel, a plain folder one without); each
+channel carries volume (linear, up to the fader's +12 dB), pan
+(normalised), mute, solo, its destination, sends (pre/post; a pre-effects
+send goes as pre-fader) and its devices in playing order: CLAP and VST3
+plug-ins with their states as the plug-ins saved them, built-ins as
+`BuiltinDevice`s (vendor FaderFrame) with every kept parameter and their
+own state, LV2 as generic devices (`lv2:` ids); a device's parameters
+with values or automation are listed with their ids. The arrangement is
+in beats: MIDI clips hold notes (velocities at 16 bits when they have
+them, release velocities, per-note pitch/pressure/timbre/volume/pan) and
+controller lanes as expression points at full resolution; audio clips
+hold their file in seconds — a FaderFrame clip keeps its samples whatever
+the tempo does, so its content time is seconds and a warp is a `Warps`
+in seconds — with fades and clip gain (a `gain` expression beside the
+audio); a take folder goes as its comp, a clip in the folder's clip per
+piece. Automation becomes points on the parameters (fader lines, linear
+in dB, and curved segments get points enough for a straight line between
+them to stay within reach); markers stay markers and sections become
+markers saying where they end (their comment), which FaderFrame reads
+back as sections. Tempo points (ramps as linear) and time signatures
+follow. What has no place — keys, chords, lyrics, the launcher, cue
+mixes, modulators, containers, SysEx, articulations, muted notes,
+reversed clips, pitch edits — is counted in the report.
+
+Import (File → Import DAWproject…, a new project the way New makes one;
+unsaved changes are asked about first): a job reads the documents,
+decodes every audio file the timelines name (from the container, or
+beside it when external) into a new scratch media folder at the session's
+rate and reads the plug-in states; `dawproject::import` then builds the
+project. Every timeline is followed wherever it nests through a context
+that takes its local times to the arrangement's beats (`Clock`: beats add
+in beats, seconds in seconds through the tempo map), with the window a
+clip lets through: clips in clips (Bitwig's audio clips), lanes, warps
+(anchors on the arrangement in samples against frames of the file, cut
+at the window — a FaderFrame warp, or none when the speed is one), loops
+played out pass by pass, linked clips (the timeline they share becomes a
+clip link). Notes of one top-level clip make one MIDI clip; each audio
+piece makes an audio clip (kept on its beat when it starts at its clip's
+edge), with the clip gain and the fades of the clip whose edge it shares.
+A notes track without an instrument whose channel plays another notes
+track's instrument becomes a MIDI track; an input-stage built-in goes back
+to the preamp slot. Automation finds its parameter by id wherever its
+points are and is taken to FaderFrame's units (gain to dB — the line in
+gain followed, then thinned —, normalised pan to −1…1, normalised
+plug-in values by their range, `Enabled` to bypass). Generic devices of
+other programs (their EQ, compressor, gate, limiter), VST2 plug-ins,
+launcher scenes and video are listed as not carried.
+
+MusicXML (`faderframe_interchange::musicxml`, `session::musicxml`, File →
+Import MusicXML Score…, also by dropping a `.musicxml`/`.mxl`): partwise
+and timewise documents, compressed `.mxl` through its container, UTF-16
+text. Each part's measures are read into events at their places in the
+bar (`<backup>`/`<forward>` for voices and staves, chords, durations as
+written — tuplets are in them —, transposing instruments at sounding
+pitch, unpitched notes on their instrument's MIDI key), then the bars are
+laid out in the order they are played (repeats with `times`, numbered
+endings; verse n sung on pass n), a short first bar placed late in a
+whole bar so bar lines stay, other odd bars given a time signature that
+counts them. Velocities come from dynamics (marks on MuseScore's scale,
+`<sound dynamics>`, a note's own `dynamics`; wedges ramp to the next mark
+that goes their way, `sf`-like marks accent one note, `fp` and kin then
+drop), articulations shorten and accent (`ARTICULATIONS`); ties join;
+grace and cue notes are left out and da capo, dal segno and codas noted.
+A part becomes an instrument track with one clip (its MIDI program at the
+start, percussion on channel 10); a grand staff is one part, so one
+track; a tablature part repeating the part above it is left out. The
+score's tempo and metre are taken when it is imported at the start of a
+project without clips; its keys go to the key lane, its chord symbols
+(kind and degrees to `Quality`, bass notes kept) to the chord track and
+the words of the first part with words to the lyrics, joined into words
+and broken into lines where the score ends them (`<end-line/>`, which the
+lead-sheet writer now writes) or at rests of a beat and before a line
+would pass two bars — all one undo step "Import MusicXML". A lead sheet
+FaderFrame wrote reads back note for note with its chords, key, metre,
+tempo and lines.
+
+Tests: the crate's (`zip`, `xml`, `presets`, `dawproject::tests` — the
+model reads back as written, Bitwig's README file reads, the written
+documents pass `xmllint` against the vendored schemas —,
+`musicxml::tests` — a song with a pickup, ties over the bar, a triplet,
+voices, words and chords; dynamics and articulations; repeats and
+endings with verses; a grand staff; timewise; `.mxl` and UTF-16; odd
+bars; a lead sheet read back), `session/tests/dawproject.rs` (the demo
+out and back; a project with a warped clip, CLAP and VST3 states,
+automation and MIDI 2.0 values out and back; another program's file;
+cancelling) and `session/tests/musicxml.rs`. Dev actions
+`export-dawproject:<path>`, `import-dawproject:<path>`,
+`import-musicxml:<path>`, `dawproject-report:x`.
 
 ### Tempo through hit points
 
@@ -5208,6 +8602,144 @@ Keystation Mackie modes, the nanoKONTROL2's DAW modes and other plain
 Mackie/HUI devices work as "Mackie Control"/"HUI". Tests: each module's,
 `session/tests/control.rs` (`a_keylab_essential_mk3_runs_the_transport_
 and_the_strips`, `an_x_touch_one_follows_the_selection`).
+
+### Phone and web remote
+
+A phone or tablet runs FaderFrame from its browser on the local network:
+the transport (play/stop/record, loop, click, start/end, a bar back or
+on, undo/redo, markers added and located, the next and previous marker
+or section), the mixer (faders, pans, mute/solo/arm, sends with their
+switches, peak meters), cue mixes, the setlist and show mode, the lyrics
+as a teleprompter, the clip launcher, mix scenes and macros. Nothing to
+install: FaderFrame serves the app itself.
+
+**The crate** `faderframe-remote` holds everything that is not the
+session: a small server of its own (`server`: a thread accepting, a
+thread per connection reading HTTP/1.1 (`http`) and then the WebSocket
+(`ws`, RFC 6455: frames, fragments, control frames, masks, close codes),
+a writer thread per WebSocket fed through a bounded queue), pairing
+(`pairing`), the protocol (`protocol`), state diffs (`diff`), QR codes
+(`qr`, ISO 18004 byte mode, versions 1–40, every level and mask; checked
+against ZBar by the ignored `codes_read_back`), SHA-1/SHA-256 (`hash`),
+secrets from the system's random source (`secret`, `getrandom`) and the
+web app (`web`: plain HTML, CSS and JavaScript under `web/`, built in
+with `include_str!`, no build step). No TLS: browsers trust no
+self-signed certificate on a LAN address without the user installing
+it, and a certificate in every phone is more than a remote is worth. The
+stance instead is the local network's, enforced by the server:
+
+* **Off by default.** `WebRemoteSettings::on` is false until the user
+  turns it on (Preferences → Remote, Transport → Web Remote On).
+* **Local peers only.** A connection from outside loopback, the private
+  IPv4 ranges, link-local and IPv6 unique-local addresses is dropped
+  before a byte is read (`net::is_local_peer`), unless the user asks for
+  devices outside (`any_network`, for a VPN of their own). "This
+  computer only" binds 127.0.0.1.
+* **No public names.** A request whose `Host` is not an address,
+  `localhost`, a single-label name or a local domain (`.local`, `.lan`,
+  `.home.arpa`, `.internal`) is refused (`net::host_allowed`): a page on
+  the internet cannot rebind its name to this computer and drive the
+  remote. A WebSocket handshake carrying an `Origin` must come from the
+  page's own origin (programs send none, and still have to pair).
+* **Pairing.** A WebSocket says nothing but `pair` and `hello` until it
+  has paired. A code (six digits, uniform) is drawn when the server
+  starts and after every pairing — one code, one device — and names the
+  role the device gets. A device pairs by typing it or by scanning the
+  QR code of `http://<address>:<port>/#pair=<code>` (the app takes the
+  code from the address and removes it); it gets a token (32 random
+  bytes) to keep, FaderFrame keeps only its SHA-256
+  (`PairedDevice::token_hash`, compared in constant time). A wrong code
+  costs its connection a second, five end the connection, and ten in all
+  withdraw the code until the user asks for a new one (Preferences says
+  someone may be guessing). An unpaired connection is dropped after two
+  minutes, a silent one after 45 s (pings every 15 s), at most 32
+  connections at once, messages up to 16 KiB, request headers up to
+  8 KiB.
+* **Roles** (`Role`): Full (the engineer), Performer (one cue mix, by its
+  name, case aside — templates and other projects find theirs) and
+  Viewer (the lyrics, setlist and position). `State::for_role` leaves
+  out what a role does not see — a performer gets only their cue mix
+  (the tracks in it by name and colour, no main-mix values, no master),
+  a viewer no mixer — and `RemoteInput::allowed` refuses in the session
+  what a role may not do, whatever the app shows. Roles change while a
+  device is connected (it is sent `welcome` again and the whole state);
+  a forgotten device is told `bye` and disconnected.
+
+The app's files are served with a content security policy of their own
+files only (`web::CSP`), `nosniff`, no caching, no referrer; text from
+the project is always set as text (`textContent`; `web::tests` holds the
+script to it).
+
+**The protocol.** JSON text messages tagged by `"t"`. The app sends
+`pair`/`hello`, `view` (its screen: meters go only to the mixer and cue
+screens) and `RemoteInput`s; the server answers `paired`, `welcome`
+(name, role), `refused` (why), `state` (whole), `patch` (`diff::diff`:
+objects key by key, arrays element by element when their length holds,
+else whole; `{"p": path, "v": value}` or `{"p": path, "d": true}`;
+`app.js`'s `applyPatch` mirrors `diff::apply`), `meters` (peaks by strip
+and cue mix id, to half a decibel, floored at −90), `notice` and `bye`.
+Faders, sends and cue levels are fader travel (the console law; the
+state carries `unity`), pans −1…1; a drag is `touch` on, the moves
+(throttled to one every 30 ms), `touch` off; double tap resets. Tracks
+are an object by id plus `order`, so a fader moving is one small patch.
+Positions are seconds through the tempo map (`transport.seconds`, the
+lyrics, markers, sections); the app moves the playhead on between
+updates while playing and lights the line being sung 150 ms early.
+
+**The session** (`session::web_remote`): `WebRemoteSettings` (on, port —
+`DEFAULT_PORT` 8642 —, `RemoteListen::{Network, ThisComputer}`,
+`any_network`, the paired devices) ↔ `Preferences::web_remote`;
+`Session::{set_web_remote, web_remote_settings, web_remote_status,
+web_remote_address, web_remote_state}`, `Action::WebRemote(RemoteOp::
+{Settings, NewCode(role), Forget, SetRole, Rename})` (not undoable; in
+`keeps_audition`/`keeps_scene_work`). `tick_web_remote` (last in the
+tick) takes the server's `Event`s on the session's thread — the path
+control surfaces' inputs take: `Paired` adds the device to the settings
+(the shell saves them), `Joined`/`Left` keep the clients, `Input`s become
+the same actions a surface's do (`Action::Edit` of `SetTrackVolume`,
+`SetTrackPan` — dual-panned images through `set_dual_pan_from_surface`
+—, `SetTrackMute`/`Solo`/`RecordArm`, `SetSendLevel`/`Enabled`,
+`SetCueLevel`/`Mute`, `SetCueSendLevel`/`Pan`/`On`; transport actions;
+`ShowOp`s (a song tapped outside show mode enters it); `LauncherOp`s;
+`SceneOp`s; `ScriptOp::RunMacro`; `locate_step` for the marker and
+section steps), so groups, selected tracks and automation writing follow
+them as from the mixer. Fader, send, pan and cue moves open a gesture
+"Web Remote" (`BeginGesture`) held while any client holds a control and
+ended on the last release, at 400 ms of rest without a touch, or when
+the client goes — one undo step, as a surface's. Every 100 ms (at once
+when a client joins) `remote_state` builds the `State` (shown values:
+`shown_volume_db`, `shown_pan`, `shown_mute`, `shown_send_db`,
+`shown_cue_send`, `shown_cue_level_db`; the launcher through
+`surface_launcher`, as the grids light it) and each client gets the diff
+against what it was last sent as its role sees it; a client whose queue
+is full gets the whole state again when it has room. Meters every 80 ms
+to screens that show them (a performer: their cue mix's).
+
+**The app** (`web/app.js`): the pairing screen (code, device name — the
+user agent's kind by default), then the role's screens as tabs —
+Transport (counter, buttons, markers, sections, mix scenes, macros),
+Mixer (strips with meters, a Sends switch), Cue Mix (a performer's own;
+the engineer picks one), Launcher (scenes by tracks, slots in their
+clips' colours, press and release for gate clips, stop buttons, Stop
+All, Back to Arrangement), Setlist (show mode's buttons, the songs — a
+tap stands on one, ▶ plays it —, the countdown, the song's notes) and
+Lyrics (large lines centred as they are sung, A−/A+ remembered). The
+screen stays awake where the browser allows it. It reconnects by itself
+with growing waits and keeps its token in local storage.
+
+Tests: the crate's units (`hash`, `ws` incl. RFC 6455's examples,
+`http`, `net`, `pairing`, `diff`, `protocol`'s role filter, `qr` against
+the standard's worked examples, `web`), `faderframe-remote/tests/server.rs`
+(on localhost through `client::Client`: files and refusals — bad host,
+foreign origin, POST, garbage —, pairing once and coming back with the
+token, inputs only once paired, forgetting, oversized and unmasked
+frames, stopping frees the port), `session/tests/web_remote.rs` (the
+demo: state then patches, a fader drag one undo step, pans at rest, loop,
+markers and undo from the phone, meters to the mixer screen, an unpaired
+device changes nothing, a performer moves only their own cue mix and is
+made the engineer while connected, a viewer reads the setlist and lyrics
+while the engineer's phone runs the show, turning it off closes the
+port), ui `web_remote::tests`.
 
 ### Track presets
 
@@ -5761,8 +9293,13 @@ full width under the header by `faderframe-ui`, wrapped into rows by
 of `Split`s and `TabGroup`s; named dock areas (`main`, `bottom`) persist when
 empty so detached views have a home; floating windows; geometry; presets
 (Recording, Editing, Mixing, MIDI, Mastering — the bottom dock holds the
-mixer, Tools, album, piano roll, automation and performance views; Mastering opens
-on Tools). Views added after a layout was saved register on first use. `faderframe_ui::dock::realize`
+mixer, Tools, album, piano roll, automation and performance views; Mixing
+adds the mix scenes beside the mixer, Mixing and Mastering the Reference
+view beside the meters, a tab behind them; Mastering opens on Tools).
+Views added after a layout was saved register on first use; saved layouts
+are never rewritten to follow the presets (a view a preset later places
+joins its place in the tab order once shown; Reset Workspace gives the
+preset). `faderframe_ui::dock::realize`
 turns the active layout into `gtk::Paned` / `gtk::Notebook` /
 `gtk::ApplicationWindow`s. Every view has exactly one persistent host widget
 that is only re-parented, so detaching a view never copies state. Divider
@@ -5969,7 +9506,8 @@ for its editor.
     `faderframe-plugin-sandbox` (pipes, `poll`, shared memory, descriptors
     for helper processes, Win32 pipes/events/mappings, AppKit windows), `faderframe-stretch` (the C shim of the vendored
     stretcher), `faderframe-ui` (GObject subclassing macros, dmabuf
-    textures, WGL/D3D12 texture import, the crash reporter's signal
+    textures, WGL/D3D12 texture import — the GPU painter's and video
+    frames', through GStreamer's d3d12 library —, the crash reporter's signal
     handlers and exception filter in `crash.rs`) and `faderframe-ui-gpu`'s `dmabuf`
     and `d3d12` modules (Vulkan external memory through wgpu's hal and
     ash; shared D3D12 textures through wgpu's hal and the windows crate;
@@ -5993,6 +9531,7 @@ Platform specifics are isolated in backends and the GTK shell:
 | Audio Units | | | ✓ (AUv2 API, AUv3 through it) |
 | Packages | Flatpak, install script | Inno Setup installer, zip | app bundle in a DMG |
 | DSP threads | futex wake-up, the audio thread's `SCHED_FIFO` | `park`/`unpark`, MMCSS "Pro Audio" | `park`/`unpark`, the IO thread's Mach time constraint and audio workgroup |
+| Video frames to GTK | VA-API dmabufs | D3D12 textures (untested) | through memory |
 
 * JACK and PipeWire are Linux-only dependencies; their crates are empty
   elsewhere. CLAP's posix-fd extension (plugin GUI event loops) exists on
@@ -6104,6 +9643,41 @@ crash, and from the start on the chips whose driver crashes), plugin
 checks, screen readers, and a setlist with a show mode.
 Windows and macOS builds and packages for all three platforms (see §14).
 
+Added in the 2026-10/11 wave: an undo tree with Audio Bisect (*Undo/redo*,
+*A/B listening*), the codec monitor and platform previews, mix scenes,
+null-tested stems and the QC report, self-freezing, stem separation
+(X-UMXL), restoration devices (de-noise, de-click, de-hum, de-clip,
+de-reverb), the convolution reverb, multiband dynamics and the vocoder,
+Wavetable, FM and Granular instruments, Pitch Correct and aligning doubles
+to a guide, slicing to pads or keys, a device's own A/B and undo, clip
+envelopes, Strip Silence, batch processing, Capture Audio (retrospective
+recording), several audio interfaces joined natively, microtonal tuning,
+ambisonics with head-tracked listening, articulation and drum maps, gear
+changes per song in show mode, ARA hosting, MIDI 2.0's resolution in clips
+and on macOS, merging project versions, comping by lyric, A/V calibration
+by a camera and panning that follows the picture, polyphonic lead sheets
+(a staff heard as the pitch editor hears it, piano parts on a grand staff),
+notes, markers and sections locked to time, more views for screen readers,
+the Hardware Insert's Mono → Stereo, DAWproject export and import, and
+MusicXML scores imported as tracks, and Lua scripts and macros (a
+sandboxed `ff` API, recorded macros, MIDI and surface triggers), and AAF
+export and import for Pro Tools, Media Composer and Resolve (OMF is not
+read: see *AAF interchange*), and a media browser (indexed sounds, loops
+and MIDI files with tempo, key and Find Similar, previews in tempo and
+key, placed by dragging), and AES67 network audio (a PTP-clocked backend
+or streams beside another device; Dante in its AES67 mode; NDI is out —
+its SDK's licence), and a phone and web remote (paired by a code or a QR
+code, local network only: transport, mixer, cue mixes for performers,
+launcher, setlist, lyrics), and a score editor (MIDI clips engraved and
+edited as notation, two voices a staff, the piano roll's notes), and 360°
+video (a viewport turning with the binaural scene, panning by clicking the
+picture, spherical and ambisonic metadata kept on export), and live
+collaboration (one project edited by several people over an encrypted link,
+undo per person, media fetched by content hash, Listen Along), and adaptive
+music for games (an interactive score of states, layers, transition rules
+and stingers, previewed live and exported as looped stems with FMOD and
+Wwise imports), and a map editor for articulation and drum maps.
+
 Picture (video, phase 1): `faderframe-video` on GStreamer as a library
 (probe, a demux-only frame index, exact-frame decoding, MJPEG proxies,
 sound from video, muxing with the picture copied, a frame service with
@@ -6171,7 +9745,8 @@ and streamer over the picture, takes rated. Picture outputs
 (`faderframe_video::output`, `session::picture_out`): a Blackmagic
 DeckLink card's SDI or HDMI paced by the card, and full screen on a
 monitor of its own. Not done: shared D3D12 frames on Windows (nothing
-here can run D3D12 sharing), video tried in the Windows and macOS packages
+here can run D3D12 sharing; the decoder's D3D12 frames to GTK are written
+but untried, see *Video frames on the GPU*), video tried in the Windows and macOS packages
 on real machines, and a DeckLink card tried (none here).
 
 **Next**, roughly in order (waves from a survey of what Live, Bitwig,
@@ -6200,8 +9775,8 @@ Logic, Cubase, Studio One, Reaper, Pro Tools and Ardour shipped in
    TD-PSOLA rather than the Stretch engine, see *Pitch editing*),
    ~~audio-to-MIDI (basic-pitch, Apache-2.0)~~ (done: *Audio to MIDI*), ~~tempo and key
    detection~~ (done: *Tempo and key from clips*), ~~per-clip effects rendered offline~~ (done: *Clip effects*), ~~a speech and lyrics transcription track (Whisper,
-   MIT)~~ (done: *Speech and lyrics*). Stem separation waits
-   for permissively licensed model weights.
+   MIT)~~ (done: *Speech and lyrics*), ~~stem separation~~ (done: X-UMXL, CC BY
+   4.0, see *Stem separation*).
 6. ~~**Performance and control**: a clip launcher with scenes recorded
    into the arrangement, control surfaces (Mackie Control/HUI, OSC)~~ —
    done (see *Clip launcher* and *Control surfaces*).
@@ -6234,8 +9809,9 @@ DAW does well yet):
 
 11. ~~**Time-locked audio**~~ — done (see *Time-locked tracks*): a
     per-track time base, Musical or Time-locked; ADR cues always locked to
-    the picture. Open: a per-note lock inside MIDI clips; markers placed
-    in time.
+    the picture; ~~a per-note lock inside MIDI clips; markers placed in
+    time~~ (done: locked notes, markers and sections, see *Time-locked
+    tracks*).
 12. ~~**Video, phase 2 — display and playback**~~ — done but for shared
     D3D12 frames on Windows and real-machine tries (see *Picture, phases
     2 and 3* above): zero-copy display (dmabuf
@@ -6259,28 +9835,32 @@ DAW does well yet):
 14. **Gaps**: ~~MIDI learn for solo, record arm, modulator macros and the
     Surround Panner window~~, ~~hardware inserts~~, ~~the Guitar
     Station's microphones as outputs of their own~~, ~~a 76-style FET
-    compressor~~ — done; ARA hosting (Melodyne, SpectraLayers; the ARA SDK
-    is Apache-2.0); stem separation (still waiting for permissively
-    licensed weights);
-    `rendering_ahead_does_not_allocate_on_the_audio_thread`'s rare timing
-    failure under load.
+    compressor~~ — done; ~~ARA hosting (Melodyne, SpectraLayers; the ARA
+    SDK is Apache-2.0)~~ (done: *ARA*, untried with a real ARA plug-in);
+    ~~stem separation~~ (done: *Stem separation*);
+    ~~`rendering_ahead_does_not_allocate_on_the_audio_thread`'s rare timing
+    failure under load~~ (done: the paced tests wait for the render-ahead
+    tiers on a retry, see *Render ahead* → Paced tests on a busy machine).
 15. **Ideas from what FaderFrame has**:
     - ~~*Lead sheets from a recording*~~ — done (see Lead sheets): the
       melody heard, chords from the chord track or the other tracks' MIDI,
       words from the lyrics, key and tempo, as MusicXML or a PDF; a
       track's clips as one line, several tracks as a score.
-    - *Comping by lyric*: Whisper's word timings on every take; choose
-      the best take word by word, the syllable shown under each note in
-      the pitch editor.
+    - ~~*Comping by lyric*~~ — done (see Comping by lyric): Whisper's
+      word timings on every take; choose the best take word by word, the
+      syllable shown under each note in the pitch editor.
     - ~~*Tempo through hit points*~~ — done (see Tempo through hit
       points): cuts and markers as hits, the steadiest step tempo map that
       lands each on a beat or a bar line.
-    - *A/V calibration by itself*: the flash-and-beep test seen by a
-      webcam (GStreamer captures it) and heard by a microphone gives the
-      picture offset.
-    - *Head-tracked binaural monitoring*: a phone's motion sensors over
-      OSC (supported already) turn the binaural scene.
-    - *Panning that follows the picture*: an object tracked on screen
+    - ~~*A/V calibration by itself*~~ — done (see A/V calibration and
+      panning that follows the picture; untried with a real webcam): the
+      flash-and-beep test seen by a webcam and heard by a microphone gives
+      the picture offset.
+    - ~~*Head-tracked binaural monitoring*~~ — done (see Ambisonics and
+      head-tracked listening): a phone's motion sensors over OSC turn the
+      binaural scene.
+    - ~~*Panning that follows the picture*~~ — done (see A/V calibration
+      and panning that follows the picture): an object tracked on screen
       becomes the automation of an object or surround pan.
     - ~~*Circuit-modelled console summing*~~ — done (see Console
       summing): the circuit solver behind the preamps and the Guitar
@@ -6302,26 +9882,32 @@ DAW does well yet):
       diagnostics.
     - ~~*Spectral editing*~~ — done (see Spectral editing): a
       spectrogram to paint noises away in.
-    - *Mix scenes*: console snapshots recalled, compared and crossfaded.
+    - ~~*Mix scenes*~~ — done (see Mix scenes): console snapshots
+      recalled, compared, crossfaded and morphed.
     - ~~*Song structure from a jam*~~ — done (see Song structure from a
       jam): self-similarity of the chroma finds verses and choruses as
       sections and markers.
-    - *Adaptive music for games*: sections and launcher scenes with
-      transition rules, exported as stems and metadata for Wwise or FMOD.
+    - ~~*Adaptive music for games*~~ — done (see Adaptive music for games
+      (the interactive score); the FMOD and Wwise imports are written to
+      their documented APIs and untried in either): sections and launcher
+      scenes with transition rules, exported as stems and metadata for
+      Wwise or FMOD.
     - ~~*Show mode*~~ — done (see Setlist and show mode, and Cue mixes
-      for the in-ear outputs) but for program changes to external gear
-      per song.
-17. **Further out**: MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`) and
-    Windows (Windows MIDI Services), and clips that keep MIDI 2.0's
-    resolution (16-bit velocities, 32-bit controllers: today they arrive
-    and leave at it, and clips hold MIDI 1.0's); more views for screen
-    readers (Album, Launcher, Automation, Tools and Video, the edit
-    toolbar: they only name themselves so far); merging project versions
-    (three-way, from `faderframe_project::compare`) for collaborators.
+      for the in-ear outputs), ~~program changes to external gear per
+      song~~ too (see Setlist and show mode → Gear changes).
+17. **Further out**: ~~MIDI 2.0 on macOS (CoreMIDI's `MIDIEventList`)~~
+    (done, tested on the macOS runners only) and Windows (Windows MIDI
+    Services: still open — a preview SDK under a go-live licence, not in
+    the `windows` crate; see *MIDI 2.0*), ~~clips that keep MIDI 2.0's
+    resolution~~ (done: 16-bit velocities, 32-bit controllers, see *MIDI
+    2.0*); ~~more views for screen readers (Album, Launcher, Automation,
+    Tools and Video, the edit toolbar)~~ (done: *Screen readers and the
+    keyboard*); ~~merging project versions (three-way) for
+    collaborators~~ (done: *Project versions and merging them*).
 
-Suggested next: mix scenes, then adaptive music for games — 11, the
-auto-align, reference tracks, the masking map and the health check, the
-earlier suggestions, are done.
+Suggested next: Windows MIDI Services once its SDK is released (17);
+trying the untested platform paths (D3D12 video and shared frames on Windows, ARA with
+a real plug-in, AES67 and DeckLink hardware).
 
 
 ### Guitar Station
@@ -6381,7 +9967,17 @@ drawings, data sheets and measurements:
   the netlist's rate, so a slow clock aliases and images as the chip does
   and turning the delay bends the pitch; sized by stages, never by time.
   18.7–600 ms; the wet response within about 2 dB of a measured unit's.
-  About 37 % of a core at 1x (`is_expensive`).
+  About 37 % of a core at 1x (`is_expensive`). It disagrees with the
+  M169A manual twice, both times as the traced circuit does (the module's
+  "Where the model and the manual disagree", measured stage by stage in
+  its tests): 4.7 % THD at the manual's distortion test point (1 kHz,
+  −5 dBV) against "under 1 %" — the compressor's rectifier ripple (C5's
+  2.2 ms), Q7's tiny base-emitter error returned some 36 times larger by
+  the anti-aliasing Sallen-Key's 248:1 capacitors, and Q9 all but cutting
+  off on TR8's 6 k AC load, the same at every step rate; and a top
+  modulation speed of 3.65 Hz against 2.2 — the traced LFO's own
+  arithmetic, whose bottom is the manual's 0.2 Hz, while no single traced
+  part moves both ends to the manual's (about 100 k at TR1's top would).
 * **Amplifiers**: the Tweed Lux (Fender 5E3: both channels, the volumes
   interacting through the shared grid, the cathodyne inverter
   (`power::CathodyneFront`), cathode-biased 6V6s, the 5Y3's sag) and the
@@ -6641,7 +10237,8 @@ frames and hertz (`AudioClip::spectral: Option<Box<SpectralEdits>>` — keep
 it `None` in new `AudioClip` literals; `SpectralEdits::original` is the
 unedited source): shapes `Rect` (a time range has `low` ≤ 1 Hz and `high`
 at Nyquist, a band spans the clip), `Lasso`, `Brush`; ops `Gain`, `Remove`,
-`Attenuate`, `Heal`; a feather in ms and semitones; one channel or all.
+`Attenuate`, `Heal`, `Denoise { reduction_db }`; a feather in ms and
+semitones; one channel or all.
 
 `faderframe-spectral` (pure; realfft) does the DSP: `apply` runs each edit
 as its own STFT pass over the span it reaches, frames as long as fit the
@@ -6655,6 +10252,16 @@ replaces it by that level, each bin's phase carried on from the frames
 before (measured phase advance), so tones continue through a dropout.
 `Spectrogram::compute` makes the editor's picture (log rows from 20 Hz,
 loudest bin per row, mean power over channels, bytes from −120 dB).
+Denoise ("Learn Noise and Remove", `faderframe_spectral::denoise`) is the
+De-noise device's DSP offline: the noise is learned per channel and bin
+from the shape's stretch of the source as recorded (frames whose centres
+fall in it; one frame round it when it is shorter), and taken out of the
+whole source in the shape's band (with the frequency feather) at the
+Balanced frame size. A source with a Denoise is processed in chunks of
+20 s (`apply_in_chunks`), each read with room either side — 4 s of
+run-in for the gains and every other edit's reach and surroundings — and
+every edit run over it in order; only the chunk is written, so a long clip
+never sits in memory whole and the joins do not show.
 
 `session::spectral`: changes (`Action::EditSpectral { clip, change:
 SpectralChange::{Add, Set, Remove, Clear} }`) are pending at once
@@ -6694,7 +10301,7 @@ and the playhead while stopped. `session::snapping` finds them
 (`Session::snap_to_object`, `snap_edges_to_object` → `SnapHit { at,
 object: SnapObject, track }`; `snap_edges_to_objects_and` takes an
 editor's own objects too); the arranger applies the rules (`clip_edit.rs`:
-`SNAP_PX` = `snapping::SNAP_PX`, `object_shift`, `snap_point`,
+`SN0.97 (grand staff)X` = `snapping::SN0.97 (grand staff)X`, `object_shift`, `snap_point`,
 `moved_edges`). Besides clips, ranges, markers, sections and the loop,
 these drags snap the same way: the Play Start Marker's flag, automation
 points (a point added and dragged, not a freehand stroke), tempo points
@@ -6707,7 +10314,7 @@ arranger's objects, before the grid; Shift moves freely there
 (`PianoRollView::note_object_shift`, its own guide line):
 
 * **Alt bypasses all snapping**, objects and grid alike.
-* **An object within `SNAP_PX` (8 px) beats the grid**; the threshold is
+* **An object within `SN0.97 (grand staff)X` (8 px) beats the grid**; the threshold is
   pixels turned into time at the current zoom (`snap_reach`), so it feels
   the same at every zoom. The nearest object wins; at equal distance the
   first found (tracks in order, then markers, sections, loop, selection,
@@ -6957,6 +10564,203 @@ screen via `UiRequest::FullScreen`): song, time and what is left, the part
 now and next, the lyric line, notes, the list, big buttons; Space, arrows,
 Enter, Esc.
 
+**Gear changes.** A song can change external gear (`SetSong::gear`:
+`SongGear { changes, timing }`, a `GearChange` = an output port, a wait in
+milliseconds before it, and a `GearMessage::{Program { channel, program,
+bank }, Control, SysEx { name, data }}` — a program after its bank select,
+a controller snapshot as several controls, patch dumps). They go out when
+the show stands on the song (`GearTiming::Cue`, the default: cued, before
+it plays, so a synth has loaded its patch by the time the song is played),
+or on its first frame (`GearTiming::Start`); a song played into straight on
+from the one before has no moment to stand on it and gets them on its first
+frame too. `session::show_gear` sends them through `MidiOutputs` on
+schedules of their own (`Schedule::{ShowCue, ShowStart}`, each cancelled
+alone; clip SysEx is `Schedule::Clips`), each message after the one before
+it has gone down a MIDI cable (`WIRE_NS_PER_BYTE`, 320 µs a byte) and after
+its change's wait (`SongGear::schedule`). Standing on another song cancels
+what has not gone out; standing on the same song again (stopped back on its
+start) sends nothing new until the setlist is edited or the show entered
+again (`GearPlayback::cued`); first-frame changes are scheduled ahead like clip
+SysEx (`tick_show_gear` from the MIDI tick: due when the first frame is
+heard — the engine's position at the callback plus the output latency — or
+at once when a start from a stop has just passed it), and a locate or stop
+cancels them. Edits are `SetlistOp::{Gear, GearText, GearTiming,
+GearProgram, GearSysexFile, GearSnapshot}` (one undo step each; text in
+`SongGear::to_text`'s form — `pc 5 bank 1 ch 1`, `cc 7=100 ch 2`, `sysex F0
+… F7`, `wait 200`, `on "<output>"`; outputs not named go to
+`Session::default_gear_output`; a snapshot takes the controllers a track's
+clips set by the song's start), `ShowOp::SendGear` sends them now. The
+setlist view's Gear column shows them (▸ for first-frame timing), a
+double-click types them, a click (or the row menu's External Gear) lists
+them with the timing, Send Now, Add Patch Dump (`UiRequest::ImportGearSysex`
+→ a file dialog), Add Controller Snapshot of a track, Clear. Dev action
+`show-gear:<song n>=<program>[/<bank>]`. Tests `setlist::tests` (project),
+`session/tests/show_gear.rs` (cue sends spaced as a cable carries them,
+first-frame and straight-on timing, a jump cancelling, edits), the
+setlist view's `the_gear_column_types_gear_changes_and_its_menu_does_the_rest`.
+
+### Adaptive music for games (the interactive score)
+
+`Project::interactive` (`faderframe_project::interactive`,
+`Command::SetInteractiveScore`, Impact None; the session wraps it in a
+batch named after the edit) holds music for a game as middleware plays it.
+*States* are song sections (they loop between an entry cue — the bars
+before it a pickup played on the way in — and an exit cue, or play once
+and go on to `then`) or launcher scenes (their clips loop as the launcher
+plays them; the scene's length is its longest clip as played). *Layers*
+are groups of tracks; *parameters* (intensity …) move them through
+`LayerCurve`s (points of value → dB, the amplitude interpolated between
+them, `FLOOR_DB` silent). *Rules* match a source and a destination (either
+may be any state): the most specific wins, the first of equals, and
+without one the music moves on the next bar (`rule_between`). A rule says
+where the source is left (`SyncPoint`: at once, the next beat, bar or grid
+of bars counted from the state's start, project marker, one of the state's
+named cues, its exit), the fades out and in (`FadeLength`, milliseconds or
+beats), a transition segment (a section state played once on the way) and
+where the destination begins (its start, its entry cue, the same place in
+its loop). *Stingers* are launcher clips played once over the music on a
+sync point, with a pickup before it. Sync points are pure: `sync_point`
+walks the stretches playback goes through from a position — a looping
+state's loop again and again, a scene repeating from its launch — and
+takes the first point at least a wait away, beats and bars from the tempo
+and metre in force there. Ids are allocated by the session; references to
+gone states are dropped by `tidy`, states whose section or scene is gone
+play nothing and are left out of exports.
+
+**The preview** (`faderframe_session::adaptive`, `Action::Adaptive(AdaptiveOp)`,
+not saved) plays one state at a time on the live engine. A section state
+is the transport looping its loop — the session *holds* the loop
+(`EngineController::hold_loop`: the project's loop is not sent while it
+holds); a scene state is the launcher playing its row. Asked for another
+state, the session finds the rule and its sync point in the state playing,
+at least `cue_margin` ahead (the render-ahead lookahead, two of the tiers'
+blocks, a callback, 60 ms) plus the fade-out, and plans the move there:
+
+* **Planned jumps** (`faderframe_transport::{Cue, Cues}`,
+  `TransportCommand::SetCues`, `EngineController::set_cues`): when
+  playback reaches `at` it goes on from `to` with the loop `then_loop`
+  says, on that frame — `frames_until_wrap` ends a block there, a cue on a
+  loop's end wins over the wrap, `to == at` only changes the loop. Up to
+  `MAX_CUES` (2: into a transition segment and on to the destination);
+  only the first is armed; a locate, stop or scrub forgets them; they are
+  not jumps (`jumps` counts locates) but count in `cues_taken`
+  (`TransportSnapshot::{cues_taken, cues_waiting}`). Rendering ahead, a
+  plan is a loop change: `AheadLink` hands the loop and the cues over
+  together as a `LoopPlan` amend at a frame beyond every anticipator, so
+  the tiers and the audio thread take the same jump on the same frame
+  (`amend_late_is_equal` also refuses a late amend whose cue falls in
+  what was rendered past its frame). A plan whose first jump lies within
+  what was rendered is not taken (the session plans again).
+* **The launcher on a sample**: `Quantize::At(sample)` (at once if past)
+  and `LaunchCommand::Arrangement { quantize }` (every launched track back
+  to the arrangement there; the slot number `launch::ARRANGEMENT` stands
+  for it, `SlotKey::hash` stays below it). A scene comes in by launching
+  its clips (and stopping the score's other scene tracks) at the sync
+  point; leaving a scene for a section returns to the arrangement there,
+  beside the jump. A launch waiting for a sample is shifted with a jump
+  like any launch (`LaunchState::transport`), so both land together.
+* **Fades** (`engine::transition`: `TransitionFade { at, out_frames,
+  in_frames, cue }`, `EngineController::transition_fade`, `Fading` on the
+  audio thread): the frame of the transition is predicted while playback
+  runs straight to `at` and fixed once the cue was taken (or the position
+  passed); the outputs heard the graph's latency later are faded down to
+  it and up from it. One playhead: the fade-out ends where the destination
+  begins (middleware overlaps them; the exports carry the times). A jump
+  that does not come cancels its fade.
+
+The tick (`tick_adaptive`) follows the cues taken (the state playing, a
+segment on the way), plans again when the jumps went missing (a locate in
+between), sends a one-shot state on to its `then` at its exit (or stops
+there with `stop_at`), and holds the loop and the layers' gains again
+after a new engine. Asked for the state playing while a move waits, the
+move is called off (scene clips relaunched in place with legato).
+Parameters move the layers' tracks through gains beside their faders
+(`EngineController::set_track_trims` → `SlotRegistry::set_trims`, folded
+into the strips' VCA gain by `write_params`; never in the project).
+Stingers launch on their sync point less the pickup and are released a
+clip's length later (`LaunchCommand::Release` at a sample).
+
+**Export** (`adaptive::export`, `AdaptiveOp::Export(dir)`, a thread like a
+render, the project as `render_copy` makes it): a stem per state and layer
+(a layer = its tracks soloed in place, so the buses and returns they feed
+come along; the tracks in no layer are "Base"; without layers one "Mix"),
+rendered through `render_one` (the graph's latency off the front: frame k
+of a file is the state's frame k) from the state's start to its end plus
+`ScoreExport::tail_seconds`, with the loop (entry to exit) in a `smpl`
+chunk and Entry, Exit, the named cues and the project markers as `cue `
+markers labelled in `LIST`/`adtl` (`faderframe_audio_files::markers::
+WavMarkers`, written after the audio by `write_wav_chunks`). A scene state
+renders a project where its clips (as played) are placed from the song's
+start, repeated to its length and the last cut there, the arrangement's
+own clips left out (`scene_project`); a stinger is its clip once on its
+own track. Then the metadata (`adaptive::formats`):
+
+* `<name>.score.json` (schema `faderframe.interactive-score/1`): states
+  (kind, source, lengths, entry/exit/loop frames, tempo, metre, tempo
+  changes, every beat with its bar, cues, markers, stems), layers and
+  their tracks, parameters with their curves, the rules as written, the
+  transition every pair of states takes, stingers, the other files.
+* `<name>.fmod.js`, for FMOD Studio 2.02 and later through its documented
+  Scripting API only (`workspace.addEvent`, `Event.addGameParameter`,
+  `addGroupTrack`, `addMarkerTrack`, `GroupTrack.addSound`,
+  `MarkerTrack.addNamedMarker/addRegion/addTransitionRegion/
+  addTransitionMarker`, `Triggerable.addParameterCondition`,
+  `AutomatableObject.addAutomator`, `Automator.addAutomationCurve`,
+  `AutomationCurve.addAutomationPoint`, `project.importAudioFile`,
+  `studio.menu.addMenuItem`): in the project's Scripts folder it adds
+  Scripts › FaderFrame › Import Interactive Score, which makes one event —
+  a labelled parameter with a label per state, the score's parameters, a
+  group track per layer with the states' stems one after another, a
+  destination marker at each state's start and entry, a loop region over
+  each loop, a transition region (beat, bar, grid, immediate) or
+  transition markers (markers, cues, the exit) per pair with a condition
+  on the state parameter (segments: to the segment, and from its end on),
+  the layers' volume automated by the parameters (sampled amplitude
+  curves, −80 dB floor), an event per stinger. The reference documents no
+  property for a transition region's quantisation, so it keeps FMOD's own
+  (the manifest names the sync point).
+* `<name>.wwise.tsv`: Wwise's tab-delimited Audio File Importer list
+  (`Audio File`, `Object Path` with `<Music Switch Container>`/
+  `<Music Playlist Container>`/`<Music Segment>`/`<Music Track>` type
+  prefixes, `Object Type`, `Notes`).
+* `<name>.waapi.json` + `<name>.waapi.py` (Audiokinetic's `waapi-client`,
+  not part of FaderFrame): `ak.wwise.core.object.set` calls for Wwise
+  2022.1 and later, written against the 2024.1 object reference — a State
+  Group with a State per state, Game Parameters, Triggers; the Music
+  Switch Container (`@Arguments` the state group, `@Entries` per state)
+  with a Music Playlist Container per state (`@LoopCount` 0 or 1) and its
+  Music Segment (`@Tempo`, `@TimeSignature…`, `@Cues` entry/exit/custom,
+  the stems imported as Music Tracks); the layers' Volume RTPCs
+  (`@RTPC` with an in-place `Curve`); the transition list
+  (`@TransitionRoot`: `MusicTransition`s with source/destination context,
+  `@ExitSourceAt` 0/1/2/3/4/5/7, `@DestinationJumpPositionPreset`,
+  `@PlayDestinationPreEntry`; least specific first since Wwise reads the
+  list from the bottom up) and `@Stingers`. Fades and transition segments
+  are written into each transition's notes: their objects are not among
+  WAAPI's documented properties.
+
+The view `faderframe-view-adaptive` (`ViewKind::InteractiveMusic`,
+`app.show-interactive-music`, View → Interactive Music) is the control
+panel: Preview/Stop, + State/Rule/Layer/Parameter/Stinger, Export… (a
+folder chooser), the state playing and the one waiting with its seconds
+and sync point; the states as buttons (a click goes there as the game
+would; right-click: loops/once, then, entry cue, start, remove; F2
+renames), the rules (a click opens everything a rule sets), layers,
+parameter sliders (the preview's values; right-click: each layer's curve)
+and stingers (a click plays one). Dev action `adaptive:` (see the CLAUDE.md
+notes). Tests: project `interactive::tests` (rule precedence, beats and
+bars under tempo and metre changes, loops coming round, grids, markers,
+cues, repeating scenes, layer curves, the command and files), transport
+`planned_jumps_land_on_their_frames_and_change_the_loop`, engine
+`launch` and `transition` units, `tests/interactive.rs` (jumps on their
+frames in any block size, the same with render-ahead, fades as heard, a
+launch and a return on samples, trims), `interactive_score_transitions_do_not_allocate`,
+`ahead` amend units, audio-files `markers::tests`, session
+`tests/adaptive.rs` (edits, the preview moving on a bar in real time,
+the export's files: loop points on their frames, manifest, `node --check`
+of the FMOD script when Node is there, the WAAPI calls, the runner
+compiled by Python), the view's tests.
+
 ### MIDI 2.0
 
 Packets: `faderframe_midi::ump` (pure: `Ump` = 1–4 words by message type,
@@ -6965,10 +10769,12 @@ MIDI 1.0 and 2.0 channel voice (`Voice2`), SysEx7, flex data (tempo,
 meter, key, text) and UMP stream messages; `scale_up`/`scale_down` = the
 specification's min-centre-max scaling; `Midi1ToMidi2` = the default
 translation with bank select and RPN/NRPN folded in, `Voice2::to_midi1`
-back; `per_note_expression`/`per_note_message` map per-note pitch bend
-(±48 semitones), absolute pitch 7.25 and the registered per-note
-controllers (volume, pan/balance, modulation, expression, brightness) to
-the host's `NoteExpressionKind`s and back).
+back; `Voice2::to_midi1_fine`/`Voice2::of_event` = one message both ways
+with its full resolution beside the MIDI 1.0 form; `per_note_expression`/
+`per_note_message` map per-note pitch bend (±48 semitones), absolute pitch
+7.25 and the registered per-note controllers (volume, pan/balance,
+modulation, expression, brightness) to the host's `NoteExpressionKind`s
+and back).
 
 Devices (Linux): `faderframe-midi-ump` is a MIDI 2.0 client of the ALSA
 sequencer (`snd_seq_set_client_midi_version`, one in and one out port,
@@ -6977,30 +10783,137 @@ hardware, programs — with `chosen_ports` taking an endpoint port for its
 groups; a reader thread polls and hands packets on; `UmpWriter` writes
 straight to a port; one handle behind a mutex). `faderframe-midi-io` lists
 them as inputs and outputs ("… (MIDI 2.0)", keys `ump:<client>:<port>`),
-leaves those clients out of midir's MIDI 1.0 lists, files packets sent
-straight to FaderFrame under "Sent to FaderFrame (MIDI 2.0)", and gives
-MIDI 2.0 outputs `Sink::Ump` (events translated to MIDI 2.0, expressions
-as per-note controllers). Elsewhere the client reports "not supported".
-`FADERFRAME_NO_UMP=1` keeps it closed.
+leaves those devices out of midir's MIDI 1.0 lists (`UmpClient::claimed`
+→ `Claimed`: by sequencer client on Linux, by name on macOS), files
+packets sent straight to FaderFrame under "Sent to FaderFrame (MIDI 2.0)",
+and gives MIDI 2.0 outputs `Sink::Ump` (events at the resolution they
+carry, expressions as per-note controllers). `FADERFRAME_NO_UMP=1` keeps
+it closed.
 
-Inside, events stay MIDI 1.0 shaped plus per-note expression:
-`MidiInputEvent`/`MidiOutputEvent` carry an optional expression next to
-their bytes; `MidiInputSender::send_ump` turns packets into them (velocity
-and controllers at 7 bits, per-note controllers and a note-on's pitch
-attribute as expression at full resolution); `MidiOutputSink` passes
-expressions on and the engine queues them. Recording and Capture MIDI keep
-per-note expression (`MidiTake::expressions` → `native_expressions`, by
-channel and key, thinned like MPE's).
+Devices (macOS 11 and later): the same `UmpClient` API on CoreMIDI
+(`core_midi`, safe code on the `coremidi` crate that midir already brings,
+which holds the FFI): an input port created with
+`MIDIInputPortCreateWithProtocol` (MIDI 2.0) connected to the MIDI 2.0
+sources, an output port sending event lists (`MIDISendEventList`) to MIDI
+2.0 destinations, and a destination of FaderFrame's own ("FaderFrame MIDI
+2.0 In", `MIDIDestinationCreateWithProtocol`) that programs send to.
+MIDI 2.0 endpoints are the ones whose `kMIDIPropertyProtocolID` is 2;
+offline and private ones are left out, and a driver's endpoint counts as
+hardware. CoreMIDI endpoints have no sequencer addresses, so `addresses`
+gives each one a stable `(client, port)` pair by its unique id (port 0 a
+source, 1 a destination; FaderFrame's own destination is `(0, 0)`, which
+midi-io files as sent straight to FaderFrame). CoreMIDI calls the input
+on its own high-priority thread, so there is no reader thread. Nothing is
+published as a source of FaderFrame's own, as on Linux. Tested on the
+macOS runners (`tests/coremidi.rs`: two clients in one process, a
+destination listed and written to bit for bit).
+
+Windows: Windows MIDI Services is not wired (the existing midir/WinMM
+path stays). What blocks it, as of November 2026: the
+`Windows.Devices.Midi2` WinRT API is still a preview (Preview 11 locked
+its metadata in October 2026 but it has not shipped in Windows); it is not
+in the Windows SDK metadata the `windows` crate projects, so bindings
+would have to be generated with `windows-bindgen` from the preview
+`Windows.Devices.Midi2.winmd` of the NuGet package, whose redistribution
+(dll, winmd, pri) is under a "go-live" agreement with obligations (keep up
+with every preview, tell customers, remove the binaries within 90 days of
+the in-box release) rather than a permissive licence; the API needs
+Windows 11 25H2 or later, and nothing here can run it (Wine has no MIDI
+service; the CI's Windows images do not have it). Once the in-box API
+ships it reaches the `windows` crate with the SDK metadata, and the
+backend is a `UmpClient` like the others: `MidiSession`, endpoint
+connections by device id, `MidiApi::IsSystemProvided` and activation
+failures as the feature test, midir/WinMM as the fallback.
+
+Resolution beside the event: inside, events stay MIDI 1.0 shaped
+(`MidiEvent`) and carry what MIDI 2.0 adds beside them, a
+`faderframe_midi::Fine` (the value at full width — a note's 16-bit
+velocity, 32 bits for controllers, pressure and pitch bend — and a note's
+attribute) on `TimedMidiEvent::fine`, `MidiInputEvent::fine`,
+`MidiOutputEvent::fine`, the recorder's `RecordedMidi::fine` and the
+snapshot's region events `(time, event, fine)`. A fine value counts only
+while it agrees with the event — its top bits are the event's own value
+(`MidiEvent::{fine_value, full_value, full_unit, velocity16}`) — so
+anything that changes an event at seven bits (a velocity curve, a MIDI
+effect, an articulation map) leaves the old one behind by itself and the
+event plays at what it says; moving an event in time, to another key or
+channel keeps it (`TimedMidiEvent::at`, buffers' `merge_from`, the PDC
+`EventDelay`, chasing). Without a fine value `full_unit` is the MIDI 1.0
+value over its own range, exactly as plugins were always given it.
+`MidiInputSender::send_ump` puts the resolution of notes, controllers,
+pressure and pitch bend beside their MIDI 1.0 forms (per-note controllers
+and a note-on's pitch 7.9 attribute still arrive as per-note expressions).
+Who uses it: CLAP note-on/off velocities as floats at 16 bits; VST3
+velocities, poly pressure and the CC/aftertouch/pitch-bend parameters at
+full resolution (and plugins' own notes back at 16 bits); the sandbox's
+shared memory (`WireEvent::{fine, has_fine, attribute, attribute_data}`,
+shm v6); the built-in synth's velocity and the per-note Velocity
+modulation source; MIDI learn values (32-bit controllers move mapped
+parameters smoothly); the MIDI effects pass the played note's resolution
+on where the note goes through (scale, the chord's own key, the echo's
+dry note); MIDI 2.0 outputs (`ump_ports::event_words` via
+`Voice2::of_event`). MIDI 1.0 outputs, LV2, AU and SFZ instruments get the
+MIDI 1.0 bytes (the top bits). The snapshot also gives MPE's member
+channel bends, pressure and timbre their 32 bits. Scripted runs play
+packets through the keyboard input with the dev action `ump:<hex words>`
+(`ump:40903c00 12340000` = a note-on at velocity 0x1234).
+
+Clips at MIDI 2.0's resolution: `MidiNote::fine: Option<NoteFine>`
+(16-bit velocity and release velocity, the note-on's attribute; keep
+`fine: None` in new `MidiNote` literals) and `ControllerPoint::fine:
+Option<u32>` (32 bits; programs have none) sit beside the 7-bit (14-bit
+for pitch bend) values that everything else keeps editing. The same rule
+holds: a fine value counts while its top bits are the stored value
+(`MidiNote::{velocity16, release16, attribute, on_fine, off_fine}`,
+`ControllerPoint::{value32, fine_of, unit, steps}`), so old files load
+with every value derived from the 7-bit one (`scale_up`) and no schema
+change, and nothing new is written for MIDI 1.0 values (a fine value equal
+to the scaled-up one is dropped: `set_velocity16`, `normalize_fine`,
+`ControllerPoint::at32`, `ControllerLane::normalize`, which also compares
+repeats at 32 bits). Recording and Capture MIDI keep what MIDI 2.0 devices
+play (`RecNote::{on, off}` + `keep_fine`, `RecController`'s 32-bit value).
+Editing at full resolution: the piano roll's velocity lane drags and draws
+lines at 16 bits (`NoteOp::{SetVelocity16, OffsetVelocity16,
+RampVelocity16}`), controller lines interpolate at 32 bits between their
+ends (freehand drawing stays at the lane's pixels, MIDI 1.0 steps); the
+older velocity operations keep the resolution where notes have it
+(`MidiNote::set_velocity_keeping`: the 7-bit result exactly as before,
+the 16 bits as near the scaled value as that allows; shuffles carry the
+16 bits along); the event list shows MIDI 1.0 steps with MIDI 2.0's
+fraction cut to two decimals (`EventRow::{fine, release_fine}`, "100.56";
+`steps_text`), and a typed or dragged fraction sets the full resolution
+(`EventValue::Fine`, `velocity_of_steps`, `ControllerPoint::of_steps`)
+while whole numbers set MIDI 1.0 values. `.midi2` clip files keep it all
+(16-bit velocities and attributes, 32-bit controllers, both ways);
+Standard MIDI File export writes the top bits.
+
+Inside, recording and Capture MIDI keep per-note expression as before
+(`MidiTake::expressions` → `native_expressions`, by channel and key,
+thinned like MPE's).
 
 Clip files: `faderframe_midi::clipfile` (`SMF2CLIP`, big-endian words, a
 Delta Clockstamp before every packet, ticks per quarter in the header,
 Start/End of Clip; gaps over 20 bits as several clockstamps with no-ops) and
-`session::midi2file` (`export_midi2_clip` writes one clip with 16-bit
-velocities, 32-bit controllers, programs with banks, expression, SysEx, the
-project's tempo/meter/key and the clip's name; `import_midi2_clip` reads
-MIDI 1.0 and 2.0 messages into a clip on a new instrument track, poly
-pressure during its note as the note's pressure). Import MIDI takes
-`.midi2`; File → Export MIDI 2.0 Clip….
+`session::midi2file` (`export_midi2_clip` writes one clip with its 16-bit
+velocities and attributes, 32-bit controllers, programs with banks,
+expression, SysEx, the project's tempo/meter/key and the clip's name;
+`import_midi2_clip` reads MIDI 1.0 and 2.0 messages into a clip on a new
+instrument track, at their resolution, poly pressure during its note as
+the note's pressure). Import MIDI takes `.midi2`; File → Export MIDI 2.0
+Clip….
+
+Tests: `ump`/`clipfile` units, `faderframe_midi` `a_fine_value_counts_while_it_agrees`,
+`midi2_packets_arrive_at_full_resolution`, project
+`a_note_keeps_its_16_bit_velocity_while_it_agrees`,
+`old_notes_and_points_load_and_new_ones_keep_their_resolution`,
+`controller_points_hold_32_bits_in_midi_1_steps`, session
+`tests/midi2_resolution.rs` (a take from a MIDI 2.0 port, a captured
+phrase, clips played to MIDI 2.0 and MIDI 1.0 devices, `.midi2` vs SMF,
+edits), `tests/{midi2,midi2file}.rs`, CLAP `notes_carry_ids_and_note_expressions_reach_their_keys`
+and VST3 `hosts_a_plugin_with_separate_controller` (velocities as floats),
+the sandbox's wire round trip, `event_delay_shifts_events`,
+`midi2_resolution_does_not_allocate`, macOS `tests/coremidi.rs`, opt-in
+ALSA `tests/sequencer.rs`.
 
 ### Screen readers and the keyboard
 
@@ -7034,16 +10947,93 @@ transport changes ("Playing", "Stopped", "Recording") and session notices
 (errors at high priority) are announced. `HostRequest::Announce` lets views
 say something.
 
+What only the view can do for a control — open the menu, text entry or
+chooser its press opens, change its own presentation (a filter, the song
+selected, a divider) — the keyboard asks of the view: a node marks it
+(`on_press`: Enter; `with_menu`: Shift+F10 and the Menu key, and Enter
+when nothing else answers; `view_steps`: the arrows) and the host calls
+`CanvasView::access_press(id, AccessPress::{Activate, Menu, Increment,
+Decrement})`, whose requests and actions go out as for an event (after a
+menu opens the control is not said again: the menu speaks for itself).
+`access::key_on` is the one place that decides what a key does on a node,
+for the host and for the views' tests (`access::press_key` drives a view
+as the host would). A node can also be `disabled` (told as unavailable,
+the keys pass it by), a `tab_stop` that does nothing (a meter the keyboard
+visits to hear it), and `fixed` along an axis (a toolbar, a header row or
+column): the host never scrolls the view to bring it in. Views with no
+scrollbars still answer `scroll_info` where they scroll (the album's
+songs, the automation lanes) so the keyboard's focus is scrolled into
+view.
+
+What changes by itself — a clip launched, an analysis finished, a level
+past its limit — a view says through `CanvasView::access_news`, asked with
+the tree four times a second while the view is shown: it compares with
+what it last told (the first call only looks) and returns sentences the
+host announces. After a key the news and the control's new state are said
+together, a sentence the control says anyway left out (a tool switched
+from the toolbar is not said twice).
+
 Views: the mixer (strips: volume and pan sliders, mute/solo/arm toggles,
 inserts that open their editors), the arranger (tracks: header toggles,
 volume, clips with their spans — Enter selects and locates), the transport
 display (position, tempo spin button, meter), the piano roll (notes —
 Enter selects, arrows transpose), the event list, setlist (and its stage
-screen), undo history, and every kit device editor (sections as groups,
-knobs as sliders by a hundredth of their travel, switches as toggles,
-stepped values a step at a time). Check with the system's AT-SPI (the
-scratchpad's `a11y_dump.py` / `a11y_events.py` on `/usr/bin/python3` with
-`gi` Atspi) and the dev action `access-key:<view>=<tab|backtab|enter|up|…>`.
+screen), undo history, every kit device editor (sections as groups, knobs
+as sliders by a hundredth of their travel, switches as toggles, stepped
+values a step at a time), and:
+
+- the edit toolbar: a toolbar of modes, tools and options as toggle
+  buttons pressed while on, menu buttons (grid mode and value, ripple
+  scope, trim and grabber kinds, nudge, quantize) opening their menus, the
+  transient sensitivity a spin button, the counters changing their units;
+  a mode, tool, ripple or grid changed by a shortcut is said;
+- the Album: the toolbar (menu buttons, "+ Files…" its chooser, the album
+  file a toggle), the player (previous/play/next/back, unavailable while
+  nothing plays, the album's position a slider by five seconds), the songs
+  as a list — a song read as its number, title, length and loudness (the
+  rest described); Enter selects it (the arrows and Delete are the list's),
+  its menu the row's; its title, fades and ISRC typed with Enter, its pause
+  or crossfade and trim spin buttons by a tenth, its inserts' menu — and
+  the export folder; an analysis, export or preparation starting and
+  finishing (with the album's loudness), a song failing, the song playing
+  are said;
+- the Clip Launcher: toolbar (quantise menu, Back to Arrangement, Record to
+  Arrangement as a toggle, + Scene), the tracks' headers (Enter selects),
+  a group per scene — launch, name (Enter renames) and a slot per track
+  read as its track, clip and state; Enter does what a click on its ▶ does
+  (a held gate or repeat clip: its release; an empty MIDI slot: a new
+  clip), every slot, scene and stop button has its menu (the slot's adds
+  Move To / Copy To, the drag's way for the keyboard) — and the stop
+  buttons; launches, stops, the way back to the arrangement and slot
+  recordings are said;
+- Automation: the toolbar (Selected tracks only a toggle, the lane tools
+  unavailable without a lane), the list's rows as shown (a track: its menu
+  adds a lane; a lane: Enter edits it, its menu the mode's, with its mode
+  and arranger visibility as controls), the editor's "Add point at the
+  playhead" (its menu: the segment's shape, Write Value) and each point a
+  slider by a hundredth of the lane — Enter locates to it, its menu
+  shapes, deletes or moves it by a sixteenth (Move Earlier/Later, in the
+  pointer's menu too);
+- Tools: the toolbar's menus and toggles, then every reading a meter the
+  keyboard visits (loudness and dynamics, levels per channel, correlation,
+  the spectrum summed up as where it is strongest, the codec pane with its
+  buttons). Announce Limits (a toolbar toggle of the view) says a reading
+  crossing its limit (`access::Limits`): the true peak over −1 dBTP, the
+  integrated loudness reaching the target (±1 LU) or leaving it, the
+  correlation below −0.1 and back over +0.1, the codec's decoded peaks
+  over full scale;
+- Video: the picture as one control read as what it shows (timecode, file,
+  frame; the calibration's step) and described (comparison, the ADR cue,
+  jobs), its menu the window's; a wiped comparison's divider a slider of
+  the view's; jobs finishing and a calibration's result are said.
+
+Tests drive the trees through `press_key` (each view's `keyboard` tests,
+`edit_bar::access_tests`, `access::tests::keys_reach_actions_presses_and_menus`).
+Check with the system's AT-SPI (the scratchpad's `a11y_dump.py` /
+`a11y_events.py` on `/usr/bin/python3` with `gi` Atspi) and the dev action
+`access-key:<view>=<tab|backtab|enter|up|down|left|right|page-up|page-down|menu|escape>[/…]`
+(`edit-bar` and `transport` name the edit toolbar and the transport
+display; announcements are logged at debug level as "access: said …").
 
 ### Singing into MIDI (voice ports)
 
@@ -7202,12 +11192,14 @@ The Pitch editor's Polyphonic option (on by default; `EditFlag::PolyphonicPitch`
 played live by PSOLA with its formants) finds every note, chords too, and
 moves each on its own.
 
-Detection (`session::polypitch`): the clip's original audio through the
+Detection (`session::polypitch::hear_notes`, which lead sheets hear their
+audio with too): the clip's original audio through the
 transcription model (`to_midi::harmony`, every note), overtone notes of
 louder ones dropped (`drop_overtones`: on the 2nd–12th harmonic, sounding
 mostly with it, under 60 % of its velocity), each note followed to its pitch
-every 5 ms (`faderframe_polypitch::pitch_tracks`: a weighted harmonic sum
-within ±70 cents, then the exact peaks of its own unshared harmonics) — a
+every 5 ms (`faderframe_polypitch::follow` — `pitch_tracks` is its pitch: a
+weighted harmonic sum within ±70 cents, then the exact peaks of its own
+unshared harmonics; it also gives the sum as the note's level) — a
 `PitchEdit` whose notes may overlap, marked `Polyphonic { original,
 rendered }`, in one "Detect Pitch" step. Notes also carry `gain_db` and
 `muted`; `PitchOp::{Gain, Mute, Forget}`.
@@ -7279,6 +11271,44 @@ time-locked. No per-clip lock: the track is the unit. The arranger marks
 locked tracks and clips with a padlock (`controls::lock_glyph`); Time
 Base in the track menus and the Inspector.
 
+Notes, markers and sections can be placed in time on their own, on any
+track, through the same planner. A locked note (`MidiNote::time_locked`,
+Logic's SMPTE lock of an event) is a hit inside a musical cue: a tempo
+change keeps its start and end on their samples — its expression points
+on theirs — while the clip and its other notes follow the beats. The
+rule is the tracks' rule applied inside the clip: a note the edit leaves
+alone keeps its sample; one the edit places (moved, resized, made, newly
+locked) is read against the tempo map in effect where it was given and
+lands on a whole sample; a clip the edit moves carries its locked notes
+at the same time from its start (in samples), so a cue moved across a
+tempo change keeps its hit as far into it. A locked note the clip no
+longer spans after a tempo change — on a musical track a slower tempo
+before the clip moves its start past the hit — makes the clip grow to
+hold it (its start back to the note, everything else keeping its place
+in the music; its end on to the note's end), so the hit is never
+silently cut off; one already outside stays outside. Keeping is one
+`SetClipContent` per clip in the edit's undo step. Quantize and Humanize
+leave locked notes' timing alone; explicit moves place them. Aliases
+share content, but a tempo change keeps each alias's locked notes on its
+own samples, so their content then differs by those notes until the next
+edit mirrors one. Locked markers and sections (`Marker::time_base`,
+`Section::time_base`, both bounds of a section) keep their samples; a
+ripple of every track moves them by the time it takes out or opens
+(`RippleShift::map_in_time`, `RippleShift::map_range_all_in_time`), a
+section move carries them with their span in its own timeline, and
+tempo from hit points leaves locked markers that are not hits exactly
+where they are. The cuts found in the picture and the shots a conform
+adds are locked markers. All three fields are written only when set, so
+older files read as musical. The piano roll draws a padlock at a locked
+note's start (beside a diamond), locks from the note menu (Lock to Time,
+checked when every selected note is) and says the note's place in time
+in its inspector and tooltip; the event list has a padlock column; the
+marker and arranger lanes draw the padlock before a locked marker's or
+section's name and lock from their menus; the Inspector's Time Base
+line counts a track's notes in time and its menu frees them. Not locked:
+controller points, SysEx and the clip launcher's clips (they play from
+their launch, not the timeline).
+
 ### Track delay and Auto-Align
 
 `Track::delay_ms` is the track delay of Pro Tools and Cubase:
@@ -7314,6 +11344,47 @@ default reference is the earliest. Apply is one undo step: each included
 track's delay and polarity. On synthetic kits (delays, filters, rooms,
 level, flips, noise, bleed) within 0.004 samples.
 
+### Aligning doubles to a guide
+
+Align Timing (`session::timing_align`, `Action::AlignTiming { guide, dubs,
+tightness }`, the arranger's clip menu "Align Timing to", dev action
+`align-timing`) warps dub clips — a doubled vocal, backing vocals, an ADR
+line — onto the audio of a guide track. A thread reads the guide as it
+plays over each dub (its clips and take folders' comps through their
+warps, reversed clips backwards) and the dub as it plays now, both mixed
+to mono and low-passed to 16 kHz, and `faderframe_analysis::timing_align`
+finds where the dub sang each moment of the guide:
+
+* **Features** every 5 ms: cepstra of third-octave band levels (bands at
+  least 450 Hz wide, so the envelope counts and not where another voice's
+  harmonics fall; each coefficient's mean over the active frames taken
+  off), the onset strength (the bands' rises) and the level against the
+  loudest. Sibilants (bright, noisy, sounding) are marked in the dub.
+* **DTW** with the symmetric slope constraint (steps of one or two frames:
+  never more than twice as fast or slow), a small cost for leaving the
+  diagonal (held vowels give no reason to wander), open at both ends:
+  first on 40 ms frames within ±0.5 s of the lag the onset envelopes
+  agree on, then on 5 ms frames within ±120 ms of that path.
+* **The map**: the dub frame per guide frame, its offset smoothed over a
+  Gaussian of 300 ms (Tightness 0: phrases) to 10 ms (1: syllables) where
+  either sounds (silences take the offsets around them), the speed held
+  within 1.25 (loose) to 2 (tight) either way. With Protect Consonants
+  each sibilant up to 150 ms plays at its own speed from where its onset
+  lands, the map rejoining within the speed allowed after it.
+
+The map becomes the dub's warp: its edges where the map puts them (the
+source offset and length moved, clamped to the source), markers where it
+bends (Ramer–Douglas–Peucker within 0.5 ms), composed with the warp the
+dub had. With "Align Pitch Too" (`EditorSettings::timing_align.pitch`)
+the dub gets a melodic pitch edit (its own, or one found now) whose
+notes move toward the guide's median pitch where they now play, folded
+into an octave and only within two semitones (a harmony keeps its
+notes). All dubs of a request change in one step "Align Timing"; a dub
+edited meanwhile is left alone, with a notice. Synthetic doubles (late,
+each syllable off by its own amount, longer or shorter, another voice, a
+harmony a fifth up) are aligned within a few milliseconds of every
+syllable (`timing_align::tests`, `session/tests/timing_align.rs`).
+
 ### A/B listening: the undo history and reference tracks
 
 A compare source can be heard instead of the mix: `nodes::compare` inside
@@ -7331,14 +11402,55 @@ plays (`Loop`). Monitoring only — renders build their own engine — and
 never on a meter or analyser (the master strip meters before it).
 
 Auditioning the undo history (`session::compare`,
-`Action::AuditionHistory(done)`, the History view's A/B): 
-`History::project_at` makes the project as undoing (or redoing) to that
-step would, on a copy; over the loop, else the edit selection, else 16
+`Action::AuditionNode(id)` for any step of the tree, `AuditionHistory(done)`
+for a place on the current line, the History view's A/B):
+`History::project_at_node` makes the project as going to that step would,
+on a copy; over the loop, else the edit selection, else 16
 bars from two before the playhead (with 2 s of run-up for tails), "Then"
 and "Now" are rendered into a per-session temporary folder, measured (EBU
 R128 with the master's channel weights), and Now/Then flips instantly,
 loudness-matched on request (the gain on the other side only). The
 render is bit-for-bit a render after really undoing.
+
+Audio Bisect (`session::bisect`, `Action::Bisect(BisectOp)`, the History
+view's bar, Edit → Audio Bisect) searches the undo tree for the edit that
+made the mix worse, as `git bisect` searches commits. The user marks a
+state that sounded good and one that sounds bad (by default the project
+now); the path between them (`History::path_between`: up to the common
+ancestor, then down, so the bad state may be on another branch) is a list
+of moves, each a step done or undone. A round plays the state in the
+middle of what is in question (the candidate) against the last state
+judged good, blind: which is A and which B is drawn at random (splitmix64,
+`Session::set_bisect_seed` for scripts and tests) and nothing shown tells
+until the round is answered; both are loudness-matched by default to the
+quieter one (EBU R128 over the stretch heard). "The candidate is better"
+makes it good, "the other is better" makes it bad; "Can't tell" asks again
+against the first bad state, and "Can't tell" there skips the candidate
+(the next is the nearest to the middle not skipped). With no candidate
+left the step is found (or, with skipped ones in the way, the few steps it
+is among): its label and when it was made, and three ways on — hear its
+before and after (named, not blind), take just it back (`inverse_of` as a
+new step, or plain undo when it is the last; a step the path undid is
+brought back with `again_of`), or go to the state before or after it.
+
+Each state is rendered once per search as an audition is (the stretch
+fixed when the search starts; a state rendered for one round serves the
+next, and the other end is rendered beside the first comparison in case
+of "Can't tell"). A round's two states are joined into one file on a
+worker thread — A, then B, each at its fairness gain — and play through
+the compare source with `Follow` sync: A ⇄ B is a crossfade between two
+regions of one file, in step with the transport, and the disk loader keeps
+the side not heard resident too (`DiskLoader::set_compare`'s `also`
+offsets). Ctrl+Alt+A flips A ⇄ B while bisecting. The search never touches
+the project or the history: cancelling (or another project, or another
+comparison taking the compare path) ends it with everything as it was, its
+files deleted (renders still running delete theirs when they end), and a
+reference compared before chosen again. Tests: `session/tests/bisect.rs`
+(a planted bad edit found from a scripted listener who measures the two
+regions the compare path plays; "Can't tell" twice skipping; the blind
+assignment hidden but kept through flips and re-joins; a good state on
+another branch; a step undone on the way brought back; cancel), the view's
+`audio_bisect_is_driven_from_its_bar`.
 
 Reference tracks (`faderframe_project::reference`,
 `Command::SetReferences`, `session::references`, the Reference view
@@ -7349,6 +11461,246 @@ matches the loudness (EBU R128) and compares long-term spectra
 (`faderframe_analysis::ltas`); Send to EQ Match gives the master's (or a
 track's) first EQ the reference's spectrum as EQ Match's reference (a
 "reference track" source in the EQ editor). Ctrl+Alt+A flips.
+
+### Codec monitor and platform previews
+
+The master can be heard as listeners get it: through a lossy codec, at a
+streaming platform's loudness (Audio → Listen → Codec Monitor, the Tools
+view's Codec pane; `session::codec`, `Action::Codec(CodecOp)`). Three
+things can be heard, switched with a 20 ms crossfade: the decoded signal,
+the original (delayed alike: a lossless tier) and their difference — what
+the codec removed or added, alone.
+
+* **Where it sits.** `nodes::codec` inside `ListenOut`, after the compare
+  source (a reference or the past is heard through it too) and before
+  headphones, the mono check and bass management: it emulates the
+  delivered master, which listeners then play on whatever they have.
+  Monitoring only — renders build their own engine
+  (`renders_never_hear_the_codec_monitor`), the master strip meters before
+  it, the analysers read the mix.
+* **The chain** (`faderframe-codec`, `CodecChain`): Opus via the `opus`
+  crate (the bundled libopus 1.6.1 of the IAMF masters, refused in
+  `faderframe_check_only` builds; an identity coder with Opus' framing
+  stands in there and in alignment tests), 48 kHz, 20 ms frames,
+  complexity 10, 16–510 kb/s a stereo pair (a mono substream half),
+  unconstrained VBR or CBR. A bed is coded as mirrored pairs and mono
+  substreams (`substreams`), whose frames start at staggered points so a
+  7.1.4 bed's encoders work in different callbacks. Other rates go to 48
+  kHz and back through two rational polyphase resamplers (Kaiser sincs at
+  `V = L·fs = M·48 kHz`, 90 dB, passband to 92 % of the lower Nyquist
+  frequency); `RatePlan::delay_for` pads the codec's delay by up to `L − 1`
+  samples at 48 kHz so the whole way, `R + (C + pad)·M` samples of `V`, is
+  a whole number of project samples. The original is then the input
+  delayed by that integer, so at 48 kHz the identity coder's output is the
+  input delayed bit for bit, and at 44.1/88.2/96 kHz the difference of the
+  round trip is under −80 dB. Cost (release): stereo 1 % of a core at 48
+  kHz, 2.6 % at 44.1 kHz, a frame's work about 0.3 ms
+  (`chain::tests::codec_cost`).
+* **Realtime.** Chains are made on the control thread
+  (`CodecLink::poll`, for the layout the newest listening node was built
+  for and the format the running node publishes) and handed in through a
+  mailbox; the node refuses one made for another format, warms a new one
+  up for its delay before crossfading to it (the mix plays meanwhile),
+  fades out and hands it back when turned off. Bitrate, VBR, what is heard
+  and the platform's gain are atomics (`CodecShared`): libopus' `ctl`s
+  change the encoder at its next frame; nothing is made anew. libopus is
+  built with variable-length stack arrays, so coding allocates nothing
+  (`the_codec_monitor_does_not_allocate`).
+* **Delay and the clocks.** While the monitor is heard, what reaches the
+  ears is `CodecShared::delay` frames later than the graph made it (1272
+  frames, 26.5 ms, at 48 kHz). The graph's latency does not change: no
+  rebuild, no plugin delay compensation, MIDI and other outputs as they
+  were. Like varispeed's resampler it is counted after the graph:
+  `EngineController::listening_delay`/`heard_latency` feed the heard clock
+  (`heard_at`, `heard_ahead`, `EngineClock` — the playhead and pictures
+  stay with the sound), the meters' and the analysers' hold-back. Turning
+  it on plays the last 26 ms again (crossfaded), turning it off skips
+  them; switching what is heard moves nothing in time. Recording does not
+  make up for it (performers may listen on cue mixes, which never pass
+  it): a recording started with the monitor on gets a notice.
+* **Measured as it plays** (`CodecMeter`, published every block): the
+  true peak of the decoded signal at the platform's gain (BS.1770 4×,
+  `faderframe_analysis::TruePeak`), the frames over 0 dBTP, and the energy
+  of the difference against the original's (shown since the last reset
+  and over the last 3 s). The first 4096 frames of a chain (the
+  resamplers' ringing at its abrupt start) are left out; starting playback
+  resets them when the Tools view resets on play.
+* **Platforms** (`faderframe_codec::PLATFORMS`, published defaults of
+  October 2026): Spotify −14 LUFS, quiet masters turned up until their
+  peaks reach −1 dBTP, Ogg Vorbis 320 kb/s; Apple Music −16 LUFS, the same
+  rule, AAC 256; YouTube −14, never turned up, Opus 160; Tidal −14, never
+  up, AAC 320; Amazon Music −14, never up, about 256; Deezer −15, never
+  up, MP3 320 CBR. Vorbis, AAC and MP3 have no encoder under a permissive
+  licence: Opus at the same bitrate stands in, and the menus, the pane and
+  the report say "emulated". The platform's gain (`Platform::gain`) comes
+  from the song's integrated loudness and true peak, measured by a render
+  of the master over the export's range (loop off, 2 s of tail; two DSP
+  helpers) once the project has stood still for 1.5 s while a platform is
+  chosen, kept for eight states by the mix fingerprint (undo back to a
+  measured state takes its measurement at once; while a change is
+  measured, the gain of the state before it stays). Until a project's
+  first render is done the Tools view's running measurement of the master
+  stands in ("from what played"), else 0 dB. The gain goes to the node in tenths of a decibel; a
+  measured gain arriving resets the measurements.
+* **Preview on platforms** (the Render window's button, with its range,
+  rate, channels and finish; Codec Monitor → Preview on Platforms… with
+  the project as it is): the master rendered to a temporary float file,
+  read back in pieces, measured (BS.1770 with the layout's weights), then
+  coded and decoded per platform on threads of their own
+  (`faderframe_codec::preview`), each measured at the platform's gain and
+  at unity (normalisation off). The report gives the gain (and whether
+  turning up stopped at the peaks), the true peak decoded both ways, the
+  frames over full scale, the artefacts' level, a clipping risk (over 0,
+  within 1 dB, safe) and advice: a ceiling low enough for −1 dBTP after
+  decoding, a master turned down by more than 2 dB, one that a platform
+  leaves quiet, loud artefacts, the stand-in codec.
+
+Tests: the crate's (`at_48_khz_the_identity_coder_is_the_input_delayed_exactly`,
+`at_other_rates_the_decoded_and_the_original_line_up`,
+`opus_is_heard_in_step_with_the_original`,
+`decoding_a_hot_master_finds_its_overs_and_says_to_lower_the_ceiling`),
+engine `tests/codec_monitor.rs` (frame-exact switching, no clicks, the
+44.1 kHz null, Opus measured, overs at +6 dB), `realtime_alloc`'s
+`the_codec_monitor_does_not_allocate` (48 and 44.1 kHz), session
+`tests/codec_monitor.rs` (switching, the gain from the song's render, the
+fingerprint cache, renders untouched, the preview), the Tools view's
+`the_codec_pane_shows_while_the_monitor_is_on`.
+
+### Mix scenes
+
+A mix scene (`faderframe_project::scenes`, `Project::mix_scenes`) is a
+snapshot of the console: per track, by id (`TrackMix`), the fader, the
+pan (mono pan or balance, the pan mode, dual pan, the surround panner),
+mute, solo, polarity, the track delay, every send's level, pan and
+switch, every cue send, each device's bypass — and, when the scene keeps
+them, every device's automatable parameter values and its state blob —
+and the console's drive (`SceneMix`). Each scene has a recall scope
+(`SceneScope`, a switch per `ScopePart`), tracks it never touches
+(`safe`) and optionally a recall of its own (`SceneFade`: a
+`FadeLength` — instant, milliseconds or beats at the tempo where the
+playhead is — and a `SwitchPoint`); the project has a default recall and
+the scenes A and B. Tracks added after a scene was stored are not in it
+and stay as they are; what has gone since (tracks, sends, cue mixes,
+devices) is passed over. Commands: `SetMixScene { scene, value, index }`
+stores, replaces (update, rename, scope, safe tracks), moves and deletes
+one scene (its inverse puts it back where it was; A or B naming a deleted
+scene come back with it), `SetMixSceneOptions` the default recall and
+A/B; both `Impact::None`. Show mode's songs may name a scene
+(`SetSong::scene`), recalled when the show stands on the song (also when
+it plays straight on into it).
+
+**A recall is ordinary edits.** `scenes::commands_to(project, target,
+scope, safe, now)` turns a scene into the mixer commands that set the
+project to it — only what differs, nothing a command would refuse (a delay
+on the master, a send switched on into a loop, a cue send from a track
+that feeds none, the drive without a console); `now` gives where a device
+parameter stands when the project has no explicit value (only the plugin
+knows). So a recall is one undo step, every view sees the faders where
+they are, and the engine syncs as it does for a hand on the console. A
+scene with devices' states loads a state that differs (with the values
+stored beside it) and sets the parameters that differ. Frozen tracks'
+devices are left alone.
+
+**Crossfades, morphs and compares move unrecorded.** `scenes::blend(a, b,
+t, switch, glide)` is the console `t` of the way from one scene to
+another: faders and send levels in fader travel (as a motorised fader
+moves), pans, dual pans, surround positions and the drive linearly,
+devices' continuous parameters linearly or geometrically (frequencies),
+and everything switched — mute, solo, polarity, delay, pan mode, the
+surround panner's modes, send and cue switches, bypass, stepped
+parameters, states — at the switch point (start: as soon as it moves,
+middle, end); at 1 it is exactly the destination. The session
+(`session::scenes`) applies each tick's blend with its inverses kept —
+the first per parameter, as a gesture coalesces — and the last command
+per parameter; when the work ends it takes them back and applies those
+last commands as one batch, so the step holds exactly where the console
+ended and undoing it returns to where the work began. A crossfade runs on
+the session's clock (`tick_scenes`) and commits at its end; a morph
+(`SceneOp::Morph`, the Scenes view's slider, a controller) commits on
+`EndMorph` or when a controller has rested `MORPH_REST`; a compare
+(`CompareStart`, `CompareHear`, `CompareEnd { keep }`) hears scene B, or
+A — another scene or the mix as it was — each side recalled over the mix
+as it was, and ends back at the mix (nothing recorded: unsaved mix
+changes are kept, the mix itself is the scratch) or keeping the side
+heard. Any action that edits the project first settles the work
+(`scenes_before` in `dispatch`, `scenes_before_edit` in `edit`, except
+edits of automation lanes and of nothing heard): a crossfade stops where
+it is ("(Stopped)", one step), a morph ends where it stands, a compare
+keeps the side heard. Saving and rendering settle it too; a new project
+forgets it.
+
+**Zipper-free: the sound glides on the audio thread.** The strips and
+sends ramp linearly across each block to the slot value they read, so
+per-tick slot writes alone give a staircase at the tick rate (ramps of a
+block, flats between). While a stream runs, a crossfade's continuous
+values therefore glide in the engine: `EngineController::glide_mix`
+writes the target project's parameters into a scratch `ParamTable` with
+the same `SlotRegistry::write_params`, keeps the continuous slots that
+differ (`SlotRegistry::glidable`: faders, pans, dual pans, surround
+positions, VCA gains, send levels and pans, cue sends, container chains,
+the drive — never NaN-valued slots like an unpanned send's) and sends an
+`engine::glide::Glide` (`Message::Glide`). The audio thread takes each
+slot's start where it is, and before every chunk writes every slot's
+value for the chunk's end — gains in fader travel — so the per-block
+ramps join into one straight line; at the end it writes the exact targets
+and hands the glide back (`Garbage::Glide`, `glide_done`). Until the
+session lets go (`release_glide`: at once for a stop, else once the glide
+is done — the project holds the same values by then), `write_params`
+skips the gliding slots, so the ticks' syncs never fight it. A new glide
+takes over the slots a running one holds from where they are. Morph steps
+and compare switches glide over 30 ms. Switched values change through the
+project at the switch point as ordinary syncs (mutes ramp over a block, a
+bypass rebuilds the graph). Without a stream, or after the engine was
+made again, the ticks alone move the values (each tick's slot writes, as
+a fader drag's). Devices' continuous parameters move per tick, as knob
+moves do (plugins smooth their own). Realtime-safe: the glide is made on
+the control thread (its fader-law table too), taken and finished without
+allocation (`mix_scene_glides_do_not_allocate`).
+
+**Automation.** A recall moves the mix as the controls would: a parameter
+a lane drives in Read keeps following its lane (the recall sets the
+static value under it, heard where the lane no longer drives); while
+playing, lanes in Touch, Latch or Write record the recall as they record a
+control (`capture_automation` on every command applied, a crossfade tick
+by tick, so the written curve glides as heard); Touch lets go when the
+recall ends, Latch and Write write on until playback stops.
+
+**Control.** MIDI learn: `MappingTarget::MixScene { control:
+SceneControl::{Recall { scene }, Next, Previous, Morph} }` (buttons on
+presses; the morph a value, relative encoders too). Control surfaces:
+`SurfaceCommand::{SceneNext, ScenePrevious, RecallScene(n),
+SceneMorph { permille }}`, from OSC `/scene/next`, `/scene/previous`,
+`/scene/recall i`, `/scene/morph f`. Next and Previous go on from the
+scene recalled last.
+
+**UI.** The Scenes view (`faderframe-view-scenes`,
+`ViewKind::MixScenes`, `app.show-mix-scenes`, View → Mix Scenes, a tab
+beside the mixer in the Mixing workspace): store (with or without the
+plugins), update, recall (Stop while fading), previous/next, the default
+crossfade and switch point (a menu of lengths; a double- or right-click
+types one: "350 ms", "2 s", "4 beats"); the list (double-click recalls,
+F2 renames, a menu for the rest: recall at once, rename, update with or
+without plugins, the scene's own crossfade, A/B, compare with the mix,
+move, MIDI learn, delete; a crossfade's progress runs along its row); the
+chosen scene's scope and safe tracks as chips and its own recall; A and
+B, the compare halves with Keep and Back, and the morph slider. The
+mixer's strip menu has a Mix Scenes submenu (`Session::mix_scene_menu`:
+store, recall each, the track safe from each, the view). Dev action
+`mix-scene:<store=name|store-plugins=name|recall=n|crossfade=n@ms|
+morph=a/b@pos|compare=a/b|compare=flip|keep|back|next|previous|stop|
+delete=n>` (n: the place in the list from 1, or the name; `compare=mix/b`).
+
+Tests: project `scenes::tests` (commands and inverses, old files load,
+recall within scope and safe tracks, nothing impossible asked, blends
+glide and switch), engine `glide::tests` and `tests/glide.rs` (one
+unbroken line in fader travel, exact targets, slots held until released,
+a stop stays), `mix_scene_glides_do_not_allocate`, session
+`tests/mix_scenes.rs` (a recall in one step, scope and safe tracks, a
+crossfade reaching its targets after its time and moving steadily with
+and without a stream, an edit stopping it, a morph and a compare in one
+step or none, next/previous, devices' values, a song's scene), the view's
+tests, the mixer's `the_strip_menu_stores_and_recalls_mix_scenes`, OSC
+`mix_scenes_are_recalled_and_morphed`.
 
 ### Mix Intelligence
 
@@ -7501,3 +11853,321 @@ the whole render where a device remembers longer than its 2 s run-up (it
 is replaced, never kept); held signals cover a job's range only while they
 fit 512 MB (beyond, the pairs' excerpts are rendered, pruned to the tracks
 they need).
+
+### Video frames on the GPU (zero-copy display)
+
+Playback frames can reach GTK without coming back through memory
+(`faderframe_video::zero_copy`, Preferences → Video → "Show frames
+straight from the decoder"). The decoder's output is a frame in video
+memory (`Frame::gpu`), which the view draws with `Painter::external` and
+the shell's painter turns into a GTK texture; anything that fails says
+so once (`zero_copy::failed`) and frames come as RGBA from then on, as
+they always do for stills, thumbnails, proxies being made and HDR
+pictures (those are mapped on the CPU).
+
+* **Linux**: VA-API decodes and its post-processor scales into an RGB
+  dmabuf in a format the display imports (`set_display_formats` from
+  `GdkDisplay::dmabuf_formats`), handed over as a `GdkDmabufTexture`.
+* **Windows** (UNTESTED: nothing that built it could run Direct3D 12 or
+  its sharing; written against GStreamer 1.26's d3d12 library and GTK
+  4.20's `GdkD3D12Texture` as documented, checked by the Windows
+  cross-build only). `Decoder::open_d3d12`: whatever decodes the picture,
+  GStreamer's `d3d12convert` scales it and converts it to RGBA in a
+  texture (caps `video/x-raw(memory:D3D12Memory), format=RGBA`); its own
+  pool makes them on a shared heap (`D3D12_HEAP_FLAG_SHARED`, GStreamer's
+  default for a filter's pool), which every import below needs. The frame
+  keeps its `gst::Buffer` (`zero_copy::GpuFrame`, `memory()` = its
+  `GstD3D12Memory`, `read_back()` = its pixels through memory). The shell
+  (`faderframe-ui/src/video_d3d12.rs`) calls GStreamer's d3d12 library,
+  looked up at run time where the running GStreamer has it
+  (`libgstd3d12-1.0-0.dll` or `gstd3d12-1.0-0.dll`; missing — GStreamer
+  before 1.26 — and the preference has no effect: `available()`,
+  `set_d3d12_display`): `gst_d3d12_memory_sync` waits on the CPU for the
+  converter's work (the frames are decoded ahead, so this is a check, and
+  GTK is handed no fence), `gst_d3d12_memory_get_resource_handle` gives the
+  `ID3D12Resource`, whose layout must be RGBA8, the frame's size, one mip.
+  Under GTK's GL renderer (its default on Windows) the texture is imported
+  into a GL context of GTK's display through `EXT_memory_object_win32`,
+  as the GPU painter's frames are (`gpu_win32::GlImport`, generalised to a
+  `Shared` descriptor): the memory's NT handle
+  (`gst_d3d12_memory_get_nt_handle`, made once and owned by it), the
+  allocation's size from the texture's device, only when GL draws on the
+  adapter GStreamer decodes on; each pooled texture is imported once, known
+  by an id of ours kept on GStreamer's memory
+  (`gst_d3d12_memory_set_token_data` under a token of
+  `gst_d3d12_create_user_token`: never reused, so a texture made later is
+  never taken for one imported before), 64 kept. Under Vulkan it is a
+  `GdkD3D12Texture` GTK imports itself (`gpu_win32::d3d12_texture_keeping`).
+  Either way the texture's release keeps a clone of the frame, so its
+  texture stays out of the converter's pool while GTK shows it, and the
+  first frame is read back both ways (GStreamer's copy, what GL or GTK
+  sees) and compared, as the painter's first frame is. Under a renderer
+  that imports nothing (Cairo) the first frame fails and frames come as
+  RGBA. `FADERFRAME_VIDEO_D3D12=0` turns it off.
+
+### A/V calibration and panning that follows the picture
+
+**A/V calibration by itself** (`session::av_calibration`,
+`faderframe_video::{camera, calibration}`, `faderframe_engine::input_tap`):
+a camera watches the video window flash and a microphone hears the beeps;
+the picture offset (`Video::offset_ms`) is set from how much later the
+picture came than the sound — the screen's own delay (compositor, the
+monitor's processing) and the speakers' included, as they should be.
+
+* *The test.* The flash-and-beep test is played by the session, not from
+  files in the project: from the playhead (past the loop when the loop
+  would wrap), a white flash of 240 ms (six frames at 25 fps: frames
+  fully inside it give its brightness) every second from a second in, a
+  1 kHz beep of 40 ms with each. The video window paints the flashes
+  (`Session::av_calibration_screen`) by `Session::picture_position` — the
+  one function the picture is timed by too (the heard position when the
+  frame reaches the screen, less the offset). The beeps play through the
+  A/B compare source in the mix's place (`compare::hear_instead`,
+  `CompareSync::Follow` from the first flash: in step with what is heard
+  by construction). Nothing in the project changes until the end; the
+  offset is one undo step, "Calibrate Picture Offset". Calibration is
+  refused while A/B listening compares something.
+* *The two clocks.* A capture pipeline runs on a monotonic
+  `GstSystemClock` of its own (`use_clock`); a live source stamps buffers
+  with their capture time as running time (v4l2src takes the driver's
+  monotonic stamp — UVC: start of exposure — else the arrival less a
+  frame), so base time + running time is the exposure start on that
+  clock. That clock and `Instant` (the heard clock's time base,
+  `history::ns_since_epoch`) are related by reading both back to back
+  (`camera::ClockMap`: the closest of sixteen pairs); both are the
+  system's monotonic clock on every platform, so the relation does not
+  drift. Frames without a time are dropped and counted. The microphone is
+  a device input tapped on the audio thread before anything touches it
+  (`EngineController::tap_input`: rtrb rings of samples and `TapBlock`
+  headers stamped with the callback's start on that time base, whatever
+  the transport does; a full ring is counted as lost and keeps its place;
+  the ends go back as garbage); a block's input came in over the
+  callback's own frames before the callback, and the device's reported
+  input latency before that (devices report their latencies without
+  their buffer — the engine adds the buffer to the output's alike).
+  Sample times come from a straight line through the stamps (late
+  wake-ups left out).
+* *Flashes, sub-frame* (`calibration::flashes`). Frames are measured as a
+  16 × 12 grid of mean brightness; cells that flash are the screen. A
+  frame integrates light over its exposure, so the frame a flash starts
+  in is partly bright: its brightness over the flash's own (frames fully
+  inside it) is the share of its exposure that saw the flash, which
+  started that share before the exposure ended (the stamp is taken as the
+  first row's exposure start, the exposure as the frame period). Each row
+  band is timed on its own and the onsets fitted with a line down the
+  picture (one slope for all flashes: a rolling shutter's readout against
+  the display's scan-out), read at the screen's middle row.
+* *Beeps, sub-millisecond* (`calibration::beeps`): the input demodulated
+  at 1 kHz and summed over the beep's length (a matched filter for a tone
+  burst) rises in a straight line from the beep's first sample; the line
+  through the first 4 ms of the rise (the direct sound, before
+  reflections steepen it) meets the noise floor at the start.
+* *The estimate* (`calibration::estimate`): every flash paired with the
+  beep nearest it (450 ms at most); the median of the differences, then
+  the mean of those within three robust deviations (at least 3 ms); the
+  spread is their standard deviation. At least half the flashes (and 3)
+  must pair. The new offset is the old less the lateness, rounded to
+  0.1 ms (refused past ±1 s).
+
+What stays in the result are the sensors' own: the camera's stamp against
+its exposure, a rolling shutter's readout down to the screen's middle row
+(it cannot be told from the display's scan-out from one picture), the
+microphone's latency as the device reports it. A virtual camera
+(`camera::Scene`, `VirtualCamera`; `CameraChoice::Virtual { display_ms }`)
+films the screen as the video window would show it, `display_ms` late,
+integrating its light over each row band's exposure and pushing the frames
+through the same pipeline stamped on its clock: the tests and a self-test
+without a camera. Cameras are listed by GStreamer's device monitor
+("Video/Source": v4l2, PipeWire, AVFoundation, Media Foundation); a
+camera is opened on a thread (it can take seconds), preferring 25 fps or
+more.
+
+Tests: `faderframe-video` `calibration::tests` (global and rolling
+shutters, the short sync-test flash, beeps with an echo and jitter, the
+estimate's outliers), `tests/camera.rs` (a virtual camera through a real
+pipeline: flashes come out when they happened, a rolling shutter as the
+slope), engine `tests/input_tap.rs`, `tapping_an_input_does_not_allocate`,
+session `tests/av_calibration.rs` (the dummy device's patch cable and a
+virtual camera 30 ms late: the offset within 2.5 ms, one undo step, a
+second run leaves less than the spread; a silent input fails and leaves
+the offset).
+
+**Panning that follows the picture** (`session::object_tracking`,
+`faderframe_video::track`): an object boxed on a frame of a video clip
+is followed through the clip and becomes automation of what places a
+track.
+
+* *The tracker* (`track::Tracker`, deterministic): normalised
+  cross-correlation of a template on a pyramid level where the box is
+  about 40 pixels across, looked for around the last place plus the
+  speed at three sizes (±4 %), every other position first, then around
+  the best; the peak refined by parabolas (place and size). A good match
+  (≥ 0.8) blends a tenth of what it found into the template, pulled back
+  a fiftieth towards the key's picture (no drift onto the background); a
+  poor one (< 0.45) is lost: the box coasts on at a slowing speed, marked
+  so a key can put it right there. Frames are decoded in order at
+  480 × 270 at most on a video job, from the proxy when there is one
+  (`track::follow_in_file`; the proxy's times count from its first frame,
+  as the frame service reads them).
+* *Keys.* The first box starts it (`FollowOp::Key`); another is a
+  correction: the stretch before keeps what was followed up to it, bent
+  onto the new box (`track::bend`: the error spread over the stretch,
+  none at its own key), and the object is followed afresh from it to the
+  next key or the clip's end. A key taken back (`RemoveKey`) lets the
+  stretch before follow on through. Keys and path are the session's,
+  forgotten with another project.
+* *Applied* (`FollowOp::Apply`, at once or as soon as it is followed
+  through): every frame within the clip, smoothed over five frames, a
+  point at the frame's start; the picture's horizontal place −1…1 drives
+  the track's pan (balance), both sides of a dual pan (spread kept), its
+  room X in a surround bed or as an object (`AutomationTarget::Surround`),
+  or its VBAP azimuth (±30° across the picture) — `Session::follow_target`
+  decides; with depth a room-panned track moves front to back by the box's
+  size (`depth` per doubling against the first key's). Points thinned
+  (`faderframe_automation::thin`) replace the stretch of the lanes the
+  path covers (`AutomationCurve::replace_range`), new lanes made where
+  there are none, all one batch "Follow Object".
+
+The video window: a Shift+drag on the picture, or a drag with "Follow an
+Object" on, draws a key; the box is drawn over the picture (the accent for
+a key, the selection colour followed, the console meters' red lost), and the menu
+takes a key back, applies to a track ("Pan a Track with It") or forgets
+it. Tests: `track::tests` (sub-pixel moves within half a pixel —
+0.08 px mean measured —, an object coming nearer, hidden and found
+again, the bend), session `tests/object_tracking.rs` (a textured square
+across a clip: pan within 0.02 of where it is, one undo step, a
+correction and taking it back; a surround bed's X and Y with depth),
+the video view's tests (the box drag, the menus, the calibration screen).
+
+### 360° video
+
+A spherical (360°) picture is looked into, not shown flat: the video
+window is a viewport into the sphere, the listener's head on headphones
+turns with it, and a click on the picture pans a track to the direction it
+shows there. Picture and sound share one frame — the ambisonic frame of
+`faderframe_core::ambisonics` (`x` front, `y` left, `z` up; azimuth
+positive to the left, elevation up) — so a track panned to a direction
+(an ambisonic field's encoder, a bed's VBAP panner) sounds where the
+picture shows that direction.
+
+* *Layouts* (`faderframe_core::spherical`, pure). `Spherical {
+  projection, stereo, pose }`: equirectangular (the front in the middle,
+  the right to the right of the frame, up at the top; `Crop` = Spherical
+  Video V2's `equi` bounds, shares of the whole projection cut from each
+  edge) or the V2 cubemap layout 0 (a 3×2 grid: right, left, up over
+  down, front, back; the four round the viewer upright, the up face's
+  top forwards, the down face's to the back; `padding` a share of a
+  face's width); stereo frames show the left eye; the pose turns the
+  projection in the scene (yaw left, pitch up, roll to the right, as an
+  `Orientation`). `Mapping` turns scene directions into a frame's pixels
+  and back; `Viewport` is a gnomonic view with a horizontal field of view
+  (20–150°) looking where an `Orientation` turns it; `dragged` turns a
+  view so what was under the pointer stays under it. `VideoSource::
+  spherical` holds a video's layout (from its file, or as the user marked
+  it — one undoable `SetVideo`).
+* *Metadata in files* (`faderframe_video::spherical`). GStreamer reads
+  and writes none of it, so the boxes are handled here. Read when a file
+  is probed (`MediaInfo::spherical`, `AudioStream::ambisonic`): Spherical
+  Video V2 (`st3d`, `sv3d` → `svhd`, `proj` → `prhd`, `equi`/`cbmp` in
+  the picture's sample entry; a mesh projection is not shown as 360°),
+  V1 (the `uuid` box of XML in the track, its cropped area) and spatial
+  audio (`SA3D` in a sound's sample entry: an AmbiX field when
+  periphonic, ACN, SN3D, its channels in order without head-locked
+  stereo — `SpatialAudio::field`); Matroska's `Projection` and
+  `StereoMode` and V1's `spherical-video` tag. Written into MP4 and
+  QuickTime movies (`write`): `moov` is read and rewritten with V2's boxes
+  before the entry's `clap`/`pasp`, V1's XML at the track's end (V1 has
+  no cubemap and no right-left stereo) and `SA3D` at the end of the first
+  sound's entry — what was there replaced, not doubled; QuickTime's sound
+  description versions 1 and 2 are told by the major brand. The media is
+  copied as it is; the chunk offsets (`stco`, `co64`) of everything stored
+  after `moov` move by the bytes it grew (a 32-bit offset that would
+  overflow refuses; fragmented movies are refused). An Opus sound marked
+  as a field also gets channel mapping family 2 (RFC 8486) in its `dOps`
+  — GStreamer's encoder writes the discrete family 255 for unplaced
+  channels, whose table family 2 reads as ACN components.
+* *Viewing* (`faderframe_video::reproject`, `faderframe-view-video`
+  `sphere.rs`). A frame is looked into on the CPU: where each view pixel
+  looks is worked out exactly every 8 pixels (`GRID`) and interpolated
+  between — cells near a pole, across the seam, between cube faces or
+  past a crop are worked out pixel by pixel — and the frame sampled
+  bilinearly (two channels at a time in a `u32`; `floorf` avoided, it is
+  a call without SSE 4.1); views over 200 000 pixels are drawn in bands on
+  up to four scoped threads. The view is drawn at the window's device
+  pixels, 1.3 MP at most (`MAX_PIXELS`, scaled up beyond), and kept until
+  the frame, the look, the field of view or the size changes. Frames of a
+  360° picture are decoded as wide as keeps the view sharp
+  (`Spherical::width_for`, at most the file's own size and
+  `sphere::MAX_DECODE_WIDTH` 5760) and always into memory
+  (`service::Media::memory`: no dmabuf frames, which the CPU cannot look
+  into). The GPU painter is not used: GSK has no custom shaders and vello
+  no arbitrary resampling. Measured (`reprojection_cost`, ignored; a
+  4K frame, dev profile on this crate's opt-level 3, a machine loaded by
+  other builds): 12 ms a 1280×720 view on four threads.
+* *The viewport and the head* (`session::sphere`). `SphereState` (the
+  session's, never saved): field of view, linked, its own look, the pan
+  track. Linked (the default) the viewport *is* the listener's head
+  (`Session::head_orientation`): `SphereOp::Look` points the head
+  (`Session::point_head` — with a tracker it moves the tracker's
+  reference so the head points there), and a tracker's OSC turns the
+  picture; the head moving asks the views to draw again
+  (`shown_changed` in `apply_head`). The binaural renderer turns the
+  scene the other way, so sound and picture turn together; speakers never
+  turn. Unlinked, the picture looks on its own; linking again gives the
+  head the picture's way. View ops (`Look`, `Fov`, `Ahead`, `Link`,
+  `PanTrack`) are no edits: Mix Intelligence auditions and mix-scene work
+  go on through them (`SphereOp::edits`).
+* *Panning by the picture.* `Session::sphere_pannable`: a track panned
+  into an ambisonic field or a bed whose azimuth applies (VBAP; not the
+  room panner, not a field or bed into a field). `SphereOp::PanTo` sets
+  azimuth (and elevation where it applies, within a bed's range) through
+  `Session::edit` — the panner's own path, so lanes in Touch, Latch or
+  Write record it while playing; the view sends a gesture (one undo step a
+  drag). `SphereOp::WriteAutomation` makes the direction lanes (one step)
+  and sets them to Touch, or back to Read. The tracks panned by direction
+  are marked on the picture where they sound (the chosen one in the
+  accent colour, "● writing" while its lanes are written).
+* *Import and export.* A movie's first sound marked as a plain AmbiX field
+  imports as a track of that order. Export Movie keeps the picture's 360°
+  layout and, when the master is an ambisonic field, writes its first
+  order (W, Y, Z, X — the first four AmbiX channels) marked with `SA3D`, as
+  YouTube takes it: QuickTime with 24-bit PCM or MP4 with Opus. Matroska
+  carries neither mark (a notice says so) and keeps every channel. Sounds
+  of more than two channels now go into QuickTime as they are, unplaced
+  (qtmux takes no more than two placed channels: they were folded down to
+  two before), as do fields and anything past eight channels (more than
+  GStreamer has default places for) — through `appsrc` from the WAV's
+  data, since nothing converts placed channels to unplaced ones.
+
+The video window: dragging a 360° picture looks round, the wheel narrows
+or widens it; with a track chosen in "Pan by Clicking", a click or drag
+pans it (Alt+drag still looks); the menu's "360° Picture" marks the
+layout (flat, equirectangular, cubemap, stereo modes), then "Look
+Straight Ahead", "Field of View", "Turn the Sound with the Picture",
+"Pan by Clicking" and "Write <track>'s Pan Automation (Touch)". Following
+an object is offered on flat pictures only. For the keyboard the picture
+has three sliders more (which way, how far up, how wide; the arrows turn
+by ten degrees).
+
+Tests: core `spherical::tests` (known directions on known pixels, crops,
+the cube's faces and their turns, the pose, stereo, viewports and drags),
+`faderframe-video` `spherical::tests` (written and read back into
+QuickTime versions 0–2 and MP4, offsets moved and media untouched,
+written twice replaced, an index at the end, Matroska, V1's XML, `SA3D`)
+and `reproject::tests` (the view looks where turned, the seam, the
+interpolation against exact directions, cubemaps, stereo, bands),
+`tests/spherical.rs` (GStreamer-made movies muxed with the marks: probed
+back, decoded, the sound out channel for channel, looked into; with
+`ffprobe` installed FFmpeg reads "Spherical Mapping" and "ambisonic 1";
+MP4/Opus with family 2; six channels kept in QuickTime and Matroska),
+session `tests/video_360.rs` (a 360° camera's movie imports as a
+spherical picture and an AmbiX track; the view is the head, turned by
+hand and by OSC; clicks pan and are written as automation while playing;
+the movie written out keeps the marks and the master's first order), the
+video view's `sphere::tests` (drags, the wheel, a click's pan as one
+gesture, the menu, a frame drawn and kept, the overlay, the keyboard).
+
+Not done: a mesh projection (V2's `mshp`) and YouTube's equi-angular
+cubemap; writing the marks into Matroska (its `Tracks` would grow and the
+clusters' and cues' positions move); following an object on a 360°
+picture (its boxes are flat); head-locked stereo beside the field.

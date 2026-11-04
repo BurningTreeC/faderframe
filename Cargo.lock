@@ -9,6 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aead"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
+dependencies = [
+ "crypto-common",
+ "generic-array",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -225,6 +235,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "built"
 version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -337,6 +357,41 @@ name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "chacha20"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
+ "zeroize",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+ "zeroize",
+]
 
 [[package]]
 name = "clack-common"
@@ -538,6 +593,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,6 +639,31 @@ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
  "typenum",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "curve25519-dalek-derive",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -694,6 +783,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af9673d8203fcb076b19dfd17e38b3d4ae9f44959416ea532ce72415a6020365"
 
 [[package]]
+name = "faderframe-aaf"
+version = "0.36.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-adm"
 version = "0.36.0"
 dependencies = [
@@ -722,11 +818,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-ara"
+version = "0.36.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "faderframe-audio"
 version = "0.36.0"
 dependencies = [
  "faderframe-realtime",
  "rtrb",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "faderframe-audio-aes67"
+version = "0.36.0"
+dependencies = [
+ "faderframe-audio",
+ "faderframe-realtime",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "socket2",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -748,6 +866,7 @@ version = "0.36.0"
 dependencies = [
  "audioadapter-buffers",
  "faderframe-realtime",
+ "flacenc",
  "realfft",
  "rubato",
  "serde",
@@ -829,6 +948,30 @@ name = "faderframe-circuit"
 version = "0.36.0"
 
 [[package]]
+name = "faderframe-codec"
+version = "0.36.0"
+dependencies = [
+ "faderframe-analysis",
+ "faderframe-core",
+ "opus",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "faderframe-collab"
+version = "0.36.0"
+dependencies = [
+ "getrandom",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "sha2",
+ "snow",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "faderframe-conform"
 version = "0.36.0"
 dependencies = [
@@ -867,11 +1010,13 @@ dependencies = [
  "base64",
  "faderframe-analysis",
  "faderframe-audio",
+ "faderframe-audio-aes67",
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-binaural",
  "faderframe-circuit",
+ "faderframe-codec",
  "faderframe-core",
  "faderframe-guitar",
  "faderframe-midi",
@@ -900,6 +1045,17 @@ version = "0.36.0"
 dependencies = [
  "flacenc",
  "opus",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "faderframe-interchange"
+version = "0.36.0"
+dependencies = [
+ "faderframe-leadsheet",
+ "faderframe-midi",
+ "flate2",
+ "roxmltree",
  "thiserror 2.0.21",
 ]
 
@@ -935,6 +1091,7 @@ name = "faderframe-midi-ump"
 version = "0.36.0"
 dependencies = [
  "alsa-sys",
+ "coremidi",
  "faderframe-midi",
  "faderframe-realtime",
  "libc",
@@ -987,6 +1144,7 @@ dependencies = [
  "clack-extensions",
  "clack-host",
  "clack-plugin",
+ "faderframe-ara",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-core",
@@ -1005,6 +1163,8 @@ dependencies = [
 name = "faderframe-plugin-host"
 version = "0.36.0"
 dependencies = [
+ "faderframe-analysis",
+ "faderframe-ara",
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
@@ -1013,6 +1173,7 @@ dependencies = [
  "faderframe-guitar",
  "faderframe-midi",
  "faderframe-realtime",
+ "faderframe-restore",
  "faderframe-stretch",
  "faderframe-transport",
  "realfft",
@@ -1075,6 +1236,7 @@ dependencies = [
 name = "faderframe-plugin-vst3"
 version = "0.36.0"
 dependencies = [
+ "faderframe-ara",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-core",
@@ -1109,6 +1271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-qc"
+version = "0.36.0"
+dependencies = [
+ "faderframe-analysis",
+ "faderframe-leadsheet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "faderframe-realtime"
 version = "0.36.0"
 dependencies = [
@@ -1118,16 +1290,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-remote"
+version = "0.36.0"
+dependencies = [
+ "base64",
+ "getrandom",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "faderframe-restore"
+version = "0.36.0"
+dependencies = [
+ "realfft",
+]
+
+[[package]]
+name = "faderframe-script"
+version = "0.36.0"
+dependencies = [
+ "mlua",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "faderframe-separate"
+version = "0.36.0"
+dependencies = [
+ "md-5",
+ "realfft",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "faderframe-session"
 version = "0.36.0"
 dependencies = [
+ "clack-extensions",
+ "clack-host",
+ "clack-plugin",
+ "faderframe-aaf",
  "faderframe-adm",
  "faderframe-analysis",
  "faderframe-audio",
+ "faderframe-audio-aes67",
  "faderframe-audio-files",
  "faderframe-audio-graph",
  "faderframe-automation",
  "faderframe-binaural",
+ "faderframe-codec",
+ "faderframe-collab",
  "faderframe-conform",
  "faderframe-control",
  "faderframe-core",
@@ -1135,6 +1351,7 @@ dependencies = [
  "faderframe-engine",
  "faderframe-guitar",
  "faderframe-iamf",
+ "faderframe-interchange",
  "faderframe-leadsheet",
  "faderframe-midi",
  "faderframe-midi-io",
@@ -1145,9 +1362,14 @@ dependencies = [
  "faderframe-plugin-vst3",
  "faderframe-polypitch",
  "faderframe-project",
+ "faderframe-qc",
  "faderframe-realtime",
+ "faderframe-remote",
+ "faderframe-script",
+ "faderframe-separate",
  "faderframe-spectral",
  "faderframe-speech",
+ "faderframe-stretch",
  "faderframe-timeline",
  "faderframe-transcribe",
  "faderframe-transport",
@@ -1156,6 +1378,9 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "midly",
+ "rmp-serde",
+ "rmpv",
+ "roxmltree",
  "rtrb",
  "serde",
  "serde_json",
@@ -1168,6 +1393,7 @@ name = "faderframe-spectral"
 version = "0.36.0"
 dependencies = [
  "faderframe-project",
+ "faderframe-restore",
  "realfft",
 ]
 
@@ -1220,12 +1446,14 @@ version = "0.36.0"
 dependencies = [
  "faderframe-adm",
  "faderframe-audio",
+ "faderframe-audio-aes67",
  "faderframe-audio-cpal",
  "faderframe-audio-files",
  "faderframe-audio-jack",
  "faderframe-audio-pipewire",
  "faderframe-automation",
  "faderframe-binaural",
+ "faderframe-codec",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-iamf",
@@ -1238,16 +1466,20 @@ dependencies = [
  "faderframe-plugin-sandbox",
  "faderframe-plugin-vst3",
  "faderframe-project",
+ "faderframe-qc",
+ "faderframe-remote",
  "faderframe-session",
  "faderframe-timeline",
  "faderframe-transport",
  "faderframe-ui-canvas",
  "faderframe-ui-gpu",
  "faderframe-video",
+ "faderframe-view-adaptive",
  "faderframe-view-adr",
  "faderframe-view-album",
  "faderframe-view-arranger",
  "faderframe-view-automation",
+ "faderframe-view-browser",
  "faderframe-view-clipfx",
  "faderframe-view-ddp",
  "faderframe-view-devices",
@@ -1256,6 +1488,7 @@ dependencies = [
  "faderframe-view-inspector",
  "faderframe-view-launcher",
  "faderframe-view-leadsheet",
+ "faderframe-view-maps",
  "faderframe-view-mix",
  "faderframe-view-mixer",
  "faderframe-view-modulators",
@@ -1263,6 +1496,8 @@ dependencies = [
  "faderframe-view-pianoroll",
  "faderframe-view-pitch",
  "faderframe-view-reference",
+ "faderframe-view-scenes",
+ "faderframe-view-score",
  "faderframe-view-setlist",
  "faderframe-view-spectral",
  "faderframe-view-surround",
@@ -1280,6 +1515,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "windows",
  "windows-sys 0.61.2",
  "x11rb",
 ]
@@ -1320,6 +1556,18 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "faderframe-view-adaptive"
+version = "0.36.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
 ]
 
 [[package]]
@@ -1374,6 +1622,18 @@ dependencies = [
  "faderframe-project",
  "faderframe-session",
  "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-browser"
+version = "0.36.0"
+dependencies = [
+ "faderframe-audio-files",
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
  "faderframe-ui-canvas",
 ]
 
@@ -1480,6 +1740,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-view-maps"
+version = "0.36.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-midi",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
 name = "faderframe-view-mix"
 version = "0.36.0"
 dependencies = [
@@ -1497,11 +1770,13 @@ dependencies = [
 name = "faderframe-view-mixer"
 version = "0.36.0"
 dependencies = [
+ "faderframe-audio-files",
  "faderframe-automation",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-project",
  "faderframe-session",
+ "faderframe-timeline",
  "faderframe-ui-canvas",
  "faderframe-view-surround",
 ]
@@ -1568,9 +1843,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-view-scenes"
+version = "0.36.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
+name = "faderframe-view-score"
+version = "0.36.0"
+dependencies = [
+ "faderframe-core",
+ "faderframe-engine",
+ "faderframe-leadsheet",
+ "faderframe-project",
+ "faderframe-session",
+ "faderframe-timeline",
+ "faderframe-ui-canvas",
+]
+
+[[package]]
 name = "faderframe-view-setlist"
 version = "0.36.0"
 dependencies = [
+ "faderframe-core",
  "faderframe-engine",
  "faderframe-project",
  "faderframe-session",
@@ -1609,6 +1909,7 @@ name = "faderframe-view-tools"
 version = "0.36.0"
 dependencies = [
  "faderframe-analysis",
+ "faderframe-codec",
  "faderframe-core",
  "faderframe-engine",
  "faderframe-project",
@@ -1647,6 +1948,12 @@ checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
 ]
+
+[[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "field-offset"
@@ -2635,6 +2942,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2948,6 +3264,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lua-src"
+version = "551.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d400ffef0e3d4d29287092bdc5a276d0bf468b2c69709d5bab0d469312d9f947"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "luajit-src"
+version = "210.7.4+c6ffc14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1db548b001f0b7da416daf0ffae963912bae6cad1799fa9f4eaba09da6dba837"
+dependencies = [
+ "cc",
+ "which",
+]
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3057,6 +3392,47 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "mlua"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7ae6b65bf54b7fdd4cf5b6f44f60862350ebf3fe3779b3a9cc005e7fa14f81"
+dependencies = [
+ "bstr",
+ "either",
+ "libc",
+ "mlua-sys",
+ "mlua_derive",
+ "num-traits",
+ "parking_lot",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "mlua-sys"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "lua-src",
+ "luajit-src",
+ "pkg-config",
+]
+
+[[package]]
+name = "mlua_derive"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c4070bd35dad9477c94311c4668145bae8991b8accacf7201a77b14cab8a9e3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3419,6 +3795,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opaque-debug"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
 name = "option-operations"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3646,6 +4028,17 @@ name = "pollster"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
+name = "poly1305"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+dependencies = [
+ "cpufeatures",
+ "opaque-debug",
+ "universal-hash",
+]
 
 [[package]]
 name = "polycool"
@@ -3895,6 +4288,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
+name = "rmpv"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
+dependencies = [
+ "rmp",
+]
+
+[[package]]
 name = "roxmltree"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4017,6 +4438,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4056,6 +4487,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]
@@ -4133,6 +4575,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "getrandom",
+ "rustc_version",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "spirv"
 version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4158,6 +4624,12 @@ name = "strength_reduce"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe895eb47f22e2ddd4dabc02bce419d2e643c8e3b585c78158b349195bc24d82"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svg_fmt"
@@ -4633,6 +5105,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "universal-hash"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
+dependencies = [
+ "crypto-common",
+ "subtle",
+]
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4989,6 +5471,15 @@ dependencies = [
  "raw-window-handle",
  "static_assertions",
  "web-sys",
+]
+
+[[package]]
+name = "which"
+version = "8.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -5407,6 +5898,12 @@ dependencies = [
  "syn 3.0.6",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"

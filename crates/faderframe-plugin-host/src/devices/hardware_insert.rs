@@ -7,6 +7,12 @@
 //! the return (its second input) and mixes them: the return at its level
 //! (and polarity), the dry signal under it as Mix says. Without the return
 //! (renders, which have no audio interface) it passes the dry signal.
+//!
+//! It is as wide as the track where it sits (a stereo track uses two
+//! outputs and two inputs from the channels chosen), except that Channels
+//! set to Mono → Stereo sends a mono track to two outputs alike and takes
+//! a pair back — for stereo gear (a reverb, a stereo delay or compressor)
+//! fed from a mono source; the track is stereo from the insert on.
 
 use super::{fixed, on_off, param, stepped};
 use crate::{
@@ -28,6 +34,9 @@ pub mod id {
     pub const INVERT: u32 = 5;
     /// The round trip (samples at the session's rate), from a ping.
     pub const ROUND_TRIP: u32 = 6;
+    /// 0: as wide as the track; 1: a mono track to two outputs alike and
+    /// a stereo return (see the module docs).
+    pub const CHANNELS: u32 = faderframe_core::builtin::HARDWARE_INSERT_CHANNELS;
 }
 
 /// Interface channels offered (outputs and inputs).
@@ -56,6 +65,7 @@ pub fn parameters() -> Vec<ParameterInfo> {
             stepped: true,
             ..param(id::ROUND_TRIP, "Round Trip", 0.0, 192_000.0, 0.0, None)
         }),
+        fixed(stepped(id::CHANNELS, "Channels", 1.0, 0.0)),
     ]
 }
 
@@ -67,6 +77,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::INVERT => on_off(v),
         id::ROUND_TRIP if v < 0.5 => "not measured".into(),
         id::ROUND_TRIP => format!("{:.0} samples", v),
+        id::CHANNELS if v >= 0.5 => "Mono → Stereo".into(),
+        id::CHANNELS => "As the Track".into(),
         _ => return None,
     })
 }
@@ -81,6 +93,11 @@ fn gain(db: f64) -> f64 {
     } else {
         10f64.powf(db / 20.0)
     }
+}
+
+/// Channels is Mono → Stereo (it widens a mono track; see the module docs).
+pub fn widens(params: &ParamValues) -> bool {
+    get(params, id::CHANNELS) >= 0.5
 }
 
 /// What the engine needs to build the insert: send and return channels,
@@ -187,5 +204,19 @@ mod tests {
             format(ParameterId(id::ROUND_TRIP), 0.0).unwrap(),
             "not measured"
         );
+        assert!(!widens(&p));
+        p.set_by_id(ParameterId(id::CHANNELS), 1.0).unwrap();
+        assert!(widens(&p));
+        assert_eq!(
+            format(ParameterId(id::CHANNELS), 1.0).unwrap(),
+            "Mono → Stereo"
+        );
+    }
+
+    #[test]
+    fn ids_are_positions() {
+        for (i, p) in parameters().iter().enumerate() {
+            assert_eq!(p.id, ParameterId(i as u32), "{}", p.name);
+        }
     }
 }

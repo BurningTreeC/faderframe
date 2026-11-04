@@ -196,6 +196,61 @@ fn each_note_of_a_chord_is_followed_to_the_cent() {
     }
 }
 
+/// Following a chord also tells how loud each note is, and where a note's
+/// fundamental lies: the octave below a note hears only its even
+/// harmonics, the octave above only its even ones — neither as strongly
+/// as the note itself; a note named an octave too high hears its octave
+/// below more strongly.
+#[test]
+fn followed_notes_carry_their_levels_and_octaves() {
+    let mut x = vec![0.0f32; (2.0 * RATE) as usize];
+    tone(&mut x, 60.0, 0.2, 1.6, 0.0, 0.2);
+    tone(&mut x, 67.0, 0.2, 1.6, 0.0, 0.05);
+    let at = |key: f32| Heard {
+        start: (0.3 * RATE) as i64,
+        end: (1.5 * RATE) as i64,
+        key,
+    };
+    let heard = [at(60.0), at(67.0)];
+    let followed = follow(&x, RATE, &heard, HOP);
+    // The pitches are pitch_tracks' exactly.
+    let tracks = pitch_tracks(&x, RATE, &heard, HOP);
+    for (f, t) in followed.iter().zip(&tracks) {
+        assert_eq!(f.pitch.len(), t.len());
+        assert!(
+            f.pitch
+                .iter()
+                .zip(t)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+    let median = |v: &[f32]| {
+        let mut v = v.to_vec();
+        v.sort_by(f32::total_cmp);
+        v[v.len() / 2]
+    };
+    let (loud, soft) = (median(&followed[0].level), median(&followed[1].level));
+    // 12 dB apart, less what the quiet G shares of the C's harmonics.
+    let db = 20.0 * (loud / soft).log10();
+    assert!((6.0..13.0).contains(&db), "{db} dB apart");
+    // The C's octaves.
+    let around = [at(48.0), at(60.0), at(72.0)];
+    let mut solo = vec![0.0f32; x.len()];
+    tone(&mut solo, 60.0, 0.2, 1.6, 0.0, 0.2);
+    let o: Vec<f32> = follow(&solo, RATE, &around, HOP)
+        .iter()
+        .map(|f| median(&f.level))
+        .collect();
+    assert!(o[0] < 0.8 * o[1] && o[2] < 0.8 * o[1], "{o:?}");
+    // Named an octave too high: the octave below is louder.
+    let high = [at(60.0), at(72.0), at(84.0)];
+    let o: Vec<f32> = follow(&solo, RATE, &high, HOP)
+        .iter()
+        .map(|f| median(&f.level))
+        .collect();
+    assert!(o[0] > 1.2 * o[1], "{o:?}");
+}
+
 #[test]
 fn a_wavering_note_comes_out_straight() {
     let mut x = vec![0.0f32; (2.0 * RATE) as usize];

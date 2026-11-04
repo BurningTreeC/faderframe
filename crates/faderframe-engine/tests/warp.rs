@@ -203,3 +203,26 @@ fn warping_a_clip_later_gives_the_track_voices() {
     let f = frequency(&out[24_000..72_000]);
     assert!((f - 440.0).abs() < 4.0, "{f} Hz");
 }
+
+#[test]
+fn a_transposed_clip_keeps_its_time_and_moves_its_pitch() {
+    use faderframe_project::StretchSettings;
+    // Unwarped and warped alike: a fifth up (7 semitones), as long as
+    // before.
+    for warp in [None, Some(uniform(48_000, WarpAlgorithm::Polyphonic))] {
+        let (mut tp, _, clip) = project(sine(440.0, 48_000), 48_000, warp.clone());
+        if let Some(ClipContent::Audio(a)) = tp.project.clips.get_mut(&clip).map(|c| &mut c.content)
+        {
+            a.stretch = StretchSettings::pitch(7.0);
+        }
+        let out = render(&tp, 0, 48_000);
+        let f = frequency(&out[12_000..36_000]);
+        let want = 440.0 * 2f64.powf(7.0 / 12.0);
+        assert!((f - want).abs() < 5.0, "{warp:?}: {f} Hz, not {want}");
+        assert!(rms(&out[40_000..46_000]) > 0.1, "it lasts its length");
+    }
+    // Nonsense or none: as recorded.
+    assert_eq!(StretchSettings::pitch(0.0), StretchSettings::Off);
+    assert_eq!(StretchSettings::pitch(f32::NAN), StretchSettings::Off);
+    assert_eq!(StretchSettings::pitch(40.0).semitones(), 24.0);
+}

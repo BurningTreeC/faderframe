@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#15161a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>FaderFrame Remote</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body class="not-engineer">
+<header id="bar">
+  <div id="where">
+    <div id="project">FaderFrame</div>
+    <div id="position"><span id="bars">—</span><span id="time"></span></div>
+  </div>
+  <div id="transport" class="engineer-only">
+    <button class="tbtn" data-button="rewind" aria-label="Back a bar">&#x23EA;</button>
+    <button class="tbtn" data-button="play_stop" id="play" aria-label="Play or stop">&#x25B6;</button>
+    <button class="tbtn" data-button="record" id="rec" aria-label="Record">&#x25CF;</button>
+    <button class="tbtn" data-button="loop" id="loop" aria-label="Loop">&#x27F3;</button>
+  </div>
+</header>
+<main id="main">
+  <section id="pair" class="screen" hidden>
+    <h1>Pair with FaderFrame</h1>
+    <p>In FaderFrame, open <b>Preferences → Remote</b> and type the code it shows, or scan its QR code with this device's camera.</p>
+    <form id="pair-form" autocomplete="off">
+      <label>Code <input id="pair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" required></label>
+      <label>This device <input id="pair-name" maxlength="40"></label>
+      <button type="submit" class="wide primary">Pair</button>
+    </form>
+    <p id="pair-message" class="message" role="status"></p>
+  </section>
+  <section id="screen-transport" class="screen" hidden></section>
+  <section id="screen-mixer" class="screen" hidden></section>
+  <section id="screen-cues" class="screen" hidden></section>
+  <section id="screen-setlist" class="screen" hidden></section>
+  <section id="screen-lyrics" class="screen" hidden></section>
+  <section id="screen-launcher" class="screen" hidden></section>
+</main>
+<nav id="tabs" role="tablist"></nav>
+<div id="status" role="status" aria-live="polite"></div>
+</body>
+</html>

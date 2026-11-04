@@ -165,16 +165,20 @@ thread_local! {
         const { RefCell::new(std::collections::VecDeque::new()) };
 }
 
-/// A texture of a dmabuf frame (imported as it is: no copy), or `None`
-/// when this is no frame the painter knows or the display refuses it
-/// (then frames come through memory from now on).
-fn external_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+/// A texture of a frame in video memory (a dmabuf, a D3D12 texture;
+/// imported as it is: no copy), or `None` when this is no frame the
+/// painter knows or the display refuses it (then frames come through
+/// memory from now on).
+fn external_texture(
+    e: &faderframe_ui_canvas::External<'_>,
+    widget: &gtk::Widget,
+) -> Option<gdk::Texture> {
     EXTERNAL.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some((_, t)) = cache.iter().find(|(k, _)| *k == e.key) {
             return Some(t.clone());
         }
-        let tex = dmabuf_texture(e)?;
+        let tex = gpu_texture(e, widget)?;
         cache.push_front((e.key, tex.clone()));
         cache.truncate(6);
         Some(tex)
@@ -182,7 +186,10 @@ fn external_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Textu
 }
 
 #[cfg(target_os = "linux")]
-fn dmabuf_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+fn gpu_texture(
+    e: &faderframe_ui_canvas::External<'_>,
+    _widget: &gtk::Widget,
+) -> Option<gdk::Texture> {
     let frame = e
         .handle
         .downcast_ref::<faderframe_video::zero_copy::GpuFrame>()?
@@ -220,8 +227,25 @@ fn dmabuf_texture(e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn dmabuf_texture(_e: &faderframe_ui_canvas::External<'_>) -> Option<gdk::Texture> {
+/// Windows: a frame in a D3D12 texture (`video_d3d12`).
+#[cfg(windows)]
+fn gpu_texture(
+    e: &faderframe_ui_canvas::External<'_>,
+    widget: &gtk::Widget,
+) -> Option<gdk::Texture> {
+    let frame = e
+        .handle
+        .downcast_ref::<faderframe_video::zero_copy::GpuFrame>()?;
+    crate::video_d3d12::texture(frame, widget)
+        .inspect_err(|why| faderframe_video::zero_copy::failed(why))
+        .ok()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn gpu_texture(
+    _e: &faderframe_ui_canvas::External<'_>,
+    _widget: &gtk::Widget,
+) -> Option<gdk::Texture> {
     None
 }
 
@@ -725,7 +749,7 @@ impl Painter for SnapshotPainter<'_> {
         if dst.is_empty() || image.width == 0 || image.height == 0 {
             return true;
         }
-        let Some(tex) = external_texture(image) else {
+        let Some(tex) = external_texture(image, self.widget) else {
             return false;
         };
         let s = self.snap();

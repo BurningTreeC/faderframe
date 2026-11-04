@@ -14,7 +14,7 @@
 //! go there, as [`MidiSystemEvent`]s: synchronisation and SysEx recording
 //! happen on the control side with the messages' timestamps.
 
-use crate::{ExpressionValue, MidiEvent, NoteExpressionKind};
+use crate::{ExpressionValue, Fine, MidiEvent, NoteExpressionKind, TimedMidiEvent};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,8 @@ pub struct MidiInputEvent {
     pub bytes: [u8; 3],
     /// Channel, key, kind and value of a per-note expression.
     pub expression: Option<(u8, u8, NoteExpressionKind, ExpressionValue)>,
+    /// The message's MIDI 2.0 resolution (from MIDI 2.0 ports).
+    pub fine: Fine,
 }
 
 impl MidiInputEvent {
@@ -78,7 +80,13 @@ impl MidiInputEvent {
             len: msg.len() as u8,
             bytes,
             expression: None,
+            fine: Fine::NONE,
         })
+    }
+
+    /// A channel message with its MIDI 2.0 resolution.
+    pub fn with_fine(port: u16, time_ns: u64, msg: &[u8], fine: Fine) -> Option<Self> {
+        Self::new(port, time_ns, msg).map(|e| Self { fine, ..e })
     }
 
     /// A per-note expression.
@@ -96,7 +104,14 @@ impl MidiInputEvent {
             len: 0,
             bytes: [0; 3],
             expression: Some((channel & 0xF, key & 0x7F, kind, ExpressionValue::new(value))),
+            fine: Fine::NONE,
         }
+    }
+
+    /// The event at `offset` in a block, with its resolution.
+    pub fn timed(&self, offset: u32) -> Option<TimedMidiEvent> {
+        self.event()
+            .map(|e| TimedMidiEvent::with_fine(offset, e, self.fine))
     }
 
     pub fn event(&self) -> Option<MidiEvent> {
@@ -247,9 +262,11 @@ impl MidiInputSender {
 
     /// Queue a Universal MIDI Packet from a MIDI 2.0 port: MIDI 1.0 and
     /// system messages as they are, SysEx7 once complete, MIDI 2.0 channel
-    /// voice messages as their MIDI 1.0 forms — and per-note controllers
-    /// (and a note-on's pitch attribute) as per-note expressions, at full
-    /// resolution. Flex data and stream messages are not for instruments.
+    /// voice messages as their MIDI 1.0 forms with their full resolution
+    /// beside them ([`Fine`]: 16-bit velocities, 32-bit controllers,
+    /// pressure and pitch bend, a note's attribute) — and per-note
+    /// controllers (and a note-on's pitch attribute) as per-note
+    /// expressions. Flex data and stream messages are not for instruments.
     pub fn send_ump(&self, port: u16, packet: &crate::ump::Ump, state: &mut UmpInput) -> bool {
         use crate::ump::{Form, Message, Voice2, per_note_expression};
         match Message::parse(packet) {
@@ -297,6 +314,28 @@ impl MidiInputSender {
                         port, now, channel, key, kind, value,
                     ));
                 }
+                // One message at full resolution (with a note's attribute;
+                // its pitch 7.9 also as the note's tuning, below).
+                if let Some((bytes, len, fine)) = voice.to_midi1_fine(channel) {
+                    let mut ok = MidiInputEvent::with_fine(port, now, &bytes[..len], fine)
+                        .is_some_and(|e| self.push(e));
+                    if let Voice2::NoteOn {
+                        note, attribute, ..
+                    } = voice
+                        && let Some(pitch) = attribute.pitch()
+                    {
+                        ok &= self.push(MidiInputEvent::expression(
+                            port,
+                            now,
+                            channel,
+                            note,
+                            NoteExpressionKind::Tuning,
+                            pitch - f64::from(note),
+                        ));
+                    }
+                    return ok;
+                }
+                // Program changes with their banks, RPN/NRPN as data entry.
                 let (messages, n) = voice.to_midi1(channel);
                 let mut ok = true;
                 for m in &messages[..n] {
@@ -306,21 +345,6 @@ impl MidiInputSender {
                         3
                     };
                     ok &= self.send(port, &m[..len]);
-                }
-                // A note-on's pitch 7.9: the note's tuning from the start.
-                if let Voice2::NoteOn {
-                    note, attribute, ..
-                } = voice
-                    && let Some(pitch) = attribute.pitch()
-                {
-                    ok &= self.push(MidiInputEvent::expression(
-                        port,
-                        now,
-                        channel,
-                        note,
-                        NoteExpressionKind::Tuning,
-                        pitch - f64::from(note),
-                    ));
                 }
                 ok
             }
@@ -414,6 +438,82 @@ mod tests {
         assert!(ev.time_ns <= rx.clock.now_ns());
         assert_eq!(feed.drain(), vec![ev], "the control thread sees it too");
         assert!(feed.drain().is_empty());
+    }
+
+    #[test]
+    fn midi2_packets_arrive_at_full_resolution() {
+        use crate::ump::{Attribute, Message, Voice2};
+        let (tx, mut rx, _feed) = midi_input_queue(16);
+        let mut state = UmpInput::default();
+        let send = |voice, state: &mut UmpInput| {
+            let p = Message::Midi2 {
+                group: 0,
+                channel: 2,
+                voice,
+            }
+            .to_ump();
+            tx.send_ump(5, &p, state)
+        };
+        assert!(send(
+            Voice2::NoteOn {
+                note: 60,
+                velocity: 0x1234,
+                attribute: Attribute { kind: 1, data: 77 },
+            },
+            &mut state
+        ));
+        assert!(send(
+            Voice2::ControlChange {
+                index: 74,
+                value: 0x8765_4321,
+            },
+            &mut state
+        ));
+        assert!(send(Voice2::PitchBend(0x7FFF_0001), &mut state));
+        assert!(send(
+            Voice2::NoteOff {
+                note: 60,
+                velocity: 0x0042,
+                attribute: Attribute::default(),
+            },
+            &mut state
+        ));
+        let got: Vec<TimedMidiEvent> =
+            std::iter::from_fn(|| rx.consumer.pop().ok().and_then(|e| e.timed(0))).collect();
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0].event,
+            MidiEvent::NoteOn {
+                channel: 2,
+                key: 60,
+                velocity: 9
+            }
+        );
+        assert_eq!(got[0].full_value(), Some(0x1234));
+        assert_eq!(got[0].fine.attribute, Attribute { kind: 1, data: 77 });
+        assert_eq!(got[1].full_value(), Some(0x8765_4321));
+        assert_eq!(got[2].full_value(), Some(0x7FFF_0001));
+        assert_eq!(got[3].full_value(), Some(0x42));
+        // And back: the same MIDI 2.0 messages.
+        for (ev, voice) in got.iter().zip([
+            Voice2::NoteOn {
+                note: 60,
+                velocity: 0x1234,
+                attribute: Attribute { kind: 1, data: 77 },
+            },
+            Voice2::ControlChange {
+                index: 74,
+                value: 0x8765_4321,
+            },
+            Voice2::PitchBend(0x7FFF_0001),
+            Voice2::NoteOff {
+                note: 60,
+                velocity: 0x0042,
+                attribute: Attribute::default(),
+            },
+        ]) {
+            assert_eq!(Voice2::of_event(ev.event, ev.fine), Some(voice));
+        }
     }
 
     #[test]

@@ -297,6 +297,7 @@ impl AudioBackend for PipeWireBackend {
             output_devices: 4,
             input_devices: 4,
             clocked_by_server: true,
+            resamples_followers: false,
             follows_devices: true,
             free_channel_counts: true,
             force_format: true,

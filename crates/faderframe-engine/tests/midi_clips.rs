@@ -48,16 +48,21 @@ fn project(muted: bool, sustain: bool) -> TestProject {
             channel: 0,
             muted,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         }],
         controllers: Vec::new(),
         expressions: Vec::new(),
         sysex: Vec::new(),
+        articulations: Vec::new(),
     };
     if sustain {
         let mut lane = ControllerLane::new(MidiController::SUSTAIN, 0);
         lane.points = vec![ControllerPoint {
             time: MusicalTime::ZERO,
             value: 127,
+            fine: None,
         }];
         clip.controllers.push(lane);
     }
@@ -147,7 +152,11 @@ fn programs_poly_pressure_and_release_velocities_play() {
         (MidiController::PolyPressure { key: 60 }, q(0.125), 77),
     ] {
         let mut lane = ControllerLane::new(controller, 0);
-        lane.points = vec![ControllerPoint { time, value }];
+        lane.points = vec![ControllerPoint {
+            time,
+            value,
+            fine: None,
+        }];
         m.controllers.push(lane);
     }
     m.controllers.sort_by_key(|l| (l.controller, l.channel));
@@ -156,7 +165,7 @@ fn programs_poly_pressure_and_release_velocities_play() {
     let events: Vec<MidiEvent> = snap.lane(track).unwrap().midi[0]
         .events
         .iter()
-        .map(|(_, e)| *e)
+        .map(|(_, e, _)| *e)
         .collect();
     let at = |e: MidiEvent| events.iter().position(|x| *x == e);
     let program = at(MidiEvent::ProgramChange {

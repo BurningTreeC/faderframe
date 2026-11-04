@@ -223,6 +223,14 @@ impl UmpClient {
         c
     }
 
+    /// The MIDI 1.0 ports (midir's names) of the MIDI 2.0 clients.
+    pub fn claimed(&self) -> crate::Claimed {
+        crate::Claimed {
+            clients: self.ump_clients(),
+            names: Vec::new(),
+        }
+    }
+
     /// Receive from a port.
     pub fn connect_input(&self, addr: (u8, u8)) -> io::Result<()> {
         let seq = self

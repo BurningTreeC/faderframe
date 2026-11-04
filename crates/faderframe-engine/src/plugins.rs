@@ -65,6 +65,8 @@ struct Hosted {
     missed: Arc<MissedReleases>,
     /// What notes reached it and left it (every graph's).
     notes: Arc<NoteLedger>,
+    /// What MIDI Tuning Standard told it (every graph's).
+    tuned: Arc<crate::tuning::TunedPlugin>,
     /// Explicit slot values last pushed to the instance.
     applied: HashMap<ParameterId, f64>,
     /// The plugin's own value before the first explicit one (restored when
@@ -73,6 +75,9 @@ struct Hosted {
     /// The slot state the instance has (a different one, e.g. a preset or
     /// its undo, is loaded).
     state: Option<String>,
+    /// A built-in's state as it was made: what a slot without a state of
+    /// its own goes back to (the undo of its first preset or loaded file).
+    initial: Option<Vec<u8>>,
 }
 
 /// Owns one [`PluginInstance`] per project plugin slot.
@@ -96,6 +101,9 @@ pub struct PluginHost {
     /// (a clip effect's own editor window): [`Self::retain_project`]
     /// keeps them.
     kept: HashSet<PluginInstanceId>,
+    /// ARA documents and the instances bound to them. Declared after
+    /// `instances`: the instances go first, their documents after.
+    ara: crate::ara::AraHost,
 }
 
 impl Default for PluginHost {
@@ -114,6 +122,7 @@ pub struct ActivatedPlugin {
     /// The instance's (shared by the nodes of all graphs).
     pub missed: Arc<MissedReleases>,
     pub notes: Arc<NoteLedger>,
+    pub tuned: Arc<crate::tuning::TunedPlugin>,
 }
 
 impl PluginHost {
@@ -126,6 +135,7 @@ impl PluginHost {
             realtime: true,
             background_loading: false,
             kept: HashSet::new(),
+            ara: crate::ara::AraHost::default(),
         }
     }
 
@@ -138,6 +148,7 @@ impl PluginHost {
     /// Drop an instance now (a slot outside the project that is gone).
     pub fn release(&mut self, plugin: PluginInstanceId) {
         self.kept.remove(&plugin);
+        self.ara.forget(plugin);
         self.instances.remove(&plugin);
         self.dirty.remove(&plugin);
     }
@@ -178,12 +189,29 @@ impl PluginHost {
 
     fn ensure(&mut self, slot: &PluginSlot) -> Result<&mut Hosted, PluginError> {
         if !self.instances.contains_key(&slot.id) {
-            let mut instance = self
-                .registry
-                .instantiate(host_format(slot.plugin.format), &slot.plugin.id)?;
+            let format = host_format(slot.plugin.format);
+            // ARA plug-ins read FaderFrame's audio and model through
+            // pointers: never in a helper process.
+            let ara = self.ara.wants(slot.id);
+            let mut instance = if ara {
+                self.registry
+                    .instantiate_in_process(format, &slot.plugin.id)?
+            } else {
+                self.registry.instantiate(format, &slot.plugin.id)?
+            };
+            // Bound before its state loads, it activates or its editor
+            // opens (ARA's rule); not an ARA plug-in: a plain insert.
+            if ara && let Err(e) = self.ara.bind(slot.id, instance.as_mut()) {
+                tracing::warn!("{}: {e}", slot.plugin.name);
+            }
             if self.background_loading {
                 instance.configure_background_loading();
             }
+            let initial = if slot.plugin.format == ProjectFormat::Builtin {
+                instance.save_state().ok()
+            } else {
+                None
+            };
             // Saved state first (complete), then explicit parameter values.
             if let Some(state) = slot.state.as_deref().and_then(decode_state) {
                 let _ = instance.load_state(&state);
@@ -206,9 +234,11 @@ impl PluginHost {
                     failed: Arc::new(AtomicBool::new(false)),
                     missed: Arc::default(),
                     notes: Arc::default(),
+                    tuned: Arc::default(),
                     applied,
                     baseline,
                     state: slot.state.clone(),
+                    initial,
                 },
             );
         }
@@ -227,6 +257,12 @@ impl PluginHost {
                 self.dirty.insert(*id);
             }
             all = all.merge(p);
+        }
+        // Edits made in an ARA plug-in change its document's archive.
+        let ara = self.ara.poll();
+        if !ara.is_empty() {
+            all.state_dirty = true;
+            self.dirty.extend(ara);
         }
         all
     }
@@ -298,6 +334,7 @@ impl PluginHost {
     /// slot (state and explicit values). `false` if it was not loaded.
     pub fn reload(&mut self, plugin: PluginInstanceId) -> bool {
         self.dirty.remove(&plugin);
+        self.ara.forget(plugin);
         self.instances.remove(&plugin).is_some()
     }
 
@@ -399,7 +436,12 @@ impl PluginHost {
     fn sync_hosted(h: &mut Hosted, slot: &PluginSlot) {
         if h.state != slot.state {
             // A new state (preset, undo): load it; explicit values follow.
-            if let Some(bytes) = slot.state.as_deref().and_then(decode_state)
+            // None: a built-in goes back to how it was made.
+            if let Some(bytes) = slot
+                .state
+                .as_deref()
+                .and_then(decode_state)
+                .or_else(|| h.initial.clone())
                 && let Err(e) = h.instance.load_state(&bytes)
             {
                 tracing::warn!("{}: cannot load the state: {e}", slot.plugin.name);
@@ -569,7 +611,21 @@ impl PluginHost {
             failed: Arc::clone(&hosted.failed),
             missed: Arc::clone(&hosted.missed),
             notes: Arc::clone(&hosted.notes),
+            tuned: Arc::clone(&hosted.tuned),
         })
+    }
+
+    /// How long a hosted plugin rings on after its input stops.
+    pub fn tail(&self, plugin: PluginInstanceId) -> Option<faderframe_plugin_host::TailLength> {
+        self.instances.get(&plugin).map(|h| h.instance.tail())
+    }
+
+    /// A hosted plugin left out of the graphs a while (its track played
+    /// from a cache) resets before its next block.
+    pub fn mark_stale(&self, plugin: PluginInstanceId) {
+        if let Some(h) = self.instances.get(&plugin) {
+            h.notes.mark_stale();
+        }
     }
 
     /// Drop instances whose slots no longer exist in the project (cue
@@ -594,13 +650,107 @@ impl PluginHost {
                 .flat_map(|t| t.slots().into_iter().map(|s| s.id))
                 .collect()
         };
+        let ara = &mut self.ara;
         self.instances.retain(|id, _| {
-            if id.is_cue_shadow() {
+            let keep = if id.is_cue_shadow() {
                 shadowed.contains(&id.base())
             } else {
                 live.contains(id)
+            };
+            if !keep {
+                ara.forget(*id);
+            }
+            keep
+        });
+        self.ara.drop_unused();
+    }
+
+    // --- ARA ------------------------------------------------------------
+
+    /// Bring the ARA documents to the project (before a graph build or a
+    /// new snapshot): instances whose binding no longer matches their slot
+    /// and documents of another project go (made again by the next build),
+    /// renderers whose regions change are deactivated. `true`: the graph
+    /// must be rebuilt.
+    pub fn sync_ara(&mut self, project: &Project, sources: &crate::snapshot::SourceMap) -> bool {
+        self.ara.prepare(project, sources);
+        let mut stale: Vec<PluginInstanceId> = self
+            .instances
+            .keys()
+            .filter(|id| self.ara.wants(**id) != self.ara.has(**id))
+            .copied()
+            .collect();
+        let replaced = self.ara.replaced();
+        for fid in &replaced {
+            stale.extend(self.ara.bound_to(fid));
+        }
+        let mut restart = !stale.is_empty();
+        for id in stale {
+            self.ara.forget(id);
+            self.instances.remove(&id);
+            self.dirty.remove(&id);
+        }
+        for fid in &replaced {
+            self.ara.drop_document(fid);
+        }
+        self.ara.drop_unused();
+        let instances = &mut self.instances;
+        restart |= self.ara.sync_all(&mut |id| {
+            if let Some(h) = instances.get_mut(&id) {
+                h.instance.deactivate();
             }
         });
+        restart
+    }
+
+    /// Whether the instance renders its track's clips through ARA.
+    pub fn is_ara_renderer(&self, plugin: PluginInstanceId) -> bool {
+        self.ara.is_renderer(plugin)
+    }
+
+    /// Tracks whose clips an ARA insert renders (the clip players leave
+    /// them out).
+    pub fn ara_rendered_tracks(&self) -> HashSet<faderframe_core::TrackId> {
+        self.ara.rendered_tracks()
+    }
+
+    /// Every ARA document's archive (before saving or rendering).
+    pub fn capture_ara(&mut self) -> Vec<faderframe_project::ara::AraArchive> {
+        self.ara.capture()
+    }
+
+    /// Whether an ARA document changed since its archive was captured.
+    pub fn ara_unsaved(&self) -> bool {
+        self.ara.unsaved()
+    }
+
+    /// The notes an ARA plug-in found in a clip on `track`.
+    pub fn ara_notes(
+        &self,
+        clip: faderframe_core::ClipId,
+        track: faderframe_core::TrackId,
+    ) -> Option<Vec<faderframe_plugin_host::ara::Note>> {
+        self.ara.notes(clip, track)
+    }
+
+    /// Show these clips in an ARA insert's editor.
+    pub fn ara_select(&self, plugin: PluginInstanceId, clips: &[faderframe_core::ClipId]) {
+        self.ara.select(plugin, clips);
+    }
+
+    /// Wait for ARA plug-ins' analyses (renders), at most `timeout`.
+    pub fn settle_ara(&mut self, timeout: std::time::Duration) -> bool {
+        self.ara.settle(timeout)
+    }
+
+    /// Playback requests ARA plug-ins made since the last call.
+    pub fn take_ara_requests(&mut self) -> Vec<faderframe_plugin_host::ara::PlaybackRequest> {
+        self.ara.take_requests()
+    }
+
+    /// ARA plug-ins' analysis progress (plug-in name, source).
+    pub fn ara_analysis(&self) -> Vec<(String, faderframe_plugin_host::ara::Analysis)> {
+        self.ara.analysis()
     }
 
     /// Latency a hosted plugin reports (samples).

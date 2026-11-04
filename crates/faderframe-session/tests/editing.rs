@@ -71,6 +71,7 @@ fn add_clip(s: &mut Session, t: TrackId, source: AudioSourceId, start: f64, bars
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     }))

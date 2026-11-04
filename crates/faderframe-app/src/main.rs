@@ -48,10 +48,11 @@ USAGE:
     faderframe [OPTIONS] [PROJECT.ffproj]
 
 OPTIONS:
-    --backend <auto|pipewire|jack|system|asio|dummy>
+    --backend <auto|pipewire|jack|system|asio|dummy|aes67>
                                  Audio system (default: from preferences, else auto;
                                  system: ALSA, WASAPI or CoreAudio; asio: Windows
-                                 builds with the `asio` feature)
+                                 builds with the `asio` feature; aes67: network
+                                 streams on a PTP clock, Preferences → Network Audio)
     --sample-rate <HZ>            Requested sample rate (44100, 48000, 96000, 192000, …)
     --buffer-size <FRAMES>        Requested buffer size (32, 64, 128, 256, 512, …)
     --threads <N>                 Processing threads incl. the audio thread (default: one per core)
@@ -93,6 +94,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<RunOptions>, Strin
                         BackendChoice::Asio
                     }
                     "dummy" | "none" => BackendChoice::Dummy,
+                    "aes67" => BackendChoice::Aes67,
                     other => return Err(format!("unknown backend '{other}'")),
                 }
             }

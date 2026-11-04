@@ -205,6 +205,8 @@ pub(crate) struct Panel {
 /// What a face gets to paint and handle its display with.
 pub(crate) struct Ctx<'a> {
     pub model: &'a Session,
+    /// The device shown.
+    pub plugin: faderframe_core::PluginInstanceId,
     pub tap: &'a AnalysisTap,
     pub theme: &'a Theme,
     pub accent: Color,
@@ -489,6 +491,7 @@ impl<F: Face> DeviceView<F> {
     ) -> Ctx<'a> {
         Ctx {
             model,
+            plugin: self.device.plugin,
             tap,
             theme,
             accent: self.face.accent(),

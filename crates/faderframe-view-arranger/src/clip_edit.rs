@@ -44,6 +44,9 @@ pub enum ClipZone {
     Transient(i64),
     /// Audio in warp view: drag to warp, double-click for a marker.
     WarpBody,
+    /// An audio clip's body while a clip envelope lane is shown: points
+    /// added, moved, removed ([`crate::clip_envelope`]).
+    Envelope,
 }
 
 impl ClipZone {
@@ -54,7 +57,7 @@ impl ClipZone {
             ClipZone::Trim(_) | ClipZone::WarpMarker(_) | ClipZone::Transient(_) => {
                 Cursor::ResizeHorizontal
             }
-            ClipZone::Fade(_) | ClipZone::WarpBody => Cursor::Crosshair,
+            ClipZone::Fade(_) | ClipZone::WarpBody | ClipZone::Envelope => Cursor::Crosshair,
             ClipZone::Bend(_) | ClipZone::Gain => Cursor::ResizeVertical,
         }
     }
@@ -167,6 +170,8 @@ pub(crate) enum EditDrag {
         points: std::collections::BTreeMap<i64, f32>,
         last: (i64, f32),
     },
+    /// A clip envelope's point.
+    Envelope(crate::clip_envelope::EnvelopeDrag),
 }
 
 fn fades_of(c: &Clip) -> Option<(ClipFades, i64)> {
@@ -219,7 +224,7 @@ impl ArrangerView {
     }
 
     /// Clip-relative project frame at x.
-    fn frame_at(&self, model: &Session, clip: &Clip, x: f32) -> i64 {
+    pub(crate) fn frame_at(&self, model: &Session, clip: &Clip, x: f32) -> i64 {
         let p = model.project();
         let rate = p.sample_rate as f64;
         p.timeline.to_samples(self.time_at(x), rate) - p.timeline.to_samples(clip.start, rate)
@@ -401,6 +406,16 @@ impl ArrangerView {
             if rect.right() - pos.x < EDGE_GRAB {
                 return ClipZone::Trim(ClipEdge::End);
             }
+        }
+        // A clip envelope shown: the body edits it (below the name strip).
+        if Self::edits_envelope(model, clip).is_some()
+            && pos.y >= header_bottom
+            && matches!(
+                tool,
+                EditTool::Smart | EditTool::Select | EditTool::Grab | EditTool::GrabSeparation
+            )
+        {
+            return ClipZone::Envelope;
         }
         match tool {
             EditTool::Trim | EditTool::TrimStretch => ClipZone::Trim(if pos.x < rect.center().x {
@@ -706,6 +721,11 @@ impl ArrangerView {
             _ => {}
         }
         let zone = self.clip_zone(model, c, rect, pos);
+        if zone == ClipZone::Envelope
+            && let Some(lane) = Self::edits_envelope(model, c)
+        {
+            return self.press_envelope(c, rect, lane, pos, clicks, mods, model, cx);
+        }
         let selected = model.selection.clips.contains(&clip);
         // Shift: everything from the clip last clicked to this one — the
         // tracks between them, over the earlier start to the later end.
@@ -886,6 +906,8 @@ impl ArrangerView {
                 origin: pos,
                 moved: false,
             },
+            // Handled before (press_envelope).
+            ClipZone::Envelope => return true,
             ClipZone::WarpBody => {
                 let ClipContent::Audio(a) = &c.content else {
                     return true;
@@ -979,6 +1001,7 @@ impl ArrangerView {
                 shape: None,
                 bend: Some(0),
             }),
+            ClipZone::Envelope => {}
             ClipZone::WarpBody | ClipZone::Transient(_) | ClipZone::WarpMarker(_) => {
                 if let ClipContent::Audio(a) = &c.content {
                     let source = match zone {
@@ -1518,6 +1541,7 @@ impl ArrangerView {
                     });
                 }
             }
+            EditDrag::Envelope(d) => self.envelope_drag_move(d, pos, mods, model, cx),
             EditDrag::Gain {
                 clips,
                 origin,
@@ -1773,6 +1797,11 @@ impl ArrangerView {
             | EditDrag::Gain { moved, .. }
             | EditDrag::Warp { moved, .. } => {
                 if moved {
+                    cx.emit(Action::EndGesture);
+                }
+            }
+            EditDrag::Envelope(d) => {
+                if d.moved {
                     cx.emit(Action::EndGesture);
                 }
             }

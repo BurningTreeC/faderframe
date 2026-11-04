@@ -53,8 +53,13 @@ impl Session {
                         .round()
                         .max(0.0) as usize
                 };
-                outs = outs.max(at(id::SEND_CHANNEL) + width);
-                ins = ins.max(at(id::RETURN_CHANNEL) + width);
+                // As wide as it plays: the track's width where it sits, two
+                // for Mono → Stereo (the chain's end where that is unknown).
+                let wide = t
+                    .layout_into(s.id)
+                    .map_or(width, |l| s.output_layout(l).channel_count().max(1));
+                outs = outs.max(at(id::SEND_CHANNEL) + wide);
+                ins = ins.max(at(id::RETURN_CHANNEL) + wide);
             }
         }
         // Every cue mix's outputs, and the talkback microphone's input.

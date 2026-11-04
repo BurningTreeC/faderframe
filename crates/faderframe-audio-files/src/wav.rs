@@ -100,11 +100,26 @@ pub fn write_wav_mask(
     dither: Dither,
     mask: Option<u32>,
 ) -> io::Result<()> {
+    write_wav_chunks(path, channels, sample_rate, format, dither, mask, &[])
+}
+
+/// [`write_wav_mask`] with more chunks after the audio (`extra`: whole
+/// chunks, headers and pad bytes included — see
+/// [`crate::markers::WavMarkers::chunks`]).
+pub fn write_wav_chunks(
+    path: &Path,
+    channels: &[Vec<f32>],
+    sample_rate: u32,
+    format: WavFormat,
+    dither: Dither,
+    mask: Option<u32>,
+    extra: &[u8],
+) -> io::Result<()> {
     let n_ch = channels.len().max(1) as u16;
     let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
     let bytes_per_sample = (format.bits() / 8) as u32;
     let data_len = frames as u64 * n_ch as u64 * bytes_per_sample as u64;
-    if data_len > u32::MAX as u64 - 64 {
+    if data_len + extra.len() as u64 > u32::MAX as u64 - 64 {
         return Err(io::Error::other("render exceeds the 4 GiB WAV size limit"));
     }
     let mut w = BufWriter::new(File::create(path)?);
@@ -112,7 +127,9 @@ pub fn write_wav_mask(
     // An odd-sized chunk is followed by a pad byte (RIFF).
     let pad = (data_len & 1) as u32;
     w.write_all(b"RIFF")?;
-    w.write_all(&(4 + fmt.len() as u32 + 8 + data_len as u32 + pad).to_le_bytes())?;
+    w.write_all(
+        &(4 + fmt.len() as u32 + 8 + data_len as u32 + pad + extra.len() as u32).to_le_bytes(),
+    )?;
     w.write_all(b"WAVE")?;
     w.write_all(&fmt)?;
     w.write_all(b"data")?;
@@ -135,6 +152,7 @@ pub fn write_wav_mask(
     if pad == 1 {
         w.write_all(&[0])?;
     }
+    w.write_all(extra)?;
     w.flush()
 }
 

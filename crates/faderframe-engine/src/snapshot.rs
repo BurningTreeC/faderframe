@@ -10,12 +10,15 @@
 //! the controller also derives a [`StreamPlan`] that tells the disk loader
 //! which pages to keep resident for a given playhead window.
 
+use crate::articulation::SwitchBuilder;
 use faderframe_audio_files::{AudioData, Page, StreamSource, generate};
 use faderframe_automation::{AutomationMode, AutomationTarget, SampleLane};
 use faderframe_core::{
     AudioSourceId, AutomationLaneId, ParameterId, PluginInstanceId, SendId, TrackId, db_to_gain,
 };
-use faderframe_midi::MidiEvent;
+use faderframe_midi::{Fine, MidiEvent};
+use faderframe_project::articulation::{ArticulationMap, Directions};
+use faderframe_project::drum_map::DrumMap;
 use faderframe_project::{
     ClipContent, ExpressionKind, FadeShape, MidiClip, MpeConfig, Project, SourceSpec, TakeFolder,
     WarpAlgorithm,
@@ -98,6 +101,115 @@ pub struct AudioRegion {
     pub fade_in_bend: f32,
     pub fade_out_bend: f32,
     pub reversed: bool,
+    /// The clip's volume and pan envelopes (`AudioClip::envelope`).
+    pub envelope: Option<Box<RegionEnvelope>>,
+}
+
+/// A clip's envelopes in lane samples at the engine rate, for the clip
+/// player (allocation-free reads; `faderframe_project::clip_envelope`).
+#[derive(Debug, Default)]
+pub struct RegionEnvelope {
+    volume: Vec<EnvelopeAt>,
+    pan: Vec<EnvelopeAt>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EnvelopeAt {
+    at: i64,
+    value: f64,
+    shape: faderframe_automation::CurveShape,
+}
+
+impl RegionEnvelope {
+    /// `e`'s points placed from lane sample `start` (clip frames at the
+    /// project rate scaled by `scale` to engine frames).
+    pub fn new(
+        e: &faderframe_project::clip_envelope::ClipEnvelope,
+        start: i64,
+        scale: f64,
+    ) -> Option<Box<Self>> {
+        let place = |points: &[faderframe_project::clip_envelope::EnvelopePoint]| {
+            points
+                .iter()
+                .map(|p| EnvelopeAt {
+                    at: start + (p.at as f64 * scale).round() as i64,
+                    value: p.value,
+                    shape: p.shape,
+                })
+                .collect::<Vec<_>>()
+        };
+        let r = Self {
+            volume: place(&e.volume),
+            pan: place(&e.pan),
+        };
+        (!r.volume.is_empty() || !r.pan.is_empty()).then(|| Box::new(r))
+    }
+
+    pub fn has_volume(&self) -> bool {
+        !self.volume.is_empty()
+    }
+
+    pub fn has_pan(&self) -> bool {
+        !self.pan.is_empty()
+    }
+
+    /// Multiply `out[k]` by the volume's gain at lane sample `from + k`.
+    #[inline]
+    pub fn apply_volume(&self, from: i64, out: &mut [f32]) {
+        walk(&self.volume, from, out.len(), |k, db| {
+            out[k] *= faderframe_project::clip_envelope::db_gain(db);
+        });
+    }
+
+    /// Multiply `left[k]`/`right[k]` by the pan's balance gains at lane
+    /// sample `from + k`.
+    #[inline]
+    pub fn apply_pan(&self, from: i64, left: &mut [f32], right: &mut [f32]) {
+        let n = left.len().min(right.len());
+        walk(&self.pan, from, n, |k, pan| {
+            let (l, r) = faderframe_project::clip_envelope::balance(pan);
+            left[k] *= l;
+            right[k] *= r;
+        });
+    }
+}
+
+/// Call `f(k, value)` for lane samples `from + k`, `k < n`, walking the
+/// points once (the value as `faderframe_project::clip_envelope::value_at`
+/// gives it).
+#[inline]
+fn walk(points: &[EnvelopeAt], from: i64, n: usize, mut f: impl FnMut(usize, f64)) {
+    let Some(first) = points.first() else {
+        return;
+    };
+    // Index of the last point at or before the sample (None: before all).
+    let mut i = points.partition_point(|p| p.at <= from).checked_sub(1);
+    for k in 0..n {
+        let t = from + k as i64;
+        while points
+            .get(i.map_or(0, |i| i + 1))
+            .is_some_and(|p| p.at <= t)
+        {
+            i = Some(i.map_or(0, |i| i + 1));
+        }
+        let v = match i {
+            None => first.value,
+            Some(i) => {
+                let a = &points[i];
+                match points.get(i + 1) {
+                    None => a.value,
+                    Some(b) if b.at <= a.at => b.value,
+                    Some(b) => faderframe_automation::interpolate(
+                        a.value,
+                        b.value,
+                        (t - a.at) as f64 / (b.at - a.at) as f64,
+                        a.shape,
+                    ),
+                }
+            }
+        };
+        f(k, v);
+    }
 }
 
 impl AudioRegion {
@@ -274,8 +386,9 @@ impl WarpedRegion {
 pub struct MidiRegion {
     pub start: i64,
     pub end: i64,
-    /// Absolute-sample events, sorted (note-offs first at equal times).
-    pub events: Vec<(i64, MidiEvent)>,
+    /// Absolute-sample events with their MIDI 2.0 resolution, sorted
+    /// (note-offs first at equal times).
+    pub events: Vec<(i64, MidiEvent, Fine)>,
     /// SysEx messages (`F0 … F7`) for the track's plugins, sorted.
     pub sysex: Vec<(i64, Box<[u8]>)>,
     /// The controllers' values along `events`, for chasing.
@@ -297,26 +410,29 @@ pub struct ChasePoints {
     starts: Vec<usize>,
     /// Per point: the values the events before it leave (controller key =
     /// channel × slots + slot, and the last event there).
-    values: Vec<(u16, MidiEvent)>,
+    values: Vec<(u16, MidiEvent, Fine)>,
 }
 
 impl ChasePoints {
     /// Points for `events`; `key` places an event among the chased
     /// controllers (`None`: not chased).
-    pub fn new(events: &[(i64, MidiEvent)], key: impl Fn(MidiEvent) -> Option<u16>) -> Self {
+    pub fn new(events: &[(i64, MidiEvent, Fine)], key: impl Fn(MidiEvent) -> Option<u16>) -> Self {
         let mut points = Self::default();
         if events.len() <= CHASE_EVERY {
             return points;
         }
-        let mut state: HashMap<u16, MidiEvent> = HashMap::new();
+        let mut state: HashMap<u16, (MidiEvent, Fine)> = HashMap::new();
         let mut order: Vec<u16> = Vec::new();
-        for (i, &(_, ev)) in events.iter().enumerate() {
+        for (i, &(_, ev, fine)) in events.iter().enumerate() {
             if i > 0 && i % CHASE_EVERY == 0 {
                 points.starts.push(points.values.len());
-                points.values.extend(order.iter().map(|k| (*k, state[k])));
+                points.values.extend(order.iter().map(|k| {
+                    let (ev, fine) = state[k];
+                    (*k, ev, fine)
+                }));
             }
             if let Some(k) = key(ev)
-                && state.insert(k, ev).is_none()
+                && state.insert(k, (ev, fine)).is_none()
             {
                 order.push(k);
             }
@@ -326,15 +442,15 @@ impl ChasePoints {
 
     /// Hand `set` the values in effect before event `upto` as far as a point
     /// knows them; the event to go on from (realtime-safe).
-    pub fn load(&self, upto: usize, mut set: impl FnMut(u16, MidiEvent)) -> usize {
+    pub fn load(&self, upto: usize, mut set: impl FnMut(u16, MidiEvent, Fine)) -> usize {
         let k = (upto / CHASE_EVERY).min(self.starts.len());
         if k == 0 {
             return 0;
         }
         let from = self.starts[k - 1];
         let to = self.starts.get(k).copied().unwrap_or(self.values.len());
-        for &(key, ev) in &self.values[from..to] {
-            set(key, ev);
+        for &(key, ev, fine) in &self.values[from..to] {
+            set(key, ev, fine);
         }
         k * CHASE_EVERY
     }
@@ -383,33 +499,53 @@ pub struct Lane {
     pub midi: Vec<MidiRegion>,
     /// The track's instrument speaks MPE (the player announces the zone).
     pub mpe: Option<MpeConfig>,
+    /// Articulation keyswitches before the notes (tracks with an
+    /// articulation map; see [`crate::articulation`]).
+    pub articulation: Option<Box<crate::articulation::ArticulationLane>>,
 }
 
-/// One MIDI value of a note's expression on its channel (`None` for what
-/// MPE does not carry).
+/// One MIDI value of a note's expression on its channel, with its 32 bits
+/// for MIDI 2.0 (`None` for what MPE does not carry).
 fn expression_event(
     kind: ExpressionKind,
     channel: u8,
     value: f32,
     cfg: MpeConfig,
-) -> Option<MidiEvent> {
+) -> Option<(MidiEvent, Fine)> {
+    use faderframe_midi::ump::{of_bend, of_unit};
     let seven = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
+    // The 32-bit value where its top bits are the MIDI 1.0 value (else
+    // that one's own).
+    let fine = |ev: MidiEvent, v: u32| match ev.fine_value(Fine::value(v)) {
+        Some(v) => (ev, Fine::value(v)),
+        None => (ev, Fine::NONE),
+    };
     Some(match kind {
-        ExpressionKind::Pitch => MidiEvent::PitchBend {
-            channel,
-            value: (8192.0 + value / cfg.bend_range.max(1) as f32 * 8192.0)
-                .round()
-                .clamp(0.0, 16383.0) as u16,
-        },
-        ExpressionKind::Pressure => MidiEvent::ChannelPressure {
-            channel,
-            pressure: seven(value),
-        },
-        ExpressionKind::Timbre => MidiEvent::ControlChange {
-            channel,
-            controller: 74,
-            value: seven(value),
-        },
+        ExpressionKind::Pitch => {
+            let x = f64::from(value) / f64::from(cfg.bend_range.max(1));
+            let ev = MidiEvent::PitchBend {
+                channel,
+                value: (8192.0 + value / cfg.bend_range.max(1) as f32 * 8192.0)
+                    .round()
+                    .clamp(0.0, 16383.0) as u16,
+            };
+            fine(ev, of_bend(x))
+        }
+        ExpressionKind::Pressure => fine(
+            MidiEvent::ChannelPressure {
+                channel,
+                pressure: seven(value),
+            },
+            of_unit(f64::from(value)),
+        ),
+        ExpressionKind::Timbre => fine(
+            MidiEvent::ControlChange {
+                channel,
+                controller: 74,
+                value: seven(value),
+            },
+            of_unit(f64::from(value)),
+        ),
         ExpressionKind::Volume
         | ExpressionKind::Pan
         | ExpressionKind::Vibrato
@@ -427,7 +563,7 @@ fn native_expression_events(
     on_pos: faderframe_timeline::MusicalTime,
     length: faderframe_timeline::MusicalTime,
     to_samples: impl Fn(faderframe_timeline::MusicalTime) -> i64,
-    events: &mut Vec<(i64, MidiEvent)>,
+    events: &mut Vec<(i64, MidiEvent, Fine)>,
 ) {
     use faderframe_midi::ExpressionValue;
     use faderframe_timeline::MusicalTime;
@@ -445,12 +581,12 @@ fn native_expression_events(
         }
         let threshold = kind.resolution();
         let mut last = e.value_at(kind, MusicalTime::ZERO);
-        events.push((to_samples(on_pos), event(kind, last)));
+        events.push((to_samples(on_pos), event(kind, last), Fine::NONE));
         let mut t = step;
         while t < length {
             let v = e.value_at(kind, t);
             if (v - last).abs() >= threshold {
-                events.push((to_samples(on_pos + t), event(kind, v)));
+                events.push((to_samples(on_pos + t), event(kind, v), Fine::NONE));
                 last = v;
             }
             t += step;
@@ -469,7 +605,7 @@ fn mpe_note_events(
     clip_end: faderframe_timeline::MusicalTime,
     cfg: MpeConfig,
     to_samples: impl Fn(faderframe_timeline::MusicalTime) -> i64,
-    events: &mut Vec<(i64, MidiEvent)>,
+    events: &mut Vec<(i64, MidiEvent, Fine)>,
 ) {
     use faderframe_timeline::MusicalTime;
     let members = cfg.members.clamp(1, 15) as usize;
@@ -500,8 +636,9 @@ fn mpe_note_events(
         let expr = m.expression(n.id);
         let value = |k: ExpressionKind, t: MusicalTime| expr.map_or(k.rest(), |e| e.value_at(k, t));
         for k in ExpressionKind::MPE {
-            if let Some(ev) = expression_event(k, channel, value(k, MusicalTime::ZERO), cfg) {
-                events.push((on, ev));
+            if let Some((ev, fine)) = expression_event(k, channel, value(k, MusicalTime::ZERO), cfg)
+            {
+                events.push((on, ev, fine));
             }
         }
         events.push((
@@ -511,6 +648,7 @@ fn mpe_note_events(
                 key: n.key,
                 velocity: n.velocity.max(1),
             },
+            n.on_fine(),
         ));
         if let Some(e) = expr {
             let length = off_pos - on_pos;
@@ -518,15 +656,18 @@ fn mpe_note_events(
                 if e.curve(k).is_empty() {
                     continue;
                 }
-                let mut last = expression_event(k, channel, value(k, MusicalTime::ZERO), cfg);
+                // Sent where the MIDI 1.0 value changes (with its 32 bits
+                // then).
+                let mut last =
+                    expression_event(k, channel, value(k, MusicalTime::ZERO), cfg).map(|(e, _)| e);
                 let mut t = step;
                 while t < length {
                     let ev = expression_event(k, channel, value(k, t), cfg);
-                    if ev != last
-                        && let Some(e) = ev
+                    if ev.map(|(e, _)| e) != last
+                        && let Some((e, fine)) = ev
                     {
-                        events.push((to_samples(on_pos + t), e));
-                        last = ev;
+                        events.push((to_samples(on_pos + t), e, fine));
+                        last = Some(e);
                     }
                     t += step;
                 }
@@ -539,6 +680,7 @@ fn mpe_note_events(
                 key: n.key,
                 velocity: n.release.unwrap_or(0),
             },
+            n.off_fine(),
         ));
     }
 }
@@ -645,6 +787,10 @@ pub struct TimelineSnapshot {
     automation: Vec<(TrackId, TrackAutomation)>,
     /// The key and chord track in samples (MIDI effects follow them).
     pub harmony: faderframe_plugin_host::Harmony,
+    /// Cached tracks' cache files (see [`crate::cache`]), by track.
+    cached: Vec<(TrackId, AudioRegion)>,
+    /// The retuned tracks' tunings (see [`crate::tuning`]).
+    tunings: crate::tuning::Tunings,
 }
 
 impl TimelineSnapshot {
@@ -656,7 +802,43 @@ impl TimelineSnapshot {
             launch: Vec::new(),
             automation: Vec::new(),
             harmony: faderframe_plugin_host::Harmony::default(),
+            cached: Vec::new(),
+            tunings: crate::tuning::Tunings::default(),
         }
+    }
+
+    /// What `track` plays (its tuning; twelve-tone equal temperament at
+    /// 440 Hz when it is not retuned). Realtime-safe.
+    #[inline]
+    pub fn tuning(&self, track: TrackId) -> &crate::tuning::Retuning {
+        self.tunings.of(track)
+    }
+
+    /// Twelve-tone equal temperament at 440 Hz.
+    #[inline]
+    pub fn standard_tuning(&self) -> &crate::tuning::Retuning {
+        self.tunings.standard()
+    }
+
+    /// The tracks that play a tuning.
+    pub fn tunings(&self) -> &crate::tuning::Tunings {
+        &self.tunings
+    }
+
+    /// A cached track's cache file (binary search; realtime-safe).
+    #[inline]
+    pub fn cached(&self, track: TrackId) -> Option<&AudioRegion> {
+        self.cached
+            .binary_search_by_key(&track, |(t, _)| *t)
+            .ok()
+            .map(|i| &self.cached[i].1)
+    }
+
+    /// The cache files cached tracks play (sorted by track; control
+    /// thread).
+    pub(crate) fn set_cached(&mut self, mut cached: Vec<(TrackId, AudioRegion)>) {
+        cached.sort_by_key(|(t, _)| *t);
+        self.cached = cached;
     }
 
     /// A launcher slot's clip.
@@ -698,6 +880,20 @@ impl TimelineSnapshot {
     }
 
     /// The disk-loading plan for this snapshot's streamed regions.
+    /// Leave out the audio clips of these tracks (an ARA insert renders
+    /// them from its own model).
+    pub fn drop_audio_of(&mut self, tracks: &HashSet<TrackId>) {
+        if tracks.is_empty() {
+            return;
+        }
+        for (t, lane) in &mut self.lanes {
+            if tracks.contains(t) {
+                lane.audio.clear();
+                lane.warped.clear();
+            }
+        }
+    }
+
     pub fn stream_plan(&self) -> StreamPlan {
         let mut regions = Vec::new();
         for (_, lane) in &self.lanes {
@@ -706,6 +902,21 @@ impl TimelineSnapshot {
         // The launcher's clips can start any moment: always loaded.
         for l in &self.launch {
             Self::plan_lane(&l.lane, self.sample_rate, true, &mut regions);
+        }
+        // Cache files, like clips (a cached track's clips stay loaded too:
+        // it may go back to its chain any moment).
+        for (_, r) in &self.cached {
+            if let Source::Stream(s) = &r.source {
+                regions.push(StreamRegion {
+                    source: Arc::clone(s),
+                    start: r.start,
+                    end: r.end,
+                    source_start: r.source_start,
+                    step: r.step,
+                    reversed: false,
+                    pinned: false,
+                });
+            }
         }
         StreamPlan { regions }
     }
@@ -781,6 +992,42 @@ impl TimelineSnapshot {
         for (&track, &cfg) in &mpe_of {
             lanes.entry(track).or_default().mpe = Some(cfg);
         }
+        // Articulation maps (with the directions along each track's
+        // clips, which carry from clip to clip) and drum maps (only those
+        // that move notes).
+        let articulated: HashMap<TrackId, (&ArticulationMap, Directions)> = project
+            .tracks
+            .iter()
+            .filter(|t| t.mpe.is_none())
+            .filter_map(|t| {
+                let map = project.track_articulation_map(t.id)?;
+                let events = project
+                    .clips_of(t.id)
+                    .into_iter()
+                    .filter(|c| !c.muted)
+                    .filter_map(|c| c.as_midi().map(|m| (c.start, m)))
+                    .flat_map(|(start, m)| {
+                        m.articulations
+                            .iter()
+                            .filter(|e| e.time < m.length)
+                            .map(move |e| (start + e.time, e.articulation))
+                    });
+                Some((t.id, (map, Directions::new(map, events))))
+            })
+            .collect();
+        let drummed: HashMap<TrackId, &DrumMap> = project
+            .tracks
+            .iter()
+            .filter(|t| t.mpe.is_none())
+            .filter_map(|t| {
+                let map = project.track_drum_map(t.id)?;
+                map.sounds
+                    .iter()
+                    .any(|s| !s.plays_as_written())
+                    .then_some((t.id, map))
+            })
+            .collect();
+        let mut switch_builders: HashMap<(TrackId, Option<u64>), SwitchBuilder> = HashMap::new();
         // Frozen tracks play their rendered audio instead of their clips.
         let frozen: HashSet<TrackId> = project
             .tracks
@@ -855,7 +1102,10 @@ impl TimelineSnapshot {
                         reversed: a.reversed,
                     }
                     .region(start, sources, sr, project_rate);
-                    let Some(r) = region else { continue };
+                    let Some(mut r) = region else { continue };
+                    if let Some(e) = &a.envelope {
+                        r.envelope = RegionEnvelope::new(e, r.start, sr / project_rate);
+                    }
                     let lane = lane_for(&mut lanes, &mut launch_lanes, clip.track, slot);
                     let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
                     match a.warp.as_ref() {
@@ -869,8 +1119,9 @@ impl TimelineSnapshot {
                                 project_rate,
                             ));
                         }
-                        // Pitch edited: through a stretcher, 1:1 in time.
-                        _ if pitched && !a.reversed => {
+                        // Pitch edited or transposed: through a stretcher,
+                        // 1:1 in time.
+                        _ if (pitched || a.stretch.semitones() != 0.0) && !a.reversed => {
                             let w = faderframe_project::Warp::uniform(a.length);
                             lane.warped.push(warped_region(
                                 clip.id.raw(),
@@ -908,10 +1159,8 @@ impl TimelineSnapshot {
                             if at >= clip_end {
                                 break;
                             }
-                            events.push((
-                                tl.to_samples(at, sr),
-                                lane.controller.event(lane.channel, p.value),
-                            ));
+                            let (ev, fine) = lane.controller.event_fine(lane.channel, p);
+                            events.push((tl.to_samples(at, sr), ev, fine));
                         }
                     }
                     if let Some(&cfg) = mpe_of.get(&clip.track) {
@@ -925,34 +1174,71 @@ impl TimelineSnapshot {
                         );
                     }
                     let plain = !mpe_of.contains_key(&clip.track);
+                    let drums = drummed.get(&clip.track).copied();
+                    let articulation = articulated.get(&clip.track);
+                    // A launcher clip's directions are its own.
+                    let own = articulation.filter(|_| slot.is_some()).map(|(map, _)| {
+                        Directions::new(
+                            map,
+                            m.articulations
+                                .iter()
+                                .filter(|e| e.time < m.length)
+                                .map(|e| (e.time, e.articulation)),
+                        )
+                    });
                     for n in m.notes.iter().filter(|n| plain && !n.muted) {
                         let on_pos = clip.start + n.start;
                         if on_pos >= clip_end {
                             continue;
                         }
-                        let off_pos = (on_pos + n.length).min(clip_end);
                         let on = tl.to_samples(on_pos, sr);
+                        // Where it plays: its drum sound's note and channel,
+                        // then what its articulation does to it (with the
+                        // switch before it).
+                        let (mut channel, mut key) = (n.channel, n.key);
+                        let (mut velocity, mut length) = (n.velocity, n.length);
+                        if let Some(d) = drums {
+                            (channel, key) = d.output(channel, key);
+                        }
+                        if let Some((map, directions)) = articulation {
+                            let state = map.state(
+                                &own.as_ref().unwrap_or(directions).at(on_pos),
+                                n.articulation,
+                            );
+                            let builder = switch_builders.entry((clip.track, slot)).or_default();
+                            builder.note(map, on, state, channel);
+                            (channel, key, velocity, length) = builder
+                                .resolved(map, state)
+                                .note(channel, key, velocity, length);
+                        }
+                        let off_pos = (on_pos + length).min(clip_end);
                         let off = tl.to_samples(off_pos, sr).max(on + 1);
+                        // At full resolution (an articulation's velocity
+                        // change leaves the 16 bits behind: they no
+                        // longer agree).
+                        let on_fine = n.on_fine();
                         events.push((
                             on,
                             MidiEvent::NoteOn {
-                                channel: n.channel,
-                                key: n.key,
-                                velocity: n.velocity.max(1),
+                                channel,
+                                key,
+                                velocity: velocity.max(1),
                             },
+                            on_fine,
                         ));
                         events.push((
                             off,
                             MidiEvent::NoteOff {
-                                channel: n.channel,
-                                key: n.key,
+                                channel,
+                                key,
                                 velocity: n.release.unwrap_or(0),
                             },
+                            n.off_fine(),
                         ));
                         if let Some(e) = m.expression(n.id) {
                             native_expression_events(
                                 e,
-                                (n.channel, n.key),
+                                (channel, key),
                                 on_pos,
                                 off_pos - on_pos,
                                 |t| tl.to_samples(t, sr),
@@ -963,7 +1249,7 @@ impl TimelineSnapshot {
                     // At equal times: note-offs, then controllers (a pedal or
                     // bend set at a note's start applies to it), then
                     // note-ons, then the expressions addressed to them.
-                    events.sort_by_key(|(t, e)| (*t, e.same_time_priority()));
+                    events.sort_by_key(|(t, e, _)| (*t, e.same_time_priority()));
                     let mut sysex: Vec<(i64, Box<[u8]>)> = m
                         .sysex
                         .iter()
@@ -988,6 +1274,10 @@ impl TimelineSnapshot {
                         });
                 }
             }
+        }
+        for ((track, slot), builder) in switch_builders {
+            let lane = lane_for(&mut lanes, &mut launch_lanes, track, slot);
+            lane.articulation = builder.finish();
         }
         let mut lanes: Vec<(TrackId, Lane)> = lanes.into_iter().collect();
         for (_, lane) in &mut lanes {
@@ -1145,6 +1435,8 @@ impl TimelineSnapshot {
             launch,
             automation,
             harmony,
+            cached: Vec::new(),
+            tunings: crate::tuning::Tunings::build(project),
         }
     }
 }
@@ -1215,7 +1507,8 @@ fn warped_region(
         source_hi: (a.source_offset + w.source_length) as f64 * src,
         points,
         mode,
-        transpose: (source_rate / sr) as f32,
+        // (A clip's own transposition on top.)
+        transpose: (source_rate / sr) as f32 * a.stretch.pitch_factor(),
         pitch,
         region,
     }
@@ -1312,6 +1605,7 @@ impl AudioPiece {
             fade_in_bend: faderframe_project::bend_factor(self.fade_in.2),
             fade_out_bend: faderframe_project::bend_factor(self.fade_out.2),
             reversed: self.reversed,
+            envelope: None,
         })
     }
 }

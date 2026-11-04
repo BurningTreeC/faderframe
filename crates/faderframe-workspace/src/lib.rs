@@ -140,6 +140,26 @@ impl ViewId {
     pub fn mix_intelligence() -> Self {
         Self::new("mix-intelligence")
     }
+
+    pub fn mix_scenes() -> Self {
+        Self::new("mix-scenes")
+    }
+
+    pub fn browser() -> Self {
+        Self::new("browser")
+    }
+
+    pub fn score() -> Self {
+        Self::new("score")
+    }
+
+    pub fn interactive_music() -> Self {
+        Self::new("interactive-music")
+    }
+
+    pub fn maps() -> Self {
+        Self::new("maps")
+    }
 }
 
 impl fmt::Debug for ViewId {

@@ -54,8 +54,19 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "export-midi", crate::dialogs::export_midi),
         entry(app, "export-midi2", crate::dialogs::export_midi2),
         entry(app, "cancel-import", |a| {
-            a.session.borrow().cancel_imports()
+            let s = a.session.borrow();
+            s.cancel_imports();
+            s.cancel_dawproject();
         }),
+        entry(app, "import-musicxml", crate::interchange::import_musicxml),
+        entry(app, "import-dawproject", |a| {
+            crate::dialogs::confirm_discard(a, crate::interchange::import_dawproject)
+        }),
+        entry(
+            app,
+            "export-dawproject",
+            crate::interchange::export_dawproject,
+        ),
         entry(app, "save", crate::dialogs::save),
         entry(app, "save-as", |a| crate::dialogs::save_as(a, None)),
         entry(app, "quit", |a| {
@@ -451,6 +462,17 @@ pub fn install(app: &Rc<AppState>) {
         ),
         dispatch(
             app,
+            "show-mix-scenes",
+            A::Workspace(W::ShowView(ViewId::mix_scenes())),
+        ),
+        dispatch(
+            app,
+            "show-interactive-music",
+            A::Workspace(W::ShowView(ViewId::interactive_music())),
+        ),
+        dispatch(app, "show-maps", A::Workspace(W::ShowView(ViewId::maps()))),
+        dispatch(
+            app,
             "show-album",
             A::Workspace(W::ShowView(ViewId::album())),
         ),
@@ -494,6 +516,20 @@ pub fn install(app: &Rc<AppState>) {
             }
         }),
         dispatch(app, "workspace-reset", A::Workspace(W::ResetActive)),
+        // Stem separation: stop what runs; the model's settings.
+        dispatch(app, "cancel-separation", A::CancelSeparations),
+        entry(app, "stems-settings", |a| {
+            crate::preferences::open(a, Some("stems"))
+        }),
+        // Ambisonic files: AmbiX as it is, first-order FuMa converted.
+        entry(app, "import-ambisonic", |a| {
+            crate::dialogs::import_ambisonic(a, faderframe_session::ambix::AmbiFile::AmbiX)
+        }),
+        entry(app, "import-fuma", |a| {
+            crate::dialogs::import_ambisonic(a, faderframe_session::ambix::AmbiFile::FuMa)
+        }),
+        // File → Batch Processing…: a chain applied to a list of files.
+        entry(app, "batch-processing", crate::batch::open),
     ];
     for (i, (_, h)) in faderframe_view_arranger::TRACK_HEIGHTS.iter().enumerate() {
         entries.push(dispatch(
@@ -509,6 +545,24 @@ pub fn install(app: &Rc<AppState>) {
     crate::toggles::install(app);
     // A/B listening: the Reference view, the flip, its development aids.
     crate::compare::install(app);
+    crate::codec_monitor::install(app);
+    // Comping by lyric's development aids.
+    crate::lyric_comp::install(app);
+    // Merging versions: the Merge window, File → Merge Project File…, and
+    // their development aids.
+    crate::version_merge::install(app);
+    // Devices' A/B compare and own undo, slicing: development aids.
+    crate::device_states::install(app);
+    // Clip envelopes and Strip Silence: the dialog and development aids.
+    crate::clip_tools_actions::install(app);
+    crate::score_actions::install(app);
+    // Live collaboration: the Collaborate window and `collab:`.
+    crate::collab::install(app);
+    crate::aaf::install(app);
+    // The media browser: showing it, its development aids.
+    crate::browser::install(app);
+    // AES67 network audio's development aids (`aes67:`).
+    crate::aes67_prefs::install(app);
     // Development aid: insert a plugin (by id) on the selected or first
     // audio track, e.g. FADERFRAME_STARTUP_ACTIONS="insert-plugin:com.vendor.plugin".
     let weak = Rc::downgrade(app);
@@ -1922,8 +1976,9 @@ pub fn install(app: &Rc<AppState>) {
             }
         }),
         named("spectral-add", |a, arg| {
-            // `<remove|attenuate|heal|gain=<db>>@<from s>-<to s>/<low Hz>-<high Hz>`
-            // on the spectral editor's clip (seconds from the clip's start).
+            // `<remove|attenuate|heal|gain=<db>|denoise[=<db>]>@<from s>-<to s>/<low Hz>-<high Hz>`
+            // on the spectral editor's clip (seconds from the clip's start;
+            // for denoise the region is the noise to learn from).
             use faderframe_project::spectral::{SpectralEdit, SpectralOp, SpectralShape};
             let parsed = (|| {
                 let (op, rest) = arg.split_once('@')?;
@@ -1934,6 +1989,12 @@ pub fn install(app: &Rc<AppState>) {
                     "remove" => SpectralOp::Remove,
                     "attenuate" => SpectralOp::Attenuate,
                     "heal" => SpectralOp::Heal,
+                    "denoise" => SpectralOp::Denoise {
+                        reduction_db: faderframe_view_spectral::DENOISE_DB,
+                    },
+                    d if d.starts_with("denoise=") => SpectralOp::Denoise {
+                        reduction_db: d.strip_prefix("denoise=")?.parse::<f32>().ok()?.abs(),
+                    },
                     g => SpectralOp::Gain {
                         db: g.strip_prefix("gain=")?.parse().ok()?,
                     },
@@ -2064,6 +2125,46 @@ pub fn install(app: &Rc<AppState>) {
                 tracing::warn!("export-lyrics: {e}");
             }
         }),
+        // Development aids: `ara-open:<track>=<plugin id>` (its first clip
+        // opened with that ARA plug-in; `ara-open:<track>` shows it in the
+        // track's own), `ara-notes:<track>` (the notes the track's ARA
+        // plug-in found in its first clip, as MIDI).
+        named("ara-open", |a, arg| {
+            let (name, id) = match arg.split_once('=') {
+                Some((n, i)) => (n, Some(i)),
+                None => (arg, None),
+            };
+            let found = {
+                let s = a.session.borrow();
+                let clip = s
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| t.clips.first().copied());
+                let plugin = id.and_then(|id| s.ara_plugins().into_iter().find(|p| p.id == id));
+                clip.map(|c| (c, plugin))
+            };
+            match found {
+                Some((clip, plugin)) if id.is_none() || plugin.is_some() => {
+                    a.dispatch(Action::OpenWithAra { clip, plugin });
+                }
+                _ => tracing::warn!("ara-open: no clip on ‘{name}’ or no ARA plug-in {id:?}"),
+            }
+        }),
+        named("ara-notes", |a, arg| {
+            let clip = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == arg)
+                .and_then(|t| t.clips.first().copied());
+            if let Some(clip) = clip {
+                a.dispatch(Action::AraNotesToMidi(clip));
+            }
+        }),
         // Development aid: `to-midi:<melody|harmony|drums>=<track>` (its
         // first clip).
         named("to-midi", |a, arg| {
@@ -2165,7 +2266,8 @@ pub fn install(app: &Rc<AppState>) {
             }
         }),
         // Development aid: `guitar-tab:<track>` (the whole track) and
-        // `sheet-style:<notes|notes-tab|tab>[@<tuning n>][/<capo>]`.
+        // `sheet-style:<notes|as-played|notes-tab|tab>[@<tuning n>][/<capo>]`
+        // (`notes` = the melody, a lead sheet).
         named("guitar-tab", |a, arg| {
             let of = a
                 .session
@@ -2194,6 +2296,7 @@ pub fn install(app: &Rc<AppState>) {
             style.notation = match notation {
                 "notes-tab" => Notation::WithTab,
                 "tab" => Notation::Tab,
+                "as-played" => Notation::AsPlayed,
                 _ => Notation::Standard,
             };
             if let Some(t) = tuning {
@@ -2207,6 +2310,9 @@ pub fn install(app: &Rc<AppState>) {
         named("export-lead-sheet", |a, arg| {
             a.dispatch(Action::ExportLeadSheet(std::path::PathBuf::from(arg)));
         }),
+        // Development aid for mix scenes (`crate::mix_actions::scene`):
+        // `mix-scene:<store=name|recall=n|crossfade=n@ms|morph=a/b@pos|compare=a/b|delete=n>`.
+        named("mix-scene", crate::mix_actions::scene),
         // Development aids for Mix Intelligence (`crate::mix_actions`).
         named("mix-analyse", crate::mix_actions::analyse),
         named("mix-cancel", crate::mix_actions::cancel),
@@ -2569,8 +2675,10 @@ pub fn install(app: &Rc<AppState>) {
         // and bottom edges), then `menu:<label>` clicks an entry of the
         // context menu it opened and `menu-state:x` logs whether it is open.
         // Development aid: `access-key:<view id>=<tab|backtab|enter|up|down|
-        // left|right|escape>[/…]` — the keyboard on a view's accessible
-        // controls (as Tab, Enter and the arrows reach them).
+        // left|right|page-up|page-down|menu|escape>[/…]` — the keyboard on a
+        // view's accessible controls (as Tab, Enter, the arrows and the Menu
+        // key reach them); `edit-bar` and `transport` name the edit toolbar
+        // and the transport display.
         // Development aid: `voice-input:<track>=<n|all|off>` — the track
         // takes MIDI from input n's voice port, or from every input's (each
         // on its own channel; singing into MIDI).
@@ -2629,14 +2737,23 @@ pub fn install(app: &Rc<AppState>) {
             let Some((view, keys)) = arg.split_once('=') else {
                 return tracing::warn!("access-key: '{arg}' is not <view id>=<keys>");
             };
-            let canvas = a
-                .dock
-                .borrow()
-                .hosts
-                .get(&faderframe_workspace::ViewId::new(view))
-                .map(|(_, h)| h.canvas.clone());
+            let canvas = match view {
+                "edit-bar" => a
+                    .chrome
+                    .borrow()
+                    .as_ref()
+                    .filter(|c| c.edit_bar.is_visible())
+                    .map(|c| c.edit_bar.clone()),
+                "transport" => a.chrome.borrow().as_ref().map(|c| c.display.clone()),
+                _ => a
+                    .dock
+                    .borrow()
+                    .hosts
+                    .get(&faderframe_workspace::ViewId::new(view))
+                    .map(|(_, h)| h.canvas.clone()),
+            };
             let Some(canvas) = canvas else {
-                return tracing::warn!("access-key: no view '{view}'");
+                return tracing::warn!("access-key: no view '{view}' (shown)");
             };
             for k in keys.split('/') {
                 let key = match k {
@@ -2653,6 +2770,9 @@ pub fn install(app: &Rc<AppState>) {
                     "down" => Key::Down,
                     "left" => Key::Left,
                     "right" => Key::Right,
+                    "page-up" => Key::PageUp,
+                    "page-down" => Key::PageDown,
+                    "menu" => Key::Menu,
                     "escape" => Key::Escape,
                     other => {
                         tracing::warn!("access-key: unknown key '{other}'");
@@ -3498,6 +3618,48 @@ pub fn install(app: &Rc<AppState>) {
                 }
             }
         }),
+        // Development aids for the FM and the Wavetable (the device editor
+        // opened last): `dx7:<path>[@<voice from 1>]` reads a DX7 SysEx
+        // file into the FM's bank and loads a voice of it;
+        // `wavetable-cycle:<slot>=<samples>` reads a user table in frames
+        // of that size (0: as the file says).
+        named("dx7", |a, arg| {
+            let Some(plugin) = crate::plugin_window::latest_device() else {
+                tracing::warn!("dx7: no device editor is open");
+                return;
+            };
+            let (path, voice) = match arg.rsplit_once('@') {
+                Some((p, n)) if n.trim().parse::<usize>().is_ok() => {
+                    (p, n.trim().parse::<usize>().ok())
+                }
+                _ => (arg, None),
+            };
+            a.dispatch(Action::ImportDx7 {
+                plugin,
+                path: std::path::PathBuf::from(path.trim()),
+            });
+            if let Some(n) = voice {
+                a.dispatch(Action::LoadDx7Voice {
+                    plugin,
+                    index: n.saturating_sub(1),
+                });
+            }
+        }),
+        named("wavetable-cycle", |a, arg| {
+            let Some(plugin) = crate::plugin_window::latest_device() else {
+                tracing::warn!("wavetable-cycle: no device editor is open");
+                return;
+            };
+            if let Some((k, v)) = arg.split_once('=')
+                && let (Ok(slot), Ok(samples)) = (k.trim().parse(), v.trim().parse())
+            {
+                a.dispatch(Action::SetWavetableCycle {
+                    plugin,
+                    slot,
+                    samples,
+                });
+            }
+        }),
         // Development aid: `reload-plugins:x` starts every plugin again (a
         // crashed one, or after switching sandboxing).
         named("reload-plugins", |a, _| {
@@ -3550,6 +3712,39 @@ pub fn install(app: &Rc<AppState>) {
         // cancel>` answers the open Overwrite / Cancel question (a render's
         // or an export's) as its button would.
         named("render-stop", |_, _| crate::render::render_stop()),
+        // Development aids for the delivery QC: `qc-report:<path>[@<spec>]`
+        // writes the QC report of the last delivery (a PDF at `path`, the
+        // JSON beside it; `spec` a spec id such as `ebu-r128`, `netflix`,
+        // `streaming`, `cd` — else the open report window's, else none);
+        // `null-test:<x|nulling|off>` null-tests the open report's untested
+        // stems, else chooses Stems in the Render window with the null test
+        // (`nulling`: stems that null; `off`: neither).
+        named("qc-report", |a, arg| {
+            // (A path may hold an '@': only a known spec id after it counts.)
+            let (path, spec) = match arg.rsplit_once('@') {
+                Some((p, s)) if faderframe_qc::Spec::by_id(s).is_some() => {
+                    (p.trim(), Some(s.trim()))
+                }
+                _ => (arg.trim(), None),
+            };
+            if !crate::render_report::save_report_to(a, std::path::Path::new(path), spec) {
+                tracing::warn!("qc-report: nothing delivered yet");
+            }
+        }),
+        named("null-test", |a, arg| {
+            let arg = arg.trim();
+            if arg != "off" && arg != "nulling" && crate::render_report::null_test_now(a) {
+                return;
+            }
+            let (test, shared) = match arg {
+                "off" => (false, false),
+                "nulling" => (false, true),
+                _ => (true, false),
+            };
+            if !crate::render::stems_options(test, shared) {
+                tracing::warn!("null-test: no stems to test and no Render window open");
+            }
+        }),
         named("answer-question", |_, arg| {
             let replace = arg.trim() == "overwrite";
             if !crate::render_report::answer_question(replace) {
@@ -3742,6 +3937,33 @@ pub fn install(app: &Rc<AppState>) {
         named("export-midi-to", |a, arg| {
             crate::dialogs::export_midi_to(a, std::path::Path::new(arg));
         }),
+        // Development aids: `export-dawproject:<path>`,
+        // `import-dawproject:<path>` (a new project, no question asked),
+        // `import-musicxml:<path>` (at the start of a project without
+        // clips with the score's tempo, else at the playhead) and
+        // `dawproject-report:x` (logs what the last DAWproject file did
+        // not carry).
+        named("export-dawproject", |a, arg| {
+            a.dispatch(Action::ExportDawProject(std::path::PathBuf::from(arg)));
+        }),
+        named("import-dawproject", |a, arg| {
+            a.dispatch(Action::ImportDawProject(std::path::PathBuf::from(arg)));
+        }),
+        named("import-musicxml", |a, arg| {
+            crate::interchange::import_musicxml_from(a, std::path::PathBuf::from(arg));
+        }),
+        named("dawproject-report", |a, _| {
+            let s = a.session.borrow();
+            match s.interchange_report() {
+                Some(r) => {
+                    tracing::info!("{}: {} thing(s) not carried", r.title, r.notes.len());
+                    for n in &r.notes {
+                        tracing::info!("  {n}");
+                    }
+                }
+                None => tracing::info!("no DAWproject file written or read yet"),
+            }
+        }),
         // Development aid: `save-to:<path>` saves the project there.
         named("save-to", |a, arg| {
             let path = std::path::PathBuf::from(arg);
@@ -3875,6 +4097,506 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("select-clip: no clip on '{arg}'"),
             }
         }),
+        // Development aid: `self-freeze:<on|off|when-needed|always|now|status|clean>` switches
+        // self-freezing (and saves it), renders without waiting for the
+        // project to settle, logs every track's state, cleans the cache
+        // folder; `self-freeze:keep-live=<track>` / `auto=<track>` set a
+        // track's Self-Freeze, `never=<plugin id>` / `allow=<plugin id>` a
+        // plugin's.
+        named("self-freeze", |a, arg| {
+            let track = |a: &AppState, name: &str| {
+                a.session
+                    .borrow()
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| t.id)
+            };
+            let set = |a: &Rc<AppState>, on: bool, mode: Option<SelfFreezeMode>| {
+                let mut s = a.session.borrow().self_freeze_settings().clone();
+                s.on = on;
+                if let Some(m) = mode {
+                    s.mode = m;
+                }
+                a.with_session(|session| {
+                    session.set_self_freeze(s);
+                    Ok(())
+                });
+            };
+            use faderframe_session::self_freeze::SelfFreezeMode;
+            match arg.split_once('=') {
+                None if arg == "on" => set(a, true, None),
+                None if arg == "off" => set(a, false, None),
+                None if arg == "when-needed" => set(a, true, Some(SelfFreezeMode::WhenNeeded)),
+                None if arg == "always" => set(a, true, Some(SelfFreezeMode::Always)),
+                None if arg == "now" => {
+                    a.with_session(|s| {
+                        s.self_freeze_now();
+                        Ok(())
+                    });
+                }
+                None if arg == "status" => {
+                    for line in a.session.borrow().self_freeze_report() {
+                        tracing::info!("{line}");
+                    }
+                }
+                None if arg == "clean" => {
+                    let freed = a
+                        .with_session(|s| Ok(s.clean_self_freeze_cache()))
+                        .unwrap_or(0);
+                    tracing::info!("self-freeze: {freed} bytes freed");
+                }
+                Some(("keep-live" | "auto", name)) => match track(a, name) {
+                    Some(t) => a.dispatch(Action::Edit(
+                        faderframe_project::Command::SetTrackSelfFreeze {
+                            track: t,
+                            off: arg.starts_with("keep-live"),
+                        },
+                    )),
+                    None => tracing::warn!("self-freeze: no track '{name}'"),
+                },
+                Some(("never" | "allow", plugin)) => a.dispatch(Action::KeepPluginLive {
+                    plugin: plugin.to_string(),
+                    on: arg.starts_with("never"),
+                }),
+                _ => tracing::warn!("self-freeze: unknown '{arg}'"),
+            }
+        }),
+        // Stem separation: `separate:<track>[@<model>][=<stem>+<stem>…]`
+        // (the track's audio; stems vocals, drums, bass, other,
+        // instrumental — all four by default), `separate-clip:` the same
+        // for the track's first clip, `download-separation-model:<id|x>`
+        // (x: the one chosen in Preferences).
+        named("separate", |a, arg| separate_dev(a, arg, false)),
+        named("separate-clip", |a, arg| separate_dev(a, arg, true)),
+        named("download-separation-model", |a, arg| {
+            let id = (!matches!(arg.trim(), "" | "x")).then(|| arg.trim().to_string());
+            a.dispatch(Action::DownloadSeparationModel(id));
+        }),
+        // `note-lock:<track>=<note index>@<on|off>`: the track's note (from
+        // 0: its MIDI clips' notes in time order, `Session::track_note`)
+        // locked to time — tempo changes keep it where it sounds — or
+        // following the music again.
+        named("note-lock", |a, arg| {
+            let parsed = arg.split_once('=').and_then(|(name, rest)| {
+                let (index, on) = rest.split_once('@')?;
+                Some((
+                    name,
+                    index.trim().parse::<usize>().ok()?,
+                    on.trim() != "off",
+                ))
+            });
+            let Some((name, index, on)) = parsed else {
+                return tracing::warn!("note-lock: '{arg}' is not <track>=<note index>@<on|off>");
+            };
+            let found = {
+                let s = a.session.borrow();
+                s.project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| s.track_note(t.id, index))
+            };
+            match found {
+                Some((clip, note)) => a.dispatch(Action::NoteOperation {
+                    clip,
+                    notes: vec![note],
+                    op: faderframe_session::NoteOp::SetTimeLocked(on),
+                }),
+                None => tracing::warn!("note-lock: no note {index} on '{name}'"),
+            }
+        }),
+        // `marker-lock:<n>=<on|off>`: marker n (from 0, in time order)
+        // placed in time or with the music (`Session::marker_time_lock`).
+        named("marker-lock", |a, arg| {
+            let parsed = arg
+                .split_once('=')
+                .and_then(|(n, on)| Some((n.trim().parse::<usize>().ok()?, on.trim() != "off")));
+            let Some((n, on)) = parsed else {
+                return tracing::warn!("marker-lock: '{arg}' is not <n>=<on|off>");
+            };
+            let action = {
+                let s = a.session.borrow();
+                s.project()
+                    .markers
+                    .get(n)
+                    .map(|m| s.marker_time_lock(m.id, on))
+            };
+            match action {
+                Some(Some(action)) => a.dispatch(action),
+                Some(None) => tracing::info!("marker-lock: marker {n} is so already"),
+                None => tracing::warn!("marker-lock: no marker {n}"),
+            }
+        }),
+        // Development aids for show-mode gear and articulation and drum
+        // maps (`crate::maps_actions`): `show-gear:<song n>=<program>[/<bank>]`,
+        // `articulation-map:<track>=<name>`, `drum-map:<track>=<gm|pads|file>`.
+        named("show-gear", crate::maps_actions::show_gear),
+        named("articulation-map", crate::maps_actions::articulation_map),
+        named("drum-map", crate::maps_actions::drum_map),
+        // Development aid: `video-360:<look=y/p[/r]|fov=d|ahead|link=on|off|
+        // pan-track=<track|none>|pan=<track>@az/el|write=<track>=on|off|
+        // layout=<flat|equirect|cubemap>[/stereo]|status>` (see the module).
+        named("video-360", crate::video_360_actions::video_360),
+        // Development aid: `av-calibrate:<camera|test|stop|cameras>[@<input>]`
+        // — A/V calibration with the first camera (`camera`, or a camera's
+        // name/label), with the virtual camera (`test[=<display ms>]`), stop
+        // it, or look for cameras; the microphone on device input n (from
+        // 1, default 1).
+        named("av-calibrate", |a, arg| {
+            use faderframe_session::av_calibration::{
+                CalibrationSettings, CameraChoice, DEFAULT_FLASHES,
+            };
+            use faderframe_session::video::VideoOp;
+            let (what, input) = match arg.rsplit_once('@') {
+                Some((w, n)) => match n.trim().parse::<u16>() {
+                    Ok(n) => (w.trim(), n.saturating_sub(1)),
+                    Err(_) => (arg.trim(), 0),
+                },
+                None => (arg.trim(), 0),
+            };
+            let (what, value) = what.split_once('=').unwrap_or((what, ""));
+            let camera = match what {
+                "stop" => return a.dispatch(Action::Video(VideoOp::CancelCalibration)),
+                "cameras" => return a.dispatch(Action::Video(VideoOp::FindCameras)),
+                "camera" | "" => CameraChoice::Default,
+                "test" => CameraChoice::Virtual {
+                    display_ms: value.trim().parse().unwrap_or(0.0),
+                    readout: 0.0,
+                },
+                name => CameraChoice::Named(name.to_string()),
+            };
+            a.dispatch(Action::Video(VideoOp::Calibrate(CalibrationSettings {
+                camera,
+                input,
+                flashes: DEFAULT_FLASHES,
+            })));
+        }),
+        // Development aid: `track-object:<track>@<frame>=<x>/<y>/<w>/<h>` —
+        // the object in that box (pixels of the video's own picture) on
+        // frame n of the first video clip's file (as the overlay counts) is
+        // followed and the track's pan (or surround position) follows it
+        // once followed through; `track-object:<track>@<frame>=…/depth`
+        // moves a room-panned track front to back by the box's size too.
+        named("track-object", |a, arg| {
+            use faderframe_session::object_tracking::{DEFAULT_DEPTH, FollowOp};
+            use faderframe_session::video::VideoOp;
+            let parsed = (|| {
+                let (track, rest) = arg.split_once('@')?;
+                let (frame, rect) = rest.split_once('=')?;
+                let frame = frame.trim().parse::<usize>().ok()?;
+                let parts: Vec<&str> = rect.split('/').map(str::trim).collect();
+                let depth = parts.get(4).is_some_and(|p| *p == "depth");
+                let n: Vec<f32> = parts
+                    .iter()
+                    .take(4)
+                    .filter_map(|p| p.parse::<f32>().ok())
+                    .collect();
+                (n.len() == 4).then(|| (track.trim().to_string(), frame, n, depth))
+            })();
+            let Some((name, frame, n, depth)) = parsed else {
+                return tracing::warn!(
+                    "track-object: '{arg}' is not <track>@<frame>=<x>/<y>/<w>/<h>[/depth]"
+                );
+            };
+            let found = {
+                let s = a.session.borrow();
+                let p = s.project();
+                let track = p.tracks.iter().find(|t| t.name == name).map(|t| t.id);
+                let clip = p
+                    .video
+                    .tracks
+                    .iter()
+                    .flat_map(|t| &t.clips)
+                    .min_by_key(|c| c.start)
+                    .cloned();
+                let size = clip
+                    .as_ref()
+                    .and_then(|c| p.video.sources.get(&c.source))
+                    .map(|s| (s.width as f32, s.height as f32));
+                track.zip(clip).zip(size)
+            };
+            let Some(((track, clip), (w, h))) = found else {
+                return tracing::warn!("track-object: no track '{name}' or no video clip");
+            };
+            let area = faderframe_video::track::Area::new(n[0] / w, n[1] / h, n[2] / w, n[3] / h);
+            a.dispatch(Action::Video(VideoOp::Follow(FollowOp::Key {
+                clip: clip.id,
+                frame,
+                area,
+            })));
+            a.dispatch(Action::Video(VideoOp::Follow(FollowOp::Apply {
+                track,
+                depth: depth.then_some(DEFAULT_DEPTH),
+            })));
+        }),
+        // Development aid: `ambi-pan:<track>=<azimuth>[/<elevation>[/<spread>[/<distance>]]]`
+        // (where a track sits in the ambisonic field it feeds; degrees,
+        // azimuth positive to the left, spread 0…1, distance 1 = the
+        // reference).
+        named("ambi-pan", |a, arg| {
+            use faderframe_core::SurroundParam as P;
+            let Some((name, values)) = arg.split_once('=') else {
+                return tracing::warn!("ambi-pan: '{arg}' is not <track>=<az>[/<el>…]");
+            };
+            let action = {
+                let s = a.session.borrow();
+                s.project().tracks.iter().find(|t| t.name == name).map(|t| {
+                    let pan = values
+                        .split('/')
+                        .zip([P::Azimuth, P::Elevation, P::Spread, P::Distance])
+                        .fold(t.surround, |pan, (v, p)| match v.trim().parse::<f32>() {
+                            Ok(v) => p.set(pan, v),
+                            Err(_) => pan,
+                        });
+                    Action::Edit(faderframe_project::Command::SetTrackSurround { track: t.id, pan })
+                })
+            };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("ambi-pan: no track '{name}'"),
+            }
+        }),
+        // Development aid: `head:<yaw>/<pitch>/<roll>` (the listener's head
+        // on headphones, degrees: yaw left, pitch up, roll to the right),
+        // `head:straight`, `head:recentre` (a tracker's way now is ahead)
+        // or `head:status` (logged).
+        named("head", |a, arg| {
+            use faderframe_session::headtrack::HeadOp;
+            match arg.trim() {
+                "straight" => a.dispatch(Action::Head(HeadOp::Straight)),
+                "recentre" | "recenter" => a.dispatch(Action::Head(HeadOp::Recentre)),
+                "status" => {
+                    let st = a.session.borrow().head_status();
+                    tracing::info!(
+                        "head: yaw {:.1}° pitch {:.1}° roll {:.1}°, listening {:?}{}, {} messages, last {:?}, error {:?}",
+                        st.ypr.0,
+                        st.ypr.1,
+                        st.ypr.2,
+                        st.listening,
+                        if st.shared { " (OSC surface)" } else { "" },
+                        st.messages,
+                        st.last_heard,
+                        st.error
+                    );
+                }
+                other => {
+                    let v: Vec<f32> = other
+                        .split('/')
+                        .filter_map(|v| v.trim().parse::<f32>().ok())
+                        .collect();
+                    if v.is_empty() {
+                        return tracing::warn!("head: '{arg}' is not <yaw>/<pitch>/<roll>");
+                    }
+                    a.dispatch(Action::Head(HeadOp::Turn {
+                        yaw: v[0],
+                        pitch: v.get(1).copied().unwrap_or(0.0),
+                        roll: v.get(2).copied().unwrap_or(0.0),
+                    }));
+                }
+            }
+        }),
+        // Development aid: `head-tracking:<on|off>[@<port>]` (listen for a
+        // head tracker's OSC on the port; kept in the preferences).
+        named("head-tracking", |a, arg| {
+            use faderframe_session::headtrack::HeadOp;
+            let (state, port) = arg.split_once('@').unwrap_or((arg, ""));
+            let mut settings = a.session.borrow().head_tracking().clone();
+            settings.enabled = match state.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return tracing::warn!("head-tracking: '{arg}' is not on|off[@port]"),
+            };
+            if let Ok(p) = port.trim().parse::<u16>() {
+                settings.port = p;
+            }
+            a.dispatch(Action::Head(HeadOp::Tracking(settings)));
+        }),
+        // Development aid: `import-ambisonic-from:<path>[|fuma]` (an AmbiX
+        // file, or first-order FuMa B-format, onto a new track of its
+        // order at the start).
+        named("import-ambisonic-from", |a, arg| {
+            use faderframe_session::ambix::AmbiFile;
+            let (path, kind) = match arg.rsplit_once('|') {
+                Some((p, k)) if k.eq_ignore_ascii_case("fuma") => (p, AmbiFile::FuMa),
+                _ => (arg, AmbiFile::AmbiX),
+            };
+            a.dispatch(Action::ImportAmbisonic {
+                files: vec![std::path::PathBuf::from(path)],
+                at: faderframe_timeline::MusicalTime::ZERO,
+                kind,
+            });
+        }),
+        // Development aid: `track-tuning:<track>=<project|12tet|edo=<n>|
+        // scl=<path>[;kbm=<path>]>` (a track's own tuning; the project's
+        // is `tuning:`).
+        named("track-tuning", |a, arg| {
+            use faderframe_project::tuning::Tuning;
+            let Some((name, what)) = arg.split_once('=') else {
+                return tracing::warn!("track-tuning: '{arg}' is not <track>=<tuning>");
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            let Some(track) = track else {
+                return tracing::warn!("track-tuning: no track '{name}'");
+            };
+            let set = |tuning| {
+                Some(Action::Edit(faderframe_project::Command::SetTuning {
+                    track: Some(track),
+                    tuning,
+                }))
+            };
+            let action =
+                match what.trim() {
+                    "project" => set(None),
+                    "12tet" => set(Some(Tuning::twelve_tet())),
+                    w => match w.strip_prefix("edo=") {
+                        Some(n) => n
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|n| (1..=1024).contains(n))
+                            .and_then(|n| set(Some(Tuning::equal(n)))),
+                        None => faderframe_session::tuning::parse_tuning_files(w).map(
+                            |(scale, mapping)| Action::LoadTuning {
+                                track: Some(track),
+                                scale,
+                                mapping,
+                            },
+                        ),
+                    },
+                };
+            match action {
+                Some(action) => a.dispatch(action),
+                None => tracing::warn!("track-tuning: '{what}' is not a tuning"),
+            }
+        }),
+        // Development aid: `retune:<track>=<auto|mts|expression|mpe|off>`
+        // (how its plugins and MIDI outputs are retuned).
+        named("retune", |a, arg| {
+            use faderframe_project::tuning::Retune;
+            let parsed = arg
+                .split_once('=')
+                .and_then(|(n, r)| Some((n.to_string(), Retune::from_id(r.trim())?)));
+            let Some((name, retune)) = parsed else {
+                return tracing::warn!(
+                    "retune: '{arg}' is not <track>=<auto|mts|expression|mpe|off>"
+                );
+            };
+            let track = a
+                .session
+                .borrow()
+                .project()
+                .tracks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id);
+            match track {
+                Some(track) => {
+                    a.dispatch(Action::Edit(faderframe_project::Command::SetTrackRetune {
+                        track,
+                        retune,
+                    }))
+                }
+                None => tracing::warn!("retune: no track '{name}'"),
+            }
+        }),
+        // Development aid: `ump:40903c00 12340000` plays Universal MIDI
+        // Packets (hex words) through the built-in keyboard input, as a
+        // MIDI 2.0 device would (16-bit velocities, 32-bit controllers).
+        named("ump", |a, arg| {
+            let words: Vec<u32> = arg
+                .split([' ', ','])
+                .filter(|t| !t.is_empty())
+                .filter_map(|t| u32::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                .collect();
+            if !a.session.borrow().midi_keyboard().send_ump(&words) {
+                tracing::warn!("ump: '{arg}' was not taken");
+            }
+        }),
+        // Development aid: `align-timing:<guide track>=<dub track>[|…][@<tightness>]`
+        // (every audio clip of the dub tracks warped onto the guide; the
+        // pitch and consonant settings as the editor's).
+        named("align-timing", |a, arg| {
+            let request = {
+                let s = a.session.borrow();
+                faderframe_session::timing_align::parse_request(
+                    s.project(),
+                    arg,
+                    s.timing_align_settings().tightness,
+                )
+            };
+            match request {
+                Ok(action) => a.dispatch(action),
+                Err(e) => tracing::warn!("align-timing: {e}"),
+            }
+        }),
+        // Development aid: `audio-devices:<output>[+<output>…]/<input>[+…]`
+        // chooses the running audio system's devices and applies them (the
+        // first output's clock drives, the others follow it); an empty
+        // side is the default (`desk/` plays and records on desk).
+        named("audio-devices", |a, arg| {
+            let (outs, ins) = arg.split_once('/').unwrap_or((arg, ""));
+            let list = |s: &str| -> Vec<String> {
+                s.split('+')
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let Some(backend) = a.session.borrow().backend_name() else {
+                tracing::warn!("audio-devices: no audio is running");
+                return;
+            };
+            let mut prefs = a.session.borrow().audio_preferences().clone();
+            prefs.devices.insert(
+                backend.to_string(),
+                faderframe_session::DeviceChoice {
+                    outputs: list(outs),
+                    inputs: list(ins),
+                },
+            );
+            if let Some(applied) = a.with_session(|s| s.apply_audio(prefs)) {
+                tracing::info!("audio-devices: {applied:?}");
+            }
+        }),
+        // Development aid: `log-devices:x` logs the running stream's devices
+        // (clock master and followers: drift, latency, gaps).
+        named("log-devices", |a, _| {
+            for d in a.session.borrow().stream_devices() {
+                tracing::info!(
+                    "device {}: master {} present {} locked {} rate {} drift {:+.2} ppm \
+                     in {:?} ({} fr) out {:?} ({} fr) gaps {}",
+                    d.name,
+                    d.master,
+                    d.present,
+                    d.locked,
+                    d.sample_rate,
+                    d.drift_ppm,
+                    d.inputs,
+                    d.input_latency,
+                    d.outputs,
+                    d.output_latency,
+                    d.gaps
+                );
+            }
+        }),
+        // Development aid: `batch:<preset>=<file>[|<file>…]` runs a batch
+        // preset on the files into a "Batch" folder beside the first one
+        // and logs how each went.
+        named("batch", crate::batch::dev_batch),
+        // Development aid for the interactive score
+        // (`crate::adaptive_actions::adaptive`).
+        named("adaptive", crate::adaptive_actions::adaptive),
+        // Development aid: `edit-map:<articulation|drum>=<track>` opens the
+        // map editor on the track's map (`crate::maps_actions::edit_map`).
+        named("edit-map", crate::maps_actions::edit_map),
     ];
     // Development aid: `window-size:<w>x<h>` resizes the main window.
     let weak = Rc::downgrade(app);
@@ -3972,6 +4694,8 @@ pub fn install(app: &Rc<AppState>) {
             pr.expression = faderframe_project::ExpressionKind::ALL
                 .into_iter()
                 .find(|k| k.label().eq_ignore_ascii_case(&name));
+            // `articulations`: the track's articulation lane.
+            pr.articulations = name.eq_ignore_ascii_case("articulations");
             if pr.expression.is_none() {
                 pr.lane = None;
             }
@@ -4262,6 +4986,38 @@ fn expression_demo(a: &Rc<AppState>, mpe: bool) {
             });
         }
     }
+}
+
+/// `separate:<track>[@<model>][=<stem>+<stem>…]` (see the action).
+fn separate_dev(app: &Rc<AppState>, arg: &str, clip: bool) {
+    use faderframe_session::separate::{Stem, StemTarget};
+    let (head, stems) = match arg.split_once('=') {
+        Some((h, s)) => (h, s.split('+').filter_map(Stem::from_id).collect()),
+        None => (arg, Stem::SOURCES.to_vec()),
+    };
+    let (name, model) = match head.split_once('@') {
+        Some((n, m)) => (n, Some(m.to_string())),
+        None => (head, None),
+    };
+    let target = {
+        let s = app.session.borrow();
+        let Some(t) = s.project().tracks.iter().find(|t| t.name == name) else {
+            return tracing::warn!("separate: no track '{name}'");
+        };
+        if clip {
+            match t.clips.first() {
+                Some(c) => StemTarget::Clip(*c),
+                None => return tracing::warn!("separate-clip: no clip on '{name}'"),
+            }
+        } else {
+            StemTarget::Track(t.id)
+        }
+    };
+    app.dispatch(Action::SeparateStems {
+        target,
+        model,
+        stems,
+    });
 }
 
 fn section_op(app: &Rc<AppState>, arg: &str, copy: bool) {

@@ -1,7 +1,7 @@
 //! Delay lines used for plugin delay compensation on graph edges.
 
 use crate::{AudioBuffer, for_each_channel_route};
-use faderframe_midi::{MidiBuffer, MidiEvent, TimedMidiEvent};
+use faderframe_midi::{MidiBuffer, TimedMidiEvent};
 use std::collections::VecDeque;
 
 /// Fixed-delay ring buffer applied to an audio edge.
@@ -35,6 +35,14 @@ impl AudioDelay {
     /// frames have gone in again is silence.
     pub fn reset(&mut self) {
         self.fresh = 0;
+    }
+
+    /// Delays as long, as wide and as roomy (one can carry on for the
+    /// other in a rebuilt graph).
+    pub fn same_shape(&self, other: &Self) -> bool {
+        self.delay == other.delay
+            && self.ring.len() == other.ring.len()
+            && self.ring.first().map(|r| r.len()) == other.ring.first().map(|r| r.len())
     }
 
     /// Push `src` into the ring and add the delayed signal into `dst`.
@@ -86,7 +94,8 @@ impl AudioDelay {
 pub(crate) struct EventDelay {
     delay: u64,
     now: u64,
-    queue: VecDeque<(u64, MidiEvent)>,
+    /// Due frame and the event (with its MIDI 2.0 resolution).
+    queue: VecDeque<(u64, TimedMidiEvent)>,
     capacity: usize,
 }
 
@@ -100,6 +109,11 @@ impl EventDelay {
         }
     }
 
+    /// Delays as long and as roomy.
+    pub fn same_shape(&self, other: &Self) -> bool {
+        self.delay == other.delay && self.capacity == other.capacity
+    }
+
     /// Drop what it holds (the panic: a note-on still on its way would
     /// sound after the notes were released).
     pub fn reset(&mut self) {
@@ -111,7 +125,7 @@ impl EventDelay {
         for e in src {
             if self.queue.len() < self.capacity {
                 self.queue
-                    .push_back((self.now + e.sample_offset as u64 + self.delay, e.event));
+                    .push_back((self.now + e.sample_offset as u64 + self.delay, *e));
             }
         }
         let end = self.now + frames as u64;
@@ -121,7 +135,7 @@ impl EventDelay {
             }
             self.queue.pop_front();
             let offset = due.saturating_sub(self.now) as u32;
-            let _ = dst.push(TimedMidiEvent::new(offset, event));
+            let _ = dst.push(event.at(offset));
         }
         self.now = end;
     }
@@ -131,6 +145,7 @@ impl EventDelay {
 mod tests {
     use super::*;
     use faderframe_core::ChannelLayout;
+    use faderframe_midi::{Fine, MidiEvent};
 
     #[test]
     fn audio_delay_shifts_impulse_across_blocks() {
@@ -190,13 +205,14 @@ mod tests {
         let mut d = EventDelay::new(10, 16);
         let mut src = MidiBuffer::with_capacity(4);
         let mut dst = MidiBuffer::with_capacity(4);
-        src.push(TimedMidiEvent::new(
+        src.push(TimedMidiEvent::with_fine(
             3,
             MidiEvent::NoteOn {
                 channel: 0,
                 key: 1,
                 velocity: 1,
             },
+            Fine::value(300),
         ))
         .unwrap();
         d.process_merge(&src, &mut dst, 8);
@@ -204,5 +220,10 @@ mod tests {
         src.clear();
         d.process_merge(&src, &mut dst, 8);
         assert_eq!(dst.as_slice()[0].sample_offset, 5); // 3 + 10 - 8
+        assert_eq!(
+            dst.as_slice()[0].full_value(),
+            Some(300),
+            "its MIDI 2.0 velocity too"
+        );
     }
 }

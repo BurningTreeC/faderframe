@@ -1,5 +1,6 @@
-//! General MIDI names: the 128 programs of the GM sound set and the drum
-//! kits GM 2 places on channel 10 (by program number, 0-based).
+//! General MIDI names: the 128 programs of the GM sound set, the drum
+//! kits GM 2 places on channel 10 (by program number, 0-based) and the
+//! percussion sounds of the GM key map (keys 35–81 on channel 10).
 
 /// The GM programs, 0-based.
 pub const PROGRAMS: [&str; 128] = [
@@ -146,6 +147,62 @@ const KITS: [(u8, &str); 9] = [
     (56, "SFX Kit"),
 ];
 
+/// The GM percussion key map (channel 10): key and sound.
+pub const DRUMS: [(u8, &str); 47] = [
+    (35, "Acoustic Bass Drum"),
+    (36, "Bass Drum 1"),
+    (37, "Side Stick"),
+    (38, "Acoustic Snare"),
+    (39, "Hand Clap"),
+    (40, "Electric Snare"),
+    (41, "Low Floor Tom"),
+    (42, "Closed Hi-Hat"),
+    (43, "High Floor Tom"),
+    (44, "Pedal Hi-Hat"),
+    (45, "Low Tom"),
+    (46, "Open Hi-Hat"),
+    (47, "Low-Mid Tom"),
+    (48, "Hi-Mid Tom"),
+    (49, "Crash Cymbal 1"),
+    (50, "High Tom"),
+    (51, "Ride Cymbal 1"),
+    (52, "Chinese Cymbal"),
+    (53, "Ride Bell"),
+    (54, "Tambourine"),
+    (55, "Splash Cymbal"),
+    (56, "Cowbell"),
+    (57, "Crash Cymbal 2"),
+    (58, "Vibraslap"),
+    (59, "Ride Cymbal 2"),
+    (60, "Hi Bongo"),
+    (61, "Low Bongo"),
+    (62, "Mute Hi Conga"),
+    (63, "Open Hi Conga"),
+    (64, "Low Conga"),
+    (65, "High Timbale"),
+    (66, "Low Timbale"),
+    (67, "High Agogo"),
+    (68, "Low Agogo"),
+    (69, "Cabasa"),
+    (70, "Maracas"),
+    (71, "Short Whistle"),
+    (72, "Long Whistle"),
+    (73, "Short Guiro"),
+    (74, "Long Guiro"),
+    (75, "Claves"),
+    (76, "Hi Wood Block"),
+    (77, "Low Wood Block"),
+    (78, "Mute Cuica"),
+    (79, "Open Cuica"),
+    (80, "Mute Triangle"),
+    (81, "Open Triangle"),
+];
+
+/// The GM percussion sound on `key` (channel 10).
+pub fn drum_name(key: u8) -> Option<&'static str> {
+    DRUMS.iter().find(|(k, _)| *k == key).map(|(_, n)| *n)
+}
+
 /// The GM name of `program` (0-based) on `channel` (0-based; 9 = drums).
 pub fn program_name(channel: u8, program: u8) -> Option<&'static str> {
     if channel == 9 {
@@ -166,5 +223,9 @@ mod tests {
         assert_eq!(program_name(9, 25), Some("Analog Kit"));
         assert_eq!(program_name(9, 1), None);
         assert_eq!(program_name(0, 128), None);
+        assert_eq!(drum_name(36), Some("Bass Drum 1"));
+        assert_eq!(drum_name(81), Some("Open Triangle"));
+        assert_eq!(drum_name(34), None);
+        assert!(DRUMS.windows(2).all(|w| w[1].0 == w[0].0 + 1));
     }
 }

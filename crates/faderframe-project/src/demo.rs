@@ -403,6 +403,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         };
         track.clips.push(clip.id);
@@ -480,6 +481,9 @@ pub fn demo_project(sample_rate: u32) -> Project {
                 channel: 0,
                 muted: false,
                 release: None,
+                time_locked: false,
+                articulation: None,
+                fine: None,
             });
         }
     }
@@ -496,6 +500,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
             controllers: Vec::new(),
             expressions: Vec::new(),
             sysex: Vec::new(),
+            articulations: Vec::new(),
         }),
     };
     keys.clips.push(melody.id);
@@ -513,6 +518,9 @@ pub fn demo_project(sample_rate: u32) -> Project {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         })
         .collect();
     let chord_clip = Clip {
@@ -528,6 +536,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
             controllers: Vec::new(),
             expressions: Vec::new(),
             sysex: Vec::new(),
+            articulations: Vec::new(),
         }),
     };
     arp_notes.clips.push(chord_clip.id);
@@ -562,6 +571,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
             start: bar0,
             end: bar4,
             color: TrackColor::palette(2),
+            time_base: Default::default(),
         },
         Section {
             id: p.ids.allocate(),
@@ -569,12 +579,14 @@ pub fn demo_project(sample_rate: u32) -> Project {
             start: bar4,
             end: bar8,
             color: TrackColor::palette(5),
+            time_base: Default::default(),
         },
     ];
     p.markers = vec![Marker {
         id: p.ids.allocate(),
         position: bar4,
         name: "Lead In".into(),
+        time_base: Default::default(),
     }];
 
     // The master: a true-peak limiter.

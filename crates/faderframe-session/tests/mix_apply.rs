@@ -58,6 +58,7 @@ fn sine(p: &mut Project, name: &str, hz: f64, amp: f32, a: f64, b: f64) -> Track
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     t.clips.push(clip.id);

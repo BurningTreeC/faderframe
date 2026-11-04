@@ -48,6 +48,7 @@ fn sine(p: &mut Project, name: &str, hz: f64, amp: f32) -> TrackId {
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     t.clips.push(clip.id);
@@ -459,6 +460,7 @@ fn snares() -> (Session, TrackId, TrackId) {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         };
         t.clips.push(clip.id);

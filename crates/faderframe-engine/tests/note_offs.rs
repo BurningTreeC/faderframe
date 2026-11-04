@@ -263,6 +263,9 @@ fn chords(tp: &mut TestProject, track: TrackId, chords: &[(f64, f64, &[u8])]) {
                 channel: 0,
                 muted: false,
                 release: None,
+                time_locked: false,
+                articulation: None,
+                fine: None,
             });
         }
     }
@@ -282,6 +285,7 @@ fn chords(tp: &mut TestProject, track: TrackId, chords: &[(f64, f64, &[u8])]) {
                 controllers: Vec::new(),
                 expressions: Vec::new(),
                 sysex: Vec::new(),
+                articulations: Vec::new(),
             }),
         },
     );
@@ -407,6 +411,7 @@ fn what_missed_blocks_end_reaches_the_instrument_with_the_next() {
         let point = |q: f64, value: u16| ControllerPoint {
             time: MusicalTime::from_quarters(q),
             value,
+            fine: None,
         };
         m.controllers.push(ControllerLane {
             controller: MidiController::Cc { number: 64 },

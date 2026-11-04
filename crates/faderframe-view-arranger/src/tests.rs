@@ -2758,3 +2758,108 @@ fn a_clip_being_dragged_keeps_no_pictures_of_its_waveform() {
     assert!(s.project().clip(clip).unwrap().start > start, "it moved");
     assert!(kept_in_row(&mut view, &s) > 0, "kept again where it landed");
 }
+
+/// Files dragged from the media browser go where files dropped from
+/// outside go, as a placement the session matches to the project.
+#[test]
+fn files_from_the_browser_are_placed_where_they_are_dropped() {
+    let s = session();
+    let drums = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Drums")
+        .unwrap()
+        .id;
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let row = ArrangerView::lane_tracks(&s)
+        .iter()
+        .position(|t| t.id == drums)
+        .unwrap();
+    let y = view.row_rect(row, size).center().y;
+    let pos = Point::new(view.x_of(MusicalTime::from_quarters(16.0)) + 2.0, y);
+    let file = std::path::PathBuf::from("/samples/Loop 120.wav");
+    let payload = faderframe_session::browser::payload(std::slice::from_ref(&file));
+    let want = view.drop_target(pos, size, &s).unwrap();
+    let action = view.drop_payload(&payload, pos, size, &s).unwrap();
+    assert_eq!(
+        action,
+        Action::Browser(faderframe_session::browser::BrowserOp::Place {
+            files: vec![file],
+            track: want.0,
+            at: want.1,
+        })
+    );
+    assert_eq!(want.0, Some(drums));
+}
+
+/// A MIDI clip's menu and a MIDI track's open them in the score; with
+/// several tracks selected, the track's menu shows them all, a staff each.
+#[test]
+fn midi_clips_and_tracks_are_edited_as_notation_from_their_menus() {
+    use faderframe_session::score::{ScoreOf, ScoreOp};
+    let mut s = Session::new(
+        faderframe_project::Project::new("Notation", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let a = s.add_track(TrackKind::Instrument).unwrap();
+    let b = s.add_track(TrackKind::Midi).unwrap();
+    let q = MusicalTime::from_quarters;
+    for (id, track) in [(1, a), (2, b)] {
+        s.dispatch(Action::Edit(Command::AddClip {
+            clip: Box::new(Clip {
+                id: ClipId(id),
+                track,
+                name: format!("clip {id}"),
+                color: None,
+                start: q(0.0),
+                muted: false,
+                content: ClipContent::Midi(faderframe_project::MidiClip {
+                    length: q(4.0),
+                    ..Default::default()
+                }),
+            }),
+        }))
+        .unwrap();
+    }
+    let action = |req: HostRequest<Action>, label: &str| -> Option<Action> {
+        let HostRequest::ContextMenu { items, .. } = req else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.action)
+    };
+    let at = Point::new(10.0, 10.0);
+    let clip = s.project().clip(ClipId(1)).unwrap().clone();
+    assert_eq!(
+        action(ArrangerView::clip_menu(&s, &clip, at), "Edit as Notation"),
+        Some(Action::Score(ScoreOp::Show(ScoreOf::Clip(ClipId(1)))))
+    );
+    let track = s.project().track(a).unwrap().clone();
+    assert_eq!(
+        action(
+            ArrangerView::track_menu(&s, &track, at),
+            "Edit This Track as Notation"
+        ),
+        Some(Action::Score(ScoreOp::Show(ScoreOf::Tracks(vec![a]))))
+    );
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![b, a],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    assert_eq!(
+        action(
+            ArrangerView::track_menu(&s, &track, at),
+            "Edit the 2 Selected Tracks as Notation"
+        ),
+        Some(Action::Score(ScoreOp::Show(ScoreOf::Tracks(vec![a, b]))))
+    );
+}

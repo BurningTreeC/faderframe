@@ -10,6 +10,9 @@ use faderframe_project::{Impact, Project};
 use faderframe_realtime::Reclaimer;
 use faderframe_transport::TransportCommand;
 
+/// How long a render waits for ARA plug-ins' analyses.
+const ARA_SETTLE_SECONDS: u64 = 120;
+
 /// Drives an engine without an audio device.
 pub struct OfflineRenderer {
     pub controller: EngineController,
@@ -71,6 +74,14 @@ impl OfflineRenderer {
             },
         );
         controller.sync(project, sources, Impact::Graph)?;
+        // ARA plug-ins still analysing their sources would render them
+        // half-done.
+        if !controller
+            .plugins()
+            .settle_ara(std::time::Duration::from_secs(ARA_SETTLE_SECONDS))
+        {
+            tracing::warn!("an ARA plug-in is still analysing: rendering anyway");
+        }
         Ok(Self {
             controller,
             processor,

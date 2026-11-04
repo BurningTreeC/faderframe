@@ -35,6 +35,10 @@ const LANES: [MidiController; 11] = [
 impl PianoRollView {
     /// Follow the lane chosen in the editor settings.
     pub(crate) fn sync_lane(&mut self, model: &Session) {
+        if model.editor.piano.articulations {
+            self.lane = LaneKind::Articulation;
+            return;
+        }
         if let Some(k) = model.editor.piano.expression {
             self.lane = LaneKind::Expression(k);
             return;
@@ -496,12 +500,33 @@ impl PianoRollView {
                 }
             }
             (Tool::Pencil, None) => {
-                let start = self.snap_floor_rel(at, clip.start, model);
+                let row = self.key_at(pos.y);
+                // A drum sound with a grid of its own keeps to it.
+                let drum = self.drum_grid(model, row).filter(|_| model.editor.snap);
+                let start = match drum {
+                    Some(g) => {
+                        let meter = &model.project().timeline.meter;
+                        (faderframe_timeline::snap_floor(clip.start + at, g, meter) - clip.start)
+                            .max(MusicalTime::ZERO)
+                    }
+                    None => self.snap_floor_rel(at, clip.start, model),
+                };
                 if start >= m.length {
                     return true;
                 }
-                let key = self.scale_key(self.key_at(pos.y), clip.start + start, model);
-                let length = self.new_note_length(model, clip.start + start);
+                let key = if drum.is_some() || self.drum_rows {
+                    row
+                } else {
+                    self.scale_key(row, clip.start + start, model)
+                };
+                let length = match drum {
+                    Some(g) => {
+                        let meter = &model.project().timeline.meter;
+                        g.step(meter.signature_at(clip.start + start))
+                            .max(MusicalTime(1))
+                    }
+                    None => self.new_note_length(model, clip.start + start),
+                };
                 self.audition(model, clip, key, cx);
                 self.drag = Some(Drag::Draw { start, key, length });
             }
@@ -535,6 +560,16 @@ impl PianoRollView {
         (((area.bottom() - y) / area.h).clamp(0.0, 1.0) * max as f32).round() as u16
     }
 
+    /// The lane's height at `y` as 0…1.
+    fn lane_unit(area: Rect, y: f32) -> f64 {
+        f64::from(((area.bottom() - y) / area.h).clamp(0.0, 1.0))
+    }
+
+    /// A velocity at MIDI 2.0's 16 bits from the lane's height.
+    fn lane_velocity16(area: Rect, y: f32) -> u16 {
+        (Self::lane_unit(area, y) * 65535.0).round() as u16
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lane_press(
         &mut self,
@@ -559,7 +594,7 @@ impl PianoRollView {
                         self.drag = Some(Drag::Velocity {
                             note: *n,
                             origin_y: pos.y,
-                            value: n.velocity,
+                            value: n.velocity16(),
                         });
                     }
                     _ => {
@@ -577,6 +612,11 @@ impl PianoRollView {
                     line: mods.shift,
                     erase: mods.alt,
                 });
+            }
+            LaneKind::Articulation => {
+                if let Some((_, clip, m)) = Self::clip(model) {
+                    self.articulation_press(pos, area, clip, m, model, mods.shift, _cx);
+                }
             }
             LaneKind::Expression(k) => {
                 // The selected notes, else the notes sounding here.
@@ -725,9 +765,13 @@ impl PianoRollView {
                 origin_y,
                 value,
             }) => {
+                // At 16 bits: as far as the pointer moved (the 7-bit value
+                // never below 1).
                 let area = Self::lane_value_rect(l.lane);
-                let delta = (*origin_y - pos.y) / area.h.max(1.0) * 127.0;
-                *value = (note.velocity as f32 + delta).round().clamp(1.0, 127.0) as u8;
+                let delta = f64::from((*origin_y - pos.y) / area.h.max(1.0)) * 65535.0;
+                *value = (f64::from(note.velocity16()) + delta)
+                    .round()
+                    .clamp(512.0, 65535.0) as u16;
             }
             Some(Drag::VelocityLine { to, .. }) => *to = pos,
             Some(Drag::Controller {
@@ -935,22 +979,22 @@ impl PianoRollView {
                 }
             }
             Drag::Velocity { note, value, .. } => {
-                if value != note.velocity {
+                // At MIDI 2.0's resolution.
+                if value != note.velocity16() {
                     let sel = Self::selection_ids(m, model);
                     if sel.len() > 1 && sel.contains(&note.id) {
                         cx.emit(Action::NoteOperation {
                             clip: clip_id,
                             notes: sel,
-                            op: NoteOp::ScaleVelocity {
-                                factor: 1.0,
-                                offset: value as i32 - note.velocity as i32,
-                            },
+                            op: NoteOp::OffsetVelocity16(
+                                i32::from(value) - i32::from(note.velocity16()),
+                            ),
                         });
                     } else {
                         cx.emit(Action::NoteOperation {
                             clip: clip_id,
                             notes: vec![note.id],
-                            op: NoteOp::SetVelocity(value),
+                            op: NoteOp::SetVelocity16(value),
                         });
                     }
                 }
@@ -980,13 +1024,13 @@ impl PianoRollView {
                             ((x - a.x) / (b.x - a.x)).clamp(0.0, 1.0)
                         };
                         let y = a.y + (b.y - a.y) * t;
-                        Self::lane_value(area, y, 127).clamp(1, 127) as u8
+                        Self::lane_velocity16(area, y).max(512)
                     };
                     let (v0, v1) = (at(self.x_of(first.start)), at(self.x_of(last.start)));
                     cx.emit(Action::NoteOperation {
                         clip: clip_id,
                         notes: hits.iter().map(|n| n.id).collect(),
-                        op: NoteOp::RampVelocity { from: v0, to: v1 },
+                        op: NoteOp::RampVelocity16 { from: v0, to: v1 },
                     });
                 }
             }
@@ -1006,7 +1050,9 @@ impl PianoRollView {
                 let (range_from, range_to, pts) = if erase {
                     (ta, tb, Vec::new())
                 } else if line {
-                    // Straight line: a point every 1/64 note.
+                    // Straight line: a point every 1/64 note, its values
+                    // at MIDI 2.0's 32 bits between the ends' MIDI 1.0
+                    // values (programs have only those).
                     let step = MusicalTime::from_quarters(1.0 / 16.0);
                     let (va, vb) = if from.x <= to.x {
                         (
@@ -1019,19 +1065,29 @@ impl PianoRollView {
                             Self::lane_value(area, from.y, c.max()),
                         )
                     };
+                    let wide =
+                        |v: u16| f64::from(ControllerPoint::new(MusicalTime::ZERO, v).value32(c));
                     let n = ((tb - ta).ticks() / step.ticks().max(1)).max(1);
                     let pts = (0..=n)
-                        .map(|i| ControllerPoint {
-                            time: ta + MusicalTime(step.ticks() * i).min(tb - ta),
-                            value: (va as f64 + (vb as f64 - va as f64) * i as f64 / n as f64)
-                                .round() as u16,
+                        .map(|i| {
+                            let time = ta + MusicalTime(step.ticks() * i).min(tb - ta);
+                            let f = i as f64 / n as f64;
+                            if c.has_fine() {
+                                let v = wide(va) + (wide(vb) - wide(va)) * f;
+                                ControllerPoint::at32(time, c, v.round() as u32)
+                            } else {
+                                let v = va as f64 + (vb as f64 - va as f64) * f;
+                                ControllerPoint::new(time, v.round() as u16)
+                            }
                         })
                         .collect();
                     (ta, tb + MusicalTime(1), pts)
                 } else {
+                    // Drawn by hand: as fine as the lane's pixels, MIDI
+                    // 1.0's steps.
                     let mut pts: Vec<ControllerPoint> = points
                         .iter()
-                        .map(|&(time, value)| ControllerPoint { time, value })
+                        .map(|&(time, value)| ControllerPoint::new(time, value))
                         .collect();
                     pts.sort_by_key(|p| p.time);
                     let a = pts.first().map_or(ta, |p| p.time);
@@ -1146,13 +1202,31 @@ impl PianoRollView {
             Action::SetPianoRoll(PianoRollSettings {
                 lane,
                 expression: None,
+                articulations: false,
                 ..pr
             })
         };
         let mut items = vec![
             MenuItem::new("Velocity", set(None))
-                .checked(pr.lane.is_none() && pr.expression.is_none()),
+                .checked(pr.lane.is_none() && pr.expression.is_none() && !pr.articulations),
         ];
+        // The track's articulations (with its articulation map).
+        let mapped = model.editor_articulation_map().is_some();
+        items.push(
+            MenuItem::new(
+                if mapped {
+                    "Articulations"
+                } else {
+                    "Articulations (choose a map in the track's menu)"
+                },
+                Action::SetPianoRoll(PianoRollSettings {
+                    articulations: true,
+                    expression: None,
+                    ..pr
+                }),
+            )
+            .checked(pr.articulations),
+        );
         // Per-note expression: native for plugins, pitch/pressure/timbre
         // also over MPE.
         let mpe = model
@@ -1173,10 +1247,11 @@ impl PianoRollView {
                 label,
                 Action::SetPianoRoll(PianoRollSettings {
                     expression: Some(k),
+                    articulations: false,
                     ..pr
                 }),
             )
-            .checked(pr.expression == Some(k));
+            .checked(!pr.articulations && pr.expression == Some(k));
             items.push(if i == 0 { item.separated() } else { item });
         }
         if let Some(track) = model.project().clip(clip).map(|c| c.track)
@@ -1285,6 +1360,17 @@ impl PianoRollView {
         items.push(op("Double Length", NoteOp::ScaleLength(2.0)).separated());
         items.push(op("Half Length", NoteOp::ScaleLength(0.5)));
         items.push(op("Mute / Unmute (M)", NoteOp::ToggleMuted).separated());
+        // Placed in time: tempo changes keep them where they sound (a hit
+        // inside a musical cue); checked when every one is.
+        let locked = Self::clip(model).is_some_and(|(_, _, m)| {
+            let mut picked = m
+                .notes
+                .iter()
+                .filter(|n| notes.is_empty() || notes.contains(&n.id))
+                .peekable();
+            picked.peek().is_some() && picked.all(|n| n.time_locked)
+        });
+        items.push(op("Lock to Time", NoteOp::ToggleTimeLocked).checked(locked));
         // The channel the notes play on (checked when they share one).
         let shared = Self::clip(model).and_then(|(_, _, m)| {
             let mut picked = m
@@ -1334,6 +1420,11 @@ impl PianoRollView {
                 notes: notes.clone(),
             },
         ));
+        // The articulation they carry (with the track's articulation map).
+        let articulations = Self::articulation_items(model, clip, &notes);
+        if !articulations.is_empty() {
+            items.push(MenuItem::submenu("Articulation", articulations).separated());
+        }
         items.push(MenuItem::new("Delete", Action::RemoveNotes { clip, notes }).separated());
         HostRequest::ContextMenu { at, items }
     }
@@ -1349,6 +1440,10 @@ impl PianoRollView {
             return false;
         };
         let l = self.layout(size);
+        if l.lane.contains(pos) && self.lane == LaneKind::Articulation {
+            cx.request(self.articulation_menu(pos, c, m, model));
+            return true;
+        }
         if l.lane.contains(pos) || l.lane_header.contains(pos) {
             cx.request(self.lane_menu(pos, clip, m, model));
             return true;
@@ -1711,6 +1806,12 @@ impl PianoRollView {
                     "{}: drag to draw · Shift-drag: line · Alt-drag: erase",
                     c.label()
                 ),
+                LaneKind::Articulation => match model.editor_articulation_map() {
+                    Some(map) => {
+                        self.articulation_tooltip(Self::lane_value_rect(l.lane), pos.y, map)
+                    }
+                    None => "No articulation map: choose one in the track's menu".into(),
+                },
                 LaneKind::Expression(k) => format!(
                     "{} {} · per note: the selected notes (else those under the pointer) · drag to draw · Shift-drag: line · Alt-drag: erase",
                     k.label(),
@@ -1724,6 +1825,27 @@ impl PianoRollView {
         }
         if l.keys.contains(pos) {
             let key = self.key_at(pos.y);
+            if self.drum_rows
+                && let Some(sound) = model.editor_drum_map().and_then(|d| d.sound(key))
+            {
+                let (ch, out) = sound.output(0);
+                let mut text = format!("{} ({})", sound.name, note_name(key));
+                if !sound.plays_as_written() {
+                    text.push_str(&format!(
+                        " · plays {} on channel {}",
+                        note_name(out),
+                        ch + 1
+                    ));
+                }
+                if let Some(port) = &sound.port {
+                    text.push_str(&format!(
+                        " · to {}",
+                        faderframe_project::midi_port_display(port)
+                    ));
+                }
+                text.push_str(" · click to listen · Shift/Ctrl-click selects its notes");
+                return Some(text);
+            }
             return Some(format!(
                 "{} · click to listen · Shift/Ctrl-click selects the pitch",
                 note_name(key)
@@ -1734,11 +1856,19 @@ impl PianoRollView {
         }
         match self.note_at(m, pos) {
             Some((n, _)) => Some(format!(
-                "{} · velocity {} · {}{}",
+                "{} · velocity {} · {}{}{}",
                 note_name(n.key),
-                n.velocity,
+                n.velocity_text(),
                 model.project().timeline.format_bbt(clip.start + n.start),
-                if n.muted { " · muted" } else { "" }
+                if n.muted { " · muted" } else { "" },
+                if n.time_locked {
+                    format!(
+                        " · locked to time at {}",
+                        Self::time_of(model, clip.start + n.start)
+                    )
+                } else {
+                    String::new()
+                }
             )),
             None => Some(match self.tool {
                 Tool::Pointer => format!(

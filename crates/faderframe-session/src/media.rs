@@ -160,6 +160,10 @@ struct LoaderState {
         Arc<StreamSource>,
         Arc<faderframe_engine::nodes::CompareShared>,
     )>,
+    /// Offsets (file frames) from where the compare source plays to other
+    /// places in it kept resident too: the side of an Audio Bisect pair not
+    /// heard, so a flip lands on pages already there.
+    compare_also: Vec<i64>,
 }
 
 struct LoaderShared {
@@ -188,6 +192,7 @@ impl DiskLoader {
                 sample_rate,
                 preview: None,
                 compare: None,
+                compare_also: Vec::new(),
             }),
             wake: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -216,7 +221,7 @@ impl DiskLoader {
             // Every engine of a session shares one epoch (see
             // `faderframe_engine::create_with_epoch`), so retired pages stay
             // valid across engine replacement.
-            let (plan, engine, loop_range, rate, preview, compare) = {
+            let (plan, engine, loop_range, rate, preview, compare, also) = {
                 let Ok(guard) = shared.state.lock() else {
                     return;
                 };
@@ -228,6 +233,7 @@ impl DiskLoader {
                     st.sample_rate,
                     st.preview.clone(),
                     st.compare.clone(),
+                    st.compare_also.clone(),
                 )
             };
             if let Some((src, wants)) = &compare {
@@ -242,6 +248,11 @@ impl DiskLoader {
                 if let Some((a, _)) = loop_range {
                     frames.extend(wants.file_frame_at(a));
                 }
+                let elsewhere: Vec<i64> = frames
+                    .iter()
+                    .flat_map(|f| also.iter().map(move |o| f + o))
+                    .collect();
+                frames.extend(elsewhere);
                 let mut keep = Vec::with_capacity(frames.len());
                 for f in frames {
                     let range = src.page_range(f - PAGE_FRAMES as i64, f + ahead);
@@ -353,16 +364,18 @@ impl DiskLoader {
     }
 
     /// Keep the compare source's pages resident round where it plays (or
-    /// stop).
+    /// stop), and round the places `also` frames from there.
     pub fn set_compare(
         &self,
         compare: Option<(
             Arc<StreamSource>,
             Arc<faderframe_engine::nodes::CompareShared>,
         )>,
+        also: Vec<i64>,
     ) {
         if let Ok(mut st) = self.shared.state.lock() {
             st.compare = compare;
+            st.compare_also = also;
         }
         self.shared.wake.notify_all();
     }
@@ -408,6 +421,8 @@ pub type ImportResult = Result<ImportedAudio, (PathBuf, ImportError)>;
 
 pub struct ImportJob {
     pub target: ImportTarget,
+    /// Ambisonic files (each onto a new track of its order).
+    pub ambisonic: Option<crate::ambix::AmbiFile>,
     pub progress: Arc<JobProgress>,
     pub names: Vec<String>,
     handle: Option<JoinHandle<Vec<ImportResult>>>,
@@ -415,6 +430,28 @@ pub struct ImportJob {
 
 impl ImportJob {
     pub fn spawn(files: Vec<PathBuf>, dest: PathBuf, rate: u32, target: ImportTarget) -> Self {
+        Self::spawn_as(files, dest, rate, target, None)
+    }
+
+    /// Ambisonic files of `kind` (FuMa converted to AmbiX on the job's
+    /// thread, its waveform made again).
+    pub fn spawn_ambisonic(
+        files: Vec<PathBuf>,
+        dest: PathBuf,
+        rate: u32,
+        target: ImportTarget,
+        kind: crate::ambix::AmbiFile,
+    ) -> Self {
+        Self::spawn_as(files, dest, rate, target, Some(kind))
+    }
+
+    fn spawn_as(
+        files: Vec<PathBuf>,
+        dest: PathBuf,
+        rate: u32,
+        target: ImportTarget,
+        ambisonic: Option<crate::ambix::AmbiFile>,
+    ) -> Self {
         let progress = Arc::new(JobProgress::default());
         progress.total.store(files.len(), Ordering::Relaxed);
         let names = files
@@ -433,6 +470,21 @@ impl ImportJob {
                     p.index.store(i, Ordering::Relaxed);
                     p.file.done.store(0, Ordering::Relaxed);
                     match import_file(f, &dest, rate, &p.file, &p.cancel) {
+                        Ok(mut a) if ambisonic == Some(crate::ambix::AmbiFile::FuMa) => {
+                            let converted = crate::ambix::fuma_to_ambix(&a.path)
+                                .and_then(|()| build_peaks(&a.path));
+                            match converted {
+                                Ok(peaks) => {
+                                    a.peaks = peaks;
+                                    out.push(Ok(a));
+                                }
+                                Err(e) => {
+                                    let _ = std::fs::remove_file(&a.path);
+                                    let _ = std::fs::remove_file(&a.peaks_path);
+                                    out.push(Err((f.clone(), ImportError::Io(e))));
+                                }
+                            }
+                        }
                         Ok(a) => out.push(Ok(a)),
                         Err(ImportError::Cancelled) => break,
                         Err(e) => out.push(Err((f.clone(), e))),
@@ -443,6 +495,7 @@ impl ImportJob {
             .ok();
         Self {
             target,
+            ambisonic,
             progress,
             names,
             handle,

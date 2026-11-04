@@ -6,9 +6,12 @@
 //! the arrangement again, "Record to Arrangement" writes what is launched
 //! into it. Clips drag between slots (Ctrl copies); a double click on an
 //! empty slot of a MIDI or instrument track makes a clip, on a MIDI clip
-//! opens it in the piano roll.
+//! opens it in the piano roll. Screen readers and the keyboard: see
+//! [`access`].
 
 #![forbid(unsafe_code)]
+
+mod access;
 
 use faderframe_core::{ClipId, SceneId, TrackId};
 use faderframe_project::launcher::{
@@ -18,8 +21,8 @@ use faderframe_project::{Clip, ClipContent, Track, TrackColor, TrackKind};
 use faderframe_session::launcher::LauncherOp;
 use faderframe_session::{Action, SelectMode, Session};
 use faderframe_ui_canvas::{
-    Color, Cursor, EventCx, HostRequest, MenuItem, Painter, Path, Point, PointerButton, Rect,
-    ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, Color, Cursor, EventCx, HostRequest, MenuItem, Painter, Path, Point,
+    PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 
 const TOOLBAR_H: f32 = 34.0;
@@ -71,6 +74,8 @@ pub struct LauncherView {
     drop_hover: Option<Point>,
     /// The slot whose launch button is held (let go: a release).
     pressed: Option<SlotKey>,
+    /// What screen readers were last told (launches, stops, recordings).
+    seen: Option<access::Seen>,
 }
 
 fn color_of(c: TrackColor) -> Color {
@@ -87,6 +92,7 @@ impl LauncherView {
             drag: None,
             pressed: None,
             drop_hover: None,
+            seen: None,
         }
     }
 
@@ -666,6 +672,13 @@ impl LauncherView {
                     )),
                     None => items.push(MenuItem::disabled("Duplicate Below")),
                 }
+                // Where a drag takes it, from the menu (the keyboard).
+                let from = SlotKey { track, scene };
+                items.extend(
+                    [false, true]
+                        .into_iter()
+                        .filter_map(|copy| Self::move_menu(model, from, copy)),
+                );
                 items.push(MenuItem::new(
                     "Delete",
                     l(LauncherOp::ClearSlot { track, scene }),
@@ -685,6 +698,58 @@ impl LauncherView {
             }
         }
         items
+    }
+
+    /// Move To / Copy To: the slots of every track that can hold the
+    /// clip, by track and scene (one with a clip of its own: replaced).
+    fn move_menu(model: &Session, from: SlotKey, copy: bool) -> Option<MenuItem<Action>> {
+        let p = model.project();
+        let clip = p.clip(*p.launcher.slots.get(&from)?)?;
+        let midi = is_midi(clip);
+        let tracks: Vec<MenuItem<Action>> = Self::tracks(model)
+            .into_iter()
+            .filter(|t| {
+                if midi {
+                    matches!(t.kind, TrackKind::Instrument | TrackKind::Midi)
+                } else {
+                    t.kind == TrackKind::Audio
+                }
+            })
+            .filter_map(|t| {
+                let scenes: Vec<MenuItem<Action>> = p
+                    .launcher
+                    .scenes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        (
+                            i,
+                            s,
+                            SlotKey {
+                                track: t.id,
+                                scene: s.id,
+                            },
+                        )
+                    })
+                    .filter(|(.., to)| *to != from)
+                    .map(|(i, s, to)| {
+                        let taken = p.launcher.slots.contains_key(&to);
+                        MenuItem::new(
+                            format!(
+                                "{}. {}{}",
+                                i + 1,
+                                s.name,
+                                if taken { " (replaces its clip)" } else { "" }
+                            ),
+                            Action::Launcher(LauncherOp::MoveClip { from, to, copy }),
+                        )
+                    })
+                    .collect();
+                (!scenes.is_empty()).then(|| MenuItem::submenu(t.name.clone(), scenes))
+            })
+            .collect();
+        (!tracks.is_empty())
+            .then(|| MenuItem::submenu(if copy { "Copy To" } else { "Move To" }, tracks))
     }
 
     /// A slot's launch settings: mode, quantisation, legato.
@@ -959,6 +1024,38 @@ impl LauncherView {
         });
     }
 
+    /// The menu of what is at a place (a right-click, the Menu key).
+    fn menu_for(&self, hit: Hit, model: &Session) -> Option<Vec<MenuItem<Action>>> {
+        Some(match hit {
+            Hit::Slot { track, scene, .. } => self.slot_menu(model, track, scene),
+            Hit::SceneLaunch(s) | Hit::SceneName(s) => Self::scene_menu(model, s),
+            Hit::Quantize => Self::quantize_menu(model),
+            Hit::TrackStop(t) => {
+                let mut items = vec![MenuItem::new(
+                    "Stop Track",
+                    Action::Launcher(LauncherOp::StopTrack(t)),
+                )];
+                items.extend(Self::learn_items(
+                    model,
+                    faderframe_project::MappingTarget::LauncherStop { track: Some(t) },
+                ));
+                items
+            }
+            Hit::StopAll => {
+                let mut items = vec![MenuItem::new(
+                    "Stop All Clips",
+                    Action::Launcher(LauncherOp::StopAll),
+                )];
+                items.extend(Self::learn_items(
+                    model,
+                    faderframe_project::MappingTarget::LauncherStop { track: None },
+                ));
+                items
+            }
+            _ => return None,
+        })
+    }
+
     fn quantize_menu(model: &Session) -> Vec<MenuItem<Action>> {
         let launcher = &model.project().launcher;
         let now = launcher.quantize;
@@ -1021,6 +1118,29 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
         self.theme = theme.clone();
     }
 
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Clip Launcher".into())
+    }
+
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        self.press(id, press, size, model, cx)
+    }
+
+    fn access_news(&mut self, model: &Session) -> Vec<String> {
+        self.news(model)
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
         self.theme = theme.clone();
         self.clamp(size, model);
@@ -1075,7 +1195,10 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
         _model: &Session,
     ) -> bool {
         let at = payload
-            .filter(|(p, _)| faderframe_session::launcher::parse_clips_payload(p).is_some())
+            .filter(|(p, _)| {
+                faderframe_session::launcher::parse_clips_payload(p).is_some()
+                    || faderframe_session::browser::parse_payload(p).is_some()
+            })
             .map(|(_, at)| at);
         let changed = at != self.drop_hover;
         self.drop_hover = at;
@@ -1090,6 +1213,19 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
         model: &Session,
     ) -> Option<Action> {
         self.drop_hover = None;
+        // Sounds from the media browser: into the slot (and those below).
+        if let Some(files) = faderframe_session::browser::parse_payload(payload) {
+            return match self.hit(pos, size, model)? {
+                Hit::Slot { track, scene, .. } => Some(Action::Browser(
+                    faderframe_session::browser::BrowserOp::ToLauncher {
+                        files,
+                        track,
+                        scene,
+                    },
+                )),
+                _ => None,
+            };
+        }
         let clips = faderframe_session::launcher::parse_clips_payload(payload)?;
         match self.hit(pos, size, model)? {
             Hit::Slot { track, scene, .. } => Some(Action::Launcher(LauncherOp::PlaceClips {
@@ -1225,33 +1361,11 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for LauncherView {
                 button: PointerButton::Secondary,
                 ..
             } => {
-                let items = match self.hit(pos, size, model) {
-                    Some(Hit::Slot { track, scene, .. }) => self.slot_menu(model, track, scene),
-                    Some(Hit::SceneLaunch(s) | Hit::SceneName(s)) => Self::scene_menu(model, s),
-                    Some(Hit::Quantize) => Self::quantize_menu(model),
-                    Some(Hit::TrackStop(t)) => {
-                        let mut items = vec![MenuItem::new(
-                            "Stop Track",
-                            Action::Launcher(LauncherOp::StopTrack(t)),
-                        )];
-                        items.extend(Self::learn_items(
-                            model,
-                            faderframe_project::MappingTarget::LauncherStop { track: Some(t) },
-                        ));
-                        items
-                    }
-                    Some(Hit::StopAll) => {
-                        let mut items = vec![MenuItem::new(
-                            "Stop All Clips",
-                            Action::Launcher(LauncherOp::StopAll),
-                        )];
-                        items.extend(Self::learn_items(
-                            model,
-                            faderframe_project::MappingTarget::LauncherStop { track: None },
-                        ));
-                        items
-                    }
-                    _ => return false,
+                let Some(items) = self
+                    .hit(pos, size, model)
+                    .and_then(|hit| self.menu_for(hit, model))
+                else {
+                    return false;
                 };
                 cx.request(HostRequest::ContextMenu { at: pos, items });
                 true

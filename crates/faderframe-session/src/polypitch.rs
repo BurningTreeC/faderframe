@@ -1,11 +1,13 @@
 //! Polyphonic pitch editing in the session (the Pitch editor's
 //! Polyphonic option, on by default).
 //!
-//! Detection: the clip's audio (its original source: a render is never
+//! Detection ([`hear_notes`], which lead sheets hear their audio with
+//! too): the clip's audio (its original source: a render is never
 //! analysed again) through the transcription model (`to_midi::harmony`:
-//! every note, chords too) and each note followed to its pitch frame by
-//! frame (`faderframe_polypitch::pitch_tracks`) — a [`PitchEdit`] whose
-//! notes may overlap, marked [`Polyphonic`], in one "Detect Pitch" step.
+//! every note, chords too), overtones of louder notes dropped, and each
+//! note followed to its pitch frame by frame
+//! (`faderframe_polypitch::follow`) — a [`PitchEdit`] whose notes may
+//! overlap, marked [`Polyphonic`], in one "Detect Pitch" step.
 //!
 //! Playback: the clip plays a render of its original with the notes moved
 //! (`faderframe_polypitch::render`), made on a worker once an edit has
@@ -14,10 +16,10 @@
 //! back notes and audio together (they are one clip content), and where
 //! they no longer agree the session renders again.
 
-use crate::to_midi::harmony;
+use crate::to_midi::{Found, harmony};
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_core::{AudioSourceId, ClipId};
-use faderframe_polypitch::{Heard, Moved, pitch_tracks};
+use faderframe_polypitch::{Heard, Moved, follow};
 use faderframe_project::pitch::{PitchEdit, PitchNote, Polyphonic, UNVOICED};
 use faderframe_project::{AudioSource, ClipContent, Command, SourceSpec};
 use std::collections::HashMap;
@@ -134,6 +136,66 @@ fn median(v: &[f32]) -> Option<f32> {
     Some(f[f.len() / 2])
 }
 
+/// A note the polyphonic detection heard.
+pub(crate) struct HeardNote {
+    /// As transcribed: seconds into the part listened to, key, velocity.
+    pub(crate) found: Found,
+    /// Where it sounds in the whole recording (its frames).
+    pub(crate) from: i64,
+    pub(crate) to: i64,
+    /// Its pitch (MIDI, the median of `track`).
+    pub(crate) pitch: f32,
+    /// Its pitch and its harmonics' level every [`Hearing::hop`] frames
+    /// from `from` (NaN, 0: not heard there).
+    pub(crate) track: Vec<f32>,
+    pub(crate) level: Vec<f32>,
+}
+
+/// What the polyphonic detection heard in a part of a recording.
+pub(crate) struct Hearing {
+    /// Frames between pitch frames.
+    pub(crate) hop: usize,
+    pub(crate) notes: Vec<HeardNote>,
+}
+
+/// Every note of `mono[lo..hi]` (`rate` Hz), chords too: the transcription
+/// model's notes, overtones of louder notes dropped, notes shorter than
+/// [`SHORTEST`] dropped, each followed to its pitch every [`HOP_SECONDS`]
+/// in the whole recording; notes never heard while followed are left out.
+/// None: the audio could not be transcribed.
+pub(crate) fn hear_notes(mono: &[f32], rate: f64, lo: usize, hi: usize) -> Option<Hearing> {
+    let (lo, hi) = (lo.min(mono.len()), hi.clamp(lo.min(mono.len()), mono.len()));
+    let mut found = harmony(&mono[lo..hi], rate)?;
+    drop_overtones(&mut found);
+    found.retain(|n| n.end - n.start >= SHORTEST);
+    let heard: Vec<Heard> = found
+        .iter()
+        .map(|n| Heard {
+            start: lo as i64 + (n.start * rate) as i64,
+            end: lo as i64 + (n.end * rate) as i64,
+            key: f32::from(n.key),
+        })
+        .collect();
+    let hop = ((HOP_SECONDS * rate).round() as usize).max(1);
+    let followed = follow(mono, rate, &heard, hop);
+    let notes = found
+        .into_iter()
+        .zip(&heard)
+        .zip(followed)
+        .filter_map(|((found, h), f)| {
+            Some(HeardNote {
+                found,
+                from: h.start,
+                to: h.end,
+                pitch: median(&f.pitch)?,
+                track: f.pitch,
+                level: f.level,
+            })
+        })
+        .collect();
+    Some(Hearing { hop, notes })
+}
+
 impl Session {
     /// Find every note of `clips` (polyphonic; on workers, placed when
     /// done).
@@ -169,27 +231,16 @@ impl Session {
                     let scale = rate / project_rate;
                     let lo = ((offset as f64 * scale) as usize).min(mono.len());
                     let hi = (((offset + span) as f64 * scale) as usize).clamp(lo, mono.len());
-                    let mut found = harmony(&mono[lo..hi], rate)?;
-                    drop_overtones(&mut found);
-                    let heard: Vec<Heard> = found
-                        .iter()
-                        .filter(|n| n.end - n.start >= SHORTEST)
-                        .map(|n| Heard {
-                            start: lo as i64 + (n.start * rate) as i64,
-                            end: lo as i64 + (n.end * rate) as i64,
-                            key: f32::from(n.key),
-                        })
-                        .collect();
-                    let hop = ((HOP_SECONDS * rate).round() as usize).max(1);
-                    let tracks = pitch_tracks(&mono, rate, &heard, hop);
+                    let heard = hear_notes(&mono, rate, lo, hi)?;
                     // Into project-rate source frames.
-                    let hop_p = ((hop as f64 / scale).round() as u32).max(1);
+                    let hop_p = ((heard.hop as f64 / scale).round() as u32).max(1);
                     let mut notes: Vec<PitchNote> = heard
-                        .iter()
-                        .zip(tracks)
-                        .filter_map(|(h, t)| {
-                            let pitch = median(&t)?;
-                            let curve = t
+                        .notes
+                        .into_iter()
+                        .map(|h| {
+                            let pitch = h.pitch;
+                            let curve = h
+                                .track
                                 .iter()
                                 .map(|v| {
                                     if v.is_finite() && (v - pitch).abs() < 3.0 {
@@ -199,9 +250,9 @@ impl Session {
                                     }
                                 })
                                 .collect();
-                            Some(PitchNote {
-                                start: (h.start as f64 / scale).round() as i64,
-                                end: (h.end as f64 / scale).round() as i64,
+                            PitchNote {
+                                start: (h.from as f64 / scale).round() as i64,
+                                end: (h.to as f64 / scale).round() as i64,
                                 pitch,
                                 shift: 0.0,
                                 drift: 0.0,
@@ -210,7 +261,7 @@ impl Session {
                                 gain_db: 0.0,
                                 muted: false,
                                 timing: None,
-                            })
+                            }
                         })
                         .collect();
                     notes.sort_by_key(|n| (n.start, (n.pitch * 100.0) as i64));

@@ -71,6 +71,9 @@ fn clip(tp: &mut TestProject, track: TrackId, keys: &[u8], quarters: f64) {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         })
         .collect();
     let id = tp.project.ids.allocate();
@@ -89,6 +92,7 @@ fn clip(tp: &mut TestProject, track: TrackId, keys: &[u8], quarters: f64) {
                 controllers: Vec::new(),
                 expressions: Vec::new(),
                 sysex: Vec::new(),
+                articulations: Vec::new(),
             }),
         },
     );

@@ -1,0 +1,22 @@
+[package]
+name = "faderframe-view-maps"
+description = "Map editor: articulation maps and drum maps, edited row by row"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-core.workspace = true
+faderframe-midi.workspace = true
+faderframe-timeline.workspace = true
+faderframe-project.workspace = true
+faderframe-session.workspace = true
+faderframe-ui-canvas.workspace = true
+
+[dev-dependencies]
+faderframe-engine.workspace = true

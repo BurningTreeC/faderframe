@@ -262,9 +262,9 @@ impl ChannelOverviewView {
     /// Whether the channel block's pan reads as one position to type.
     fn pans(model: &Session, t: &Track) -> bool {
         t.kind.has_audio()
-            && !matches!(t.layout, faderframe_core::ChannelLayout::Surround(_))
+            && !t.layout.is_spatial()
             && !model.project().dual_panned(t)
-            && model.project().surround_panned(t).is_none()
+            && model.project().spatially_panned(t).is_none()
     }
 
     /// The gap a dragged card would land in (between which cards).
@@ -683,8 +683,12 @@ impl ChannelOverviewView {
             String::new()
         } else if let faderframe_core::ChannelLayout::Surround(f) = t.layout {
             format!("Bed  {}", f.name())
+        } else if let faderframe_core::ChannelLayout::Ambisonic(o) = t.layout {
+            format!("Field  {}", o.short_name())
         } else if model.project().surround_panned(t).is_some() {
             "Pan  surround".into()
+        } else if model.project().ambisonic_panned(t).is_some() {
+            "Pan  ambisonic".into()
         } else if model.project().dual_panned(t) {
             let d = model.shown_dual_pan(t);
             format!("Pan  {} / {}", format_pan(d.left), format_pan(d.right))

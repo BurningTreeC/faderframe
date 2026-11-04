@@ -4,13 +4,16 @@
 //! channel pressure, polyphonic key pressure, program changes), per-note
 //! expression points and SysEx (its bytes) — each editable by field, added
 //! and removed, one undo step each; and the channel of whole clips set at
-//! once (their notes and their controller lanes).
+//! once (their notes and their controller lanes). Velocities and controller
+//! values keep MIDI 2.0's resolution: rows show it as a fraction of MIDI
+//! 1.0's steps ([`EventRow::fine`]), [`EventValue::Fine`] sets it.
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ClipId, NoteId};
 use faderframe_project::{
     ClipContent, Command, ControllerLane, ControllerPoint, ExpressionKind, ExpressionPoint,
-    MidiClip, MidiController, MidiNote, NoteExpression, SysexEvent,
+    MidiClip, MidiController, MidiNote, NoteExpression, SysexEvent, velocity_of_steps,
+    velocity_steps,
 };
 use faderframe_timeline::MusicalTime;
 
@@ -35,6 +38,8 @@ pub enum EventRef {
     },
     /// A SysEx message by its place among the clip's (they are sorted).
     Sysex(usize),
+    /// An articulation direction by its place in the clip's lane (sorted).
+    Articulation(usize),
 }
 
 /// What an event is.
@@ -44,6 +49,8 @@ pub enum EventKind {
     Controller(MidiController),
     Expression(ExpressionKind),
     Sysex,
+    /// An articulation direction (the articulation lane).
+    Articulation,
 }
 
 /// One row of the list.
@@ -68,6 +75,16 @@ pub struct EventRow {
     pub muted: bool,
     /// A SysEx message.
     pub bytes: Vec<u8>,
+    /// A note placed in time (`MidiNote::time_locked`).
+    pub time_locked: bool,
+    /// A note's articulation (an attribute) or a direction's.
+    pub articulation: Option<faderframe_project::articulation::ArticulationId>,
+    /// `data2` with MIDI 2.0's resolution, when the event has it: in MIDI
+    /// 1.0 steps with a fraction (a velocity of 100.5; a pitch bend of
+    /// 8192.25).
+    pub fine: Option<f64>,
+    /// The release velocity likewise.
+    pub release_fine: Option<f64>,
 }
 
 /// What an edit changes.
@@ -88,6 +105,8 @@ pub enum EventField {
     Muted,
     /// A SysEx message's bytes.
     Bytes,
+    /// A note placed in time (0 or 1; see `faderframe_project::time_lock`).
+    TimeLocked,
 }
 
 /// The value an edit sets.
@@ -100,6 +119,9 @@ pub enum EventValue {
     Amount(f32),
     /// A whole SysEx message, `F0 … F7`.
     Bytes(Vec<u8>),
+    /// A velocity or controller value at MIDI 2.0's resolution: MIDI 1.0
+    /// steps with a fraction (see [`EventRow::fine`]).
+    Fine(f64),
 }
 
 /// What a new event is.
@@ -229,6 +251,11 @@ fn edit_event(
         EventValue::Number(n) => Some(*n),
         _ => None,
     };
+    let fine = match value {
+        EventValue::Fine(v) => Some(*v),
+        _ => None,
+    };
+    let up = |v: i64| faderframe_midi::ump::scale_up(v.clamp(0, 127) as u32, 7, 16) as u16;
     let time = match value {
         EventValue::Time(t) => Some(*t),
         _ => None,
@@ -246,11 +273,21 @@ fn edit_event(
                 }
                 (EventField::Channel, Some(c), _) => n.channel = c.clamp(0, 15) as u8,
                 (EventField::Data1, Some(k), _) => n.key = k.clamp(0, 127) as u8,
-                (EventField::Data2, Some(v), _) => n.velocity = v.clamp(1, 127) as u8,
+                // Whole steps at seven bits; a fraction at 16.
+                (EventField::Data2, Some(v), _) => n.set_velocity16(up(v.clamp(1, 127))),
+                (EventField::Data2, None, None) => match fine {
+                    Some(v) => n.set_velocity16(velocity_of_steps(v).max(512)),
+                    None => return,
+                },
                 (EventField::Release, Some(v), _) => {
-                    n.release = (v >= 0).then(|| v.min(127) as u8);
+                    n.set_release16((v >= 0).then(|| up(v)));
                 }
+                (EventField::Release, None, None) => match fine {
+                    Some(v) => n.set_release16(Some(velocity_of_steps(v.max(0.0)))),
+                    None => return,
+                },
                 (EventField::Muted, Some(v), _) => n.muted = v != 0,
+                (EventField::TimeLocked, Some(v), _) => n.time_locked = v != 0,
                 _ => return,
             }
             m.notes.sort_by_key(|n| (n.start, n.key));
@@ -279,7 +316,12 @@ fn edit_event(
                 },
                 (EventField::Data2, Some(v), _) => {
                     point.value = v.clamp(0, i64::from(to_controller.max())) as u16;
+                    point.fine = None;
                 }
+                (EventField::Data2, None, None) => match fine {
+                    Some(v) => point = ControllerPoint::of_steps(point.time, to_controller, v),
+                    None => return,
+                },
                 _ => return,
             }
             m.lane_mut(controller, channel).points.remove(i);
@@ -330,6 +372,18 @@ fn edit_event(
             }
             m.sysex.sort_by_key(|s| s.time);
         }
+        EventRef::Articulation(i) => {
+            if i >= m.articulations.len() {
+                return;
+            }
+            match (field, value) {
+                (EventField::Position, EventValue::Time(t)) => {
+                    m.articulations[i].time = (*t - start).max(MusicalTime::ZERO);
+                }
+                _ => return,
+            }
+            m.articulations.sort_by_key(|e| e.time);
+        }
     }
 }
 
@@ -379,6 +433,10 @@ impl Session {
             release: None,
             muted: false,
             bytes: Vec::new(),
+            time_locked: false,
+            articulation: None,
+            fine: None,
+            release_fine: None,
         };
         let mut rows: Vec<(u8, EventRow)> = Vec::new();
         for n in &m.notes {
@@ -388,9 +446,21 @@ impl Session {
                     channel: Some(n.channel),
                     data1: Some(u16::from(n.key)),
                     data2: Some(u16::from(n.velocity)),
+                    fine: n
+                        .has_fine_velocity()
+                        .then(|| velocity_steps(n.velocity16())),
+                    release_fine: n
+                        .release
+                        .zip(n.release16())
+                        .filter(|&(r, v)| {
+                            v != faderframe_midi::ump::scale_up(u32::from(r), 7, 16) as u16
+                        })
+                        .map(|(_, v)| velocity_steps(v)),
                     length: Some(n.length),
                     release: n.release,
                     muted: n.muted,
+                    time_locked: n.time_locked,
+                    articulation: n.articulation,
                     ..row(EventRef::Note(n.id), EventKind::Note, start + n.start)
                 },
             ));
@@ -432,6 +502,7 @@ impl Session {
                             _ => None,
                         },
                         data2: Some(p.value),
+                        fine: p.fine_of(lane.controller).map(|_| p.steps(lane.controller)),
                         ..row(
                             EventRef::Controller {
                                 controller: lane.controller,
@@ -454,7 +525,22 @@ impl Session {
                 },
             ));
         }
-        rows.sort_by_key(|(order, r)| (r.at, *order, r.data1));
+        // Articulation directions first at their time (they switch before
+        // the notes there).
+        for (i, e) in m.articulations.iter().enumerate() {
+            rows.push((
+                0,
+                EventRow {
+                    articulation: Some(e.articulation),
+                    ..row(
+                        EventRef::Articulation(i),
+                        EventKind::Articulation,
+                        start + e.time,
+                    )
+                },
+            ));
+        }
+        rows.sort_by_key(|(order, r)| (r.at, *order, r.kind != EventKind::Articulation, r.data1));
         rows.into_iter().map(|(_, r)| r).collect()
     }
 
@@ -513,7 +599,7 @@ impl Session {
                         x.curve_mut(kind).retain(|p| p.time != time);
                     }
                 }
-                EventRef::Note(_) | EventRef::Sysex(_) => {}
+                EventRef::Note(_) | EventRef::Sysex(_) | EventRef::Articulation(_) => {}
             }
         }
         let mut sysex: Vec<usize> = events
@@ -528,6 +614,20 @@ impl Session {
         for i in sysex.into_iter().rev() {
             if i < m.sysex.len() {
                 m.sysex.remove(i);
+            }
+        }
+        let mut directions: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                EventRef::Articulation(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        directions.sort_unstable();
+        directions.dedup();
+        for i in directions.into_iter().rev() {
+            if i < m.articulations.len() {
+                m.articulations.remove(i);
             }
         }
         tidy_lanes(&mut m);
@@ -561,6 +661,9 @@ impl Session {
                     channel,
                     muted: false,
                     release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
                 });
                 m.notes.sort_by_key(|n| (n.start, n.key));
                 EventRef::Note(id)
@@ -570,7 +673,16 @@ impl Session {
                     MidiController::PitchBend | MidiController::Program => controller.rest(),
                     _ => 64,
                 };
-                put_point(&mut m, controller, channel, ControllerPoint { time, value });
+                put_point(
+                    &mut m,
+                    controller,
+                    channel,
+                    ControllerPoint {
+                        time,
+                        value,
+                        fine: None,
+                    },
+                );
                 EventRef::Controller {
                     controller,
                     channel,

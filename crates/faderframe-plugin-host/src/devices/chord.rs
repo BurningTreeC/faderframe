@@ -298,6 +298,7 @@ impl ChordProcessor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn press(
         &mut self,
         out: &mut MidiBuffer,
@@ -306,6 +307,7 @@ impl ChordProcessor {
         channel: u8,
         key: u8,
         velocity: u8,
+        fine: faderframe_midi::Fine,
     ) {
         self.release(out, offset, channel, key);
         let sample = ctx.transport.sample_position + i64::from(offset);
@@ -324,7 +326,13 @@ impl ChordProcessor {
             let place = if down { n - 1 - i } else { i };
             let delay = (place as f64 * strum).round() as u64;
             if delay == 0 {
-                self.sounding.on(out, offset, channel, k, vel);
+                // The played key at its own resolution.
+                let fine = if k == key {
+                    fine
+                } else {
+                    faderframe_midi::Fine::NONE
+                };
+                self.sounding.on_fine(out, offset, channel, k, vel, fine);
                 v.started[i] = true;
             } else {
                 let at = self.clock + u64::from(offset) + delay;
@@ -391,7 +399,7 @@ impl PluginProcessor for ChordProcessor {
                 cursor = at;
                 match midi_fx::note(&e.event) {
                     Some((true, channel, key, velocity)) => {
-                        self.press(out, ctx, at as u32, channel, key, velocity);
+                        self.press(out, ctx, at as u32, channel, key, velocity, e.fine);
                     }
                     Some((false, channel, key, _)) => self.release(out, at as u32, channel, key),
                     None => midi_fx::pass(out, input, e),

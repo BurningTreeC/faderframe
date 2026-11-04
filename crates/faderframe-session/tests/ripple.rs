@@ -96,6 +96,7 @@ fn clip(s: &mut Session, t: TrackId, start: f64, len: f64) -> ClipId {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })
@@ -183,6 +184,7 @@ fn marker(s: &mut Session, at: f64) -> MarkerId {
             id,
             position: bar(at),
             name: "M".into(),
+            time_base: Default::default(),
         },
     })
     .unwrap();
@@ -374,6 +376,7 @@ fn a_global_ripple_moves_the_timeline_as_chosen() {
             start: bar(4.0),
             end: bar(8.0),
             color: TrackColor { r: 1, g: 2, b: 3 },
+            time_base: Default::default(),
         },
     })
     .unwrap();

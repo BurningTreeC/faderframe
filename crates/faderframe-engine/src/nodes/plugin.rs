@@ -238,6 +238,9 @@ pub struct NoteLedger {
     /// What fed its notes in the last block (the node's `upstream`; 0:
     /// none ran yet).
     fed_by: AtomicU64,
+    /// The processor is to reset before its next block: it was left
+    /// unplayed (its track played from a cache) and holds what it had then.
+    stale: AtomicBool,
 }
 
 impl Default for NoteLedger {
@@ -249,6 +252,7 @@ impl Default for NoteLedger {
             fed: AtomicBool::new(true),
             source: AtomicU8::new(FROM_NOTHING),
             fed_by: AtomicU64::new(0),
+            stale: AtomicBool::new(false),
         }
     }
 }
@@ -374,6 +378,18 @@ impl NoteLedger {
         follow_keys(&self.out, events);
     }
 
+    /// The processor comes back after blocks it was left out of (its track
+    /// played from a cache): it resets before its next block (control
+    /// side).
+    pub fn mark_stale(&self) {
+        self.stale.store(true, Ordering::Release);
+    }
+
+    /// Whether the processor is to reset now (cleared).
+    fn take_stale(&self) -> bool {
+        self.stale.load(Ordering::Acquire) && self.stale.swap(false, Ordering::AcqRel)
+    }
+
     /// A reset processor holds nothing, and what it sent is silenced.
     fn forget(&self) {
         for w in self.given.iter().chain(self.out.iter()) {
@@ -430,6 +446,12 @@ pub struct PluginNode {
     /// A block's events after those (a node that takes events: one
     /// buffer, else none).
     merged: Vec<MidiBuffer>,
+    /// It renders the timeline itself (an ARA playback renderer): its
+    /// transport is set back by its input latency, so what it renders
+    /// lines up with what reaches it.
+    renders_timeline: bool,
+    /// How its track's tuning reaches the plugin.
+    retune: crate::tuning::Retuner,
 }
 
 impl PluginNode {
@@ -474,7 +496,21 @@ impl PluginNode {
             } else {
                 Vec::new()
             },
+            renders_timeline: false,
+            retune: crate::tuning::Retuner::none(),
         }
+    }
+
+    /// The plugin renders the timeline itself (an ARA playback renderer).
+    pub fn rendering_the_timeline(mut self) -> Self {
+        self.renders_timeline = true;
+        self
+    }
+
+    /// Retune the notes it is given (see [`crate::tuning`]).
+    pub fn with_retune(mut self, retune: crate::tuning::Retuner) -> Self {
+        self.retune = retune;
+        self
     }
 
     fn last_sent(&mut self, id: ParameterId) -> Option<&mut f32> {
@@ -677,6 +713,12 @@ impl Processor<EngineContext> for PluginNode {
     }
 
     fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+        // Back from blocks it was left out of: whatever it held then
+        // (tails, voices, keys at its input) is gone.
+        if self.notes.take_stale() {
+            self.reset();
+            self.notes.forget_held();
+        }
         let takes = !self.merged.is_empty();
         let rewired = takes && self.notes.rewired(self.upstream);
         if self.bypass || self.failed.load(Ordering::Relaxed) {
@@ -720,11 +762,26 @@ impl Processor<EngineContext> for PluginNode {
             }
             None => self.mods.clear(),
         }
+        // Its track's tuning: a built-in gets the table, other plugins
+        // their notes retuned (below).
+        let tuning = cx.data.timeline.tuning(self.track);
+        let standard = cx.data.timeline.standard_tuning();
+        if let Some(table) = self.retune.to_give(tuning) {
+            self.processor.set_tuning(table);
+        }
+        let retune = takes && self.retune.wants(tuning, standard);
         let events = std::mem::take(&mut self.events);
         let mods = std::mem::take(&mut self.mods);
         let note_mods = std::mem::take(&mut self.note_mods);
+        let behind;
+        let transport = if self.renders_timeline && self.input_latency > 0 {
+            behind = transport_behind(&cx.data.transport, self.input_latency);
+            &behind
+        } else {
+            &cx.data.transport
+        };
         let ctx = PluginProcessContext {
-            transport: &cx.data.transport,
+            transport,
             param_events: &events,
             harmony: &cx.data.timeline.harmony,
             param_mods: &mods,
@@ -736,7 +793,7 @@ impl Processor<EngineContext> for PluginNode {
         // ended and what is held now; then what blocks it missed would have
         // ended (in this graph or another).
         let catch_up = takes && self.notes.feeds();
-        let held = takes && (rewired || catch_up || self.missed.pending());
+        let held = takes && (rewired || catch_up || self.missed.pending() || retune);
         if held && let Some(merged) = self.merged.first_mut() {
             merged.clear();
             if rewired {
@@ -747,6 +804,9 @@ impl Processor<EngineContext> for PluginNode {
             self.missed.take_into(merged);
             if let Some(input) = io.events_in.first() {
                 merged.merge_from(input, 0);
+            }
+            if retune {
+                self.retune.apply(tuning, standard, merged);
             }
         }
         let status = if held {
@@ -809,10 +869,24 @@ impl Processor<EngineContext> for PluginNode {
         self.notes.forget();
         self.sent.clear();
         self.voices.reset();
+        self.retune.reset();
         for d in &mut self.delay {
             d.fill(0.0);
         }
     }
+}
+
+/// The transport `frames` earlier (what a node that late hears).
+fn transport_behind(
+    t: &faderframe_transport::TransportInfo,
+    frames: u32,
+) -> faderframe_transport::TransportInfo {
+    let mut out = *t;
+    out.sample_position -= i64::from(frames);
+    if t.sample_rate > 0.0 {
+        out.quarter_position -= f64::from(frames) / t.sample_rate * t.tempo / 60.0;
+    }
+    out
 }
 
 #[cfg(test)]

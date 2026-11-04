@@ -237,18 +237,19 @@ impl Session {
                 menu: Vec::new(),
                 short: None,
             });
-            // Into a surround bed the surround panner places it instead.
-            if let Some(format) = self.project.surround_panned(t) {
+            // Into a surround bed (or an ambisonic field) the surround
+            // panner places it instead.
+            if let Some(dst) = self.project.spatially_panned(t) {
                 let object = self.project.is_object(t);
                 let pan = self.project.effective_surround(t);
                 for p in faderframe_core::SurroundParam::ALL {
                     // Objects have no LFE send.
-                    if !p.applies(t.layout, format, &pan)
+                    if !p.applies_into(t.layout, dst, &pan)
                         || (object && p == faderframe_core::SurroundParam::Lfe)
                     {
                         continue;
                     }
-                    let (min, max, default) = p.range_in(format);
+                    let (min, max, default) = p.range_into(dst);
                     let (kind, unit) = match p {
                         faderframe_core::SurroundParam::X => (ParamKind::Pan, ""),
                         faderframe_core::SurroundParam::Lfe => (ParamKind::Gain, "dB"),
@@ -1058,6 +1059,11 @@ impl Session {
             );
         }
         self.update_suspended();
+    }
+
+    /// The lane is being written now.
+    pub(crate) fn writing_automation(&self, lane: AutomationLaneId) -> bool {
+        self.automation_writer.writing.contains_key(&lane)
     }
 
     /// A gesture ended: Touch lanes stop writing.

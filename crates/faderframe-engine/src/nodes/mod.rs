@@ -1,13 +1,17 @@
 //! Engine-specific graph processors.
 
+pub mod along;
 mod bass;
+mod cached;
 mod chain;
 mod clip_player;
+pub mod codec;
 pub mod compare;
 mod console;
 mod crosstalk;
 mod delay;
 mod diffuse;
+pub mod file_preview;
 mod io;
 mod listen;
 mod midi_player;
@@ -16,16 +20,22 @@ mod psola;
 mod send;
 mod strip;
 
+pub use along::{AlongFeed, AlongLink, AlongShared};
+pub use cached::{CachedPlayer, Handover, STOP_FADE_SECONDS};
 pub use chain::{ChainMix, ChainNotes};
 pub use clip_player::{AudioClipPlayer, StretchVoices};
+pub use codec::{CodecHear, CodecLink, CodecReading, CodecShared, CodecWanted};
 pub use compare::{CompareLink, CompareSettings, CompareShared, CompareSource, CompareSync};
 pub use console::ConsoleChannel;
 pub use crosstalk::Crosstalk;
 pub use delay::{DelayShape, TrackDelay};
+pub use file_preview::{
+    FilePreviewLink, FilePreviewShared, PreviewAudio, PreviewSound, PreviewStart, PreviewWriter,
+};
 pub use io::{
     DeviceInputTap, DeviceOutputSink, FoldDown, HardwareReturn, HardwareSendGain, MonitorGate,
 };
-pub use listen::{ListenLink, ListenOut, Listening};
+pub use listen::{DEFAULT_HEAD_SMOOTHING, HeadShared, ListenLink, ListenOut, Listening};
 pub use midi_player::MidiClipPlayer;
 pub(crate) use midi_player::chase_key;
 pub use plugin::{MissedReleases, NoteLedger, PluginNode};

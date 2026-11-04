@@ -8,12 +8,15 @@
 //! clip's part of its source at 16 kHz; each line then starts at the
 //! vocal's attack nearest to where the model heard it (the model's times
 //! are coarse: [`align_to_onsets`]); its lines replace those starting
-//! inside the clip, in one undo step.
+//! inside the clip, in one undo step — with the words heard in that part
+//! of the source (timed word by word, see [`crate::lyric_comp`]: the
+//! pitch editor shows their syllables under its notes).
 
 use crate::pitch::mono_of;
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_core::ClipId;
 use faderframe_project::Command;
+use faderframe_project::lyric_comp::{SourceWords, SungWord};
 use faderframe_project::lyrics::{self, LyricLine};
 use faderframe_speech::{Options, Segment, Whisper, files};
 use std::path::PathBuf;
@@ -27,11 +30,14 @@ pub const CHECKPOINT: &str = "whisper-base";
 pub const CHECKPOINT_MB: u32 = 290;
 
 type Download = JoinHandle<std::result::Result<(), String>>;
-/// A transcription running: its clip, the segments it will hear, how far
-/// it is (per mille).
+/// What a transcription heard: its lines, and the words heard in the
+/// clip's part of its source (that part, project-rate frames).
+type Heard = (Vec<Segment>, Vec<SungWord>, (i64, i64));
+/// A transcription running: its clip, what it will hear, how far it is
+/// (per mille).
 type Job = (
     ClipId,
-    JoinHandle<std::result::Result<Vec<Segment>, String>>,
+    JoinHandle<std::result::Result<Heard, String>>,
     Arc<AtomicU32>,
 );
 
@@ -207,12 +213,17 @@ impl Session {
                 )
                 .ok_or("the clip's audio could not be resampled")?;
                 let w = Whisper::load(&model_dir()).map_err(|e| e.to_string())?;
-                let mut segments = w.transcribe(&audio, &Options::default(), |f| {
+                let options = Options {
+                    word_timestamps: true,
+                    ..Options::default()
+                };
+                let mut segments = w.transcribe(&audio, &options, |f| {
                     p.store((f * 1000.0) as u32, Ordering::Relaxed);
                 });
+                let words = crate::lyric_comp::sung_words(&segments, from, k, &mono, rate);
                 // Lines start where the voice does.
                 align_to_onsets(&mut segments, &word_onsets(&mono[a..b], rate));
-                Ok(segments)
+                Ok((segments, words, (from, from + span)))
             })
             .map_err(|e| SessionError::Other(e.to_string()))?;
         self.speech.jobs.push((clip, job, progress));
@@ -256,7 +267,7 @@ impl Session {
             }
             let (clip, job, _) = self.speech.jobs.swap_remove(i);
             let result = match job.join() {
-                Ok(Ok(segments)) => self.place_lyrics(clip, &segments),
+                Ok(Ok(heard)) => self.place_lyrics(clip, heard),
                 Ok(Err(e)) => Err(SessionError::Other(e)),
                 Err(_) => Err(SessionError::Other("the transcription failed".into())),
             };
@@ -268,8 +279,9 @@ impl Session {
     }
 
     /// The segments (seconds into the clip's source part) as lyric lines
-    /// replacing those inside the clip.
-    fn place_lyrics(&mut self, clip: ClipId, segments: &[Segment]) -> Result<()> {
+    /// replacing those inside the clip, and the words heard in its source.
+    fn place_lyrics(&mut self, clip: ClipId, heard: Heard) -> Result<()> {
+        let (segments, words, span) = heard;
         let Some(c) = self.project.clip(clip).cloned() else {
             return Ok(());
         };
@@ -298,7 +310,23 @@ impl Session {
         let n = new.len();
         let end = c.end(&p.timeline, p.sample_rate);
         let lyrics = lyrics::replace_span(&p.lyrics, c.start, end, new);
-        self.batch("Transcribe", vec![Command::SetLyrics { lyrics }])?;
+        let mut heard = p
+            .source_words
+            .get(&a.source)
+            .cloned()
+            .unwrap_or_else(|| SourceWords::new(p.sample_rate));
+        heard.add(span, words);
+        heard.rate = p.sample_rate;
+        self.batch(
+            "Transcribe",
+            vec![
+                Command::SetLyrics { lyrics },
+                Command::SetSourceWords {
+                    source: a.source,
+                    words: Some(Box::new(heard)),
+                },
+            ],
+        )?;
         self.notify(
             NoticeLevel::Info,
             if n == 0 {
@@ -407,6 +435,7 @@ mod tests {
             start: a,
             end: b,
             text: "la".into(),
+            ..Segment::default()
         }
     }
 

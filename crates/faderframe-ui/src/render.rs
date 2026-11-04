@@ -16,7 +16,7 @@ use faderframe_session::NoticeLevel;
 use faderframe_session::delivery::{DELIVERY_PRESETS, Finish, PeakHandling, describe};
 use faderframe_session::render::{
     Overwrite, RenderChannels, RenderError, RenderJob, RenderRange, RenderSettings, RenderSource,
-    Rendered, Staged, files, resolve_range,
+    Rendered, Staged, StemOptions, files, resolve_range,
 };
 use gtk::prelude::*;
 use gtk::{gio, glib};
@@ -52,6 +52,12 @@ struct Form {
     /// The track rendered alone, and the tracks it lists.
     track: gtk::DropDown,
     track_ids: Vec<TrackId>,
+    /// Stems: the null test, stems that null, and why they would not.
+    stems_row: gtk::Box,
+    stems_label: gtk::Label,
+    null_test: gtk::CheckButton,
+    shared_stem: gtk::CheckButton,
+    null_warning: gtk::Label,
     format: gtk::DropDown,
     rate: gtk::DropDown,
     channels: gtk::DropDown,
@@ -144,6 +150,14 @@ impl Form {
             overwrite: Overwrite::Never,
             keep_latency: false,
             head: None,
+            stems: if self.source.selected() == SOURCE_STEMS {
+                StemOptions {
+                    null_test: self.null_test.is_active(),
+                    shared_stem: self.shared_stem.is_active(),
+                }
+            } else {
+                StemOptions::default()
+            },
             output: PathBuf::from(self.output.text().as_str()),
         }
     }
@@ -217,6 +231,38 @@ impl Form {
         self.bar_to.set_sensitive(self.range.selected() == 2);
         self.track
             .set_visible(self.source.selected() == SOURCE_TRACK);
+        let stems = self.source.selected() == SOURCE_STEMS;
+        self.stems_row.set_visible(stems);
+        self.stems_label.set_visible(stems);
+        // Stems that null are null-tested anyway.
+        self.null_test.set_sensitive(!settings.stems.shared_stem);
+        if stems {
+            // Why they would not sum to the mix, before rendering.
+            let causes = s.null_causes(&settings);
+            let warning = if causes.is_empty() {
+                String::new()
+            } else if settings.stems.shared_stem {
+                format!(
+                    "Made to null: the Shared Processing stem carries what these do to the sum —\n{}",
+                    causes
+                        .iter()
+                        .map(|c| format!("• {}", c.text))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            } else {
+                format!(
+                    "These stems will not sum to the mix:\n{}",
+                    causes
+                        .iter()
+                        .map(|c| format!("• {}", c.text))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            self.null_warning.set_visible(!warning.is_empty());
+            self.null_warning.set_text(&warning);
+        }
         self.dither.set_sensitive(settings.format.is_integer());
         let level = self.level.selected();
         for (w, modes) in &self.level_parts {
@@ -231,7 +277,11 @@ impl Form {
                 let ch = match settings.channels {
                     RenderChannels::Mono | RenderChannels::First => 1,
                     RenderChannels::Master => faderframe_session::render::master_bed(p)
-                        .map_or(2, faderframe_core::SurroundFormat::channels),
+                        .map(faderframe_core::SurroundFormat::channels)
+                        .or_else(|| {
+                            faderframe_session::render::master_field(p).map(|o| o.channels())
+                        })
+                        .unwrap_or(2),
                     RenderChannels::Stereo | RenderChannels::Binaural(_) => 2,
                     RenderChannels::Adm(_) => {
                         faderframe_session::adm::plan(p).map_or(0, |plan| plan.channels())
@@ -255,6 +305,11 @@ impl Form {
                 };
                 let files = match settings.source {
                     RenderSource::Master | RenderSource::Track(_) => 1,
+                    // Only the stems that make up the mix, and the
+                    // Shared Processing stem.
+                    RenderSource::Stems if settings.stems.shared_stem => {
+                        faderframe_session::render::null::stems_summed(p).0.len() + 1
+                    }
                     RenderSource::Stems => p
                         .tracks
                         .iter()
@@ -363,6 +418,19 @@ pub fn render_now(output: Option<&str>) {
     }
 }
 
+/// Choose Stems in the open window with the null test (and stems that
+/// null) on or off (scripted runs: `null-test:<x|nulling|off>`); false
+/// when no window is open.
+pub fn stems_options(null_test: bool, shared_stem: bool) -> bool {
+    let Some(form) = open_form() else {
+        return false;
+    };
+    form.source.set_selected(SOURCE_STEMS);
+    form.null_test.set_active(null_test);
+    form.shared_stem.set_active(shared_stem);
+    true
+}
+
 /// Press Stop on the render running in the window (scripted runs).
 pub fn render_stop() {
     let run = RUNNING.with(|r| r.borrow().as_ref().and_then(std::rc::Weak::upgrade));
@@ -449,9 +517,40 @@ pub fn open(app: &Rc<AppState>) {
     source_box.append(&source);
     source_box.append(&track);
     labelled(&grid, 2, "Source", &source_box);
+    // Stems: compared with the mix, or made to null.
+    let stems_row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let checks = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let null_test = gtk::CheckButton::with_label("Null-test them against the mix");
+    null_test.set_tooltip_text(Some(
+        "After rendering, sum the stems that make up the mix and compare them with the mix \
+         rendered with the same settings; the render report tells the residual and why",
+    ));
+    let shared_stem = gtk::CheckButton::with_label("Make them null (a Shared Processing stem)");
+    shared_stem.set_tooltip_text(Some(
+        "Level processing worked out on the mix and applied to every stem alike; what the \
+         shared processing (the master's limiter, bus compressors, sidechains) adds is written \
+         as one more stem, so the files sum to the mix. Only the stems that make up the mix are \
+         written",
+    ));
+    checks.append(&null_test);
+    checks.append(&shared_stem);
+    stems_row.append(&checks);
+    let null_warning = gtk::Label::new(None);
+    null_warning.set_xalign(0.0);
+    null_warning.set_wrap(true);
+    null_warning.add_css_class("warning");
+    null_warning.set_visible(false);
+    stems_row.append(&null_warning);
+    let stems_label = gtk::Label::new(Some("Stems"));
+    stems_label.set_xalign(1.0);
+    stems_label.set_valign(gtk::Align::Start);
+    stems_label.add_css_class("dim-label");
+    grid.attach(&stems_label, 0, 3, 1, 1);
+    stems_row.set_hexpand(true);
+    grid.attach(&stems_row, 1, 3, 1, 1);
     let format_names: Vec<&str> = FORMATS.iter().map(|f| f.label()).collect();
     let format = gtk::DropDown::from_strings(&format_names);
-    labelled(&grid, 3, "Format", &format);
+    labelled(&grid, 4, "Format", &format);
     let project_rate = app.session.borrow().project().sample_rate;
     let mut rates = vec![format!(
         "Project rate ({})",
@@ -460,7 +559,7 @@ pub fn open(app: &Rc<AppState>) {
     rates.extend(STANDARD_SAMPLE_RATES.iter().map(|r| format_sample_rate(*r)));
     let rate_refs: Vec<&str> = rates.iter().map(String::as_str).collect();
     let rate = gtk::DropDown::from_strings(&rate_refs);
-    labelled(&grid, 4, "Sample rate", &rate);
+    labelled(&grid, 5, "Sample rate", &rate);
     // A surround master: as it is, or folded down.
     let bed = faderframe_session::render::master_bed(app.session.borrow().project());
     let (channel_names, channel_choices): (Vec<String>, Vec<RenderChannels>) = match bed {
@@ -489,10 +588,30 @@ pub fn open(app: &Rc<AppState>) {
             }
             (names, choices)
         }
-        None => (
-            vec!["Stereo".into(), "Mono (summed)".into()],
-            vec![RenderChannels::Stereo, RenderChannels::Mono],
-        ),
+        None => match faderframe_session::render::master_field(app.session.borrow().project()) {
+            // An ambisonic master: as it is (AmbiX), or decoded.
+            Some(o) => {
+                let room = app.session.borrow().headphones().unwrap_or_default();
+                (
+                    vec![
+                        format!("As the master ({}, AmbiX, every channel)", o.name()),
+                        "Stereo (decoded)".into(),
+                        "Mono (W, omnidirectional)".into(),
+                        format!("Headphones (binaural · {})", room.name()),
+                    ],
+                    vec![
+                        RenderChannels::Master,
+                        RenderChannels::Stereo,
+                        RenderChannels::Mono,
+                        RenderChannels::Binaural(room),
+                    ],
+                )
+            }
+            None => (
+                vec!["Stereo".into(), "Mono (summed)".into()],
+                vec![RenderChannels::Stereo, RenderChannels::Mono],
+            ),
+        },
     };
     // IAMF masters of any master: Opus to stream, FLAC or LPCM lossless.
     let (mut channel_names, mut channel_choices) = (channel_names, channel_choices);
@@ -521,14 +640,14 @@ pub fn open(app: &Rc<AppState>) {
     }
     let names: Vec<&str> = channel_names.iter().map(String::as_str).collect();
     let channels = gtk::DropDown::from_strings(&names);
-    labelled(&grid, 5, "Channels", &channels);
+    labelled(&grid, 6, "Channels", &channels);
     let tail = gtk::SpinButton::with_range(0.0, 60.0, 0.5);
     tail.set_digits(1);
     tail.set_value(2.0);
     tail.set_tooltip_text(Some(
         "Extra seconds rendered after the range so echo/reverb tails ring out",
     ));
-    labelled(&grid, 6, "Tail (seconds)", &tail);
+    labelled(&grid, 7, "Tail (seconds)", &tail);
     let level_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let level = gtk::DropDown::from_strings(&[
         "Unchanged",
@@ -564,14 +683,14 @@ pub fn open(app: &Rc<AppState>) {
     for (w, _) in &level_parts {
         level_box.append(w);
     }
-    labelled(&grid, 7, "Level", &level_box);
+    labelled(&grid, 8, "Level", &level_box);
     let dither_names: Vec<&str> = Dither::ALL.iter().map(|d| d.label()).collect();
     let dither = gtk::DropDown::from_strings(&dither_names);
     dither.set_selected(1);
     dither.set_tooltip_text(Some(
         "Integer formats only. Noise shaping (at 44.1 and 48 kHz) moves the dither noise out of the ear's most sensitive range — for 16-bit delivery",
     ));
-    labelled(&grid, 8, "Dither", &dither);
+    labelled(&grid, 9, "Dither", &dither);
     let out_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let output = gtk::Entry::new();
     output.set_text(&default_output(app).to_string_lossy());
@@ -579,25 +698,34 @@ pub fn open(app: &Rc<AppState>) {
     let choose = gtk::Button::with_label("Choose…");
     out_box.append(&output);
     out_box.append(&choose);
-    labelled(&grid, 9, "Output", &out_box);
+    labelled(&grid, 10, "Output", &out_box);
     let info = gtk::Label::new(None);
     info.set_xalign(0.0);
     info.set_wrap(true);
     info.set_selectable(true);
     info.add_css_class("dim-label");
-    grid.attach(&info, 0, 10, 2, 1);
+    grid.attach(&info, 0, 11, 2, 1);
     let progress = gtk::ProgressBar::new();
     progress.set_show_text(true);
-    grid.attach(&progress, 0, 11, 2, 1);
+    grid.attach(&progress, 0, 12, 2, 1);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     // Closes the window, or stops a running render.
     let cancel = gtk::Button::with_label("Close");
     let render = gtk::Button::with_label("Render");
     render.add_css_class("suggested-action");
+    // The master as these settings render it, coded as each streaming
+    // platform streams it (Audio › Listen › Codec Monitor).
+    let platforms = gtk::Button::with_label("Preview on Platforms…");
+    platforms.set_tooltip_text(Some(
+        "Render the master as set here, then code and decode it as Spotify, Apple Music, \
+         YouTube, Tidal, Amazon Music and Deezer stream it: the gain each applies, the true \
+         peak after decoding, clipping risk and advice. Nothing is written to the output.",
+    ));
+    actions.append(&platforms);
     actions.append(&cancel);
     actions.append(&render);
-    grid.attach(&actions, 0, 12, 2, 1);
+    grid.attach(&actions, 0, 13, 2, 1);
     win.set_child(Some(&grid));
 
     let form = Rc::new(Form {
@@ -609,6 +737,11 @@ pub fn open(app: &Rc<AppState>) {
         source,
         track,
         track_ids,
+        stems_row,
+        stems_label,
+        null_test,
+        shared_stem,
+        null_warning,
         format,
         rate,
         channels,
@@ -708,6 +841,10 @@ pub fn open(app: &Rc<AppState>) {
         let r = refresh.clone();
         sb.connect_value_changed(move |_| r());
     }
+    for cb in [&form.null_test, &form.shared_stem] {
+        let r = refresh.clone();
+        cb.connect_toggled(move |_| r());
+    }
 
     {
         let form = Rc::clone(&form);
@@ -737,6 +874,17 @@ pub fn open(app: &Rc<AppState>) {
                 dialog.select_folder(Some(&win), gio::Cancellable::NONE, done);
             } else {
                 dialog.save(Some(&win), gio::Cancellable::NONE, done);
+            }
+        });
+    }
+
+    {
+        let form = Rc::clone(&form);
+        let weak = Rc::downgrade(app);
+        platforms.connect_clicked(move |_| {
+            if let Some(app) = weak.upgrade() {
+                let settings = form.settings(project_rate);
+                crate::codec_monitor::preview(&app, Some(settings), Vec::new());
             }
         });
     }
@@ -952,6 +1100,13 @@ fn start(app: &Rc<AppState>, run: &Rc<Run>, settings: RenderSettings, what: Stri
             };
             run.progress.set_fraction(j.progress.fraction());
             if j.progress
+                .null_testing
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                run.progress
+                    .set_text(Some("Comparing the stems with the mix…"));
+            } else if j
+                .progress
                 .measuring
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
@@ -967,7 +1122,8 @@ fn start(app: &Rc<AppState>, run: &Rc<Run>, settings: RenderSettings, what: Stri
         };
         run.cancel.set_label("Close");
         if let Some(app) = weak.upgrade() {
-            settle(&app, &run, j.join(), what.clone());
+            let null_test = j.null_test();
+            settle(&app, &run, j.join(), what.clone(), null_test);
         }
         glib::ControlFlow::Break
     });
@@ -980,6 +1136,7 @@ fn settle(
     run: &Rc<Run>,
     result: Result<Vec<Rendered>, RenderError>,
     what: String,
+    null_test: Option<faderframe_qc::NullTest>,
 ) {
     let done = |busy: bool| {
         run.busy.set(busy);
@@ -1019,14 +1176,22 @@ fn settle(
                     )
                 })
                 .collect();
-            let text = format!(
+            let mut text = format!(
                 "Rendered {} file{}\n{}",
                 files.len(),
                 if files.len() == 1 { "" } else { "s" },
                 list.join("\n")
             );
+            if let Some(t) = &null_test {
+                text += &format!("\nNull test: {}", t.summary);
+            }
             run.info.set_text(&text);
-            app.session.borrow_mut().notify(NoticeLevel::Info, text);
+            {
+                let mut s = app.session.borrow_mut();
+                s.notify(NoticeLevel::Info, text);
+                // The delivery the QC report is of.
+                s.delivered(&what, files.clone(), null_test);
+            }
             crate::render_report::show(app, win.as_ref(), &what, &files);
         }
         Err(RenderError::Exists(staged)) => {
@@ -1049,7 +1214,7 @@ fn settle(
                     };
                     if yes {
                         let result = staged.commit(&Overwrite::Confirmed(conflicts));
-                        settle(&app, &run, result, what);
+                        settle(&app, &run, result, what, null_test);
                     } else {
                         staged.discard();
                         run.busy.set(false);

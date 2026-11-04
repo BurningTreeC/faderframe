@@ -1,6 +1,7 @@
-//! The Hardware Insert's face: the way out and back (interface output →
-//! the gear → interface input), the round trip and a Ping that measures
-//! it, and the send, return and mix controls.
+//! The Hardware Insert's face: the way out and back (interface outputs →
+//! the gear → interface inputs, as many as the insert is wide), the round
+//! trip and a Ping that measures it, and the send, return, mix and Mono →
+//! Stereo controls.
 
 use crate::kit::{self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SWITCH_H};
 use faderframe_core::ParameterId;
@@ -22,6 +23,25 @@ impl HardwareInsertFace {
         Self {
             accent: theme.device.wave,
         }
+    }
+
+    /// How many interface channels each way the insert uses, and whether
+    /// its track is that wide already where it sits (Mono → Stereo then
+    /// changes nothing).
+    fn widths(cx: &Ctx<'_>) -> (usize, bool) {
+        let Some((track, slot)) = cx.model.plugin_owner(cx.plugin) else {
+            return (1, false);
+        };
+        let Some(into) = cx
+            .model
+            .project()
+            .track(track)
+            .and_then(|t| t.layout_into(slot.id))
+        else {
+            return (1, false);
+        };
+        let wide = into.channel_count() > 1;
+        (slot.output_layout(into).channel_count().max(1), wide)
     }
 
     /// The Ping button in the display.
@@ -53,6 +73,12 @@ impl Face for HardwareInsertFace {
             pid(id::SEND_CHANNEL),
             "OUTPUT",
             Rect::new(k[1].x, k[1].y + 12.0, k[1].w, 38.0),
+        ));
+        // Stereo gear on a mono track (both outputs alike, a pair back).
+        c.push(Ctl::toggle(
+            pid(id::CHANNELS),
+            "Mono → Stereo",
+            Rect::new(k[1].x, k[1].y + 58.0, k[1].w, SWITCH_H),
         ));
         let r = kit::inside(&s[1]);
         let k = kit::row(
@@ -99,15 +125,32 @@ impl Face for HardwareInsertFace {
     fn paint_display(&mut self, p: &mut dyn Painter, r: Rect, cx: &Ctx<'_>) {
         cx.tap.watch();
         let th = cx.theme;
-        let channels = |v: f64, word: &str| format!("{word} {}", v.round() as i64 + 1);
+        // As wide as it plays: the track's width where it sits, a pair for
+        // Mono → Stereo.
+        let (width, track_wide) = Self::widths(cx);
+        let channels = |v: f64, word: &str| {
+            let first = v.round() as i64 + 1;
+            if width > 1 {
+                format!("{word} {first}–{}", first + width as i64 - 1)
+            } else {
+                format!("{word} {first}")
+            }
+        };
         let out = channels(cx.value(pid(id::SEND_CHANNEL)), "OUT");
         let inp = channels(cx.value(pid(id::RETURN_CHANNEL)), "IN");
+        let gear = if cx.value(pid(id::CHANNELS)) >= 0.5 && !track_wide {
+            "mono → stereo"
+        } else if width > 1 {
+            "outboard (stereo)"
+        } else {
+            "outboard"
+        };
         // The way: DAW → interface output → gear → interface input → DAW.
         let y = r.y + r.h * 0.38;
         let boxes = [
             ("FADERFRAME", "send"),
             (out.as_str(), "interface"),
-            ("YOUR GEAR", "outboard"),
+            ("YOUR GEAR", gear),
             (inp.as_str(), "interface"),
             ("FADERFRAME", "return"),
         ];

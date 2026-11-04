@@ -124,6 +124,8 @@ impl Session {
                 id: arrangement.ids.allocate(),
                 position: self.project.timeline.to_musical(at(new(*a)).max(0), rate),
                 name: format!("New shot {}", n + 1),
+                // The picture's: kept in time.
+                time_base: faderframe_project::TimeBase::TimeLocked,
             });
         }
         arrangement.markers.extend(markers);

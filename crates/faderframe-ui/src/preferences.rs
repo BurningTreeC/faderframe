@@ -416,12 +416,13 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
     let zero_copy =
         gtk::CheckButton::with_label("Show frames straight from the decoder (zero-copy)");
     zero_copy.set_active(prefs.video_zero_copy);
-    zero_copy.set_sensitive(cfg!(target_os = "linux"));
+    zero_copy.set_sensitive(cfg!(any(target_os = "linux", windows)));
     row(&g, 4, "Display", &zero_copy);
     g.attach(
         &note(
-            "VA-API decodes and scales the picture into video memory the display shows as it is \
-             (Linux); without VA-API, or off, frames come through memory.",
+            "VA-API (Linux) or Direct3D 12 (Windows, GStreamer 1.26) scales the picture into \
+             video memory the display shows as it is; without them, or off, frames come \
+             through memory.",
         ),
         1,
         5,
@@ -563,7 +564,7 @@ fn video_page(app: &Rc<AppState>) -> gtk::Widget {
         zero_copy.connect_toggled(move |b| {
             let on = b.is_active();
             apply(&|p| p.video_zero_copy = on);
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             faderframe_video::zero_copy::set_allowed(on);
         });
     }
@@ -1035,6 +1036,13 @@ pub fn open(app: &Rc<AppState>, page: Option<&str>) {
     stack.add_titled(&video_page(app), Some("video"), "Video");
     stack.add_titled(&engine_page(app), Some("engine"), "Engine");
     stack.add_titled(&project_page(app), Some("project"), "Project");
+    stack.add_titled(&crate::stems_prefs::page(app, row), Some("stems"), "Stems");
+    stack.add_titled(
+        &crate::aes67_prefs::page(app, row),
+        Some("network"),
+        "Network Audio",
+    );
+    stack.add_titled(&crate::web_remote::page(app, row), Some("remote"), "Remote");
     if let Some(p) = page {
         show_page(&stack, p);
     }

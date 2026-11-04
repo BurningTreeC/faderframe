@@ -11,27 +11,40 @@
 //! active GDK backend. HiDPI and fractional scaling are handled by GTK —
 //! views work in logical pixels.
 
+mod aaf;
 pub mod access;
 mod actions;
+mod adaptive_actions;
 pub mod app_bundle;
 mod audio_prefs;
 mod auto_align;
+mod batch;
+mod browser;
 pub mod canvas;
+mod capture_audio;
+mod clip_tools_actions;
+mod codec_monitor;
+mod collab;
 mod compare;
 mod console;
 pub mod crash;
 mod cues;
+mod device_states;
 mod dialogs;
 pub mod dock;
 pub mod drawing;
 mod edit_keys;
 mod favorites;
 pub mod gpu;
-#[cfg(all(feature = "gpu-painter", windows))]
+#[cfg(windows)]
 mod gpu_win32;
+mod head_tracking;
 mod icons;
+mod interchange;
 mod learn;
 mod listen;
+mod lyric_comp;
+mod maps_actions;
 mod metronome_prefs;
 mod midi_prefs;
 mod mix_actions;
@@ -49,10 +62,15 @@ mod recent;
 mod recording;
 mod render;
 mod render_report;
+mod score_actions;
 mod screenshot;
+mod scripts;
+mod self_freeze_prefs;
 mod speaker_layouts;
 mod start;
 pub mod state;
+mod stems_prefs;
+mod strip_silence;
 mod style;
 mod surface_prefs;
 mod templates;
@@ -60,9 +78,18 @@ mod theme_editor;
 mod toggles;
 mod transport_display;
 mod transport_keys;
+mod tuning;
 mod user_themes;
+mod version_merge;
 mod video;
+// Windows: video frames in D3D12 textures to GTK.
+#[cfg(windows)]
+mod video_d3d12;
+mod web_remote;
 mod window;
+// AES67 network audio: Preferences → Network Audio and `aes67:` scripts.
+mod aes67_prefs;
+mod video_360_actions;
 
 pub use state::{BackendChoice, RunOptions};
 
@@ -192,7 +219,11 @@ fn build_session(
         tracing::warn!("render ahead: {e}");
     }
     listen::apply_preferences(&mut session, prefs);
+    head_tracking::apply(&mut session, prefs);
     favorites::load_into(&mut session);
+    self_freeze_prefs::apply(&mut session, prefs);
+    capture_audio::apply(&mut session, prefs);
+    web_remote::apply(&mut session, prefs);
     if let Err(e) = session.set_bass_management(prefs.bass_management) {
         tracing::warn!("bass management: {e}");
     }
@@ -282,6 +313,8 @@ fn open_after_first_frame(
 fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     let mut options = options.clone();
     let prefs = prefs::Preferences::load();
+    // The user's scripts and macros live with the settings.
+    faderframe_session::script::set_user_dir(Some(paths::config_dir().join("scripts")));
     if options.backend == BackendChoice::Auto {
         options.backend = prefs.backend();
     }
@@ -316,6 +349,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     }
     session.set_sync_settings(prefs.sync_settings());
     session.set_voice_settings(prefs.voice);
+    session.set_separation_settings(prefs.separation.clone());
     session.set_video_settings(prefs.video_settings());
     // Video frames go to the display as dmabufs it takes.
     #[cfg(target_os = "linux")]
@@ -323,6 +357,12 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         let f = display.dmabuf_formats();
         let formats = (0..f.n_formats()).map(|i| f.format(i)).collect();
         faderframe_video::zero_copy::set_display_formats(formats);
+        faderframe_video::zero_copy::set_allowed(prefs.video_zero_copy);
+    }
+    // Windows: in D3D12 textures, where GStreamer's d3d12 library is.
+    #[cfg(windows)]
+    {
+        faderframe_video::zero_copy::set_d3d12_display(video_d3d12::available());
         faderframe_video::zero_copy::set_allowed(prefs.video_zero_copy);
     }
     // The picture on a DeckLink output, when one was chosen and is there.
@@ -358,9 +398,14 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     edit_keys::install_actions(&state);
     recording::install_actions(&state);
     listen::install_actions(&state);
+    head_tracking::install_actions(&state);
+    capture_audio::install_actions(&state);
+    web_remote::install_actions(&state);
     monitoring::install_actions(&state);
     console::install_actions(&state);
+    tuning::install_actions(&state);
     cues::install_actions(&state);
+    scripts::install(&state);
     edit_keys::install_window(&state, &window);
     actions::install_window_keys(&state, &window);
     dialogs::install_close_guard(&state, &window);

@@ -1,21 +1,13 @@
-//! MIDI 2.0 ports: what FaderFrame sends them (MIDI 2.0 protocol, group 1),
-//! and which sequencer clients are left to them.
+//! MIDI 2.0 ports: what FaderFrame sends them (MIDI 2.0 protocol, group 1).
 
 use faderframe_midi::MidiOutputEvent;
-use faderframe_midi::ump::{Message, Midi1ToMidi2, per_note_message, sysex7};
+use faderframe_midi::ump::{Message, Midi1ToMidi2, Voice2, per_note_message, sysex7};
 
-/// The sequencer client number at the end of a port's full name
-/// ("MPK mini 3:MPK mini 3 MIDI 1 32:0" → 32).
-pub fn sequencer_client(full: &str) -> Option<u8> {
-    let (_, tail) = full.rsplit_once(' ')?;
-    let (c, p) = tail.split_once(':')?;
-    p.parse::<u32>().ok()?;
-    c.parse().ok()
-}
-
-/// An output event's packets: channel messages translated to MIDI 2.0,
-/// per-note expressions as per-note controllers, system messages as they
-/// are.
+/// An output event's packets: channel messages in MIDI 2.0 at the
+/// resolution they carry (16-bit velocities, 32-bit controllers, a note's
+/// attribute; else translated from MIDI 1.0, bank select and RPN/NRPN
+/// folded in), per-note expressions as per-note controllers, system
+/// messages as they are.
 pub fn event_words(t: &mut Midi1ToMidi2, ev: &MidiOutputEvent, out: &mut Vec<u32>) {
     let message = if let Some((channel, key, kind, value)) = ev.expression {
         Message::Midi2 {
@@ -28,7 +20,13 @@ pub fn event_words(t: &mut Midi1ToMidi2, ev: &MidiOutputEvent, out: &mut Vec<u32
         let Some(&status) = b.first() else {
             return;
         };
-        if status >= 0xF0 {
+        if let Some(voice) = ev.event().and_then(|e| Voice2::of_event(e, ev.fine)) {
+            Message::Midi2 {
+                group: 0,
+                channel: status & 0xF,
+                voice,
+            }
+        } else if status >= 0xF0 {
             Message::System {
                 group: 0,
                 status,
@@ -74,7 +72,7 @@ pub fn bytes_words(t: &mut Midi1ToMidi2, bytes: &[u8], out: &mut Vec<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faderframe_midi::ump::{Voice2, packets};
+    use faderframe_midi::ump::packets;
     use faderframe_midi::{ExpressionValue, NoteExpressionKind};
 
     #[test]
@@ -117,10 +115,46 @@ mod tests {
         ));
         assert!(matches!(got[2], Message::Sysex7 { len: 4, .. }));
         assert!(matches!(got[3], Message::System { status: 0xF8, .. }));
+        // Events with MIDI 2.0's resolution keep it.
+        let (velocity, fine) = faderframe_midi::Fine::of_velocity(0xABCD, true);
+        let on = MidiOutputEvent {
+            fine,
+            ..MidiOutputEvent::new(0, 0, &[0x91, 62, velocity]).unwrap()
+        };
+        let (value, fine) = faderframe_midi::Fine::of_value(0x1357_9BDF, 7);
+        let cc = MidiOutputEvent {
+            fine,
+            ..MidiOutputEvent::new(0, 0, &[0xB1, 1, value as u8]).unwrap()
+        };
+        let mut w = Vec::new();
+        event_words(&mut t, &on, &mut w);
+        event_words(&mut t, &cc, &mut w);
+        let got: Vec<Message> = packets(&w).map(|p| Message::parse(&p)).collect();
+        assert!(matches!(
+            got[0],
+            Message::Midi2 {
+                channel: 1,
+                voice: Voice2::NoteOn {
+                    note: 62,
+                    velocity: 0xABCD,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            got[1],
+            Message::Midi2 {
+                voice: Voice2::ControlChange {
+                    index: 1,
+                    value: 0x1357_9BDF
+                },
+                ..
+            }
+        ));
         assert_eq!(
-            sequencer_client("MPK mini 3:MPK mini 3 MIDI 1 32:0"),
+            faderframe_midi_ump::sequencer_client("MPK mini 3:MPK mini 3 MIDI 1 32:0"),
             Some(32)
         );
-        assert_eq!(sequencer_client("Plain"), None);
     }
 }

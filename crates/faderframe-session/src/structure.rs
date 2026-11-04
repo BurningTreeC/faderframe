@@ -204,6 +204,7 @@ impl Session {
                     start: *a,
                     end: *b,
                     color: TrackColor::palette(p.label * 3 + 1),
+                    time_base: Default::default(),
                 },
             });
         }

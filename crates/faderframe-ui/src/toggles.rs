@@ -337,6 +337,38 @@ pub(crate) const TOGGLES: &[Toggle] = &[
         on: |s| s.master_panel(),
         press: None,
     },
+    // Audio › Listen › Codec Monitor: variable bitrate (the plain codec;
+    // a platform's own setting is shown).
+    Toggle {
+        name: "codec-vbr",
+        on: |s| s.codec_settings().codec().1,
+        press: Some(|a| {
+            let on = a.session.borrow().codec_settings().codec().1;
+            a.dispatch(Action::Codec(faderframe_session::codec::CodecOp::Vbr(!on)));
+        }),
+    }, // Head tracking: the listener's head turned by a tracker over OSC
+    // (saved by `head_tracking::follow`).
+    Toggle {
+        name: "toggle-head-tracking",
+        on: |s| s.head_tracking().enabled,
+        press: Some(|a| {
+            let toggle = a.session.borrow().head_tracking_toggle();
+            a.dispatch(toggle);
+        }),
+    },
+    // Transport › Keep Input for Capture Audio (saved by
+    // `capture_audio::change`).
+    Toggle {
+        name: "toggle-audio-capture",
+        on: |s| s.audio_capture_settings().on,
+        press: Some(|a| crate::capture_audio::change(a, |s| s.on = !s.on)),
+    },
+    // Transport › Web Remote On (saved by `web_remote::follow`).
+    Toggle {
+        name: "toggle-web-remote",
+        on: |s| s.web_remote_settings().on,
+        press: Some(|a| crate::web_remote::change(a, |s| s.on = !s.on)),
+    },
 ];
 
 pub(crate) fn mode_id(m: EditMode) -> &'static str {
@@ -414,6 +446,24 @@ pub(crate) const CHOICES: &[Choice] = &[
             }
             None => tracing::warn!("ripple-scope: unknown '{id}'"),
         },
+    },
+    // Audio › Listen › Codec Monitor (`codec-monitor:<off|opus@<kbps>|
+    // platform=<id>|difference|…>` in scripts) and what it plays.
+    Choice {
+        name: "codec-monitor",
+        now: crate::codec_monitor::choice_now,
+        choose: crate::codec_monitor::choose,
+    },
+    Choice {
+        name: "codec-hear",
+        now: crate::codec_monitor::hear_now,
+        choose: crate::codec_monitor::choose_hear,
+    },
+    // Edit › Clip Envelopes (`show-clip-envelope:<hide|volume|pan>`).
+    Choice {
+        name: "show-clip-envelope",
+        now: crate::clip_tools_actions::shown_lane,
+        choose: crate::clip_tools_actions::show_lane,
     },
 ];
 

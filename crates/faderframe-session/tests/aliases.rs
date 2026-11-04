@@ -53,6 +53,9 @@ fn an_alias_follows_the_edits_of_its_original() {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     s.dispatch(Action::Edit(Command::AddNote { clip: b, note }))
         .unwrap();

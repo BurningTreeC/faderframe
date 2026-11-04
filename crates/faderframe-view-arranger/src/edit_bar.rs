@@ -1,6 +1,12 @@
 //! The edit toolbar: edit modes, ripple editing, tools, grid and nudge
 //! values, editing options, the selection counters and zoom — shown full
 //! width under the transport (toggled there).
+//!
+//! For screen readers and the keyboard it is a toolbar of its controls:
+//! modes, tools and options as toggle buttons (pressed while on), the menu
+//! buttons opening their menus with Enter (Shift+F10 and the Menu key
+//! too), the transient sensitivity stepped by the arrows. A mode, tool,
+//! ripple or grid changed elsewhere (the shortcuts) is said.
 
 use faderframe_session::{
     Action, CounterUnit, EditFlag, EditMode, EditTool, GridMode, NudgeValue, RippleOp, Session,
@@ -8,8 +14,9 @@ use faderframe_session::{
 };
 use faderframe_timeline::{GridDivision, MusicalTime, format_seconds};
 use faderframe_ui_canvas::{
-    CanvasView, EventCx, Flow, FlowMetrics, HostRequest, MenuItem, Paint, Painter, Point,
-    PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, AccessRole, CanvasView, EventCx, Flow, FlowMetrics, HostRequest,
+    MenuItem, Paint, Painter, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    access_id,
 };
 
 /// One control of the toolbar.
@@ -38,7 +45,25 @@ pub enum Item {
 
 pub struct EditToolbarView {
     theme: Theme,
+    /// What screen readers were last told: the mode, the tool, ripple and
+    /// the grid ([`CanvasView::access_news`]).
+    told: Option<Told>,
 }
+
+/// The toolbar's state as said.
+#[derive(Clone, Copy, PartialEq)]
+struct Told {
+    mode: EditMode,
+    tool: EditTool,
+    ripple: bool,
+    grid: GridDivision,
+}
+
+/// The transient sensitivities offered (its menu, its steps).
+const SENSITIVITIES: [f32; 8] = [0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0];
+
+/// Kinds of node (the toolbar's, then a control's place).
+const BAR: u64 = 0xED17;
 
 /// The grid value menu (shared by the arranger).
 pub fn grid_menu(current: GridDivision) -> Vec<MenuItem<Action>> {
@@ -77,7 +102,7 @@ fn grid_value_label(g: GridDivision) -> String {
 
 impl EditToolbarView {
     pub fn new(theme: Theme) -> Self {
-        Self { theme }
+        Self { theme, told: None }
     }
 
     /// One row's height.
@@ -463,6 +488,221 @@ impl EditToolbarView {
         }
     }
 
+    /// A control's node id: its place in the toolbar (a tool's place keeps
+    /// it when its kind changes: Trim and Stretch, Grab and Separate).
+    fn node_id(item: Item) -> u64 {
+        let (kind, n) = match item {
+            Item::Mode(m) => (1, EditMode::ALL.iter().position(|x| *x == m).unwrap_or(0)),
+            Item::GridModeMenu => (2, 0),
+            Item::Ripple => (3, 0),
+            Item::RippleMenu => (4, 0),
+            Item::Tool(t) => (
+                5,
+                match t {
+                    EditTool::Smart => 0,
+                    EditTool::Zoom => 1,
+                    EditTool::Trim | EditTool::TrimStretch => 2,
+                    EditTool::Select => 3,
+                    EditTool::Grab | EditTool::GrabSeparation => 4,
+                    EditTool::Scrub => 5,
+                    EditTool::Pencil => 6,
+                },
+            ),
+            Item::TrimMenu => (6, 0),
+            Item::GrabMenu => (7, 0),
+            Item::GridValue => (8, 0),
+            Item::Triplet => (9, 0),
+            Item::Dotted => (10, 0),
+            Item::Nudge => (11, 0),
+            Item::Groove => (12, 0),
+            Item::Flag(f) => (13, f as usize),
+            Item::Sensitivity => (14, 0),
+            Item::Counter(i) => (15, i),
+            Item::Zoom(z) => (16, z as usize),
+        };
+        access_id(&[BAR, kind, n as u64])
+    }
+
+    /// What a screen reader calls a control.
+    fn access_label(item: Item, s: &Session) -> String {
+        let e = &s.editor;
+        match item {
+            Item::Mode(m) => format!("{} mode", m.label()),
+            Item::GridModeMenu => match e.grid_mode {
+                GridMode::Absolute => "Grid mode: absolute".into(),
+                GridMode::Relative => "Grid mode: relative".into(),
+            },
+            Item::Ripple => "Ripple editing".into(),
+            Item::RippleMenu => format!("Ripple reaches: {}", e.ripple.scope.label()),
+            Item::Tool(t) => match t {
+                EditTool::Smart => "Smart tool",
+                EditTool::Zoom => "Zoom tool",
+                EditTool::Trim => "Trim tool",
+                EditTool::TrimStretch => "Time-stretch trim tool",
+                EditTool::Select => "Selector",
+                EditTool::Grab => "Grabber",
+                EditTool::GrabSeparation => "Separation grabber",
+                EditTool::Scrub => "Scrubber",
+                EditTool::Pencil => "Pencil",
+            }
+            .into(),
+            Item::TrimMenu => "Trim tool kind".into(),
+            Item::GrabMenu => "Grabber kind".into(),
+            Item::GridValue => format!("Grid value: {}", grid_value_label(e.grid)),
+            Item::Triplet => "Triplet grid".into(),
+            Item::Dotted => "Dotted grid".into(),
+            Item::Nudge => format!("Nudge value: {}", e.nudge.label()),
+            Item::Groove => "Quantize and humanize".into(),
+            Item::Flag(f) => match f {
+                EditFlag::SnapToObjects => "Snap to objects",
+                EditFlag::SnapToSamples => "Snap to samples",
+                EditFlag::SnapToZeroCrossings => "Snap to zero crossings",
+                EditFlag::TabToTransients => "Tab to transients",
+                EditFlag::LinkTimeline => "Link timeline and edit selection",
+                EditFlag::InsertionFollowsPlayback => "Insertion follows playback",
+                EditFlag::FollowPlayhead => "Follow playhead",
+                EditFlag::ShowTransients => "Show transients",
+                EditFlag::Warp => "Warp view",
+                EditFlag::EditToolbar => "Edit toolbar",
+                EditFlag::PolyphonicPitch => "Polyphonic pitch",
+                EditFlag::StopToStart => "Stop to start",
+            }
+            .into(),
+            Item::Sensitivity => "Transient sensitivity".into(),
+            Item::Counter(_) | Item::Zoom(_) => String::new(),
+        }
+    }
+
+    /// The toolbar's controls as a screen reader meets them.
+    fn access_nodes(&self, size: Size, s: &Session) -> Vec<AccessNode<Action>> {
+        let e = &s.editor;
+        let controls = self.items(size, s).into_iter().map(|(item, r, label, on)| {
+            let id = Self::node_id(item);
+            let node = |role, text: String| {
+                AccessNode::new(id, role, text)
+                    .at(r)
+                    .described(Self::tooltip_of(item))
+            };
+            let toggle = |action: Action| {
+                node(AccessRole::ToggleButton, Self::access_label(item, s))
+                    .checked(on)
+                    .on_activate(action)
+            };
+            let menu = || node(AccessRole::Button, Self::access_label(item, s)).with_menu();
+            match item {
+                Item::Mode(m) => toggle(Action::SetEditMode(m)),
+                Item::Ripple => toggle(Action::Ripple(RippleOp::Toggle)),
+                Item::Tool(t) => toggle(Action::SetEditTool(t)),
+                Item::Triplet => toggle(Action::SetGrid(e.grid.toggled_triplet())),
+                Item::Dotted => toggle(Action::SetGrid(e.grid.toggled_dotted())),
+                Item::Flag(f) => toggle(Action::SetEditFlag(f, !on)),
+                Item::GridModeMenu
+                | Item::RippleMenu
+                | Item::TrimMenu
+                | Item::GrabMenu
+                | Item::GridValue
+                | Item::Nudge
+                | Item::Groove => menu(),
+                Item::Sensitivity => {
+                    let now = e.transient_sensitivity;
+                    let at = SENSITIVITIES
+                        .iter()
+                        .position(|v| (v - now).abs() < 0.01)
+                        .unwrap_or_else(|| {
+                            SENSITIVITIES
+                                .partition_point(|v| *v < now)
+                                .min(SENSITIVITIES.len() - 1)
+                        });
+                    let up = SENSITIVITIES[(at + 1).min(SENSITIVITIES.len() - 1)];
+                    let down = SENSITIVITIES[at.saturating_sub(1)];
+                    node(AccessRole::SpinButton, Self::access_label(item, s))
+                        .value(
+                            f64::from(now) * 100.0,
+                            10.0,
+                            100.0,
+                            format!("{:.0} %", now * 100.0),
+                        )
+                        .on_step(
+                            Action::SetTransientSensitivity(up),
+                            Action::SetTransientSensitivity(down),
+                        )
+                        .with_menu()
+                }
+                Item::Counter(_) => {
+                    let i = CounterUnit::ALL
+                        .iter()
+                        .position(|u| *u == e.counter_unit)
+                        .unwrap_or(0);
+                    let next = CounterUnit::ALL[(i + 1) % CounterUnit::ALL.len()];
+                    node(
+                        AccessRole::Button,
+                        format!("Selection {}", label.to_lowercase()),
+                    )
+                    .described(format!(
+                        "The edit selection in {} (Enter: {})",
+                        e.counter_unit.label(),
+                        next.label()
+                    ))
+                    .on_activate(Action::SetCounterUnit(next))
+                }
+                Item::Zoom(z) => node(
+                    AccessRole::Button,
+                    match z {
+                        ZoomRequest::Out => "Zoom out",
+                        ZoomRequest::In => "Zoom in",
+                        ZoomRequest::Selection => "Zoom to the edit selection",
+                        ZoomRequest::Fit => "Zoom to fit the project",
+                    }
+                    .into(),
+                )
+                .on_activate(Action::Zoom(z)),
+            }
+        });
+        vec![
+            AccessNode::new(access_id(&[BAR]), AccessRole::Toolbar, "Edit toolbar")
+                .at(Rect::from_size(size))
+                .with_children(controls),
+        ]
+    }
+
+    /// The edit mode, tool, ripple or grid as it changed (the shortcuts),
+    /// said as their controls are.
+    fn news(&mut self, s: &Session) -> Vec<String> {
+        let e = &s.editor;
+        let now = Told {
+            mode: e.edit_mode,
+            tool: e.tool,
+            ripple: s.ripples(),
+            grid: e.grid,
+        };
+        let Some(before) = self.told.replace(now) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if before.mode != now.mode {
+            out.push(format!(
+                "{}, on",
+                Self::access_label(Item::Mode(now.mode), s)
+            ));
+        }
+        if before.tool != now.tool {
+            out.push(format!(
+                "{}, on",
+                Self::access_label(Item::Tool(now.tool), s)
+            ));
+        }
+        if before.ripple != now.ripple {
+            out.push(format!(
+                "Ripple editing, {}",
+                if now.ripple { "on" } else { "off" }
+            ));
+        }
+        if before.grid != now.grid {
+            out.push(Self::access_label(Item::GridValue, s));
+        }
+        out
+    }
+
     fn press(&self, item: Item, at: Point, s: &Session, cx: &mut EventCx<'_, Action>) {
         let e = &s.editor;
         match item {
@@ -563,7 +803,7 @@ impl EditToolbarView {
                 cx.request(HostRequest::ContextMenu { at, items });
             }
             Item::Sensitivity => {
-                let items = [0.1f32, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9, 1.0]
+                let items = SENSITIVITIES
                     .into_iter()
                     .map(|v| {
                         MenuItem::new(
@@ -592,6 +832,41 @@ impl EditToolbarView {
 impl CanvasView<Session, Action> for EditToolbarView {
     fn set_theme(&mut self, theme: &Theme) {
         self.theme = theme.clone();
+    }
+
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Edit toolbar".into())
+    }
+
+    /// A menu button's menu, under it.
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        if press != AccessPress::Menu {
+            return false;
+        }
+        let Some((item, r, ..)) = self
+            .items(size, model)
+            .into_iter()
+            .find(|(item, ..)| Self::node_id(*item) == id)
+        else {
+            return false;
+        };
+        self.press(item, Point::new(r.x, r.bottom()), model, cx);
+        true
+    }
+
+    fn access_news(&mut self, model: &Session) -> Vec<String> {
+        self.news(model)
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, s: &Session, _theme: &Theme) {
@@ -763,6 +1038,147 @@ mod tests {
         click(&mut v, &mut s, Item::Ripple);
         assert!(!s.ripples());
         assert_eq!(s.editor.edit_mode, EditMode::Slip);
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    use faderframe_engine::EngineConfig;
+    use faderframe_ui_canvas::access::{find_node, focus_order, press_key};
+    use faderframe_ui_canvas::{Key, Modifiers};
+
+    const SIZE: Size = Size::new(1900.0, 36.0);
+
+    fn node_of(v: &EditToolbarView, s: &Session, item: Item) -> AccessNode<Action> {
+        let nodes = v.accessible(SIZE, s);
+        find_node(&nodes, EditToolbarView::node_id(item))
+            .cloned()
+            .unwrap_or_else(|| panic!("{item:?}"))
+    }
+
+    /// The keyboard presses `key` on `item`: the actions go to the
+    /// session, the requests come back.
+    fn key(
+        v: &mut EditToolbarView,
+        s: &mut Session,
+        item: Item,
+        key: Key,
+    ) -> Vec<HostRequest<Action>> {
+        let nodes = v.accessible(SIZE, s);
+        let (actions, requests) = press_key(
+            v,
+            &nodes,
+            EditToolbarView::node_id(item),
+            key,
+            Modifiers::NONE,
+            SIZE,
+            s,
+        )
+        .unwrap_or_else(|| panic!("{key:?} does something on {item:?}"));
+        for a in actions {
+            s.dispatch(a).unwrap();
+        }
+        requests
+    }
+
+    /// Every control is in the toolbar, in the order shown; modes, tools
+    /// and options are toggle buttons pressed while on; Enter switches
+    /// them, opens the menu buttons' menus, changes the counters' units.
+    #[test]
+    fn the_toolbar_is_a_row_of_controls_the_keyboard_reaches() {
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let mut v = EditToolbarView::new(Theme::default());
+        assert_eq!(v.accessible_name().as_deref(), Some("Edit toolbar"));
+        let nodes = v.accessible(SIZE, &s);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].role, AccessRole::Toolbar);
+        let items = v.items(SIZE, &s);
+        let order: Vec<u64> = focus_order(&nodes).iter().map(|n| n.id).collect();
+        let expected: Vec<u64> = items
+            .iter()
+            .map(|(i, ..)| EditToolbarView::node_id(*i))
+            .collect();
+        assert_eq!(order, expected, "every control, in the order shown");
+        for (item, r, _, on) in &items {
+            let n = node_of(&v, &s, *item);
+            assert_eq!(n.bounds, *r);
+            assert!(!n.label.is_empty(), "{item:?} is named");
+            if n.role == AccessRole::ToggleButton {
+                assert_eq!(n.checked, Some(*on), "{item:?}");
+            }
+        }
+        let grid = node_of(&v, &s, Item::Mode(EditMode::Grid));
+        assert_eq!(grid.spoken(), "Grid mode, on");
+        // Tools: Enter takes one; it is pressed then, the others not.
+        key(&mut v, &mut s, Item::Tool(EditTool::Trim), Key::Enter);
+        assert_eq!(s.editor.tool, EditTool::Trim);
+        assert_eq!(
+            node_of(&v, &s, Item::Tool(EditTool::Trim)).checked,
+            Some(true)
+        );
+        assert_eq!(
+            node_of(&v, &s, Item::Tool(EditTool::Smart)).checked,
+            Some(false)
+        );
+        // The trim kind's menu: a time-stretching trim keeps the place.
+        let menu = key(&mut v, &mut s, Item::TrimMenu, Key::Enter);
+        let Some(HostRequest::ContextMenu { items, .. }) = menu.first() else {
+            panic!("the trim menu")
+        };
+        let stretch = items
+            .iter()
+            .find(|i| i.label == "Time-Stretch Trim")
+            .and_then(|i| i.action.clone())
+            .unwrap();
+        s.dispatch(stretch).unwrap();
+        let n = node_of(&v, &s, Item::Tool(EditTool::TrimStretch));
+        assert_eq!(n.spoken(), "Time-stretch trim tool, on");
+        // Options switch; the grid value's menu opens with Enter and the
+        // Menu key.
+        key(&mut v, &mut s, Item::Flag(EditFlag::Warp), Key::Enter);
+        assert!(s.editor.warp);
+        for k in [Key::Enter, Key::Menu] {
+            let menu = key(&mut v, &mut s, Item::GridValue, k);
+            assert!(matches!(
+                menu.first(),
+                Some(HostRequest::ContextMenu { items, .. }) if items.iter().any(|i| i.label == "1/256")
+            ));
+        }
+        // The sensitivity steps through its values.
+        let before = s.editor.transient_sensitivity;
+        key(&mut v, &mut s, Item::Sensitivity, Key::Up);
+        assert!(s.editor.transient_sensitivity > before);
+        assert!(node_of(&v, &s, Item::Sensitivity).value.is_some());
+        // A counter changes the units.
+        key(&mut v, &mut s, Item::Counter(1), Key::Enter);
+        assert_eq!(s.editor.counter_unit, CounterUnit::MinSecs);
+        assert!(
+            node_of(&v, &s, Item::Counter(1))
+                .label
+                .starts_with("Selection end ")
+        );
+        // Zoom buttons act.
+        let before = s.editor.zoom_request.0;
+        key(&mut v, &mut s, Item::Zoom(ZoomRequest::Fit), Key::Enter);
+        assert_eq!(s.editor.zoom_request, (before + 1, ZoomRequest::Fit));
+    }
+
+    /// A mode, tool, ripple or grid changed by a shortcut is said as its
+    /// control would say it; nothing on the first look.
+    #[test]
+    fn changes_made_elsewhere_are_said() {
+        let mut s = Session::demo(EngineConfig::default()).unwrap();
+        let mut v = EditToolbarView::new(Theme::default());
+        assert!(v.access_news(&s).is_empty());
+        assert!(v.access_news(&s).is_empty(), "nothing changed");
+        s.dispatch(Action::SetEditTool(EditTool::Pencil)).unwrap();
+        s.dispatch(Action::SetEditMode(EditMode::Slip)).unwrap();
+        assert_eq!(v.access_news(&s), ["Slip mode, on", "Pencil, on"]);
+        s.dispatch(Action::Ripple(RippleOp::Toggle)).unwrap();
+        s.dispatch(Action::SetGrid(GridDivision::Note(8))).unwrap();
+        assert_eq!(v.access_news(&s), ["Ripple editing, on", "Grid value: 1/8"]);
+        assert!(v.access_news(&s).is_empty());
     }
 }
 

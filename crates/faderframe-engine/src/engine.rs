@@ -72,6 +72,9 @@ enum Message {
     ResetProcessors,
     /// Stop when playback reaches this position (once), or never.
     StopAt(Option<i64>),
+    /// Fade an interactive score's transition (see [`crate::transition`]),
+    /// or no more.
+    TransitionFade(Option<crate::transition::TransitionFade>),
     BeginRecord(Box<Recorder>),
     EndRecord,
     MidiInput(Box<faderframe_midi::MidiInputQueue>),
@@ -101,6 +104,18 @@ enum Message {
     Launch(crate::launch::LaunchCommand),
     /// Play at a speed (see [`crate::varispeed`]), or no more.
     Varispeed(Option<Box<crate::varispeed::Varispeed>>),
+    /// Move parameter slots to targets (see [`crate::glide`]), or stop
+    /// moving them where they are.
+    Glide(Option<Box<crate::glide::Glide>>),
+    /// Copy a device input to the control side (see [`crate::input_tap`]),
+    /// or no more.
+    InputTap(Option<Box<crate::input_tap::TapRt>>),
+    /// Keep the inputs for Capture Audio (see [`crate::input_capture`]),
+    /// or no more.
+    InputCapture(Option<Box<crate::input_capture::CaptureRt>>),
+    /// Play a MIDI file into the auditioned instrument (see
+    /// [`crate::midi_preview`]), or no more.
+    MidiPreview(Option<Box<crate::midi_preview::MidiPreviewRun>>),
 }
 
 /// Objects retired by the audio thread, dropped on the control thread.
@@ -121,6 +136,10 @@ enum Garbage {
     Voice(#[allow(dead_code)] Box<crate::voice::VoiceRun>),
     #[allow(clippy::redundant_allocation)]
     ClickSounds(#[allow(dead_code)] Box<Arc<ClickSounds>>),
+    Glide(#[allow(dead_code)] Box<crate::glide::Glide>),
+    InputTap(#[allow(dead_code)] Box<crate::input_tap::TapRt>),
+    InputCapture(#[allow(dead_code)] Box<crate::input_capture::CaptureRt>),
+    MidiPreview(#[allow(dead_code)] Box<crate::midi_preview::MidiPreviewRun>),
 }
 
 /// When a callback started (MIDI clock) and the transport position then,
@@ -227,6 +246,11 @@ pub struct EngineShared {
     /// Its answer: the round trip (frames), `PING_PENDING` or
     /// `PING_LOST`.
     ping_result: std::sync::atomic::AtomicI64,
+    /// Parameter glides (see [`crate::glide`]): the one taken last, the
+    /// last one finished, and how far the running one is (f32 bits).
+    glide_current: AtomicU64,
+    glide_done: AtomicU64,
+    glide_progress: AtomicU32,
 }
 
 /// How long the output fades out and in around a latency change.
@@ -329,6 +353,7 @@ pub fn create_with_epoch(
     let meters = Arc::new(MeterBank::new(config.meter_capacity));
     meters.set_rate(config.sample_rate as f32);
     let scope = Arc::new(faderframe_realtime::ScopeRing::new(SCOPE_FRAMES));
+    let share = Arc::new(faderframe_realtime::ScopeRing::new(SCOPE_FRAMES));
     let (midi_input, live_sysex) = crate::midi::MidiInputState::new();
     let processor = EngineProcessor {
         rx,
@@ -357,6 +382,7 @@ pub fn create_with_epoch(
             launch: crate::launch::LaunchState::new(),
             history: Default::default(),
             recording: Default::default(),
+            share: Arc::clone(&share),
         },
         transport: TransportState::default(),
         shared: Arc::clone(&shared),
@@ -372,7 +398,9 @@ pub fn create_with_epoch(
         midi_out: None,
         clock: crate::midi::ClockGen::default(),
         clock_due: 0,
+        midi_out_due: [0; 64],
         stop_at: None,
+        fading: crate::transition::Fading::default(),
         mtc_due: 0,
         output_latency: 0,
         graph_latency: 0,
@@ -387,6 +415,10 @@ pub fn create_with_epoch(
         callbacks: 0,
         count_in_end: i64::MIN,
         counted_in: CountedIn::No,
+        glide: None,
+        input_tap: None,
+        input_capture: None,
+        midi_preview: None,
     };
     let controller = EngineController {
         config,
@@ -402,6 +434,7 @@ pub fn create_with_epoch(
         params,
         meters,
         scope,
+        share,
         slots: SlotRegistry::new(config.param_capacity, config.meter_capacity),
         plugins: PluginHost::default(),
         profile: None,
@@ -446,9 +479,16 @@ pub fn create_with_epoch(
         graph_device_block: 0,
         graph_device_outputs: 0,
         ahead_misses: Arc::new(AtomicU64::new(0)),
+        ahead_watch: None,
         varispeed: false,
         sent_loop: None,
+        held_loop: None,
         capture: None,
+        glide_seq: 0,
+        gliding: Default::default(),
+        glide_release: None,
+        glide_scratch: None,
+        cache: crate::cache::CacheOverlay::default(),
     };
     (controller, processor)
 }
@@ -481,8 +521,15 @@ pub struct EngineProcessor {
     /// The last MIDI clock and MTC messages' due times: callbacks run late
     /// now and then, so later messages are kept after earlier ones.
     clock_due: u64,
+    /// The last external MIDI message's due time per port (ports from
+    /// 64 on unguarded): a callback stamped a little early must not send
+    /// its first event (a note) before the previous callback's last (its
+    /// keyswitch); equal times keep their order in the sender.
+    midi_out_due: [u64; 64],
     /// Stop when playback reaches this position (a setlist song's end).
     stop_at: Option<i64>,
+    /// An interactive score's transition fading (its preview).
+    fading: crate::transition::Fading,
     mtc_due: u64,
     /// Frames from a callback to its audio being heard (buffer + device).
     output_latency: u32,
@@ -514,6 +561,16 @@ pub struct EngineProcessor {
     /// Whether playback began with a count-in (the metronome may keep
     /// quiet after it: [`MetronomeShared::count_in_only`]).
     counted_in: CountedIn,
+    /// Parameter slots on their way to targets (see [`crate::glide`]).
+    glide: Option<Box<crate::glide::Glide>>,
+    /// A device input copied to the control side (see
+    /// [`crate::input_tap`]).
+    input_tap: Option<Box<crate::input_tap::TapRt>>,
+    /// The inputs kept for Capture Audio (see [`crate::input_capture`]).
+    input_capture: Option<Box<crate::input_capture::CaptureRt>>,
+    /// A MIDI file previewed into the auditioned instrument (see
+    /// [`crate::midi_preview`]).
+    midi_preview: Option<Box<crate::midi_preview::MidiPreviewRun>>,
 }
 
 /// Playback after a count-in, until the next start without one (the
@@ -636,6 +693,7 @@ impl EngineProcessor {
                     }
                 }
                 Message::StopAt(at) => self.stop_at = at,
+                Message::TransitionFade(fade) => self.fading.set(fade, &self.transport),
                 Message::ResetProcessors => {
                     // Rendered ahead: each anticipator resets on its own
                     // thread; the transport goes on.
@@ -768,6 +826,55 @@ impl EngineProcessor {
                     );
                     self.ctx.launch.follow(&self.ctx.timeline);
                 }
+                Message::Glide(glide) => {
+                    let old = match glide {
+                        Some(mut g) => {
+                            g.begin(&self.ctx.params);
+                            self.shared.glide_current.store(g.id, Ordering::Relaxed);
+                            self.shared.glide_progress.store(0, Ordering::Relaxed);
+                            self.glide.replace(g)
+                        }
+                        None => self.glide.take(),
+                    };
+                    if let Some(old) = old {
+                        self.retire(Garbage::Glide(old));
+                    }
+                }
+                Message::InputTap(tap) => {
+                    if let Some(old) = std::mem::replace(&mut self.input_tap, tap) {
+                        self.retire(Garbage::InputTap(old));
+                    }
+                }
+                Message::InputCapture(capture) => {
+                    if let Some(old) = std::mem::replace(&mut self.input_capture, capture) {
+                        self.retire(Garbage::InputCapture(old));
+                    }
+                }
+                Message::MidiPreview(run) => {
+                    if let Some(mut old) = std::mem::replace(&mut self.midi_preview, run) {
+                        // Its notes end with the next callback's MIDI.
+                        old.release(&mut self.midi, None);
+                        self.retire(Garbage::MidiPreview(old));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Move the gliding slots on by a chunk of `n` frames (their values
+    /// for its end, before the graph reads them).
+    fn advance_glide(&mut self, n: usize) {
+        let Some(g) = self.glide.as_deref_mut() else {
+            return;
+        };
+        let done = g.advance(n, &self.ctx.params);
+        self.shared
+            .glide_progress
+            .store(g.progress().to_bits(), Ordering::Relaxed);
+        if done {
+            self.shared.glide_done.store(g.id, Ordering::Relaxed);
+            if let Some(g) = self.glide.take() {
+                self.retire(Garbage::Glide(g));
             }
         }
     }
@@ -892,6 +999,11 @@ impl EngineProcessor {
             self.shared.transport.publish(&self.transport);
             self.shared.epoch.advance();
             return;
+        }
+        // The input as the device gave it, stamped on the heard clock's
+        // time base.
+        if let Some(tap) = self.input_tap.as_deref_mut() {
+            tap.capture(&*io, crate::history::ns_since_epoch(started));
         }
         // Varispeed: the engine renders the frames the device's need at
         // the speed (resampled both ways).
@@ -1025,6 +1137,10 @@ impl EngineProcessor {
                 v.deliver(&mut self.midi, now, &self.shared.midi_dropped);
             }
         }
+        // A MIDI file previewed: its events join this callback's MIDI.
+        if let Some(p) = self.midi_preview.as_deref_mut() {
+            p.play(&mut self.midi, &self.transport, frames);
+        }
         let callback_ns = self.midi_out.as_ref().map_or(0, |q| q.clock.now_ns());
 
         if let Some(clock) = self.midi.clock() {
@@ -1081,6 +1197,10 @@ impl EngineProcessor {
                 (false, _, c) => c,
             };
             self.ctx.discontinuity = self.transport.take_discontinuity();
+            if self.fading.active() {
+                self.fading
+                    .before_chunk(self.ctx.history.chunk_start(), &self.transport);
+            }
             self.ctx
                 .launch
                 .transport(info.playing, self.transport.position());
@@ -1100,14 +1220,28 @@ impl EngineProcessor {
                     &self.shared.midi.consumed,
                 );
             }
+            let mut recorded = 0;
             if info.playing
                 && info.recording
                 && let Some(rec) = self.recorder.as_deref_mut()
             {
-                let got = rec.capture(&*io, offset, n, pos, &self.shared.record_overruns);
+                recorded = rec.capture(&*io, offset, n, pos, &self.shared.record_overruns);
                 self.shared
                     .recorded_frames
-                    .fetch_add(got as u64, Ordering::Relaxed);
+                    .fetch_add(recorded as u64, Ordering::Relaxed);
+            }
+            // Capture Audio: the same frames at the same position, playing
+            // or not (a count-in or a scrub places nothing).
+            if let Some(cap) = self.input_capture.as_deref_mut() {
+                let playing = info.playing && counting_in == 0 && !self.transport.scrubbing();
+                cap.capture(
+                    &*io,
+                    offset,
+                    n,
+                    self.ctx.history.chunk_start().max(0) as u64,
+                    playing.then_some(pos),
+                    recorded > 0,
+                );
             }
             let clock_ports = self.shared.midi.clock_ports.load(Ordering::Relaxed);
             let scrubbing = self.transport.scrubbing();
@@ -1161,6 +1295,7 @@ impl EngineProcessor {
                     }
                 });
             }
+            self.advance_glide(n);
             if graph_ok && let Some(graph) = self.graph.as_deref_mut() {
                 let ins = io.input_channels();
                 graph.fill_device_inputs(n, |first, buf| {
@@ -1191,33 +1326,25 @@ impl EngineProcessor {
                     let latency = self.output_latency as usize + offset;
                     let ns_per_frame = 1e9 / rate.max(1.0);
                     let dropped = &self.shared.midi_out_dropped;
+                    let last_due = &mut self.midi_out_due;
                     graph.read_event_outputs(|port, buf| {
                         if port == crate::midi::NO_PORT {
                             return;
                         }
                         for ev in buf.iter() {
-                            let due = base
+                            let mut due = base
                                 + ((latency + ev.sample_offset as usize) as f64 * ns_per_frame)
                                     as u64;
-                            let m = if let faderframe_midi::MidiEvent::NoteExpression {
-                                channel,
-                                key,
-                                kind,
-                                value,
-                            } = ev.event
-                            {
-                                // For MIDI 2.0 ports (per-note controllers).
-                                faderframe_midi::MidiOutputEvent::expression(
-                                    port, due, channel, key, kind, value,
-                                )
-                            } else {
-                                let (bytes, len) = ev.event.to_bytes();
-                                let Some(m) =
-                                    faderframe_midi::MidiOutputEvent::new(port, due, &bytes[..len])
-                                else {
-                                    continue;
-                                };
-                                m
+                            if let Some(last) = last_due.get_mut(usize::from(port)) {
+                                due = due.max(*last);
+                                *last = due;
+                            }
+                            // With its MIDI 2.0 resolution, and note
+                            // expressions: MIDI 2.0 ports send them (as
+                            // per-note controllers).
+                            let Some(m) = faderframe_midi::MidiOutputEvent::of_event(port, due, ev)
+                            else {
+                                continue;
                             };
                             if q.producer.push(m).is_err() {
                                 dropped.fetch_add(1, Ordering::Relaxed);
@@ -1257,6 +1384,16 @@ impl EngineProcessor {
                         *o *= self.transport.scrub_gain(i);
                     }
                 }
+            }
+            // An interactive score's transition fading out and in, as heard.
+            if self.fading.active() {
+                self.fading.apply(
+                    io,
+                    offset,
+                    n,
+                    self.ctx.history.chunk_start(),
+                    self.graph_latency,
+                );
             }
             if (click || count_in_heard || self.click.sounding()) && !scrubbing {
                 // As late as the graph's outputs: the beats of what is heard
@@ -1311,6 +1448,10 @@ impl EngineProcessor {
             self.ctx.launch.played(pos, n);
             self.ctx.launch.follow(&self.ctx.timeline);
             self.transport.advance(n);
+            if self.fading.active() {
+                self.fading
+                    .after_chunk(self.ctx.history.chunk_start() + n as i64, &self.transport);
+            }
             if let Some(at) = self.stop_at
                 && self.transport.playing()
                 && pos < at
@@ -1438,6 +1579,8 @@ pub struct Heard {
 pub struct EngineClock {
     shared: Arc<EngineShared>,
     varispeed_delay: u32,
+    /// The codec monitor's delay while it is heard.
+    codec: Arc<crate::nodes::CodecShared>,
 }
 
 impl EngineClock {
@@ -1474,7 +1617,9 @@ impl EngineClock {
 
     /// [`EngineController::heard_ahead`], from any thread.
     pub fn heard_ahead(&self, at: std::time::Instant) -> Option<Heard> {
-        let device = self.shared.output_latency.load(Ordering::Relaxed) + self.varispeed_delay;
+        let device = self.shared.output_latency.load(Ordering::Relaxed)
+            + self.varispeed_delay
+            + self.codec.delay();
         heard(&self.shared, device, at, false)
     }
 }
@@ -1522,6 +1667,8 @@ pub struct EngineController {
     params: Arc<ParamTable>,
     meters: Arc<MeterBank>,
     scope: Arc<faderframe_realtime::ScopeRing>,
+    /// The track shared with others (Listen Along): its post-fader audio.
+    share: Arc<faderframe_realtime::ScopeRing>,
     slots: SlotRegistry,
     readback: Arc<ParamTable>,
     plugins: PluginHost,
@@ -1603,13 +1750,27 @@ pub struct EngineController {
     /// The device output count it was built for.
     graph_device_outputs: usize,
     ahead_misses: Arc<AtomicU64>,
+    /// Where the installed link plays and its anticipators are.
+    ahead_watch: Option<crate::ahead::AheadWatch>,
     /// Varispeed is on.
     varispeed: bool,
     /// The loop as last sent to the transport (samples, switch).
     sent_loop: Option<(Option<LoopRange>, bool)>,
+    /// A loop held instead of the project's ([`Self::hold_loop`]).
+    held_loop: Option<(Option<LoopRange>, bool)>,
     /// What an analysis render captures ([`crate::capture`]; `None`:
     /// nothing, and nothing built for it).
     capture: Option<Arc<crate::capture::Capture>>,
+    /// Parameter glides (see [`crate::glide`]): the last one's id, the
+    /// slots it holds (parameter syncs leave them alone), the glide whose
+    /// end releases them, and a table targets are worked out in.
+    glide_seq: u64,
+    gliding: std::collections::HashSet<faderframe_realtime::ParamSlot>,
+    glide_release: Option<u64>,
+    glide_scratch: Option<ParamTable>,
+    /// Tracks played from a cache of their chain's output
+    /// ([`crate::cache`]).
+    cache: crate::cache::CacheOverlay,
 }
 
 /// The tracks with launcher clips (sorted).
@@ -1906,6 +2067,7 @@ impl EngineController {
         EngineClock {
             shared: Arc::clone(&self.shared),
             varispeed_delay: self.varispeed_delay(),
+            codec: Arc::clone(self.listen.link.codec().shared()),
         }
     }
 
@@ -1940,7 +2102,7 @@ impl EngineController {
     /// `None` before the first callback. While a locate or stop has not
     /// reached the ears yet, `jumped` says where the transport went.
     pub fn heard_at(&self, now: std::time::Instant) -> Option<Heard> {
-        heard(&self.shared, self.device_latency(), now, true)
+        heard(&self.shared, self.heard_latency(), now, true)
     }
 
     /// What will be heard at `at`, a moment from now (a picture for when it
@@ -1949,7 +2111,23 @@ impl EngineController {
     /// it stays on the stopped position until the latency has filled, as
     /// the sound does.
     pub fn heard_ahead(&self, at: std::time::Instant) -> Option<Heard> {
-        heard(&self.shared, self.device_latency(), at, false)
+        heard(&self.shared, self.heard_latency(), at, false)
+    }
+
+    /// What listening adds after the graph and before the device (frames):
+    /// the codec monitor's delay while it is heard (`nodes::codec`; 0
+    /// otherwise). Not part of the graph's latency (nothing is compensated
+    /// for it, nothing rebuilt), nor of [`Self::output_latency`] (MIDI
+    /// outputs, recording and other outputs never pass it): the heard
+    /// clock, the meters and the analysers count it.
+    pub fn listening_delay(&self) -> u32 {
+        self.listen.link.codec().shared().delay()
+    }
+
+    /// Frames from the graph's output to the ears of whoever listens to
+    /// the master: [`Self::device_latency`] and [`Self::listening_delay`].
+    pub fn heard_latency(&self) -> u32 {
+        self.device_latency() + self.listening_delay()
     }
 
     /// Varispeed's resampler delay each way (0 when it does not run).
@@ -1998,6 +2176,62 @@ impl EngineController {
     /// what they asked for (a restart needs a graph rebuild).
     pub fn poll_plugins(&mut self) -> faderframe_plugin_host::PluginPoll {
         self.plugins.poll()
+    }
+
+    /// Every ARA document's archive, for the project (before saving or
+    /// rendering).
+    pub fn capture_ara_archives(&mut self) -> Vec<faderframe_project::ara::AraArchive> {
+        self.plugins.capture_ara()
+    }
+
+    /// Whether an ARA plug-in's document changed since the archives were
+    /// captured.
+    pub fn ara_unsaved(&self) -> bool {
+        self.plugins.ara_unsaved()
+    }
+
+    /// The notes an ARA plug-in found in a clip on `track` (song seconds),
+    /// `None` when no ARA insert renders it or the plug-in has none.
+    pub fn ara_notes(
+        &self,
+        clip: faderframe_core::ClipId,
+        track: faderframe_core::TrackId,
+    ) -> Option<Vec<faderframe_plugin_host::ara::Note>> {
+        self.plugins.ara_notes(clip, track)
+    }
+
+    /// Show these clips in an ARA insert's editor (its view's selection).
+    pub fn ara_select(
+        &self,
+        plugin: faderframe_core::PluginInstanceId,
+        clips: &[faderframe_core::ClipId],
+    ) {
+        self.plugins.ara_select(plugin, clips);
+    }
+
+    /// Playback requests ARA plug-ins made (start, stop, locate, cycle).
+    pub fn take_ara_requests(&mut self) -> Vec<faderframe_plugin_host::ara::PlaybackRequest> {
+        self.plugins.take_ara_requests()
+    }
+
+    /// ARA plug-ins' analysis progress (plug-in name, source).
+    pub fn ara_analysis(&self) -> Vec<(String, faderframe_plugin_host::ara::Analysis)> {
+        self.plugins.ara_analysis()
+    }
+
+    /// The ARA plug-ins installed (format, id).
+    pub fn ara_plugins(&self) -> Vec<(faderframe_plugin_host::PluginFormat, String)> {
+        self.plugins.registry().ara_plugins()
+    }
+
+    /// Whether the instance renders its track's clips through ARA.
+    pub fn is_ara_renderer(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.plugins.is_ara_renderer(plugin)
+    }
+
+    /// Tracks whose clips an ARA insert renders now.
+    pub fn ara_rendered_tracks(&self) -> std::collections::HashSet<faderframe_core::TrackId> {
+        self.plugins.ara_rendered_tracks()
     }
 
     /// Preset files of a plugin format's own folders (e.g. VST3).
@@ -2185,6 +2419,19 @@ impl EngineController {
         self.scope.set_source(track.map(|t| t.raw()));
     }
 
+    /// Audio of the track shared with others (see
+    /// [`Self::set_share_source`]).
+    pub fn share(&self) -> &Arc<faderframe_realtime::ScopeRing> {
+        &self.share
+    }
+
+    /// The track whose post-fader output goes to [`Self::share`] (a live
+    /// session's host streams its master to peers listening along; `None`:
+    /// nothing is written).
+    pub fn set_share_source(&self, track: Option<TrackId>) {
+        self.share.set_source(track.map(|t| t.raw()));
+    }
+
     /// Does the plugin have a sidechain input?
     pub fn plugin_has_sidechain(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
         self.plugins.has_sidechain(plugin)
@@ -2275,6 +2522,100 @@ impl EngineController {
         Arc::clone(&self.plan)
     }
 
+    /// Glide the mixer's continuous parameters (faders, pans, send and
+    /// cue levels and pans, surround positions, the console's drive) from
+    /// where the audio thread has them to `project`'s values over
+    /// `seconds` (see [`crate::glide`]); switched values are left to the
+    /// caller. Slots a glide already moves go on from where they are.
+    /// Until released ([`Self::release_glide`]) the slots it moves are
+    /// not written by parameter syncs. Returns its id (`None`: nothing to
+    /// move).
+    pub fn glide_mix(
+        &mut self,
+        project: &Project,
+        seconds: f64,
+    ) -> Result<Option<u64>, EngineError> {
+        let capacity = self.params.capacity();
+        let scratch = self
+            .glide_scratch
+            .get_or_insert_with(|| ParamTable::new(capacity));
+        let none = std::collections::HashSet::new();
+        self.slots.write_params(
+            project,
+            scratch,
+            &self.midi_live,
+            &self.suspended_lanes,
+            &none,
+        )?;
+        let mut entries = Vec::new();
+        for (slot, law) in self.slots.glidable() {
+            let to = scratch.get(slot);
+            let now = self.params.get(slot);
+            // Not a number (a send's pan off): switched, not glided.
+            if to.is_nan() || now.is_nan() {
+                continue;
+            }
+            if (to - now).abs() > 1e-7 || self.gliding.contains(&slot) {
+                entries.push((slot, law, to));
+            }
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let rate = f64::from(self.stream_sample_rate().max(1));
+        let frames = (seconds.max(0.0) * rate).round().max(1.0) as u64;
+        self.glide_seq += 1;
+        let glide = crate::glide::Glide::new(self.glide_seq, &entries, frames);
+        self.gliding = glide.slots().collect();
+        self.glide_release = None;
+        self.send(Message::Glide(Some(Box::new(glide))))?;
+        Ok(Some(self.glide_seq))
+    }
+
+    /// Has the audio thread finished glide `id` (its targets written)?
+    pub fn glide_done(&self, id: u64) -> bool {
+        self.shared.glide_done.load(Ordering::Relaxed) >= id
+    }
+
+    /// How far the latest glide is (0…1; `None`: none holds slots).
+    pub fn glide_progress(&self) -> Option<f32> {
+        if self.gliding.is_empty() {
+            return None;
+        }
+        if self.glide_done(self.glide_seq) {
+            return Some(1.0);
+        }
+        if self.shared.glide_current.load(Ordering::Relaxed) != self.glide_seq {
+            // Not taken by the audio thread yet.
+            return Some(0.0);
+        }
+        Some(f32::from_bits(self.shared.glide_progress.load(Ordering::Relaxed)).clamp(0.0, 1.0))
+    }
+
+    /// Does a glide hold slots (parameter syncs leave them alone)?
+    pub fn gliding(&self) -> bool {
+        !self.gliding.is_empty()
+    }
+
+    /// Let go of the glide's slots: `now` stops it where it is (the next
+    /// parameter sync writes the project's values), else once the audio
+    /// thread has finished it (its targets are the project's values).
+    pub fn release_glide(&mut self, now: bool) -> Result<(), EngineError> {
+        if self.gliding.is_empty() {
+            return Ok(());
+        }
+        if now || self.glide_done(self.glide_seq) {
+            self.gliding.clear();
+            self.glide_release = None;
+            if !self.glide_done(self.glide_seq) {
+                self.send(Message::Glide(None))?;
+            }
+        } else {
+            self.glide_release = Some(self.glide_seq);
+        }
+        Ok(())
+    }
+
     pub fn graphs_installed(&self) -> u64 {
         self.shared.graphs_installed.load(Ordering::Relaxed)
     }
@@ -2286,6 +2627,14 @@ impl EngineController {
     /// Drop objects the audio thread has retired. Call regularly (e.g. from
     /// the UI frame timer).
     pub fn collect_garbage(&mut self) -> usize {
+        // A glide let go of once finished: its slots are the project's
+        // again.
+        if let Some(id) = self.glide_release
+            && self.glide_done(id)
+        {
+            self.gliding.clear();
+            self.glide_release = None;
+        }
         let mut n = 0;
         while self.garbage.pop().is_ok() {
             n += 1;
@@ -2307,6 +2656,15 @@ impl EngineController {
     ) -> Result<(), EngineError> {
         self.collect_garbage();
         self.collect_listening();
+        // ARA documents follow clips and the tempo map; a renderer whose
+        // regions change was deactivated and needs the graph rebuilt.
+        let impact = if matches!(impact, Impact::Timeline | Impact::Graph)
+            && self.plugins.sync_ara(project, sources)
+        {
+            Impact::Graph
+        } else {
+            impact
+        };
         match impact {
             Impact::None => Ok(()),
             // The loop: to the transport as it is (no snapshot, nothing
@@ -2359,6 +2717,7 @@ impl EngineController {
             &self.params,
             &self.midi_live,
             &self.suspended_lanes,
+            &self.gliding,
         )?;
         self.slots
             .write_talkback(project, &self.params, &self.talkback)?;
@@ -2409,6 +2768,18 @@ impl EngineController {
     pub fn rebuild_graph(&mut self, project: &Project) -> Result<(), EngineError> {
         self.slots.retain_project(project);
         self.plugins.retain_project(project);
+        // Cached tracks that are gone; chains coming back from their
+        // caches reset their devices before their first block.
+        for (t, _) in self.cache.states() {
+            if project.track(t).is_none() {
+                self.cache.remove(t);
+            }
+        }
+        for t in self.cache.take_resets() {
+            for slot in project.track(t).map(|t| t.slots()).unwrap_or_default() {
+                self.plugins.mark_stale(slot.id);
+            }
+        }
         let mut prepare =
             PrepareConfig::new(self.config.sample_rate as f64, self.config.max_block_size);
         prepare.measure_nodes = self.config.measure_nodes;
@@ -2466,6 +2837,7 @@ impl EngineController {
             },
             &self.talkback,
             self.capture.as_deref(),
+            &self.cache,
         )?;
         self.low_latency_tracks = monitoring;
         self.bypassed_for_monitoring = built.bypassed_for_monitoring.clone();
@@ -2506,6 +2878,7 @@ impl EngineController {
             &self.params,
             &self.midi_live,
             &self.suspended_lanes,
+            &self.gliding,
         )?;
         self.slots
             .write_talkback(project, &self.params, &self.talkback)?;
@@ -2553,13 +2926,16 @@ impl EngineController {
         project: &Project,
         sources: &SourceMap,
     ) -> Result<(), EngineError> {
-        let snapshot = TimelineSnapshot::build_with(
+        let mut snapshot = TimelineSnapshot::build_with(
             project,
             sources,
             self.config.sample_rate,
             &self.suspended_lanes,
             self.take_audition,
         );
+        snapshot.set_cached(self.cache.regions());
+        // Clips an ARA insert renders play through it, not the clip player.
+        snapshot.drop_audio_of(&self.plugins.ara_rendered_tracks());
         self.plan = Arc::new(snapshot.stream_plan());
         let snapshot = Arc::new(snapshot);
         // A snapshot a thread never picked up is dropped right here.
@@ -2590,7 +2966,9 @@ impl EngineController {
     /// was sent last (a loop dragged while playing: one command per
     /// change, nothing else).
     pub fn send_loop(&mut self, project: &Project) -> Result<(), EngineError> {
-        let wanted = self.loop_in_samples(project);
+        let wanted = self
+            .held_loop
+            .unwrap_or_else(|| self.loop_in_samples(project));
         if self.sent_loop == Some(wanted) {
             return Ok(());
         }
@@ -2618,6 +2996,55 @@ impl EngineController {
     /// not (`None`).
     pub fn stop_at(&mut self, at: Option<i64>) -> Result<(), EngineError> {
         self.send(Message::StopAt(at))
+    }
+
+    /// Fade an interactive score's transition on the device outputs (its
+    /// preview; see [`crate::transition`]), or no more.
+    pub fn transition_fade(
+        &mut self,
+        fade: Option<crate::transition::TransitionFade>,
+    ) -> Result<(), EngineError> {
+        self.send(Message::TransitionFade(fade))
+    }
+
+    /// Plan jumps of the transport (an interactive score's transitions,
+    /// sample-accurate; see [`faderframe_transport::Cue`]): a loop change
+    /// the render-ahead tiers take on beyond where they are, so the first
+    /// jump must lie further ahead than they render. Replaces what was
+    /// planned; none: [`faderframe_transport::Cues::NONE`].
+    pub fn set_cues(&mut self, cues: faderframe_transport::Cues) -> Result<(), EngineError> {
+        self.send(Message::Transport(TransportCommand::SetCues(cues)))
+    }
+
+    /// Set the transport's loop as it is asked here (not the project's: an
+    /// interactive score's preview loops its states; `None`: the project's
+    /// again). The project's loop is not sent while this one holds.
+    pub fn hold_loop(
+        &mut self,
+        project: &Project,
+        held: Option<(Option<LoopRange>, bool)>,
+    ) -> Result<(), EngineError> {
+        self.held_loop = held;
+        self.send_loop(project)
+    }
+
+    /// The loop held by [`Self::hold_loop`].
+    pub fn held_loop(&self) -> Option<(Option<LoopRange>, bool)> {
+        self.held_loop
+    }
+
+    /// Gains beside the faders (linear, by track; an interactive score's
+    /// layers in its preview), written at once; empty: none.
+    pub fn set_track_trims(
+        &mut self,
+        project: &Project,
+        trims: std::collections::HashMap<TrackId, f32>,
+    ) -> Result<(), EngineError> {
+        if self.slots.trims() == &trims {
+            return Ok(());
+        }
+        self.slots.set_trims(trims);
+        self.update_params(project)
     }
 
     /// Varispeed on (for the stream as it runs) or off; see
@@ -2686,6 +3113,67 @@ impl EngineController {
     /// collection).
     pub fn end_recording(&mut self) -> Result<(), EngineError> {
         self.send(Message::EndRecord)
+    }
+
+    /// Copy device input `channel` (from 0) of every callback to the
+    /// control side, with when the callback started, whatever the
+    /// transport does (see [`crate::input_tap`]); room for `seconds` in
+    /// case the reader stalls. Replaces a tap set before.
+    pub fn tap_input(
+        &mut self,
+        channel: u16,
+        seconds: f64,
+    ) -> Result<crate::input_tap::InputTap, EngineError> {
+        let rate = self.stream_rate().max(self.config.sample_rate);
+        let (rt, tap) = crate::input_tap::tap(channel, rate, seconds);
+        self.send(Message::InputTap(Some(Box::new(rt))))?;
+        Ok(tap)
+    }
+
+    /// No more input tap.
+    pub fn untap_input(&mut self) -> Result<(), EngineError> {
+        self.send(Message::InputTap(None))
+    }
+
+    /// Keep device input `channels` (from 0) of every chunk processed,
+    /// playing or stopped, for Capture Audio (see
+    /// [`crate::input_capture`]); room for `seconds` in case the reader
+    /// stalls. Replaces a capture set before (its ends finish once the
+    /// audio thread let go of them and the garbage was collected).
+    pub fn capture_inputs(
+        &mut self,
+        channels: Vec<u16>,
+        seconds: f64,
+    ) -> Result<crate::input_capture::CaptureStreams, EngineError> {
+        let (rt, streams) = crate::input_capture::rings(channels, self.config.sample_rate, seconds);
+        self.send(Message::InputCapture(Some(Box::new(rt))))?;
+        Ok(streams)
+    }
+
+    /// No more Capture Audio.
+    pub fn end_input_capture(&mut self) -> Result<(), EngineError> {
+        self.send(Message::InputCapture(None))
+    }
+
+    /// Play a MIDI file into the instrument the editor auditions
+    /// ([`crate::midi::MidiShared::audition_track`]; see
+    /// [`crate::midi_preview`]), replacing the one playing (its notes
+    /// end), or stop (`None`). Returns the new one's status.
+    pub fn set_midi_preview(
+        &mut self,
+        preview: Option<crate::midi_preview::MidiPreview>,
+    ) -> Result<Option<Arc<crate::midi_preview::MidiPreviewStatus>>, EngineError> {
+        match preview {
+            Some(p) => {
+                let (run, status) = crate::midi_preview::MidiPreviewRun::new(p);
+                self.send(Message::MidiPreview(Some(Box::new(run))))?;
+                Ok(Some(status))
+            }
+            None => {
+                self.send(Message::MidiPreview(None))?;
+                Ok(None)
+            }
+        }
     }
 
     /// Feed live MIDI from this queue (replaces the previous one).
@@ -2828,6 +3316,92 @@ impl EngineController {
         self.midi_live = tracks;
     }
 
+    /// Play `track` from a cache of its chain's output, or (`None`) from
+    /// its chain again (see [`crate::cache`]): a handover fades from one to
+    /// the other. Applied by the next graph build (sync `Graph`); returns
+    /// whether anything changed.
+    pub fn set_cached(
+        &mut self,
+        track: faderframe_core::TrackId,
+        chain: Option<crate::cache::CachedChain>,
+    ) -> bool {
+        self.cache.set(track, chain, self.config.sample_rate, 0)
+    }
+
+    /// Play `track` from its chain again, gently: nothing it plays changed
+    /// (an editor opened, the track armed), so the cache stays heard while
+    /// the chain plays through its devices' tails (up to
+    /// [`crate::cache::MAX_WARM_SECONDS`]), then the fade. Applied by the
+    /// next graph build; returns whether anything changed.
+    pub fn release_cache(&mut self, project: &Project, track: faderframe_core::TrackId) -> bool {
+        let rate = f64::from(self.config.sample_rate);
+        let most = (crate::cache::MAX_WARM_SECONDS * rate) as u32;
+        let warm = project
+            .track(track)
+            .map(|t| t.slots())
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| !s.bypass)
+            .map(|s| match self.plugins.tail(s.id) {
+                Some(faderframe_plugin_host::TailLength::Samples(n)) => n.min(most),
+                Some(faderframe_plugin_host::TailLength::Infinite) => most,
+                Some(faderframe_plugin_host::TailLength::None) | None => 0,
+            })
+            .max()
+            .unwrap_or(0)
+            .min(most);
+        self.cache.set(track, None, self.config.sample_rate, warm)
+    }
+
+    /// Handovers that are over (the next graph build drops the side no
+    /// longer heard): whether a rebuild is due.
+    pub fn settle_cache(&mut self) -> bool {
+        self.cache.settle()
+    }
+
+    /// End every handover at once (no device runs: nothing would move the
+    /// fades); [`Self::settle_cache`] then finds them over.
+    pub fn skip_cache_fades(&mut self) {
+        self.cache.skip_fades();
+    }
+
+    /// Forget every cache at once (no fades: the next graph plays every
+    /// chain again, their devices reset).
+    pub fn clear_cache(&mut self) -> bool {
+        let tracks: Vec<_> = self.cache.states().into_iter().map(|(t, _)| t).collect();
+        let mut changed = false;
+        for t in tracks {
+            changed |= self.cache.remove(t);
+        }
+        changed
+    }
+
+    /// Where a cached track is (`None`: it plays its chain alone).
+    pub fn cache_state(&self, track: faderframe_core::TrackId) -> Option<crate::cache::CacheState> {
+        self.cache.state(track)
+    }
+
+    /// Every cached track (handovers included).
+    pub fn cache_states(&self) -> Vec<(faderframe_core::TrackId, crate::cache::CacheState)> {
+        self.cache.states()
+    }
+
+    /// The cache a track plays.
+    pub fn cached_chain(
+        &self,
+        track: faderframe_core::TrackId,
+    ) -> Option<Arc<crate::cache::CachedChain>> {
+        self.cache.chain(track)
+    }
+
+    /// The state a track's handover shares with its nodes (tests).
+    pub fn cache_handover(
+        &self,
+        track: faderframe_core::TrackId,
+    ) -> Option<Arc<crate::cache::HandoverShared>> {
+        self.cache.handover(track)
+    }
+
     /// Tracks whose plugins are being edited: they play on the audio thread
     /// (changes are heard at once). Applied by [`Self::update_params`].
     pub fn set_edited_tracks(
@@ -2867,6 +3441,27 @@ impl EngineController {
 
     pub fn binaural(&self) -> Option<faderframe_binaural::Room> {
         self.listen.binaural
+    }
+
+    /// Turn the listener's head (a head tracker, or by hand): binaural
+    /// listening turns the scene the other way at once — no rebuild, no
+    /// new renderer; speakers and renders never turn.
+    pub fn set_head_orientation(&self, head: faderframe_core::ambisonics::Orientation) {
+        self.listen.link.head().set(head);
+    }
+
+    /// The listener's head as last set.
+    pub fn head_orientation(&self) -> faderframe_core::ambisonics::Orientation {
+        self.listen.link.head().get()
+    }
+
+    /// How long the head glides to a new orientation (seconds).
+    pub fn set_head_smoothing(&self, seconds: f32) {
+        self.listen.link.head().set_smoothing(seconds);
+    }
+
+    pub fn head_smoothing(&self) -> f32 {
+        self.listen.link.head().smoothing()
     }
 
     /// The head and the headphone correction listening on headphones uses
@@ -2981,6 +3576,7 @@ impl EngineController {
     fn restart_ahead(&mut self) {
         let had = self.ahead.take().is_some();
         self.bus_ahead = None;
+        self.ahead_watch = None;
         if had {
             let _ = self.send(Message::AheadOff);
         }
@@ -3009,6 +3605,7 @@ impl EngineController {
             launch: crate::launch::LaunchState::new(),
             history: Default::default(),
             recording: Default::default(),
+            share: Arc::clone(&self.share),
         };
         let rate = self.config.sample_rate as f64;
         let (deep, deep_tier) = crate::ahead::start(
@@ -3019,6 +3616,7 @@ impl EngineController {
                 lookahead,
                 threads: self.ahead_threads,
                 upstream: None,
+                upstream_ready: None,
                 follow: None,
                 epoch: Arc::clone(&self.shared.epoch),
             },
@@ -3037,6 +3635,7 @@ impl EngineController {
                     ),
                     threads: self.ahead_threads.div_ceil(2),
                     upstream: Some(Arc::clone(&deep.progress)),
+                    upstream_ready: Some(Arc::clone(&deep.ready)),
                     follow: Some(Arc::clone(&scheduling)),
                     epoch: Arc::clone(&self.shared.epoch),
                 },
@@ -3050,8 +3649,10 @@ impl EngineController {
         }
         tiers.push(deep_tier);
         let link = crate::ahead::AheadLink::new(tiers, rate, scheduling);
+        let watch = link.watch();
         if self.send(Message::Ahead(Box::new(link))).is_ok() {
             self.ahead = Some(deep);
+            self.ahead_watch = Some(watch);
         } else {
             self.bus_ahead = None;
         }
@@ -3069,6 +3670,19 @@ impl EngineController {
     /// Blocks in which a rendered-ahead track's audio was not there yet.
     pub fn ahead_misses(&self) -> u64 {
         self.ahead_misses.load(Ordering::Relaxed)
+    }
+
+    /// Whether a device callback of `frames` coming now would find
+    /// everything it plays from the render-ahead rings rendered (always
+    /// without render-ahead, and before the audio thread has taken the
+    /// anticipators' first sequence). The audio thread never waits for
+    /// it: a device run by hand can — the tests' paced runs on a machine
+    /// so busy that the anticipators, threads as ordinary as the test's
+    /// own there, are kept from any lookahead.
+    pub fn ahead_ready_for(&self, frames: usize) -> bool {
+        self.ahead_watch
+            .as_ref()
+            .is_none_or(|w| w.ready_for(frames))
     }
 
     /// Tracks whose channel strips (and sends) are rendered ahead too:

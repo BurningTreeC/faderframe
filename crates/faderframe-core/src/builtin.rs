@@ -67,6 +67,10 @@ pub const CONTAINER: &str = "faderframe.container";
 /// Outboard gear: a send to the interface's outputs and a return from its
 /// inputs, the round trip measured and compensated.
 pub const HARDWARE_INSERT: &str = "faderframe.hardware-insert";
+/// The Hardware Insert's Channels parameter: 1 = Mono → Stereo (a mono
+/// track sent to two outputs alike and returned as a pair, stereo from the
+/// insert on — `faderframe_project::PluginSlot::output_layout`).
+pub const HARDWARE_INSERT_CHANNELS: u32 = 7;
 /// A FET limiting amplifier in the classic 1176's manner.
 pub const COMPRESSOR_76: &str = "faderframe.76-compressor";
 /// An analog tape machine: record and reproduce on modelled tape (effect).
@@ -74,6 +78,44 @@ pub const TAPE_MACHINE: &str = "faderframe.tape-machine";
 /// An optical leveling amplifier in the classic LA-2A's manner (its T4
 /// cell, valve make-up amplifier and transformers).
 pub const LEVELER_2A: &str = "faderframe.2a-leveler";
+/// Turns an ambisonic field (AmbiX, first to third order) by yaw, pitch
+/// and roll.
+pub const AMBI_ROTATOR: &str = "faderframe.ambi-rotator";
+
+/// De-noise: steady noise taken out of the spectrum, from a learned profile
+/// or followed adaptively (restoration).
+pub const DENOISE: &str = "faderframe.denoise";
+/// De-click: clicks and crackle found and filled (restoration).
+pub const DECLICK: &str = "faderframe.declick";
+/// De-hum: mains hum and buzz notched at its harmonics, following its
+/// drift (restoration).
+pub const DEHUM: &str = "faderframe.dehum";
+/// De-clip: clipped peaks rebuilt (restoration).
+pub const DECLIP: &str = "faderframe.declip";
+/// De-reverb: a room's late tail taken down (restoration).
+pub const DEREVERB: &str = "faderframe.dereverb";
+
+/// Convolution Reverb: an impulse response — a file kept with the project,
+/// or one of the spaces built in — played without latency (effect).
+pub const CONVOLUTION_REVERB: &str = "faderframe.convolution-reverb";
+/// Multiband Dynamics: up to six bands split by Linkwitz–Riley or
+/// linear-phase crossovers, each compressed or expanded, downward or
+/// upward, with a sidechain (effect).
+pub const MULTIBAND_DYNAMICS: &str = "faderframe.multiband-dynamics";
+/// Vocoder: the input's spectral envelope laid on a carrier — the built-in
+/// synth, noise or the sidechain (effect).
+pub const VOCODER: &str = "faderframe.vocoder";
+/// Wavetable synthesizer: two wavetable oscillators (factory tables or the
+/// user's), warps, unison, sub and noise (instrument).
+pub const WAVETABLE: &str = "faderframe.wavetable";
+/// Six-operator FM synthesizer: the 32 classic algorithms and a free
+/// matrix, DX7 voices (instrument).
+pub const FM: &str = "faderframe.fm";
+/// Granular synthesizer: clouds of grains from a sample (instrument).
+pub const GRANULAR: &str = "faderframe.granular";
+/// Pitch Correct: a voice pulled to the notes of a key, a chord, a set of
+/// notes or a MIDI track as it is sung (effect; takes notes).
+pub const PITCH_CORRECT: &str = "faderframe.pitch-correct";
 
 /// Built-ins with an editor of their own (others get the generic one).
 pub fn has_editor(id: &str) -> bool {
@@ -104,6 +146,18 @@ pub fn has_editor(id: &str) -> bool {
             | COMPRESSOR_76
             | TAPE_MACHINE
             | LEVELER_2A
+            | DENOISE
+            | DECLICK
+            | DEHUM
+            | DECLIP
+            | DEREVERB
+            | CONVOLUTION_REVERB
+            | MULTIBAND_DYNAMICS
+            | VOCODER
+            | WAVETABLE
+            | FM
+            | GRANULAR
+            | PITCH_CORRECT
     )
 }
 

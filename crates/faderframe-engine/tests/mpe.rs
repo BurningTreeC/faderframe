@@ -26,6 +26,9 @@ fn note(id: u64, start: f64, length: f64, key: u8) -> MidiNote {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     }
 }
 
@@ -67,6 +70,7 @@ fn project(mpe: Option<MpeConfig>) -> (TestProject, TrackId) {
             controllers: Vec::new(),
             expressions: vec![glide],
             sysex: Vec::new(),
+            articulations: Vec::new(),
         }),
     };
     tp.project.track_mut(t).unwrap().clips.push(clip.id);
@@ -76,7 +80,11 @@ fn project(mpe: Option<MpeConfig>) -> (TestProject, TrackId) {
 
 fn events(tp: &TestProject, t: TrackId) -> Vec<(i64, MidiEvent)> {
     let snap = TimelineSnapshot::build(&tp.project, &tp.sources, SR);
-    snap.lane(t).unwrap().midi[0].events.clone()
+    snap.lane(t).unwrap().midi[0]
+        .events
+        .iter()
+        .map(|&(t, e, _)| (t, e))
+        .collect()
 }
 
 #[test]

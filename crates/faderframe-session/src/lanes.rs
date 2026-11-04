@@ -238,6 +238,7 @@ impl Session {
                 id,
                 position: at.max(MusicalTime::ZERO),
                 name: format!("Marker {n}"),
+                time_base: Default::default(),
             },
         })?;
         Ok(id)
@@ -272,6 +273,7 @@ impl Session {
                 start,
                 end,
                 color,
+                time_base: Default::default(),
             },
         })?;
         Ok(id)

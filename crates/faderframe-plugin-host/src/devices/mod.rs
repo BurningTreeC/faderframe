@@ -1,12 +1,16 @@
 //! The stock devices: dynamics (compressor, limiter, gate, de-esser),
 //! effects (saturator, reverb, delay, modulation), utilities (utility,
 //! tuner), MIDI effects (arpeggiator, chord, scale, note echo) and
-//! instruments (synth, sampler, drum sampler). Each module has its parameters (ids stable once released), how
+//! instruments (synth, sampler, drum sampler), and restoration (de-noise,
+//! de-click, de-hum, de-clip, de-reverb, on `faderframe_restore`), and the
+//! convolution reverb, multiband dynamics and the vocoder. Each
+//! module has its parameters (ids stable once released), how
 //! it shows their values, what it publishes through the [`AnalysisTap`],
 //! its latency and its processor.
 //!
 //! [`AnalysisTap`]: crate::tap::AnalysisTap
 
+pub mod ambi_rotate;
 pub mod arpeggiator;
 pub mod channel_strip;
 pub mod chord;
@@ -15,7 +19,9 @@ pub mod deesser;
 pub mod delay;
 pub mod drums;
 pub mod fet76;
+pub mod fm;
 pub mod gate;
+pub mod granular;
 pub mod guitar;
 pub mod hardware_insert;
 pub mod keep_length;
@@ -24,6 +30,7 @@ pub mod limiter;
 pub(crate) mod midi_fx;
 pub mod modulation;
 pub mod note_echo;
+pub mod poly;
 pub mod preamp;
 pub mod reverb;
 #[cfg(test)]
@@ -37,6 +44,19 @@ pub mod synth;
 pub mod tape;
 pub mod tuner;
 pub mod utility;
+pub mod wavetable;
+// The restoration devices.
+pub mod declick;
+pub mod declip;
+pub mod dehum;
+pub mod denoise;
+pub mod dereverb;
+// Convolution reverb, multiband dynamics, the vocoder.
+pub mod convolution;
+pub mod multiband;
+pub mod vocoder;
+// Voice.
+pub mod pitch_correct;
 
 use crate::{ParameterInfo, ParameterUnit};
 use faderframe_core::ParameterId;
@@ -53,7 +73,17 @@ pub fn reduction_value(id: &str) -> Option<usize> {
         b::DEESSER => Some(deesser::value::REDUCTION),
         b::CHANNEL_STRIP => Some(channel_strip::value::COMP_GR),
         b::LEVELER_2A => Some(leveler::value::GR),
+        b::MULTIBAND_DYNAMICS => Some(multiband::value::REDUCTION),
         _ => None,
+    }
+}
+
+/// Parameters of a built-in that lists of settings (a clip-effect card)
+/// leave out: what the device measured, as De-noise's learned profile.
+pub fn hidden(id: &str, pid: ParameterId) -> bool {
+    match id {
+        faderframe_core::builtin::DENOISE => denoise::hidden(pid),
+        _ => false,
     }
 }
 

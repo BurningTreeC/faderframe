@@ -1,24 +1,37 @@
-//! Zero-copy frames (Linux): VA-API decodes and scales the picture into a
+//! Zero-copy frames. Linux: VA-API decodes and scales the picture into a
 //! dmabuf the display imports as it is, so a frame never travels through
 //! the CPU. The shell says which dmabuf formats its display takes
 //! ([`set_display_formats`]); the playback decoder then asks VA-API's
 //! post-processor for an RGB one of those at the shown size (its colour
 //! conversion knows the picture's matrix, which a YUV import would have to
-//! guess). When anything is missing — no VA-API, no format both sides know,
-//! an import that fails ([`failed`]) — frames come as RGBA, as before.
+//! guess). Windows (`d3d12`): GStreamer's Direct3D 12 converter scales the
+//! picture into an RGBA texture the shell hands GTK. When anything is
+//! missing — no VA-API or Direct3D 12 converter, no format both sides
+//! know, an import that fails ([`failed`]) — frames come as RGBA, as
+//! before.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
+#[cfg(target_os = "linux")]
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(windows)]
+mod d3d12;
+#[cfg(windows)]
+pub use d3d12::*;
+
+#[cfg(target_os = "linux")]
 static FORMATS: RwLock<Vec<(u32, u64)>> = RwLock::new(Vec::new());
 static FAILED: AtomicBool = AtomicBool::new(false);
 static ALLOWED: AtomicBool = AtomicBool::new(true);
 
 /// RGB formats asked for (8 bits a channel; GTK takes them all).
+#[cfg(target_os = "linux")]
 const RGB: [&str; 4] = ["XR24", "AR24", "XB24", "AB24"];
 
 /// The dmabuf formats (fourcc, modifier) the display imports.
+#[cfg(target_os = "linux")]
 pub fn set_display_formats(formats: Vec<(u32, u64)>) {
     *FORMATS.write().unwrap_or_else(|p| p.into_inner()) = formats;
 }
@@ -28,6 +41,7 @@ pub fn set_allowed(on: bool) {
     ALLOWED.store(on, Ordering::Relaxed);
 }
 
+#[cfg(target_os = "linux")]
 /// Whether playback decodes into dmabufs (`FADERFRAME_VIDEO_DMABUF=0`
 /// turns it off).
 pub fn enabled() -> bool {
@@ -44,6 +58,7 @@ pub fn failed(why: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// A DRM fourcc from its four letters.
 pub fn fourcc(code: &str) -> u32 {
     let b = code.as_bytes();
@@ -51,6 +66,7 @@ pub fn fourcc(code: &str) -> u32 {
     at(0) | (at(1) << 8) | (at(2) << 16) | (at(3) << 24)
 }
 
+#[cfg(target_os = "linux")]
 /// "XR24:0x0200000000000901" → (fourcc, modifier); no modifier: linear.
 fn parse_drm_format(s: &str) -> Option<(u32, u64)> {
     let (code, modifier) = match s.split_once(':') {
@@ -60,6 +76,7 @@ fn parse_drm_format(s: &str) -> Option<(u32, u64)> {
     (code.len() == 4).then(|| (fourcc(code), modifier))
 }
 
+#[cfg(target_os = "linux")]
 /// The `drm-format` values of `caps` (DMABuf structures).
 fn drm_formats(caps: &gst::CapsRef) -> Vec<String> {
     let mut out = Vec::new();
@@ -76,6 +93,7 @@ fn drm_formats(caps: &gst::CapsRef) -> Vec<String> {
     out
 }
 
+#[cfg(target_os = "linux")]
 /// The RGB dmabuf formats VA-API's post-processor makes here (empty
 /// without VA-API).
 pub fn postproc_formats() -> Vec<(u32, u64)> {
@@ -93,6 +111,7 @@ pub fn postproc_formats() -> Vec<(u32, u64)> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 /// Caps for `post`'s output at `width`×`height`: the RGB formats it makes
 /// that the display takes, or `None` when there is none.
 pub(crate) fn caps_for(post: &gst::Element, width: u32, height: u32) -> Option<gst::Caps> {
@@ -119,6 +138,7 @@ pub(crate) fn caps_for(post: &gst::Element, width: u32, height: u32) -> Option<g
     Some(caps)
 }
 
+#[cfg(target_os = "linux")]
 /// One plane of a dmabuf frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plane {
@@ -128,6 +148,7 @@ pub struct Plane {
     pub stride: u32,
 }
 
+#[cfg(target_os = "linux")]
 /// A frame in a dmabuf: the planes, and the buffer that keeps them.
 #[derive(Clone)]
 pub struct GpuFrame {
@@ -137,14 +158,17 @@ pub struct GpuFrame {
     buffer: gst::Buffer,
 }
 
+#[cfg(target_os = "linux")]
 impl PartialEq for GpuFrame {
     fn eq(&self, other: &Self) -> bool {
         self.buffer.as_ptr() == other.buffer.as_ptr()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Eq for GpuFrame {}
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for GpuFrame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -157,6 +181,7 @@ impl std::fmt::Debug for GpuFrame {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl GpuFrame {
     /// The dmabuf planes of `buffer` (DMA_DRM caps described by `info`).
     pub(crate) fn of(buffer: &gst::Buffer, info: &gst_video::VideoInfoDmaDrm) -> Option<Self> {
@@ -188,6 +213,7 @@ impl GpuFrame {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
     use super::*;

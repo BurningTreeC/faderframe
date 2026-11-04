@@ -177,6 +177,9 @@ fn note(tp: &mut TestProject, track: TrackId, key: u8) {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     let id = tp.project.ids.allocate();
     tp.project.clips.insert(
@@ -194,6 +197,7 @@ fn note(tp: &mut TestProject, track: TrackId, key: u8) {
                 controllers: Vec::new(),
                 expressions: Vec::new(),
                 sysex: Vec::new(),
+                articulations: Vec::new(),
             }),
         },
     );

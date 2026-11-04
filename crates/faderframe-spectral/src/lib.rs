@@ -11,10 +11,14 @@
 //! them down to the level around the edit in time where they stand out;
 //! Heal replaces them by it — the level before and after, interpolated per
 //! bin in dB, each bin's phase carried on from the sound before (so a tone
-//! continues through a dropout).
+//! continues through a dropout). Denoise ("Learn Noise and Remove") learns
+//! the noise where its shape is and takes it out of the whole source in the
+//! shape's band ([`denoise`]); a source with one is processed in chunks
+//! with run-in margins.
 
 #![forbid(unsafe_code)]
 
+pub mod denoise;
 pub mod mask;
 pub mod spectrogram;
 
@@ -329,7 +333,7 @@ fn edit_channel(
                     };
                     *c = *c * (1.0 - w) + Complex32::from_polar(w * s, phase);
                 }
-                SpectralOp::Attenuate | SpectralOp::Heal => {}
+                SpectralOp::Attenuate | SpectralOp::Heal | SpectralOp::Denoise { .. } => {}
             }
         }
         stft.synthesise();
@@ -361,6 +365,12 @@ pub fn apply(
     write: &mut Write<'_>,
     progress: &mut dyn FnMut(f32),
 ) -> Result<(), String> {
+    if edits
+        .iter()
+        .any(|e| matches!(e.op, SpectralOp::Denoise { .. }))
+    {
+        return apply_in_chunks(edits, channels, frames, rate, read, write, progress);
+    }
     let reached: Vec<(Mask, usize, i64, i64)> = edits.iter().map(|e| reach(e, rate)).collect();
     // The spans the edits change, merged.
     let mut spans: Vec<(i64, i64)> = reached
@@ -440,6 +450,108 @@ pub fn apply(
         pos = wb;
     }
     copy(pos, frames, read, write)?;
+    progress(1.0);
+    Ok(())
+}
+
+/// Seconds of a source written per chunk when it is de-noised.
+const CHUNK_SECONDS: f64 = 20.0;
+
+/// [`apply`] with a Denoise among the edits: it reaches the whole source,
+/// so the source goes in chunks, each read with room either side — the
+/// de-noise's run-in and every other edit's reach and surroundings — and
+/// every edit run over it in order; only the chunk is written.
+fn apply_in_chunks(
+    edits: &[SpectralEdit],
+    channels: usize,
+    frames: i64,
+    rate: f64,
+    read: &mut Read<'_>,
+    write: &mut Write<'_>,
+    progress: &mut dyn FnMut(f32),
+) -> Result<(), String> {
+    // Each Denoise learns from the source as recorded, first.
+    let mut learned: Vec<Option<Vec<Vec<f64>>>> = Vec::with_capacity(edits.len());
+    for e in edits {
+        learned.push(match e.op {
+            SpectralOp::Denoise { .. } => Some(denoise::learn(e, channels, rate, read)?),
+            _ => None,
+        });
+    }
+    let reached: Vec<Option<(Mask, usize, i64, i64)>> = edits
+        .iter()
+        .map(|e| (!matches!(e.op, SpectralOp::Denoise { .. })).then(|| reach(e, rate)))
+        .collect();
+    // Room either side: the run-in, and the longest other edit with its
+    // surroundings (it is run whole wherever it touches a chunk).
+    let local = reached
+        .iter()
+        .flatten()
+        .map(|(_, n, a, b)| {
+            let n = *n as i64;
+            (b - a) + 2 * (2 * n + (AROUND as i64 + 2) * n / 4)
+        })
+        .max()
+        .unwrap_or(0);
+    let pad = (denoise::RUN_IN_SECONDS * rate) as i64 + 2 * denoise::frame(rate) as i64 + local;
+    let chunk = ((CHUNK_SECONDS * rate) as i64).max(1);
+    let total = frames.max(1) as f32;
+    let mut seed = 0x9E37_79B9u32;
+    let mut stfts: Vec<Stft> = Vec::new();
+    let mut passes: Vec<(f32, denoise::Pass)> = Vec::new();
+    let mut at = 0i64;
+    while at < frames {
+        let end = (at + chunk).min(frames);
+        let origin = at - pad;
+        let len = (end + pad - origin) as usize;
+        let mut buffer = vec![vec![0.0f32; len]; channels];
+        read(origin, &mut buffer)?;
+        for (i, e) in edits.iter().enumerate() {
+            match (&e.op, &reached[i], &learned[i]) {
+                (SpectralOp::Denoise { reduction_db }, _, Some(noise)) => {
+                    let pass = match passes.iter().position(|(r, _)| r == reduction_db) {
+                        Some(k) => &mut passes[k].1,
+                        None => {
+                            passes.push((*reduction_db, denoise::Pass::new(rate, *reduction_db)));
+                            let last = passes.len() - 1;
+                            &mut passes[last].1
+                        }
+                    };
+                    let weights = denoise::band_weights(e, rate, pass.bins());
+                    for (c, x) in buffer.iter_mut().enumerate() {
+                        if e.channel.is_none_or(|ch| usize::from(ch) == c) {
+                            pass.run(x, &noise[c.min(noise.len() - 1)], &weights);
+                        }
+                    }
+                }
+                (_, Some((mask, n, a, b)), _) => {
+                    if *b <= origin || *a >= origin + len as i64 {
+                        continue;
+                    }
+                    let stft = match stfts.iter().position(|s| s.n == *n) {
+                        Some(k) => &mut stfts[k],
+                        None => {
+                            stfts.push(Stft::new(*n, rate));
+                            let last = stfts.len() - 1;
+                            &mut stfts[last]
+                        }
+                    };
+                    for (c, x) in buffer.iter_mut().enumerate() {
+                        if e.channel.is_none_or(|ch| usize::from(ch) == c) {
+                            edit_channel(e, mask, stft, x, origin, frames, &mut seed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let from = (at - origin) as usize;
+        let to = (end - origin) as usize;
+        let out: Vec<&[f32]> = buffer.iter().map(|x| &x[from..to]).collect();
+        write(&out)?;
+        progress(end as f32 / total);
+        at = end;
+    }
     progress(1.0);
     Ok(())
 }

@@ -292,10 +292,87 @@ impl AudioClipPlayer {
     }
 }
 
+/// Samples whose gains are worked out at once (on the stack).
+const CHUNK: usize = 128;
+
+/// A region's gains over up to [`CHUNK`] samples: clip gain, fades and the
+/// volume envelope, and per side of a stereo output the pan envelope's
+/// balance. Worked out once per sample, not per channel.
+struct Gains {
+    from: i64,
+    sides: [[f32; CHUNK]; 2],
+    /// The two rows differ (a pan envelope on a stereo output).
+    panned: bool,
+}
+
+impl Gains {
+    /// For lane samples `[a, b)` (`b - a <= CHUNK`) into `channels` outputs.
+    #[inline]
+    fn of(region: &AudioRegion, a: i64, b: i64, channels: usize) -> Self {
+        let n = (b - a).clamp(0, CHUNK as i64) as usize;
+        let mut sides = [[0.0; CHUNK]; 2];
+        for (k, g) in sides[0][..n].iter_mut().enumerate() {
+            *g = region.gain_at(a + k as i64);
+        }
+        let mut panned = false;
+        if let Some(e) = &region.envelope {
+            if e.has_volume() {
+                e.apply_volume(a, &mut sides[0][..n]);
+            }
+            if e.has_pan() && channels == 2 {
+                let [left, right] = &mut sides;
+                right[..n].copy_from_slice(&left[..n]);
+                e.apply_pan(a, &mut left[..n], &mut right[..n]);
+                panned = true;
+            }
+        }
+        Self {
+            from: a,
+            sides,
+            panned,
+        }
+    }
+
+    /// Gain at lane sample `t` for output channel `d`.
+    #[inline]
+    fn at(&self, d: usize, t: i64) -> f32 {
+        let row = if self.panned { d.min(1) } else { 0 };
+        self.sides[row][(t - self.from) as usize]
+    }
+}
+
+/// Run `f(c, e)` over `[a, b)` in pieces of at most [`CHUNK`] samples.
+#[inline]
+fn chunks(a: i64, b: i64, mut f: impl FnMut(i64, i64)) {
+    let mut c = a;
+    while c < b {
+        let e = (c + CHUNK as i64).min(b);
+        f(c, e);
+        c = e;
+    }
+}
+
 /// Mix `region` into `out` for timeline samples `[a, b)` of the block
 /// starting at `pos`.
 #[inline]
 fn play_region(region: &AudioRegion, out: &mut AudioBuffer, pos: i64, a: i64, b: i64) {
+    let channels = out.num_channels();
+    chunks(a, b, |c, e| {
+        let g = Gains::of(region, c, e, channels);
+        play_region_part(region, out, pos, c, e, &g);
+    });
+}
+
+/// [`play_region`] over one chunk with its gains.
+#[inline]
+fn play_region_part(
+    region: &AudioRegion,
+    out: &mut AudioBuffer,
+    pos: i64,
+    a: i64,
+    b: i64,
+    g: &Gains,
+) {
     let out_ch = out.num_channels();
     let src_ch = region.source.channels();
     let len_src = region.source.frames();
@@ -314,7 +391,7 @@ fn play_region(region: &AudioRegion, out: &mut AudioBuffer, pos: i64, a: i64, b:
                     if frame < 0 || frame >= len_src {
                         continue;
                     }
-                    dst[(t - pos) as usize] += src[frame as usize] * region.gain_at(t) * w;
+                    dst[(t - pos) as usize] += src[frame as usize] * g.at(d, t) * w;
                 }
             });
         }
@@ -329,7 +406,7 @@ fn play_region(region: &AudioRegion, out: &mut AudioBuffer, pos: i64, a: i64, b:
                         if let Some(seg) = seg {
                             for (k, v) in seg[..n].iter().enumerate() {
                                 let t = a + (off + k) as i64;
-                                dst[(t - pos) as usize] += v * region.gain_at(t) * w;
+                                dst[(t - pos) as usize] += v * g.at(d, t) * w;
                             }
                         }
                     },
@@ -359,7 +436,7 @@ fn play_region(region: &AudioRegion, out: &mut AudioBuffer, pos: i64, a: i64, b:
                         continue;
                     };
                     let v = s0 + (s1.unwrap_or(s0) - s0) * frac;
-                    dst[(t - pos) as usize] += v * region.gain_at(t) * w;
+                    dst[(t - pos) as usize] += v * g.at(d, t) * w;
                 }
             });
         }
@@ -379,6 +456,22 @@ fn sample(source: &Source, ch: usize, frame: i64) -> Option<f32> {
 
 /// A warped clip resampled along its time map (pitch follows the speed).
 fn play_varispeed(w: &WarpedRegion, out: &mut AudioBuffer, pos: i64, a: i64, b: i64) {
+    let channels = out.num_channels();
+    chunks(a, b, |c, e| {
+        let gains = Gains::of(&w.region, c, e, channels);
+        play_varispeed_part(w, out, pos, c, e, &gains);
+    });
+}
+
+/// [`play_varispeed`] over one chunk with its gains.
+fn play_varispeed_part(
+    w: &WarpedRegion,
+    out: &mut AudioBuffer,
+    pos: i64,
+    a: i64,
+    b: i64,
+    gains: &Gains,
+) {
     let region = &w.region;
     let (lo, hi) = (w.source_lo, w.source_hi);
     for_each_channel_route(region.source.channels(), out.num_channels(), |s, d, g| {
@@ -394,8 +487,32 @@ fn play_varispeed(w: &WarpedRegion, out: &mut AudioBuffer, pos: i64, a: i64, b: 
                 continue;
             };
             let s1 = sample(&region.source, s, i0 + 1).unwrap_or(s0);
-            dst[(t - pos) as usize] += (s0 + (s1 - s0) * frac) * region.gain_at(t) * g;
+            dst[(t - pos) as usize] += (s0 + (s1 - s0) * frac) * gains.at(d, t) * g;
         }
+    });
+}
+
+/// Mix a voice's `n` output frames (lane samples from `a`) of `w` into
+/// `out` with the region's gains.
+fn mix_voice(
+    w: &WarpedRegion,
+    output: &[Vec<f32>],
+    src_ch: usize,
+    n: usize,
+    out: &mut AudioBuffer,
+    a: i64,
+    shift: i64,
+) {
+    let channels = out.num_channels();
+    chunks(a, a + n as i64, |c, e| {
+        let gains = Gains::of(&w.region, c, e, channels);
+        for_each_channel_route(src_ch, channels, |s, d, g| {
+            let dst = out.channel_mut(d);
+            for t in c..e {
+                let x = output[s][(t - a) as usize];
+                dst[(t - shift) as usize] += x * gains.at(d, t) * g;
+            }
+        });
     });
 }
 
@@ -427,13 +544,7 @@ impl AudioClipPlayer {
                 v.last_cycle = cycle;
                 let src_ch = w.region.source.channels().min(v.channels());
                 let output = &v.output;
-                for_each_channel_route(src_ch, out.num_channels(), |s, d, g| {
-                    let dst = out.channel_mut(d);
-                    for (k, x) in output[s][..n].iter().enumerate() {
-                        let t = a + k as i64;
-                        dst[(t - shift) as usize] += x * w.region.gain_at(t) * g;
-                    }
-                });
+                mix_voice(w, output, src_ch, n, out, a, shift);
                 continue;
             }
             let voice = match w.mode {
@@ -470,13 +581,7 @@ impl AudioClipPlayer {
             v.last_cycle = cycle;
             let src_ch = w.region.source.channels().min(v.stretcher.channels());
             let output = &v.output;
-            for_each_channel_route(src_ch, out.num_channels(), |s, d, g| {
-                let dst = out.channel_mut(d);
-                for (k, x) in output[s][..n].iter().enumerate() {
-                    let t = a + k as i64;
-                    dst[(t - shift) as usize] += x * w.region.gain_at(t) * g;
-                }
-            });
+            mix_voice(w, output, src_ch, n, out, a, shift);
         }
     }
 }

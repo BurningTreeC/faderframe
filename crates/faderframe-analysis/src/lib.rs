@@ -19,15 +19,21 @@ pub mod ltas;
 pub mod melody;
 pub mod pitch;
 pub mod polyvoice;
+pub mod qc;
+pub mod silence;
+pub mod sound_print;
 mod spectrum;
 pub mod structure;
+pub mod sung;
 pub mod tempo;
+pub mod timing_align;
 pub mod vinyl;
 pub mod voice;
 
 pub use dynamics::{Dynamics, DynamicsMeter};
 pub use loudness::{
-    Loudness, LoudnessMeter, WeightedLoudness, integrated_weighted, speaker_weight,
+    Loudness, LoudnessMeter, TP_LATENCY, TruePeak, WeightedLoudness, integrated_weighted,
+    speaker_weight,
 };
 pub use spectrum::{FLOOR_DB, Spectrum, fft};
 

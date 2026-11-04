@@ -21,7 +21,10 @@
 //! listens to the master binaurally. `--latency N` puts N frames of plugin
 //! latency first on every other track (plugin delay compensation: the
 //! others are delayed to meet them; automation behind it is read back
-//! through the play history).
+//! through the play history). `--self-freeze` runs the same callbacks a
+//! second time with every track that has devices played from a cache of
+//! its chain's output (rendered first, as self-freezing does: the track
+//! alone into a plain master, its latency kept) and prints the CPU saved.
 //!
 //! Example: `cargo run -p faderframe-bench --release -- --tracks 128 --block 64 --rate 96000`
 
@@ -79,6 +82,8 @@ struct Args {
     headphones: bool,
     /// Plugin latency first on every other track (frames; 0: none).
     latency: u32,
+    /// Measure again with the tracks played from caches of their chains.
+    self_freeze: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +121,7 @@ fn parse() -> Result<Args, String> {
         panner: faderframe_core::surround::SurroundPanner::Room,
         headphones: false,
         latency: 0,
+        self_freeze: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -179,6 +185,7 @@ fn parse() -> Result<Args, String> {
             "--headphones" => a.headphones = true,
             "--latency" => a.latency = num("--latency")?.parse().map_err(|_| "bad --latency")?,
             "--ahead-buses" => a.ahead_buses = true,
+            "--self-freeze" => a.self_freeze = true,
             "--ahead" => {
                 a.ahead = Some(num("--ahead")?.parse().map_err(|_| "bad --ahead")?);
                 a.paced = true;
@@ -202,7 +209,7 @@ fn parse() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>|lv2:<uri>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source] [--pan mono|balance|dual] [--pan-automation] [--bed 5.1|7.1|7.1.4] [--panner room|vbap] [--headphones] [--latency FRAMES]"
+                    "faderframe-bench [--tracks N] [--block FRAMES] [--rate HZ] [--seconds S] [--buses N] [--no-inserts] [--no-sends] [--measure-nodes] [--threads N] [--fx N] [--plugin clap:<id>|vst3:<id>|lv2:<uri>] [--paced] [--ahead MS] [--ahead-buses] [--crosstalk] [--preamp 0..5] [--mono-source] [--pan mono|balance|dual] [--pan-automation] [--bed 5.1|7.1|7.1.4] [--panner room|vbap] [--headphones] [--latency FRAMES] [--self-freeze]"
                 );
                 std::process::exit(0);
             }
@@ -470,6 +477,7 @@ fn build(args: &Args) -> Project {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         };
         t.clips.push(clip.id);
@@ -578,38 +586,7 @@ fn main() {
         }
     }
     let stats = r.controller.graph_stats().clone();
-    let _ = r.play_from(0);
-    let callbacks = (args.seconds * args.rate as f64 / args.block as f64) as usize;
-    // Warm up caches and branch predictors.
-    for _ in 0..64 {
-        r.processor.process_device(&mut bufs);
-        if args.paced {
-            std::thread::sleep(std::time::Duration::from_nanos(budget_ns as u64));
-        }
-    }
-    r.controller.reset_metrics();
-    let mut times = Vec::with_capacity(callbacks);
-    let wall = Instant::now();
-    let period = std::time::Duration::from_nanos(budget_ns as u64);
-    for i in 0..callbacks {
-        if args.paced {
-            // The next "interrupt" of the virtual sound card.
-            let due = wall + period * i as u32;
-            while Instant::now() < due {
-                let left = due - Instant::now();
-                if left > std::time::Duration::from_micros(200) {
-                    std::thread::sleep(left - std::time::Duration::from_micros(100));
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-        let t = Instant::now();
-        r.processor.process_device(&mut bufs);
-        times.push(t.elapsed().as_nanos() as u64);
-    }
-    let wall = wall.elapsed().as_secs_f64();
-    r.controller.collect_garbage();
+    let (mut times, wall) = run(&mut r, &args, &mut bufs, budget_ns, false);
     times.sort_unstable();
     let pct =
         |p: f64| times[((times.len() as f64 * p) as usize).min(times.len() - 1)] as f64 / 1000.0;
@@ -698,4 +675,214 @@ fn main() {
             r.controller.ahead_misses()
         );
     }
+    if args.self_freeze {
+        self_freeze(
+            &mut r, &project, &sources, &args, &mut bufs, budget_ns, mean,
+        );
+    }
+}
+
+/// Play `args.seconds` from the start (after a warm-up) and time every
+/// callback (ns); `prefetch` loads the streamed pages each needs first,
+/// outside the timing (cache files: no disk loader runs here).
+fn run(
+    r: &mut OfflineRenderer,
+    args: &Args,
+    bufs: &mut OwnedBuffers,
+    budget_ns: f64,
+    prefetch: bool,
+) -> (Vec<u64>, f64) {
+    let _ = r.play_from(0);
+    let callbacks = (args.seconds * args.rate as f64 / args.block as f64) as usize;
+    let shared = r.controller.shared();
+    let mut reclaimer = faderframe_realtime::Reclaimer::default();
+    let mut scratch = Vec::new();
+    let mut load = |r: &mut OfflineRenderer| {
+        if prefetch {
+            let pos = r.controller.transport_snapshot().position;
+            let ahead = (args.block + faderframe_audio_files::PAGE_FRAMES) as i64;
+            let plan = r.controller.stream_plan();
+            let _ = plan.ensure(
+                &[(pos, pos + ahead)],
+                &shared.epoch,
+                &mut reclaimer,
+                &mut scratch,
+            );
+            reclaimer.collect(&shared.epoch);
+        }
+    };
+    // Warm up caches and branch predictors.
+    for _ in 0..64 {
+        load(r);
+        r.processor.process_device(bufs);
+        if args.paced {
+            std::thread::sleep(std::time::Duration::from_nanos(budget_ns as u64));
+        }
+    }
+    r.controller.reset_metrics();
+    let mut times = Vec::with_capacity(callbacks);
+    let wall = Instant::now();
+    let period = std::time::Duration::from_nanos(budget_ns as u64);
+    for i in 0..callbacks {
+        load(r);
+        if args.paced {
+            // The next "interrupt" of the virtual sound card.
+            let due = wall + period * i as u32;
+            while Instant::now() < due {
+                let left = due - Instant::now();
+                if left > std::time::Duration::from_micros(200) {
+                    std::thread::sleep(left - std::time::Duration::from_micros(100));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let t = Instant::now();
+        r.processor.process_device(bufs);
+        times.push(t.elapsed().as_nanos() as u64);
+    }
+    let wall = wall.elapsed().as_secs_f64();
+    r.controller.collect_garbage();
+    (times, wall)
+}
+
+/// The same callbacks again with every track that has devices played from
+/// a cache of its chain (see the module docs); prints what that saves.
+#[allow(clippy::too_many_arguments)]
+fn self_freeze(
+    r: &mut OfflineRenderer,
+    project: &Project,
+    sources: &faderframe_engine::SourceMap,
+    args: &Args,
+    bufs: &mut OwnedBuffers,
+    budget_ns: f64,
+    live_mean_us: f64,
+) {
+    use faderframe_engine::cache::CachedChain;
+    let dir = std::env::temp_dir().join(format!("ff-bench-self-freeze-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("faderframe-bench: {}: {e}", dir.display());
+        return;
+    }
+    let config = EngineConfig {
+        sample_rate: args.rate,
+        max_block_size: args.block.max(16),
+        ..EngineConfig::default()
+    };
+    let frames = ((args.seconds + 2.0) * args.rate as f64) as usize;
+    let began = Instant::now();
+    let mut cached = 0;
+    for t in &project.tracks {
+        let devices = t.slots().iter().any(|s| !s.bypass);
+        if !matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) || !devices {
+            continue;
+        }
+        // The track alone at unity into a plain master, its latency kept.
+        let mut p = project.clone();
+        let master = p.master_id();
+        p.tracks
+            .retain(|x| x.id == t.id || x.kind == TrackKind::Master);
+        p.clips.retain(|_, c| c.track == t.id);
+        for x in &mut p.tracks {
+            x.sends.clear();
+            if x.kind == TrackKind::Master {
+                x.layout = t.chain_layout();
+                x.inserts.clear();
+                x.preamp = None;
+                x.volume_db = 0.0;
+                x.automation.lanes.clear();
+            } else {
+                x.output =
+                    master.map_or(OutputRouting::Master, |m| OutputRouting::Track { track: m });
+                x.volume_db = 0.0;
+                x.pan = 0.0;
+                x.automation.lanes.retain(|l| {
+                    matches!(
+                        l.target,
+                        faderframe_automation::AutomationTarget::PluginParameter { .. }
+                            | faderframe_automation::AutomationTarget::PluginBypass(_)
+                    )
+                });
+            }
+        }
+        let channels = t.chain_layout().channel_count().clamp(1, 2);
+        let rendered = OfflineRenderer::new(&p, sources, config, args.block, 2).map(|mut c| {
+            let file_latency = c.controller.graph_stats().output_latency;
+            let _ = c.play_from(0);
+            (file_latency, c.render(frames))
+        });
+        let (file_latency, mut audio) = match rendered {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("faderframe-bench: {}: {e}", t.name);
+                continue;
+            }
+        };
+        audio.truncate(channels);
+        let path = dir.join(format!("{}.wav", t.id.raw()));
+        if let Err(e) = faderframe_audio_files::write_wav(
+            &path,
+            &audio,
+            args.rate,
+            faderframe_audio_files::WavFormat::Float32,
+            false,
+        ) {
+            eprintln!("faderframe-bench: {}: {e}", path.display());
+            continue;
+        }
+        let Ok(stream) = faderframe_audio_files::StreamSource::open(&path) else {
+            continue;
+        };
+        let chain = CachedChain {
+            source: faderframe_engine::Source::Stream(stream),
+            start: 0,
+            file_latency,
+            latency: r.controller.track_latency(t.id),
+            key: t.id.raw(),
+        };
+        if r.controller.set_cached(t.id, Some(chain)) {
+            cached += 1;
+        }
+    }
+    let render_seconds = began.elapsed().as_secs_f64();
+    // Straight to the caches (nothing is heard here): no fades.
+    let sync = |r: &mut OfflineRenderer| {
+        if let Err(e) = r
+            .controller
+            .sync(project, sources, faderframe_project::Impact::Graph)
+        {
+            eprintln!("faderframe-bench: {e}");
+        }
+    };
+    sync(r);
+    r.controller.skip_cache_fades();
+    if r.controller.settle_cache() {
+        sync(r);
+    }
+    let stats = r.controller.graph_stats().clone();
+    let (mut times, _) = run(r, args, bufs, budget_ns, true);
+    times.sort_unstable();
+    let mean = times.iter().sum::<u64>() as f64 / times.len().max(1) as f64 / 1000.0;
+    let p99 = times[((times.len() as f64 * 0.99) as usize).min(times.len().saturating_sub(1))]
+        as f64
+        / 1000.0;
+    println!("  self-freeze : {cached} tracks cached (rendered in {render_seconds:.1} s)");
+    println!(
+        "    graph     : {} nodes in {} jobs",
+        stats.nodes, stats.jobs
+    );
+    println!(
+        "    callback µs: mean {mean:.1} · p99 {p99:.1} · load {:.1}% of the deadline",
+        mean * 1000.0 / budget_ns * 100.0
+    );
+    println!(
+        "    CPU saved : {:.1} µs per callback ({:.0}% of the live mean)",
+        live_mean_us - mean,
+        if live_mean_us > 0.0 {
+            (live_mean_us - mean) / live_mean_us * 100.0
+        } else {
+            0.0
+        }
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

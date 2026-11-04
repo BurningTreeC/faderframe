@@ -112,6 +112,11 @@ pub enum SpectralOp {
     Attenuate,
     /// Replaced by the sound around it in time (dropouts, longer noises).
     Heal,
+    /// The noise learned where the shape is (its stretch of the source as
+    /// recorded: noise alone), taken out of the whole source in the shape's
+    /// band, by `reduction_db` at most (`faderframe_restore::denoise`, the
+    /// De-noise device's DSP).
+    Denoise { reduction_db: f32 },
 }
 
 impl SpectralOp {
@@ -121,6 +126,9 @@ impl SpectralOp {
             SpectralOp::Remove => "Remove".into(),
             SpectralOp::Attenuate => "Attenuate".into(),
             SpectralOp::Heal => "Heal".into(),
+            SpectralOp::Denoise { reduction_db } => {
+                format!("De-noise −{:.0} dB", reduction_db.abs())
+            }
         }
     }
 }
@@ -199,5 +207,9 @@ mod tests {
         let back: SpectralEdit = serde_json::from_str(&json).unwrap();
         assert_eq!(back, edit);
         assert_eq!(SpectralOp::Gain { db: -6.0 }.label(), "Gain −6.0 dB");
+        let denoise = SpectralOp::Denoise { reduction_db: 12.0 };
+        assert_eq!(denoise.label(), "De-noise −12 dB");
+        let json = serde_json::to_string(&denoise).unwrap();
+        assert_eq!(json, r#"{"type":"denoise","reduction_db":12.0}"#);
     }
 }

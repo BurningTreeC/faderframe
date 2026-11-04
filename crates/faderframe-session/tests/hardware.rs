@@ -77,6 +77,7 @@ fn the_round_trip_is_pinged_and_compensated() {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     }))
@@ -142,4 +143,53 @@ fn the_round_trip_is_pinged_and_compensated() {
     run(&mut s, 1000);
     assert!(s.meter(t).left.level_db > -20.0, "{:?}", s.meter(t));
     s.stop_audio();
+}
+
+/// Mono → Stereo on a mono track: the insert opens two outputs and two
+/// inputs from its channels, and the track is stereo from it on (undo
+/// takes it back to one each way and a mono track).
+#[test]
+fn mono_to_stereo_takes_a_pair_each_way() {
+    let mut s = Session::new(
+        Project::new("Outboard", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    let t = s.add_track(TrackKind::Audio).unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: t,
+        layout: ChannelLayout::Mono,
+    }))
+    .unwrap();
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: PluginRef::builtin(builtin::HARDWARE_INSERT, "Hardware Insert"),
+    })
+    .unwrap();
+    let insert = s.project().track(t).unwrap().inserts[0].id;
+    // As the track: output 3, input 3.
+    assert_eq!(s.required_channels(), (3, 3));
+    assert_eq!(
+        s.project().track(t).unwrap().chain_layout(),
+        ChannelLayout::Mono
+    );
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: t,
+        plugin: insert,
+        parameter: ParameterId(id::CHANNELS),
+        value: Some(1.0),
+    }))
+    .unwrap();
+    assert_eq!(s.required_channels(), (4, 4), "outputs and inputs 3 and 4");
+    let track = s.project().track(t).unwrap();
+    assert_eq!(track.chain_layout(), ChannelLayout::Stereo);
+    assert_eq!(track.layout_into(insert), Some(ChannelLayout::Mono));
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.required_channels(), (3, 3));
+    assert_eq!(
+        s.project().track(t).unwrap().chain_layout(),
+        ChannelLayout::Mono
+    );
 }

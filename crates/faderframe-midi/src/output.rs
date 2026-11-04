@@ -5,7 +5,7 @@
 //! same callback is heard, so external instruments play in time with the
 //! mix. A sender thread waits until each message is due.
 
-use crate::{ExpressionValue, MidiClock, MidiEvent, NoteExpressionKind};
+use crate::{ExpressionValue, Fine, MidiClock, MidiEvent, NoteExpressionKind, TimedMidiEvent};
 
 /// One message for an output port (channel or system real-time/common), or
 /// a per-note expression (no bytes: MIDI 2.0 ports send it as a per-note
@@ -20,6 +20,9 @@ pub struct MidiOutputEvent {
     pub bytes: [u8; 3],
     /// Channel, key, kind and value of a per-note expression.
     pub expression: Option<(u8, u8, NoteExpressionKind, ExpressionValue)>,
+    /// The message's MIDI 2.0 resolution (MIDI 2.0 ports send it, MIDI 1.0
+    /// ports the bytes).
+    pub fine: Fine,
 }
 
 impl MidiOutputEvent {
@@ -35,7 +38,24 @@ impl MidiOutputEvent {
             len: msg.len() as u8,
             bytes,
             expression: None,
+            fine: Fine::NONE,
         })
+    }
+
+    /// An engine event (a channel message with its resolution, or a note
+    /// expression); `None` for SysEx.
+    pub fn of_event(port: u16, due_ns: u64, ev: &TimedMidiEvent) -> Option<Self> {
+        if let MidiEvent::NoteExpression {
+            channel,
+            key,
+            kind,
+            value,
+        } = ev.event
+        {
+            return Some(Self::expression(port, due_ns, channel, key, kind, value));
+        }
+        let (bytes, len) = ev.event.to_bytes();
+        Self::new(port, due_ns, &bytes[..len]).map(|m| Self { fine: ev.fine, ..m })
     }
 
     /// A per-note expression.
@@ -53,6 +73,7 @@ impl MidiOutputEvent {
             len: 0,
             bytes: [0; 3],
             expression: Some((channel & 0xF, key & 0x7F, kind, value)),
+            fine: Fine::NONE,
         }
     }
 

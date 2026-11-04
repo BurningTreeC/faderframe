@@ -1,6 +1,6 @@
 [package]
 name = "faderframe-midi-ump"
-description = "MIDI 2.0 devices: a Universal MIDI Packet client of the ALSA sequencer (Linux)"
+description = "MIDI 2.0 devices: a Universal MIDI Packet client of the ALSA sequencer (Linux) and CoreMIDI (macOS)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,3 +17,6 @@ faderframe-midi.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa-sys = "0.4"
 libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coremidi = "0.9"

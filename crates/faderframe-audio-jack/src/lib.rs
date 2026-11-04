@@ -81,6 +81,7 @@ impl AudioBackend for JackBackend {
             // One server clock (JACK2 drives one device; pipewire-jack's
             // devices are kept in step by PipeWire).
             clocked_by_server: true,
+            resamples_followers: false,
             follows_devices: true,
             free_channel_counts: true,
             force_format: false,

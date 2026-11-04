@@ -13,8 +13,8 @@
 use crate::prefs::Preferences;
 use crate::state::{AppState, BackendChoice};
 use faderframe_audio::{
-    Capabilities, DeviceInfo, RateControl, STANDARD_BUFFER_SIZES, STANDARD_SAMPLE_RATES,
-    format_sample_rate,
+    Capabilities, DeviceInfo, DeviceStatus, RateControl, STANDARD_BUFFER_SIZES,
+    STANDARD_SAMPLE_RATES, format_sample_rate,
 };
 use faderframe_session::{Applied, AudioHealth, AudioPreferences, DeviceChoice};
 use gtk::glib;
@@ -152,6 +152,9 @@ struct Page {
     running: gtk::Label,
     asked: gtk::Label,
     latency: gtk::Label,
+    /// The devices a joined stream runs on (clock master, followers).
+    joined: gtk::Label,
+    joined_row: gtk::Label,
     mapping: gtk::Label,
     health: gtk::Label,
 }
@@ -557,6 +560,13 @@ impl Page {
                  (PipeWire resamples the ones that follow the graph's driver — a little latency \
                  and processing, no drift)."
                     .to_string()
+            } else if scan.caps.resamples_followers {
+                "These devices run on clocks of their own: the output device's clock drives \
+                 the engine and FaderFrame resamples the others to it, steered so they never \
+                 drift. Their channels come a few milliseconds later (recordings from them are \
+                 moved back by their own latency); one that is unplugged only falls silent and \
+                 joins again when it is back."
+                    .to_string()
             } else {
                 "Input and output on different devices run on two clocks and nothing here \
                  resamples between them: the input drifts, with a dropout now and then (counted \
@@ -639,7 +649,7 @@ impl Page {
                     &format!(
                         "Input {input} fr ({}) · output {output} fr ({}) beyond the buffer, as the \
                          audio system reports them\nHeard {} after processing (buffer + output) · \
-                         recordings move back {} (input + output){}",
+                         recordings move back {} (input + output){}{}",
                         ms(input, rate),
                         ms(output, rate),
                         ms(st.buffer_size + output, rate),
@@ -648,6 +658,11 @@ impl Page {
                             format!(" + {} of plugin delay", ms(graph, rate))
                         } else {
                             String::new()
+                        },
+                        if status.joined.iter().any(|d| !d.master) {
+                            " — devices that follow: their own, below"
+                        } else {
+                            ""
                         }
                     ),
                 );
@@ -658,6 +673,11 @@ impl Page {
                 set(&self.latency, "");
             }
         }
+        let rate = st.map_or(48_000, |s| s.sample_rate);
+        let joined = joined_lines(&status.joined, rate);
+        self.joined.set_visible(!joined.is_empty());
+        self.joined_row.set_visible(!joined.is_empty());
+        set(&self.joined, &joined);
         // Where each channel goes.
         let r = &status.routing;
         let mut lines = Vec::new();
@@ -751,6 +771,74 @@ impl Page {
     }
 }
 
+/// One line per device of a joined stream: the clock master, then each
+/// follower with its rate, drift, latency and gaps (empty for one device).
+fn joined_lines(devices: &[DeviceStatus], rate: u32) -> String {
+    let mut lines = Vec::new();
+    for d in devices {
+        let channels = |c: &[u16], what: &str| match (c.first(), c.last()) {
+            (Some(a), Some(b)) if a == b => Some(format!("{what} {}", a + 1)),
+            (Some(a), Some(b)) => Some(format!("{what} {}–{}", a + 1, b + 1)),
+            _ => None,
+        };
+        let places: Vec<String> = [channels(&d.inputs, "in"), channels(&d.outputs, "out")]
+            .into_iter()
+            .flatten()
+            .collect();
+        let at = if places.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", places.join(", "))
+        };
+        if d.master {
+            lines.push(format!(
+                "{}{at} — clock master: its callback drives the engine",
+                d.name
+            ));
+            continue;
+        }
+        if !d.present {
+            lines.push(format!(
+                "{}{at} — not connected: its channels are silent until it is back{}",
+                d.name,
+                if d.gaps > 0 {
+                    format!(" · {} gap{}", d.gaps, if d.gaps == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                }
+            ));
+            continue;
+        }
+        let mut parts = vec![format!(
+            "follows at {}{}",
+            format_sample_rate(d.sample_rate),
+            if d.sample_rate != rate {
+                " (resampled)"
+            } else {
+                ""
+            }
+        )];
+        parts.push(if d.locked {
+            format!("drift {:+.1} ppm", d.drift_ppm)
+        } else {
+            "settling…".to_string()
+        });
+        if !d.inputs.is_empty() {
+            parts.push(format!("input latency {}", ms(d.input_latency, rate)));
+        }
+        if !d.outputs.is_empty() {
+            parts.push(format!("output latency {}", ms(d.output_latency, rate)));
+        }
+        parts.push(match d.gaps {
+            0 => "no gaps".to_string(),
+            1 => "1 gap".to_string(),
+            n => format!("{n} gaps"),
+        });
+        lines.push(format!("{}{at} — {}", d.name, parts.join(" · ")));
+    }
+    lines.join("\n")
+}
+
 /// What the audio system itself decides, said once under its settings.
 fn system_note(scan: &Scan, device: Option<&DeviceInfo>) -> String {
     if let Some(e) = &scan.error {
@@ -787,6 +875,10 @@ fn system_note(scan: &Scan, device: Option<&DeviceInfo>) -> String {
                          driver's control panel (from the interface maker)."
             .into(),
         Some("dummy") => "No device: the engine runs on a timer, silently.".into(),
+        Some("aes67") => "AES67: the engine runs on the network's PTP clock; its inputs are \
+                          the streams received and its outputs the streams sent (Preferences → \
+                          Network Audio, which also sets the rate). A buffer size applies at once."
+            .into(),
         Some(_) => {
             let mut t = format!(
                 "{} opens the device at the rate and buffer size chosen, if it takes them \
@@ -825,8 +917,9 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
          that follow). JACK: the server owns the rate and buffer size. ALSA: one device \
          opened directly."
     } else {
-        "The system's own API opens one device at the rate and buffer size chosen; input from \
-         another device runs on another clock."
+        "The system's own API opens the output device at the rate and buffer size chosen; \
+         other devices (a second output, an input elsewhere) follow its clock, resampled by \
+         FaderFrame so that they never drift."
     }));
     backend.set_selected(
         backends
@@ -925,6 +1018,13 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
     g.attach(&asked, 1, next(&mut y), 1, 1);
     let latency = label();
     row(g, next(&mut y), "Latency", &latency);
+    let joined = label();
+    let joined_row = row(g, next(&mut y), "Devices", &joined);
+    joined.set_tooltip_text(Some(
+        "The output device's clock drives the engine; every other device follows it through a \
+         ring and a resampler steered by its drift. Its latency here is beyond the buffer, as \
+         above; a gap is a moment its audio was missing (it went away, or its ring ran dry)",
+    ));
     let health = label();
     health.add_css_class("warning");
     health.set_visible(false);
@@ -985,6 +1085,8 @@ pub fn rows(app: &Rc<AppState>, alive: &Rc<Cell<bool>>, g: &gtk::Grid, mut y: i3
         running,
         asked,
         latency,
+        joined,
+        joined_row,
         mapping,
         health,
     });
@@ -1206,6 +1308,14 @@ fn processing_rows(app: &Rc<AppState>, g: &gtk::Grid, mut y: i32) -> i32 {
     ahead_row.append(&buses);
     row(g, y, "Render ahead", &ahead_row);
     y += 1;
+    // Self-freezing: applies at once.
+    row(
+        g,
+        y,
+        "Self-freeze",
+        &crate::self_freeze_prefs::controls(app),
+    );
+    y += 1;
     g.attach(
         &note(
             "Any buffer size from 16 to 8192 frames works; larger device buffers are processed \
@@ -1263,6 +1373,53 @@ mod tests {
     use super::*;
     use crate::state::RunOptions;
     use std::time::Instant;
+
+    /// A joined stream's devices, one line each: the clock master, a
+    /// follower settled (its rate, drift, latency, gaps), one away.
+    #[test]
+    fn the_joined_devices_are_told_one_a_line() {
+        let devices = [
+            DeviceStatus {
+                name: "Desk".into(),
+                master: true,
+                present: true,
+                inputs: vec![0, 1],
+                outputs: vec![0, 1],
+                ..DeviceStatus::default()
+            },
+            DeviceStatus {
+                name: "Mic".into(),
+                present: true,
+                locked: true,
+                inputs: vec![2],
+                sample_rate: 44_100,
+                drift_ppm: 61.24,
+                input_latency: 480,
+                ..DeviceStatus::default()
+            },
+            DeviceStatus {
+                name: "Phones".into(),
+                present: false,
+                outputs: vec![2, 3],
+                sample_rate: 48_000,
+                gaps: 2,
+                ..DeviceStatus::default()
+            },
+        ];
+        let text = joined_lines(&devices, 48_000);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "Desk (in 1–2, out 1–2) — clock master: its callback drives the engine",
+                "Mic (in 3) — follows at 44.1 kHz (resampled) · drift +61.2 ppm · input latency \
+                 10.00 ms · no gaps",
+                "Phones (out 3–4) — not connected: its channels are silent until it is back · 2 \
+                 gaps",
+            ]
+        );
+        assert!(joined_lines(&[], 48_000).is_empty(), "one device: nothing");
+    }
 
     /// With a display: choosing an output device, then another audio
     /// system, rebuilds the page from inside its own handlers (both

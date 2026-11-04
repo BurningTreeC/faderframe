@@ -47,7 +47,7 @@ impl Preset {
             // The meters (loudness, level, phase, spectrum) dominate.
             Preset::Mastering => (0.42, ViewId::tools(), false),
         };
-        let bottom_views = vec![
+        let mut bottom_views = vec![
             ViewId::mixer(),
             ViewId::tools(),
             ViewId::album(),
@@ -55,6 +55,17 @@ impl Preset {
             ViewId::automation(),
             ViewId::performance(),
         ];
+        // Mixing keeps the mix scenes beside the mixer.
+        if self == Preset::Mixing {
+            bottom_views.insert(1, ViewId::mix_scenes());
+        }
+        // Mixing and Mastering keep the reference tracks beside the
+        // meters (a tab behind them): A/B with a released record.
+        if matches!(self, Preset::Mixing | Preset::Mastering)
+            && let Some(i) = bottom_views.iter().position(|v| *v == ViewId::tools())
+        {
+            bottom_views.insert(i + 1, ViewId::reference());
+        }
         let active_idx = bottom_views.iter().position(|v| *v == active).unwrap_or(0);
         let main = DockNode::split(
             Axis::Vertical,
@@ -131,10 +142,57 @@ mod tests {
         assert!(layouts[0].is_showing(&ViewId::mixer()));
         assert!(!layouts[1].is_showing(&ViewId::piano_roll()));
         assert!(layouts[3].is_showing(&ViewId::piano_roll()));
+        // The mix scenes beside the mixer when mixing (a tab behind it).
+        assert!(layouts[2].is_placed(&ViewId::mix_scenes()));
+        assert!(!layouts[1].is_placed(&ViewId::mix_scenes()));
+        // The reference tracks beside the meters when mixing and
+        // mastering (a tab behind them, the meters showing).
+        let placed: Vec<bool> = layouts
+            .iter()
+            .map(|l| l.is_placed(&ViewId::reference()))
+            .collect();
+        assert_eq!(placed, [false, false, true, false, true]);
+        assert!(!layouts[4].is_showing(&ViewId::reference()));
         assert_ne!(layouts[0], layouts[2]);
         // The master strip at the side: Mastering only, by default.
         let panel: Vec<bool> = layouts.iter().map(|l| l.master_panel).collect();
         assert_eq!(panel, [false, false, false, false, true]);
+    }
+
+    /// A layout saved before the presets placed the Reference view loads
+    /// as it was saved; the view joins the bottom dock in its place once
+    /// shown.
+    #[test]
+    fn saved_layouts_without_the_reference_view_stay_as_saved() {
+        let mut old = Preset::Mastering.layout();
+        if let Some(g) = old.area_mut(&DockAreaId::bottom()) {
+            g.views.retain(|v| *v != ViewId::reference());
+            g.active = g
+                .views
+                .iter()
+                .position(|v| *v == ViewId::tools())
+                .unwrap_or(0);
+        }
+        old.validate().unwrap();
+        let json = serde_json::to_string(&old).unwrap();
+        let mut set: crate::WorkspaceSet =
+            serde_json::from_str(&serde_json::to_string(&crate::WorkspaceSet::default()).unwrap())
+                .unwrap();
+        set.workspaces[4].layout = serde_json::from_str(&json).unwrap();
+        set.sanitise();
+        let loaded = &set.workspaces[4].layout;
+        assert_eq!(*loaded, old, "unchanged by loading");
+        assert!(!loaded.is_placed(&ViewId::reference()));
+        assert!(loaded.is_showing(&ViewId::tools()));
+        // Shown, it goes beside the meters; resetting gives the preset.
+        let mut l = loaded.clone();
+        l.activate(&ViewId::reference()).unwrap();
+        let bottom = l.area(&DockAreaId::bottom()).unwrap();
+        let at = |v: ViewId| bottom.views.iter().position(|x| *x == v);
+        assert_eq!(at(ViewId::reference()), at(ViewId::tools()).map(|i| i + 1));
+        set.switch_to(4);
+        set.reset_active();
+        assert_eq!(set.active_layout(), &Preset::Mastering.layout());
     }
 
     #[test]

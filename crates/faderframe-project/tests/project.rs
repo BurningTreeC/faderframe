@@ -369,6 +369,9 @@ fn note_editing_round_trip() {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     h.apply(&mut p, Command::AddNote { clip, note }).unwrap();
     let stored = *p.clip(clip).unwrap().as_midi().unwrap().note(id).unwrap();
@@ -561,6 +564,7 @@ fn sources_are_undoable_and_protected_while_in_use() {
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     let mut h = History::default();

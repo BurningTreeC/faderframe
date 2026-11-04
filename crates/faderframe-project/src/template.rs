@@ -6,7 +6,8 @@
 //! markers and sections, loop and punch, the album's delivery settings and
 //! the launcher's scenes — and leaves out what was recorded or imported:
 //! clips (arranger, launcher and video), their media, freezes, aliases, lyrics
-//! (transcribed from the audio) and album songs that are files.
+//! and the words heard in sources (transcribed from the audio) and album
+//! songs that are files.
 
 use crate::Project;
 use crate::album::SongSource;
@@ -19,7 +20,10 @@ pub fn without_content(project: &Project) -> Project {
     p.clips.clear();
     p.sources.clear();
     p.clip_links.clear();
+    // ARA documents describe the media that goes.
+    p.ara.archives.clear();
     p.lyrics.clear();
+    p.source_words.clear();
     for t in &mut p.tracks {
         t.clips.clear();
         t.freeze = None;

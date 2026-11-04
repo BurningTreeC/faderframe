@@ -256,6 +256,34 @@ pub(crate) fn note_failure() {
     FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Lower the calling thread below the UI and the job threads: background
+/// work nobody waits for (self-freezing's renders). Linux: niceness 10 on
+/// the thread itself; Windows: below normal; elsewhere nothing (`false`).
+pub fn lower_this_thread() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no preconditions and returns the caller's id;
+        // setpriority with PRIO_PROCESS and a thread id changes only that
+        // thread's niceness (raising it needs no privilege).
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            libc::setpriority(libc::PRIO_PROCESS, tid, 10) == 0
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: the pseudo handle of the calling thread, always valid.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) != 0 }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
 /// Keeps the CPUs out of deep sleep states while it lives (Linux:
 /// `/dev/cpu_dma_latency` held at 0 µs, as the kernel's PM QoS
 /// interface wants: the request lasts while the file is open). Waking a

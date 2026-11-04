@@ -1079,6 +1079,30 @@ impl FfInstance for Vst3Instance {
             .ok_or_else(|| PluginError::Failed("not active".into()))?;
         Ok(Box::new(Vst3Processor { cell }))
     }
+
+    fn ara_factory(&mut self) -> Option<faderframe_ara::Factory> {
+        crate::ara::factory(&self.component)
+    }
+
+    fn bind_ara(
+        &mut self,
+        controller: faderframe_ara::ControllerRef,
+        roles: faderframe_ara::Roles,
+    ) -> Result<faderframe_ara::Extension, PluginError> {
+        if self.rt.is_some() || self.view.is_some() {
+            return Err(PluginError::Failed(format!(
+                "{}: ARA binding after activation or with its editor made",
+                self.scanned.name
+            )));
+        }
+        crate::ara::bind(&self.component, controller, roles).ok_or_else(|| {
+            PluginError::Failed(format!("{}: ARA binding failed", self.scanned.name))
+        })
+    }
+
+    fn deactivate(&mut self) {
+        Vst3Instance::deactivate(self);
+    }
 }
 
 impl Drop for Vst3Instance {

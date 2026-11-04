@@ -140,6 +140,7 @@ impl TestProject {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             },
         );
@@ -159,4 +160,39 @@ pub fn hits(signal: &[f32], threshold: f32) -> Vec<usize> {
         .filter(|(_, v)| v.abs() > threshold)
         .map(|(i, _)| i)
         .collect()
+}
+
+/// A device played by hand that waits, before a callback, until the
+/// render-ahead tiers have rendered what it plays
+/// ([`faderframe_engine::EngineController::ahead_ready_for`]) — at most
+/// for what is left of its budget. No audio thread waits; a paced test
+/// run can when the machine is busy: its anticipators run as ordinary
+/// threads beside the whole build, and a few milliseconds without a turn
+/// is a miss where nothing is wrong. Patient runs still count misses: what
+/// never arrives (a sequence rendered the wrong way, a ring left empty)
+/// is one after the budget.
+pub struct Patience {
+    left: std::time::Duration,
+    /// How long it waited in all.
+    pub waited: std::time::Duration,
+}
+
+impl Patience {
+    pub fn new(budget: std::time::Duration) -> Self {
+        Self {
+            left: budget,
+            waited: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Before a callback of `frames`.
+    pub fn wait(&mut self, controller: &faderframe_engine::EngineController, frames: usize) {
+        let start = std::time::Instant::now();
+        while !controller.ahead_ready_for(frames) && start.elapsed() < self.left {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        let waited = start.elapsed();
+        self.left = self.left.saturating_sub(waited);
+        self.waited += waited;
+    }
 }

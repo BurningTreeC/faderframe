@@ -1,5 +1,6 @@
 //! What a media file holds: its picture (size, rate, codec), its sound
-//! streams and its length.
+//! streams and its length, and whether the picture is 360° and a sound an
+//! ambisonic field ([`crate::spherical`]).
 
 use crate::{Result, VideoError};
 use faderframe_core::timecode::FrameRate;
@@ -43,6 +44,9 @@ pub struct AudioStream {
     pub codec: String,
     /// Its language or title, when tagged.
     pub label: Option<String>,
+    /// An ambisonic field, as the file says (`SA3D`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambisonic: Option<crate::spherical::SpatialAudio>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,6 +56,9 @@ pub struct MediaInfo {
     pub duration_ns: i64,
     /// The container ("Quicktime", "Matroska", …).
     pub container: String,
+    /// The picture is 360°, laid out so (from the file's metadata).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spherical: Option<faderframe_core::spherical::Spherical>,
 }
 
 fn codec_of(caps: Option<gst::Caps>) -> String {
@@ -82,14 +89,26 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
                 codec: codec_of(v.caps()),
             }
         });
+    // GStreamer reads no 360° metadata: our own reader does.
+    let found = crate::spherical::read(path).unwrap_or_else(|e| {
+        tracing::info!("{}: no 360° metadata read ({e})", path.display());
+        crate::spherical::Found::default()
+    });
     let audio = info
         .audio_streams()
         .into_iter()
-        .map(|a| AudioStream {
+        .enumerate()
+        .map(|(i, a)| AudioStream {
             channels: a.channels(),
             rate: a.sample_rate(),
             codec: codec_of(a.caps()),
             label: a.language().map(|l| l.to_string()),
+            ambisonic: found
+                .audio
+                .get(i)
+                .cloned()
+                .flatten()
+                .filter(|s| s.map.len() as u32 == a.channels()),
         })
         .collect();
     let container = info
@@ -97,10 +116,12 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
         .and_then(|s| s.caps())
         .map(|c| codec_of(Some(c)))
         .unwrap_or_default();
+    let spherical = video.as_ref().and(found.video);
     Ok(MediaInfo {
         video,
         audio,
         duration_ns: info.duration().map_or(0, crate::ns),
         container,
+        spherical,
     })
 }

@@ -1,9 +1,10 @@
+use crate::articulation::{ArticulationLane, SWITCH_LEAD};
 use crate::context::EngineContext;
 use crate::launch::{self, Play};
 use crate::snapshot::Lane;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
-use faderframe_midi::{MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
+use faderframe_midi::{Fine, MidiBuffer, MidiEvent, NoteTracker, TimedMidiEvent};
 use faderframe_realtime::ParamSlot;
 
 /// Controller slots per channel: 128 CCs, pitch bend, channel pressure,
@@ -40,7 +41,9 @@ fn slot(ev: MidiEvent) -> Option<(usize, usize)> {
 /// *chased*: playback starting mid-clip first sends the value each
 /// controller has at that point (a held sustain pedal, a bend, the mod
 /// wheel, the program), and controllers the player moved go back to rest (sustain off,
-/// bend centred) when playback jumps or stops. All state is fixed-size.
+/// bend centred) when playback jumps or stops. Articulation switches
+/// (keyswitches, programs, controllers; [`crate::articulation`]) go out
+/// before their notes and are chased the same way. All state is fixed-size.
 pub struct MidiClipPlayer {
     track: TrackId,
     /// A MIDI track's mute: while set, it plays nothing (its sounding
@@ -49,13 +52,22 @@ pub struct MidiClipPlayer {
     muted: bool,
     tracker: NoteTracker,
     /// Value last sent per channel and controller slot.
-    sent: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
+    sent: Box<ChannelValues>,
     /// Scratch for chasing.
-    chase: Box<[[Option<MidiEvent>; SLOTS]; 16]>,
+    chase: Box<ChannelValues>,
     was_playing: bool,
     /// What played last (the arrangement or a launched clip).
     playing: Play,
+    /// Keyswitch note-offs a chase could not send in its block (a block
+    /// one frame long), sent at the start of the next.
+    pending_offs: [Option<MidiEvent>; PENDING_OFFS],
 }
+
+/// A value per channel and controller slot, with its MIDI 2.0 resolution.
+type ChannelValues = [[Option<(MidiEvent, Fine)>; SLOTS]; 16];
+
+/// Keyswitch note-offs kept for the next block.
+const PENDING_OFFS: usize = 16;
 
 impl MidiClipPlayer {
     pub fn new(track: TrackId) -> Self {
@@ -68,6 +80,7 @@ impl MidiClipPlayer {
             chase: Box::new([[None; SLOTS]; 16]),
             was_playing: false,
             playing: Play::Arrangement,
+            pending_offs: [None; PENDING_OFFS],
         }
     }
 
@@ -81,7 +94,7 @@ impl MidiClipPlayer {
     fn rest(&mut self, out: &mut MidiBuffer) {
         for (ch, slots) in self.sent.iter_mut().enumerate() {
             for (i, s) in slots.iter_mut().enumerate() {
-                let Some(ev) = s.take() else { continue };
+                let Some((ev, _)) = s.take() else { continue };
                 let rest = match (i, ev) {
                     (PB, _) => MidiEvent::PitchBend {
                         channel: ch as u8,
@@ -133,8 +146,42 @@ impl MidiClipPlayer {
         }
     }
 
+    /// Send the articulation state in effect at lane time `pos` at block
+    /// offset `at`: its controllers, program and keyswitch note-ons, the
+    /// note-offs a sample later (in the next block when this one ends
+    /// first). Realtime-safe.
+    fn chase_switch(
+        &mut self,
+        art: &ArticulationLane,
+        pos: i64,
+        at: u32,
+        frames: usize,
+        out: &mut MidiBuffer,
+    ) {
+        let Some(state) = art.at(pos).and_then(|s| art.state(s)) else {
+            return;
+        };
+        for &ev in state.on.iter() {
+            if out.push(TimedMidiEvent::new(at, ev)).is_ok() {
+                self.tracker.observe(ev);
+                if let Some((ch, i)) = slot(ev) {
+                    self.sent[ch][i] = Some((ev, Fine::NONE));
+                }
+            }
+        }
+        for &ev in state.off.iter() {
+            if (at as usize) + 1 < frames {
+                if out.push(TimedMidiEvent::new(at + 1, ev)).is_ok() {
+                    self.tracker.observe(ev);
+                }
+            } else if let Some(free) = self.pending_offs.iter_mut().find(|p| p.is_none()) {
+                *free = Some(ev);
+            }
+        }
+    }
+
     /// Send the controller values in effect at `pos` (realtime-safe).
-    fn chase_to(&mut self, cx: &EngineContext, pos: i64, out: &mut MidiBuffer) {
+    fn chase_to(&mut self, cx: &EngineContext, pos: i64, frames: usize, out: &mut MidiBuffer) {
         let Some(lane) = cx.timeline.lane(self.track) else {
             return;
         };
@@ -144,27 +191,32 @@ impl MidiClipPlayer {
         let upto = lane.midi.partition_point(|r| r.start <= pos);
         for region in lane.midi[..upto].iter().filter(|r| r.end > pos) {
             // From the chase point before `pos` (not the region's start).
-            let to = region.events.partition_point(|(time, _)| *time < pos);
+            let to = region.events.partition_point(|(time, _, _)| *time < pos);
             let chase = &mut self.chase;
-            let from = region.chase.load(to, |key, ev| {
+            let from = region.chase.load(to, |key, ev, fine| {
                 let key = usize::from(key);
-                chase[key / SLOTS][key % SLOTS] = Some(ev);
+                chase[key / SLOTS][key % SLOTS] = Some((ev, fine));
             });
-            for &(_, ev) in &region.events[from..to] {
+            for &(_, ev, fine) in &region.events[from..to] {
                 if let Some((ch, i)) = slot(ev) {
-                    self.chase[ch][i] = Some(ev);
+                    self.chase[ch][i] = Some((ev, fine));
                 }
             }
         }
         for ch in 0..16 {
             for i in 0..SLOTS {
-                if let Some(ev) = self.chase[ch][i]
-                    && self.sent[ch][i] != Some(ev)
-                    && out.push(TimedMidiEvent::new(0, ev)).is_ok()
+                if let Some((ev, fine)) = self.chase[ch][i]
+                    && self.sent[ch][i] != Some((ev, fine))
+                    && out.push(TimedMidiEvent::with_fine(0, ev, fine)).is_ok()
                 {
-                    self.sent[ch][i] = Some(ev);
+                    self.sent[ch][i] = Some((ev, fine));
                 }
             }
+        }
+        // The articulation in effect (after the controllers: a switch's
+        // controller wins).
+        if let Some(art) = lane.articulation.as_deref() {
+            self.chase_switch(art, pos, 0, frames, out);
         }
     }
 }
@@ -173,6 +225,45 @@ impl MidiClipPlayer {
     /// Emit `lane`'s events in lane time `[pos, end)`, lane time `t` at
     /// block offset `t - shift`.
     fn play_span(&mut self, lane: &Lane, out: &mut MidiBuffer, pos: i64, end: i64, shift: i64) {
+        // Articulation switches before the notes: their note-ons and
+        // controllers a sample ahead, their keyswitches' note-offs on the
+        // note's sample (sorted before its note-on).
+        if let Some(art) = lane.articulation.as_deref() {
+            let first = art.switches.partition_point(|s| s.at - SWITCH_LEAD < pos);
+            for s in &art.switches[first..] {
+                let t = s.at - SWITCH_LEAD;
+                if t >= end {
+                    break;
+                }
+                let Some(state) = art.state(s) else { continue };
+                for &ev in state.on.iter() {
+                    if out
+                        .push(TimedMidiEvent::new((t - shift) as u32, ev))
+                        .is_ok()
+                    {
+                        self.tracker.observe(ev);
+                        if let Some((ch, i)) = slot(ev) {
+                            self.sent[ch][i] = Some((ev, Fine::NONE));
+                        }
+                    }
+                }
+            }
+            let first = art.switches.partition_point(|s| s.at < pos);
+            for s in &art.switches[first..] {
+                if s.at >= end {
+                    break;
+                }
+                let Some(state) = art.state(s) else { continue };
+                for &ev in state.off.iter() {
+                    if out
+                        .push(TimedMidiEvent::new((s.at - shift) as u32, ev))
+                        .is_ok()
+                    {
+                        self.tracker.observe(ev);
+                    }
+                }
+            }
+        }
         let upto = lane.midi.partition_point(|r| r.start < end);
         for region in lane.midi[..upto].iter().filter(|r| r.end >= pos) {
             // SysEx for the track's plugins (bytes copied into the buffer).
@@ -183,18 +274,22 @@ impl MidiClipPlayer {
                 }
                 let _ = out.push_sysex((*time - shift) as u32, bytes);
             }
-            let first = region.events.partition_point(|(time, _)| *time < pos);
-            for &(time, event) in &region.events[first..] {
+            let first = region.events.partition_point(|(time, _, _)| *time < pos);
+            for &(time, event, fine) in &region.events[first..] {
                 if time >= end {
                     break;
                 }
                 if out
-                    .push(TimedMidiEvent::new((time - shift) as u32, event))
+                    .push(TimedMidiEvent::with_fine(
+                        (time - shift) as u32,
+                        event,
+                        fine,
+                    ))
                     .is_ok()
                 {
                     self.tracker.observe(event);
                     if let Some((ch, i)) = slot(event) {
-                        self.sent[ch][i] = Some(event);
+                        self.sent[ch][i] = Some((event, fine));
                     }
                 }
             }
@@ -208,6 +303,14 @@ impl Processor<EngineContext> for MidiClipPlayer {
             return;
         };
         let t = &cx.data.transport;
+        // Keyswitch note-offs a chase left for this block.
+        for p in self.pending_offs.iter_mut() {
+            if let Some(ev) = p.take()
+                && out.push(TimedMidiEvent::new(0, ev)).is_ok()
+            {
+                self.tracker.observe(ev);
+            }
+        }
         let muted = self.mute.is_some_and(|m| cx.data.params.get(m) >= 0.5);
         if cx.data.discontinuity || (self.was_playing && !t.playing) || (muted && !self.muted) {
             self.tracker.release_all(out, 0);
@@ -233,7 +336,7 @@ impl Processor<EngineContext> for MidiClipPlayer {
                 Self::announce_mpe(cfg, out);
             }
             if pieces[0].2 == Play::Arrangement {
-                self.chase_to(cx.data, pos, out);
+                self.chase_to(cx.data, pos, io.frames, out);
             }
             self.playing = pieces[0].2;
         }
@@ -263,6 +366,13 @@ impl Processor<EngineContext> for MidiClipPlayer {
                         if local == 0 && t != start {
                             self.tracker.release_all(out, (t - pos) as u32);
                         }
+                        // From the clip's start (each time round): the
+                        // articulation its first note wants.
+                        if local == 0
+                            && let Some(art) = l.lane.articulation.as_deref()
+                        {
+                            self.chase_switch(art, 0, (t - pos) as u32, io.frames, out);
+                        }
                         let m = (l.length - local).min(to - t);
                         self.play_span(&l.lane, out, local, local + m, local - (t - pos));
                         t += m;
@@ -278,6 +388,7 @@ impl Processor<EngineContext> for MidiClipPlayer {
         for slots in self.sent.iter_mut() {
             slots.fill(None);
         }
+        self.pending_offs = [None; PENDING_OFFS];
         self.was_playing = false;
     }
 }
@@ -326,27 +437,34 @@ mod tests {
                     velocity: 0,
                 },
             };
-            events.push((t, ev));
+            // Every other controller value with its 32 bits.
+            let fine = match ev {
+                MidiEvent::ControlChange { value, .. } if i % 2 == 0 => {
+                    Fine::value(u32::from(value) << 25 | i as u32)
+                }
+                _ => Fine::NONE,
+            };
+            events.push((t, ev, fine));
         }
         let points = ChasePoints::new(&events, chase_key);
         for upto in (0..=events.len()).step_by(37).chain([events.len()]) {
             let mut scanned = std::collections::HashMap::new();
-            for &(_, ev) in &events[..upto] {
+            for &(_, ev, fine) in &events[..upto] {
                 if let Some(k) = chase_key(ev) {
-                    scanned.insert(k, ev);
+                    scanned.insert(k, (ev, fine));
                 }
             }
             let mut chased = std::collections::HashMap::new();
-            let from = points.load(upto, |k, ev| {
-                chased.insert(k, ev);
+            let from = points.load(upto, |k, ev, fine| {
+                chased.insert(k, (ev, fine));
             });
             assert!(
                 from <= upto && upto - from <= CHASE_EVERY,
                 "{from} for {upto}"
             );
-            for &(_, ev) in &events[from..upto] {
+            for &(_, ev, fine) in &events[from..upto] {
                 if let Some(k) = chase_key(ev) {
-                    chased.insert(k, ev);
+                    chased.insert(k, (ev, fine));
                 }
             }
             assert_eq!(chased, scanned, "up to event {upto}");

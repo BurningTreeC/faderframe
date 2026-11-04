@@ -18,6 +18,8 @@
 //! | `/jog i`, `/undo`, `/save`, `/marker`, `/refresh` | |
 //! | `/flip`, `/page/pan`, `/page/send/K` | what faders and pots move |
 //! | `/automation/{off,read,touch,latch,write}` | the selected track's mode |
+//! | `/scene/{next,previous}`, `/scene/recall i` (1-based), `/scene/morph f` (0 = A … 1 = B) | the mix scenes |
+//! | `/macro/run i`, `/macro/N` | run macro i (or N; 1-based) |
 //!
 //! Out (only what changed): `/strip/N/{name s, fader f, level s, pan f,
 //! mute i, solo i, arm i, select i, meter f}` (the meter 0…1),
@@ -32,7 +34,8 @@
 //! shown, 1-based) and `/launcher/scenes i` (how many).
 
 use crate::{
-    Button, MASTER, Protocol, SceneLight, SlotKind, SurfaceInput, SurfaceState, meter_level,
+    Button, MASTER, Protocol, SceneLight, SlotKind, SurfaceCommand, SurfaceInput, SurfaceState,
+    meter_level,
 };
 use std::collections::HashMap;
 
@@ -359,6 +362,36 @@ impl OscSurface {
                 };
                 press(Button::Automation(b), out);
             }
+            ["scene", "next"] if on => out.push(SurfaceInput::Command(SurfaceCommand::SceneNext)),
+            ["scene", "previous"] if on => {
+                out.push(SurfaceInput::Command(SurfaceCommand::ScenePrevious));
+            }
+            ["scene", "recall"] => {
+                if let Some(n) = value.filter(|v| *v >= 1.0) {
+                    out.push(SurfaceInput::Command(SurfaceCommand::RecallScene(
+                        n as usize - 1,
+                    )));
+                }
+            }
+            ["scene", "morph"] => {
+                if let Some(v) = value {
+                    out.push(SurfaceInput::Command(SurfaceCommand::SceneMorph {
+                        permille: (v.clamp(0.0, 1.0) * 1000.0).round() as u16,
+                    }));
+                }
+            }
+            ["macro", "run"] => {
+                if let Some(n) = value.filter(|v| *v >= 1.0 && *v <= f32::from(u16::MAX)) {
+                    out.push(SurfaceInput::Command(SurfaceCommand::RunMacro(n as u16)));
+                }
+            }
+            ["macro", n] if on => {
+                if let Ok(n) = n.parse::<u16>()
+                    && n >= 1
+                {
+                    out.push(SurfaceInput::Command(SurfaceCommand::RunMacro(n)));
+                }
+            }
             ["undo"] if on => press(Button::Undo, out),
             ["save"] if on => press(Button::Save, out),
             ["marker"] if on => press(Button::Marker, out),
@@ -684,6 +717,56 @@ mod tests {
                 button: Button::SceneDown,
                 pressed: true
             }
+        );
+    }
+
+    #[test]
+    fn mix_scenes_are_recalled_and_morphed() {
+        let mut s = OscSurface::new(8);
+        let mut out = Vec::new();
+        for m in [
+            Message::new("/scene/next", vec![]),
+            Message::new("/scene/previous", vec![Arg::Int(1)]),
+            Message::new("/scene/recall", vec![Arg::Int(3)]),
+            Message::new("/scene/recall", vec![Arg::Int(0)]),
+            Message::new("/scene/morph", vec![Arg::Float(0.25)]),
+            Message::new("/scene/morph", vec![Arg::Float(7.0)]),
+        ] {
+            s.receive(&encode(&m), &mut out);
+        }
+        let c = |c| SurfaceInput::Command(c);
+        assert_eq!(
+            out,
+            [
+                c(SurfaceCommand::SceneNext),
+                c(SurfaceCommand::ScenePrevious),
+                c(SurfaceCommand::RecallScene(2)),
+                c(SurfaceCommand::SceneMorph { permille: 250 }),
+                c(SurfaceCommand::SceneMorph { permille: 1000 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn macros_are_run_by_number() {
+        let mut s = OscSurface::new(8);
+        let mut out = Vec::new();
+        for m in [
+            Message::new("/macro/run", vec![Arg::Int(3)]),
+            Message::new("/macro/run", vec![Arg::Int(0)]),
+            Message::new("/macro/7", vec![]),
+            Message::new("/macro/7", vec![Arg::Int(0)]),
+            Message::new("/macro/x", vec![]),
+        ] {
+            s.receive(&encode(&m), &mut out);
+        }
+        let c = |c| SurfaceInput::Command(c);
+        assert_eq!(
+            out,
+            [
+                c(SurfaceCommand::RunMacro(3)),
+                c(SurfaceCommand::RunMacro(7))
+            ]
         );
     }
 }

@@ -90,6 +90,12 @@ impl Session {
         self.exports.agreed.clear();
     }
 
+    /// Did the user agree to replace `path` for the action being
+    /// dispatched? (An export written later keeps the answer.)
+    pub(crate) fn agreed_to(&self, path: &Path) -> bool {
+        self.exports.agreed.iter().any(|p| p == path)
+    }
+
     /// Dispatch `action` with `paths` agreed to be replaced (a save
     /// dialog asked about them).
     pub fn dispatch_agreeing(&mut self, action: Action, paths: Vec<PathBuf>) -> Result<()> {

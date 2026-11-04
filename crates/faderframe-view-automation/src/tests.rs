@@ -226,3 +226,195 @@ fn the_plus_offers_the_missing_parameters() {
     let lanes = &s.project().track(drums).unwrap().automation.lanes;
     assert!(lanes.iter().any(|l| l.target == want));
 }
+
+mod keyboard {
+    use super::*;
+    use faderframe_ui_canvas::access::{find_node, focus_order, press_key};
+    use faderframe_ui_canvas::{AccessNode, AccessRole, Key};
+
+    fn named(view: &AutomationView, s: &Session, label: &str) -> AccessNode<Action> {
+        let nodes = view.accessible(SIZE, s);
+        focus_order(&nodes)
+            .into_iter()
+            .find(|n| n.label.starts_with(label))
+            .cloned()
+            .unwrap_or_else(|| panic!("no control '{label}'"))
+    }
+
+    fn key(
+        view: &mut AutomationView,
+        s: &mut Session,
+        label: &str,
+        k: Key,
+    ) -> Vec<HostRequest<Action>> {
+        let id = named(view, s, label).id;
+        let nodes = view.accessible(SIZE, s);
+        let (actions, requests) = press_key(view, &nodes, id, k, Modifiers::NONE, SIZE, s)
+            .unwrap_or_else(|| panic!("{k:?} does something on '{label}'"));
+        for a in actions {
+            s.dispatch(a).unwrap();
+        }
+        requests
+    }
+
+    fn menu(requests: Vec<HostRequest<Action>>) -> Vec<MenuItem<Action>> {
+        match requests.into_iter().next() {
+            Some(HostRequest::ContextMenu { items, .. }) => items,
+            _ => panic!("a menu"),
+        }
+    }
+
+    /// The toolbar, the lane list as shown and the lane's editor: a track
+    /// row's menu adds lanes, a lane is chosen with Enter, its mode and
+    /// visibility are controls of their own.
+    #[test]
+    fn the_lanes_and_tools_are_reached_by_the_keyboard() {
+        let (mut s, drums) = session();
+        let mut view = AutomationView::new(Theme::default());
+        assert_eq!(view.accessible_name().as_deref(), Some("Automation"));
+        let nodes = view.accessible(SIZE, &s);
+        let roles: Vec<AccessRole> = nodes.iter().map(|n| n.role).collect();
+        assert_eq!(
+            roles,
+            [AccessRole::Toolbar, AccessRole::List, AccessRole::Group]
+        );
+        // The list's rows are the rows shown.
+        assert_eq!(nodes[1].children.len(), view.rows(&s).len());
+        // "Selected tracks only": the view's own filter, a toggle.
+        let only = named(&view, &s, "Selected tracks only");
+        assert_eq!(only.role, AccessRole::ToggleButton);
+        assert_eq!(only.checked, Some(false));
+        s.selection.tracks.clear();
+        s.selection.tracks.insert(drums);
+        key(&mut view, &mut s, "Selected tracks only", Key::Enter);
+        assert!(view.selected_only);
+        assert_eq!(named(&view, &s, "Selected tracks only").checked, Some(true));
+        assert_eq!(view.accessible(SIZE, &s)[1].children.len(), 2);
+        // The track's row: its menu adds a lane.
+        let items = menu(key(&mut view, &mut s, "Drums, 1 lane", Key::Enter));
+        let mute = items
+            .iter()
+            .find(|i| i.label == "Mute")
+            .and_then(|i| i.action.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
+                )
+            });
+        s.dispatch(mute).unwrap();
+        assert_eq!(view.accessible(SIZE, &s)[1].children.len(), 3);
+        // A lane: Enter edits it; its mode's menu; the arranger's eye.
+        let lane = named(&view, &s, "Mute on Drums");
+        assert_eq!(lane.selected, Some(false));
+        key(&mut view, &mut s, "Mute on Drums", Key::Enter);
+        assert_eq!(named(&view, &s, "Mute on Drums").selected, Some(true));
+        assert!(
+            view.accessible(SIZE, &s)[2]
+                .label
+                .starts_with("Mute on Drums")
+        );
+        let modes = menu(key(&mut view, &mut s, "Mode: ", Key::Enter));
+        assert_eq!(modes.len(), 5);
+        let eye = find_node(&view.accessible(SIZE, &s), lane.id)
+            .unwrap()
+            .children
+            .iter()
+            .find(|n| n.label == "Shown in the arranger")
+            .cloned()
+            .unwrap();
+        assert_eq!(eye.role, AccessRole::ToggleButton);
+        let was = eye.checked.unwrap();
+        let nodes = view.accessible(SIZE, &s);
+        let (actions, _) = press_key(
+            &mut view,
+            &nodes,
+            eye.id,
+            Key::Enter,
+            Modifiers::NONE,
+            SIZE,
+            &s,
+        )
+        .unwrap();
+        for a in actions {
+            s.dispatch(a).unwrap();
+        }
+        let now = find_node(&view.accessible(SIZE, &s), eye.id)
+            .and_then(|n| n.checked)
+            .unwrap();
+        assert_eq!(now, !was);
+        // The lane tools act on it: Delete Lane.
+        assert!(!named(&view, &s, "Delete lane").disabled);
+        key(&mut view, &mut s, "Delete lane", Key::Enter);
+        let lanes = &s.project().track(drums).unwrap().automation.lanes;
+        assert_eq!(lanes.len(), 1, "the mute lane went");
+    }
+
+    /// Points are sliders: Enter adds one at the playhead, the arrows move
+    /// a point's value, Enter puts the playhead on it, its menu shapes,
+    /// moves and deletes it.
+    #[test]
+    fn points_are_added_stepped_and_moved_by_the_keyboard() {
+        let (mut s, drums) = session();
+        let mut view = AutomationView::new(Theme::default());
+        s.dispatch(Action::Transport(
+            faderframe_session::TransportAction::Locate(MusicalTime::from_quarters(4.0)),
+        ))
+        .unwrap();
+        key(&mut view, &mut s, "Add point at the playhead", Key::Enter);
+        let points = volume_lane(&s, drums).curve.points().to_vec();
+        assert_eq!(points.len(), 2, "the value before it and the point");
+        let at = s.playhead();
+        assert!((at.quarters() - 4.0).abs() < 1e-3);
+        assert_eq!(points[1].time, at);
+        assert!(
+            named(&view, &s, "Add point at the playhead").disabled,
+            "a point is there now"
+        );
+        // The second point: a step up, a hundredth of the lane.
+        let point = named(&view, &s, "Point 2 at ");
+        assert_eq!(point.role, AccessRole::Slider);
+        let before = points[1].value;
+        key(&mut view, &mut s, "Point 2 at ", Key::Up);
+        let after = volume_lane(&s, drums).curve.points()[1].value;
+        assert!(after > before, "{before} → {after}");
+        // Enter: the playhead on it.
+        key(&mut view, &mut s, "Point 1 at ", Key::Enter);
+        assert_eq!(s.playhead(), MusicalTime::ZERO);
+        // Its menu: later by a sixteenth.
+        let items = menu(key(&mut view, &mut s, "Point 2 at ", Key::Menu));
+        let later = items
+            .iter()
+            .find(|i| i.label == "Move Later by a Sixteenth")
+            .and_then(|i| i.action.clone())
+            .unwrap();
+        s.dispatch(later).unwrap();
+        assert_eq!(
+            volume_lane(&s, drums).curve.points()[1].time,
+            MusicalTime::from_quarters(at.quarters() + 0.25)
+        );
+        assert!(items.iter().any(|i| i.label == "Delete Point"));
+        assert!(items.iter().any(|i| i.label == "Step (hold)"));
+    }
+
+    /// Without a lane the lane tools are there but unavailable.
+    #[test]
+    fn the_lane_tools_wait_for_a_lane() {
+        let s = Session::new(
+            faderframe_project::Project::new("Empty", 48_000),
+            None,
+            EngineConfig::default(),
+        )
+        .unwrap();
+        let view = AutomationView::new(Theme::default());
+        for b in ["Write value", "Thin", "Clear", "Delete lane"] {
+            assert!(named(&view, &s, b).disabled, "{b}");
+        }
+        assert!(!named(&view, &s, "All lanes read").disabled);
+        let nodes = view.accessible(SIZE, &s);
+        assert!(
+            nodes.iter().all(|n| n.role != AccessRole::Group),
+            "no editor"
+        );
+    }
+}

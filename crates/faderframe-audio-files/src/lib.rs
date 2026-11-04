@@ -14,8 +14,10 @@
 pub mod bw64;
 pub mod decode;
 pub mod dither;
+pub mod flac;
 mod generate;
 pub mod import;
+pub mod markers;
 pub mod onsets;
 mod peaks;
 pub mod resample;
@@ -27,7 +29,9 @@ pub use dither::Dither;
 pub use generate::{GeneratorSpec, generate};
 pub use peaks::{PeakBuilder, PeakCache, PeakLevel};
 pub use stream::{PAGE_FRAMES, Page, StreamSource};
-pub use wav::{WavData, WavFormat, read_wav, write_wav, write_wav_mask, write_wav_with};
+pub use wav::{
+    WavData, WavFormat, read_wav, write_wav, write_wav_chunks, write_wav_mask, write_wav_with,
+};
 
 /// Decoded, non-interleaved audio in memory. Immutable once shared, so the
 /// realtime thread may read it through an `Arc` without synchronisation.

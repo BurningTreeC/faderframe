@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
-    /// "auto", "pipewire", "jack", "system", "asio" or "dummy".
+    /// "auto", "pipewire", "jack", "system", "asio", "dummy" or "aes67".
     pub backend: String,
     pub sample_rate: Option<u32>,
     pub buffer_size: Option<u32>,
@@ -137,6 +137,8 @@ pub struct Preferences {
     /// Bass management of the speakers (crossover, redirect, LFE
     /// low-pass; off by default).
     pub bass_management: faderframe_core::surround::BassManagement,
+    /// The codec monitor's settings (it starts off).
+    pub codec_monitor: faderframe_session::codec::CodecMonitorSettings,
     /// Low-latency monitoring (tracks heard live skip plugin delay
     /// compensation).
     pub low_latency_monitoring: bool,
@@ -151,7 +153,8 @@ pub struct Preferences {
     pub video_proxy_height: u32,
     /// Where video indexes and proxies go (`None`: the cache folder).
     pub video_cache_dir: Option<String>,
-    /// Video frames shown straight from the decoder (dmabufs, Linux).
+    /// Video frames shown straight from the decoder (dmabufs on Linux, D3D12
+    /// textures on Windows).
     pub video_zero_copy: bool,
     /// The monitor Video Full Screen goes to (connector and model).
     pub video_fullscreen_monitor: Option<String>,
@@ -159,6 +162,25 @@ pub struct Preferences {
     pub video_output: Option<(u32, String)>,
     /// How voice ports hear singing (Preferences → MIDI).
     pub voice: faderframe_session::voice::VoiceSettings,
+    /// Tracks nobody touches played from caches of their devices' output
+    /// (Preferences → Audio; see `faderframe_session::self_freeze`).
+    pub self_freeze: faderframe_session::self_freeze::SelfFreezeSettings,
+    /// Stem separation: the model and its refinement (Preferences →
+    /// Stems).
+    pub separation: faderframe_session::separate::SeparationSettings,
+    /// Head tracking for binaural listening (Audio → Listen → Head
+    /// Tracking Settings…; see `faderframe_session::headtrack`).
+    pub head_tracking: faderframe_session::headtrack::HeadTrackingSettings,
+    /// What Capture Audio keeps (Preferences → Recording; see
+    /// `faderframe_session::audio_capture`).
+    pub audio_capture: faderframe_session::audio_capture::AudioCaptureSettings,
+    /// AES67 network audio: interface, PTP clock, streams sent and
+    /// received (Preferences → Network Audio).
+    pub aes67: faderframe_audio_aes67::Aes67Settings,
+    /// The phone/web remote: on/off, port, who may connect, the paired
+    /// devices (Preferences → Remote; see
+    /// `faderframe_session::web_remote`).
+    pub web_remote: faderframe_session::web_remote::WebRemoteSettings,
 }
 
 impl Default for Preferences {
@@ -223,6 +245,7 @@ impl Default for Preferences {
             headphone_head: None,
             headphone_correction: None,
             bass_management: Default::default(),
+            codec_monitor: Default::default(),
             low_latency_monitoring: false,
             low_latency_limit_ms: faderframe_session::DEFAULT_LOW_LATENCY_LIMIT_MS,
             shortcuts: Default::default(),
@@ -233,6 +256,12 @@ impl Default for Preferences {
             video_fullscreen_monitor: None,
             video_output: None,
             voice: Default::default(),
+            self_freeze: Default::default(),
+            separation: Default::default(),
+            head_tracking: Default::default(),
+            audio_capture: Default::default(),
+            aes67: Default::default(),
+            web_remote: Default::default(),
         }
     }
 }
@@ -377,6 +406,7 @@ impl Preferences {
             "system" => BackendChoice::System,
             "asio" => BackendChoice::Asio,
             "dummy" => BackendChoice::Dummy,
+            "aes67" => BackendChoice::Aes67,
             _ => BackendChoice::Auto,
         }
     }
@@ -389,6 +419,7 @@ impl Preferences {
             BackendChoice::System => "system",
             BackendChoice::Asio => "asio",
             BackendChoice::Dummy => "dummy",
+            BackendChoice::Aes67 => "aes67",
         }
         .into();
     }
@@ -510,5 +541,29 @@ mod tests {
             serde_json::from_str(r#"{"global_lanes":{"tempo":false}}"#).unwrap();
         assert!(!partial.global_lanes.tempo);
         assert!(partial.global_lanes.markers);
+    }
+
+    /// Capture Audio keeps the inputs by default (older files too) and
+    /// its settings round-trip.
+    #[test]
+    fn audio_capture_preferences_round_trip_and_start_on() {
+        use faderframe_session::audio_capture::{AudioCaptureSettings, CaptureTracks};
+        let old: Preferences = serde_json::from_str(r#"{"snap":false}"#).unwrap();
+        assert_eq!(old.audio_capture, AudioCaptureSettings::default());
+        assert!(old.audio_capture.on);
+        let mut prefs = old;
+        prefs.audio_capture = AudioCaptureSettings {
+            on: false,
+            seconds: 90,
+            max_megabytes: 256,
+            tracks: CaptureTracks::Armed,
+        };
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(restored, prefs);
+        let partial: Preferences =
+            serde_json::from_str(r#"{"audio_capture":{"tracks":"all"}}"#).unwrap();
+        assert_eq!(partial.audio_capture.tracks, CaptureTracks::All);
+        assert_eq!(partial.audio_capture.seconds, 300);
     }
 }

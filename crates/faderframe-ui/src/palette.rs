@@ -64,6 +64,7 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.view-performance", &["F8"]),
     ("app.view-tools", &["F12"]),
     ("app.view-inspector", &["F11"]),
+    ("app.view-browser", &["<Control><Shift>b"]),
     ("app.workspace-1", &["<Control>1"]),
     ("app.workspace-2", &["<Control>2"]),
     ("app.workspace-3", &["<Control>3"]),
@@ -86,6 +87,8 @@ pub(crate) const DEFAULT_SHORTCUTS: &[(&str, &[&str])] = &[
     ("app.ripple", &["<Control><Alt>r"]),
     // A/B: the mix ⇄ "Then" or the reference.
     ("app.compare-flip", &["<Control><Alt>a"]),
+    // Capture Audio (Capture MIDI is Ctrl+Shift+C).
+    ("app.capture-audio", &["<Control><Alt>c"]),
 ];
 
 /// Whether a command is on now (the check or radio dot its menu item

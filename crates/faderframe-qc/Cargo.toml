@@ -1,0 +1,17 @@
+[package]
+name = "faderframe-qc"
+description = "Delivery QC for FaderFrame: checks against delivery specs, null tests of stems, the QC report as JSON and PDF, SHA-256 receipts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-analysis.workspace = true
+faderframe-leadsheet.workspace = true
+serde.workspace = true
+serde_json.workspace = true

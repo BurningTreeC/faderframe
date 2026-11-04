@@ -51,10 +51,28 @@ enum Kind {
     Tape,
     /// The 2A Leveler (an optical leveling amplifier).
     Leveler,
+    /// The restoration devices.
+    Denoise,
+    Declick,
+    Dehum,
+    Declip,
+    Dereverb,
+    /// The Ambisonic Rotator (a field turned by yaw, pitch and roll).
+    AmbiRotator,
+    /// The Convolution Reverb.
+    Convolution,
+    Multiband,
+    Vocoder,
+    /// The instruments sharing `devices::poly`: Wavetable, FM, Granular.
+    Wavetable,
+    Fm,
+    Granular,
+    /// Pitch Correct (a live pitch corrector; takes notes).
+    PitchCorrect,
 }
 
 impl Kind {
-    const ALL: [Kind; 39] = [
+    const ALL: [Kind; 52] = [
         Kind::Preamp(0),
         Kind::Preamp(1),
         Kind::Preamp(2),
@@ -94,6 +112,19 @@ impl Kind {
         Kind::LatencyProbe,
         Kind::Tape,
         Kind::Leveler,
+        Kind::Denoise,
+        Kind::Declick,
+        Kind::Dehum,
+        Kind::Declip,
+        Kind::Dereverb,
+        Kind::AmbiRotator,
+        Kind::Convolution,
+        Kind::Multiband,
+        Kind::Vocoder,
+        Kind::Wavetable,
+        Kind::Fm,
+        Kind::Granular,
+        Kind::PitchCorrect,
     ];
 
     /// Are its processors built for where they run — on the audio thread
@@ -149,6 +180,19 @@ impl Kind {
             builtin::COMPRESSOR_76 => Kind::Fet76,
             builtin::TAPE_MACHINE => Kind::Tape,
             builtin::LEVELER_2A => Kind::Leveler,
+            builtin::DENOISE => Kind::Denoise,
+            builtin::DECLICK => Kind::Declick,
+            builtin::DEHUM => Kind::Dehum,
+            builtin::DECLIP => Kind::Declip,
+            builtin::DEREVERB => Kind::Dereverb,
+            builtin::AMBI_ROTATOR => Kind::AmbiRotator,
+            builtin::CONVOLUTION_REVERB => Kind::Convolution,
+            builtin::MULTIBAND_DYNAMICS => Kind::Multiband,
+            builtin::VOCODER => Kind::Vocoder,
+            builtin::WAVETABLE => Kind::Wavetable,
+            builtin::FM => Kind::Fm,
+            builtin::GRANULAR => Kind::Granular,
+            builtin::PITCH_CORRECT => Kind::PitchCorrect,
             _ => return None,
         })
     }
@@ -366,6 +410,94 @@ impl Kind {
                 vec![stereo, sidechain],
                 0,
             ),
+            Kind::Denoise => (
+                builtin::DENOISE,
+                "De-noise",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Declick => (
+                builtin::DECLICK,
+                "De-click",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Dehum => (
+                builtin::DEHUM,
+                "De-hum",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Declip => (
+                builtin::DECLIP,
+                "De-clip",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Dereverb => (
+                builtin::DEREVERB,
+                "De-reverb",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            // (It takes the track's ambisonic channels, 4, 9 or 16.)
+            Kind::AmbiRotator => (
+                builtin::AMBI_ROTATOR,
+                "Ambisonic Rotator",
+                PluginCategory::Utility,
+                vec![stereo],
+                0,
+            ),
+            Kind::Convolution => (
+                builtin::CONVOLUTION_REVERB,
+                "Convolution Reverb",
+                PluginCategory::Effect,
+                vec![stereo],
+                0,
+            ),
+            Kind::Multiband => (
+                builtin::MULTIBAND_DYNAMICS,
+                "Multiband Dynamics",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                0,
+            ),
+            // Takes notes: its synth plays them on an instrument track.
+            Kind::Vocoder => (
+                builtin::VOCODER,
+                "Vocoder",
+                PluginCategory::Effect,
+                vec![stereo, sidechain],
+                1,
+            ),
+            Kind::Wavetable => (
+                builtin::WAVETABLE,
+                "Wavetable",
+                PluginCategory::Instrument,
+                vec![],
+                1,
+            ),
+            Kind::Fm => (builtin::FM, "FM", PluginCategory::Instrument, vec![], 1),
+            Kind::Granular => (
+                builtin::GRANULAR,
+                "Granular",
+                PluginCategory::Instrument,
+                vec![],
+                1,
+            ),
+            // Notes in: a MIDI track playing the track gives the targets.
+            Kind::PitchCorrect => (
+                builtin::PITCH_CORRECT,
+                "Pitch Correct",
+                PluginCategory::Effect,
+                vec![stereo],
+                1,
+            ),
         };
         PluginDescriptor {
             format: PluginFormat::Builtin,
@@ -443,6 +575,19 @@ impl Kind {
             Kind::Fet76 => crate::devices::fet76::parameters(),
             Kind::Tape => crate::devices::tape::parameters(),
             Kind::Leveler => crate::devices::leveler::parameters(),
+            Kind::Denoise => crate::devices::denoise::parameters(),
+            Kind::Declick => crate::devices::declick::parameters(),
+            Kind::Dehum => crate::devices::dehum::parameters(),
+            Kind::Declip => crate::devices::declip::parameters(),
+            Kind::Dereverb => crate::devices::dereverb::parameters(),
+            Kind::AmbiRotator => crate::devices::ambi_rotate::parameters(),
+            Kind::Convolution => crate::devices::convolution::parameters(),
+            Kind::Multiband => crate::devices::multiband::parameters(),
+            Kind::Vocoder => crate::devices::vocoder::parameters(),
+            Kind::Wavetable => crate::devices::wavetable::parameters(),
+            Kind::Fm => crate::devices::fm::parameters(),
+            Kind::Granular => crate::devices::granular::parameters(),
+            Kind::PitchCorrect => crate::devices::pitch_correct::parameters(),
         }
     }
 
@@ -460,6 +605,21 @@ impl Kind {
                 use crate::devices::guitar::{MAX_PEDALS, id::slot};
                 let s = id.0.checked_sub(slot(0, 0))? / (slot(1, 0) - slot(0, 0));
                 ((s as usize) < MAX_PEDALS).then(|| format!("Pedal {}", s + 1))
+            }
+            Kind::Multiband => crate::devices::multiband::id::field_of(id.0)
+                .map(|(b, _)| format!("Band {}", b + 1)),
+            Kind::Wavetable => {
+                use crate::devices::wavetable::id::{OSC_FIELDS, SUB, osc};
+                (id.0 >= osc(0, 0) && id.0 < SUB)
+                    .then(|| format!("Osc {}", (id.0 - osc(0, 0)) / OSC_FIELDS + 1))
+            }
+            Kind::Fm => {
+                use crate::devices::fm::id::{MATRIX, OP_FIELDS, OPS};
+                if (OPS..MATRIX).contains(&id.0) {
+                    Some(format!("Op {}", (id.0 - OPS) / OP_FIELDS + 1))
+                } else {
+                    (id.0 >= MATRIX).then(|| "Matrix".to_string())
+                }
             }
             _ => None,
         }
@@ -494,6 +654,18 @@ impl Kind {
             Kind::Fet76 => Some(crate::devices::fet76::TAP_VALUES),
             Kind::Tape => Some(crate::devices::tape::TAP_VALUES),
             Kind::Leveler => Some(crate::devices::leveler::TAP_VALUES),
+            Kind::Denoise => Some(crate::devices::denoise::TAP_VALUES),
+            Kind::Declick => Some(crate::devices::declick::TAP_VALUES),
+            Kind::Dehum => Some(crate::devices::dehum::TAP_VALUES),
+            Kind::Declip => Some(crate::devices::declip::TAP_VALUES),
+            Kind::Dereverb => Some(crate::devices::dereverb::TAP_VALUES),
+            Kind::Convolution => Some(crate::devices::convolution::TAP_VALUES),
+            Kind::Multiband => Some(crate::devices::multiband::TAP_VALUES),
+            Kind::Vocoder => Some(crate::devices::vocoder::TAP_VALUES),
+            Kind::Wavetable => Some(crate::devices::wavetable::TAP_VALUES),
+            Kind::Fm => Some(crate::devices::fm::TAP_VALUES),
+            Kind::Granular => Some(crate::devices::granular::TAP_VALUES),
+            Kind::PitchCorrect => Some(crate::devices::pitch_correct::TAP_VALUES),
             _ => None,
         }
     }
@@ -538,7 +710,7 @@ pub struct BuiltinInstance {
     /// The sample rate of the last processor (latencies in samples depend
     /// on it).
     rate: f64,
-    /// The samplers' samples.
+    /// The samplers' samples (and the Convolution Reverb's response).
     samples: Option<crate::devices::samples::SampleHost>,
     /// The output buses tracks take (the Drum Sampler's processors read it
     /// every block: an adopted processor follows it too).
@@ -579,6 +751,11 @@ struct SharedProcessor {
     cell: Arc<faderframe_realtime::TryCell<Box<dyn PluginProcessor>>>,
     block: usize,
     fresh: bool,
+    /// The tuning last given, and whether the processor still has to get
+    /// it (another graph had it then): handed on with the next block this
+    /// one gets.
+    tuning: faderframe_midi::tuning::TuningTable,
+    tuning_pending: bool,
 }
 
 impl PluginProcessor for SharedProcessor {
@@ -592,6 +769,9 @@ impl PluginProcessor for SharedProcessor {
         };
         if std::mem::take(&mut self.fresh) {
             p.reset();
+        }
+        if std::mem::take(&mut self.tuning_pending) {
+            p.set_tuning(&self.tuning);
         }
         p.process(ctx, io)
     }
@@ -616,6 +796,17 @@ impl PluginProcessor for SharedProcessor {
             p.set_callback_deadline(deadline);
         }
     }
+
+    fn set_tuning(&mut self, tuning: &faderframe_midi::tuning::TuningTable) {
+        self.tuning = *tuning;
+        match self.cell.try_lock() {
+            Some(mut p) => {
+                p.set_tuning(tuning);
+                self.tuning_pending = false;
+            }
+            None => self.tuning_pending = true,
+        }
+    }
 }
 
 impl BuiltinInstance {
@@ -630,11 +821,16 @@ impl BuiltinInstance {
                     >= 0.5,
             ),
             Kind::Drums => u64::from(crate::devices::drums::keeps_length(&self.params)),
-            // Its channels and round trip are the graph's (send, return and
-            // the return's latency): built again when they change.
+            // Its channels, width and round trip are the graph's (send,
+            // return and the return's latency): built again when they
+            // change.
             Kind::HardwareInsert => {
                 let (send, ret, _, trip) = crate::devices::hardware_insert::routing(&self.params);
-                u64::from(send) | (u64::from(ret) << 8) | (u64::from(trip) << 16)
+                let wide = crate::devices::hardware_insert::widens(&self.params);
+                u64::from(send)
+                    | (u64::from(ret) << 8)
+                    | (u64::from(trip) << 16)
+                    | (u64::from(wide) << 40)
             }
             // The British 73's line is part of its circuit.
             Kind::Preamp(i) => u64::from(crate::devices::preamp::bridging(i, &self.params)),
@@ -718,6 +914,16 @@ impl PluginInstance for BuiltinInstance {
             .any(|p| p.id == id && p.automatable && !p.stepped)
     }
 
+    fn modulatable_per_note(&self, id: ParameterId) -> bool {
+        self.modulatable(id)
+            && match self.kind {
+                Kind::Wavetable => crate::devices::wavetable::per_voice(id),
+                Kind::Fm => crate::devices::fm::per_voice(id),
+                Kind::Granular => crate::devices::granular::per_voice(id),
+                _ => false,
+            }
+    }
+
     fn parameter_group(&self, id: ParameterId) -> Option<String> {
         self.kind.parameter_group(id)
     }
@@ -753,6 +959,19 @@ impl PluginInstance for BuiltinInstance {
             Kind::Guitar => crate::devices::guitar::format(id, value),
             Kind::Tape => crate::devices::tape::format(id, value),
             Kind::Leveler => crate::devices::leveler::format(id, value),
+            Kind::Denoise => crate::devices::denoise::format(id, value),
+            Kind::Declick => crate::devices::declick::format(id, value),
+            Kind::Dehum => crate::devices::dehum::format(id, value),
+            Kind::Declip => crate::devices::declip::format(id, value),
+            Kind::Dereverb => crate::devices::dereverb::format(id, value),
+            Kind::AmbiRotator => crate::devices::ambi_rotate::format(id, value),
+            Kind::Convolution => crate::devices::convolution::format(id, value),
+            Kind::Multiband => crate::devices::multiband::format(id, value),
+            Kind::Vocoder => crate::devices::vocoder::format(id, value),
+            Kind::Wavetable => crate::devices::wavetable::format(id, value),
+            Kind::Fm => crate::devices::fm::format(id, value),
+            Kind::Granular => crate::devices::granular::format(id, value),
+            Kind::PitchCorrect => crate::devices::pitch_correct::format(id, value),
             _ => None,
         }
     }
@@ -885,13 +1104,24 @@ impl PluginInstance for BuiltinInstance {
             Kind::Fet76 => crate::devices::fet76::latency(&self.params, self.rate),
             Kind::Tape => crate::devices::tape::latency(&self.params, self.rate),
             Kind::Leveler => crate::devices::leveler::latency(&self.params, self.rate),
+            Kind::Denoise => crate::devices::denoise::latency(&self.params, self.rate),
+            Kind::Declick => crate::devices::declick::latency(&self.params, self.rate),
+            Kind::Dehum => crate::devices::dehum::latency(&self.params, self.rate),
+            Kind::Declip => crate::devices::declip::latency(&self.params, self.rate),
+            Kind::Dereverb => crate::devices::dereverb::latency(&self.params, self.rate),
+            Kind::Convolution => crate::devices::convolution::latency(&self.params, self.rate),
+            Kind::Multiband => crate::devices::multiband::latency(&self.params, self.rate),
+            Kind::Vocoder => crate::devices::vocoder::latency(&self.params, self.rate),
+            Kind::PitchCorrect => crate::devices::pitch_correct::latency(&self.params, self.rate),
             _ => 0,
         }
     }
 
     fn note_expressions(&self) -> Option<Vec<faderframe_midi::NoteExpressionKind>> {
         match self.kind {
-            Kind::Synth => Some(faderframe_midi::NoteExpressionKind::ALL.to_vec()),
+            Kind::Synth | Kind::Wavetable | Kind::Fm | Kind::Granular => {
+                Some(faderframe_midi::NoteExpressionKind::ALL.to_vec())
+            }
             _ => Some(Vec::new()),
         }
     }
@@ -904,6 +1134,10 @@ impl PluginInstance for BuiltinInstance {
             Kind::Echo | Kind::Reverb => TailLength::Infinite,
             Kind::Modulation => TailLength::Samples(4_096),
             Kind::Synth => TailLength::Samples(48_000 * 5),
+            // Releases up to 10 s (an FM operator's to 30 s) and the
+            // effects' tails.
+            Kind::Wavetable | Kind::Granular => TailLength::Samples(48_000 * 12),
+            Kind::Fm => TailLength::Samples(48_000 * 32),
             Kind::Sampler | Kind::Drums => TailLength::Samples(48_000 * 20),
             Kind::Gain
             | Kind::Compressor
@@ -914,7 +1148,18 @@ impl PluginInstance for BuiltinInstance {
             | Kind::Saturator
             | Kind::Tuner
             | Kind::Container
-            | Kind::HardwareInsert => TailLength::None,
+            | Kind::HardwareInsert
+            | Kind::AmbiRotator => TailLength::None,
+            // The slowest release (2.5 s) to come back.
+            Kind::Multiband => TailLength::Samples((self.rate * 2.5) as u32),
+            // The bands' longest release and the synth's.
+            Kind::Vocoder => TailLength::Samples(self.rate as u32),
+            // Its latency is all it holds back (and a grain).
+            Kind::PitchCorrect => TailLength::Samples(4_096),
+            // Their latency is the whole of what they hold back.
+            Kind::Denoise | Kind::Declick | Kind::Dehum | Kind::Declip | Kind::Dereverb => {
+                TailLength::None
+            }
             // The longest release (1.1 s) to come back.
             Kind::Fet76 => TailLength::Samples(96_000),
             // The head bump's ring at 3.75 ips and the transport's delay.
@@ -926,6 +1171,19 @@ impl PluginInstance for BuiltinInstance {
             Kind::NoteEcho => TailLength::Samples(48_000 * 40),
             // The longest ring of a resonant cut near 10 Hz.
             Kind::Eq => TailLength::Samples(48_000),
+            // The response playing and the longest pre-delay.
+            Kind::Convolution => {
+                let seconds = self.tap.as_ref().map_or(0.0, |t| {
+                    f64::from(t.value(crate::devices::convolution::value::SECONDS))
+                });
+                let seconds = if seconds > 0.0 {
+                    seconds
+                } else {
+                    crate::devices::convolution::shape::MAX_SECONDS
+                };
+                let pre = crate::devices::convolution::MAX_PRE_MS * 1e-3;
+                TailLength::Samples(((seconds + pre) * self.rate).ceil() as u32)
+            }
             Kind::ProgramEq => TailLength::Samples(24_000),
             Kind::LatencyProbe => TailLength::Samples(self.latency_samples()),
         }
@@ -966,6 +1224,8 @@ impl PluginInstance for BuiltinInstance {
                 cell: Arc::clone(&k.cell),
                 block: k.block,
                 fresh: true,
+                tuning: Default::default(),
+                tuning_pending: false,
             }));
         }
         // The old one goes with the graphs that still hold it.
@@ -982,6 +1242,8 @@ impl PluginInstance for BuiltinInstance {
             cell,
             block,
             fresh: false,
+            tuning: Default::default(),
+            tuning_pending: false,
         }))
     }
 }
@@ -1169,6 +1431,82 @@ impl BuiltinInstance {
                 tap()?,
                 config,
             )?),
+            Kind::Denoise => Box::new(crate::devices::denoise::DenoiseProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Declick => Box::new(crate::devices::declick::DeclickProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Dehum => Box::new(crate::devices::dehum::DehumProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Declip => Box::new(crate::devices::declip::DeclipProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Dereverb => Box::new(crate::devices::dereverb::DereverbProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::AmbiRotator => Box::new(crate::devices::ambi_rotate::RotatorProcessor::new(
+                params,
+                config.max_block_size as usize,
+            )),
+            Kind::Convolution => {
+                let (files, background) = self.samples.as_ref().map_or_else(
+                    || (crate::devices::samples::empty(), false),
+                    |h| (Arc::clone(&h.shared), h.background()),
+                );
+                Box::new(crate::devices::convolution::ConvolutionProcessor::new(
+                    params,
+                    tap()?,
+                    config,
+                    files,
+                    !background,
+                ))
+            }
+            Kind::Multiband => Box::new(crate::devices::multiband::MultibandProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Vocoder => Box::new(crate::devices::vocoder::VocoderProcessor::new(
+                params,
+                tap()?,
+                config,
+            )),
+            Kind::Wavetable => Box::new(crate::devices::wavetable::WavetableProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+                self.samples
+                    .as_ref()
+                    .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
+            )),
+            Kind::Fm => Box::new(crate::devices::fm::FmProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+            )),
+            Kind::Granular => Box::new(crate::devices::granular::GranularProcessor::new(
+                params,
+                self.tap.clone(),
+                config,
+                self.samples
+                    .as_ref()
+                    .map_or_else(crate::devices::samples::empty, |h| Arc::clone(&h.shared)),
+            )),
+            Kind::PitchCorrect => Box::new(
+                crate::devices::pitch_correct::PitchCorrectProcessor::new(params, tap()?, config),
+            ),
         };
         Ok(Box::new(Modulated {
             params: self.params.clone(),
@@ -1241,6 +1579,10 @@ impl PluginProcessor for Modulated {
     fn set_callback_deadline(&mut self, deadline: Option<std::time::Instant>) {
         self.inner.set_callback_deadline(deadline);
     }
+
+    fn set_tuning(&mut self, tuning: &faderframe_midi::tuning::TuningTable) {
+        self.inner.set_tuning(tuning);
+    }
 }
 
 /// Factory for [`PluginFormat::Builtin`].
@@ -1261,8 +1603,20 @@ impl PluginFactory for BuiltinFactory {
         let tap = kind
             .tap_values()
             .map(|n| Arc::new(AnalysisTap::new(params.clone(), n)));
-        let samples = matches!(kind, Kind::Sampler | Kind::Drums).then(|| {
-            let mut host = crate::devices::samples::SampleHost::default();
+        // The samplers' samples, the Convolution Reverb's impulse file and
+        // the Wavetable's tables are kept alike.
+        let samples = matches!(
+            kind,
+            Kind::Sampler | Kind::Drums | Kind::Convolution | Kind::Wavetable | Kind::Granular
+        )
+        .then(|| {
+            let mut host = if kind == Kind::Wavetable {
+                crate::devices::samples::SampleHost::with_prepare(
+                    crate::devices::wavetable::prepare,
+                )
+            } else {
+                crate::devices::samples::SampleHost::default()
+            };
             host.set_doc(
                 crate::devices::samples::SampleDoc::default(),
                 tap.as_deref(),

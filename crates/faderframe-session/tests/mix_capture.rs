@@ -54,6 +54,7 @@ fn clip_of(
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     p.track_mut(track).unwrap().clips.push(clip.id);

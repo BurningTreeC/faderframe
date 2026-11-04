@@ -84,6 +84,7 @@ fn audio(s: &mut Session, t: TrackId, start: MusicalTime, frames: i64) -> ClipId
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })
@@ -305,6 +306,7 @@ fn tempo_from_hit_points_keeps_time_locked_tracks() {
                 id: MarkerId(500 + i as u64),
                 position,
                 name: format!("Hit {i}"),
+                time_base: Default::default(),
             },
         })
         .unwrap();
@@ -445,6 +447,7 @@ fn section_moves_carry_time_locked_material_with_their_section() {
                 start: bar(*a),
                 end: bar(*b),
                 color: TrackColor::palette(i),
+                time_base: Default::default(),
             },
         })
         .unwrap();

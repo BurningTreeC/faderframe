@@ -345,8 +345,9 @@ fn heading(app: &AppState, plugin: PluginInstanceId, with_vendor: bool) -> Optio
 }
 
 /// An editor window's header: the device's name over its place, Bypass,
-/// Presets and (multi-output plugins) Outputs; callers add their button at
-/// the end.
+/// Presets, (multi-output plugins) Outputs, the device's own undo and its
+/// A/B compare (`crate::device_states`); callers add their button at the
+/// end.
 fn editor_header(app: &Rc<AppState>, plugin: PluginInstanceId, h: &Heading) -> gtk::HeaderBar {
     let header = gtk::HeaderBar::new();
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -361,6 +362,9 @@ fn editor_header(app: &Rc<AppState>, plugin: PluginInstanceId, h: &Heading) -> g
     header.pack_start(&presets_button(app, plugin));
     if let Some(outputs) = outputs_button(app, plugin) {
         header.pack_start(&outputs);
+    }
+    if let Some(compare) = crate::device_states::header_controls(app, plugin) {
+        header.pack_start(&compare);
     }
     header
 }

@@ -360,7 +360,9 @@ impl PluginRef {
         self.format == PluginFormat::Builtin && faderframe_core::builtin::widens_mono(&self.id)
     }
 
-    /// What this device's slot puts out when `input` reaches it.
+    /// What this device puts out when `input` reaches it, by the plugin
+    /// alone (a slot's settings can widen too: see
+    /// [`PluginSlot::output_layout`]).
     pub fn output_layout(&self, input: ChannelLayout) -> ChannelLayout {
         if input == ChannelLayout::Mono && self.widens_mono() {
             ChannelLayout::Stereo
@@ -393,6 +395,36 @@ pub struct PluginSlot {
     /// solo) feeds the plugin's sidechain input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidechain: Option<TrackId>,
+}
+
+impl PluginSlot {
+    /// A saved parameter's value (`None`: never saved, the default).
+    pub fn saved(&self, id: ParameterId) -> Option<f64> {
+        self.parameters.iter().find(|p| p.id == id).map(|p| p.value)
+    }
+
+    /// Turns a mono track stereo from here on: a device that always does
+    /// ([`PluginRef::widens_mono`]) or a Hardware Insert set to Mono →
+    /// Stereo (a mono track sent to two outputs, its return a pair).
+    pub fn widens_mono(&self) -> bool {
+        self.plugin.widens_mono()
+            || (self.plugin.format == PluginFormat::Builtin
+                && self.plugin.id == faderframe_core::builtin::HARDWARE_INSERT
+                && self
+                    .saved(ParameterId(
+                        faderframe_core::builtin::HARDWARE_INSERT_CHANNELS,
+                    ))
+                    .is_some_and(|v| v >= 0.5))
+    }
+
+    /// What this slot puts out when `input` reaches it.
+    pub fn output_layout(&self, input: ChannelLayout) -> ChannelLayout {
+        if input == ChannelLayout::Mono && self.widens_mono() {
+            ChannelLayout::Stereo
+        } else {
+            input
+        }
+    }
 }
 
 /// A device's name as every view shows it: its plugin's name, and when the
@@ -575,6 +607,28 @@ pub struct Track {
     /// (containers in containers too; see [`crate::container`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub containers: std::collections::BTreeMap<PluginInstanceId, Vec<crate::container::Chain>>,
+    /// Never played from a self-freeze cache: its devices always run
+    /// (devices that hear the room, roll dice or read the clock; see
+    /// `faderframe_session::self_freeze`). Off by default;
+    /// [`crate::Command::SetTrackSelfFreeze`] switches it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_self_freeze: bool,
+    /// The articulation map its notes' articulations come from (one of
+    /// [`crate::Project::articulation_maps`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub articulation_map: Option<faderframe_core::ArticulationMapId>,
+    /// The drum map that names, orders and routes its notes (one of
+    /// [`crate::Project::drum_maps`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drum_map: Option<faderframe_core::DrumMapId>,
+    /// Its own tuning (`None`: the project's; see [`crate::tuning`]).
+    /// [`crate::Command::SetTuning`] sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<faderframe_midi::tuning::Tuning>,
+    /// How its hosted plugins and MIDI outputs are retuned
+    /// ([`crate::Command::SetTrackRetune`]).
+    #[serde(default, skip_serializing_if = "crate::tuning::Retune::is_auto")]
+    pub retune: crate::tuning::Retune,
 }
 
 /// Tracks whose controls move together.
@@ -688,6 +742,11 @@ impl Track {
             role: None,
             modulators: Vec::new(),
             containers: Default::default(),
+            no_self_freeze: false,
+            articulation_map: None,
+            drum_map: None,
+            tuning: None,
+            retune: crate::tuning::Retune::Auto,
         }
     }
 
@@ -764,7 +823,21 @@ impl Track {
     pub fn chain_layout(&self) -> ChannelLayout {
         self.inserts
             .iter()
-            .fold(self.layout, |l, s| s.plugin.output_layout(l))
+            .fold(self.layout, |l, s| s.output_layout(l))
+    }
+
+    /// The layout reaching insert `plugin` (`None`: not one of the
+    /// track's inserts — a device inside a container, the preamp, the
+    /// instrument).
+    pub fn layout_into(&self, plugin: PluginInstanceId) -> Option<ChannelLayout> {
+        let mut layout = self.layout;
+        for s in &self.inserts {
+            if s.id == plugin {
+                return Some(layout);
+            }
+            layout = s.output_layout(layout);
+        }
+        None
     }
 
     /// The slot with `id` (see [`Self::plugin_mut`]).

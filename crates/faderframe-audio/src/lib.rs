@@ -21,13 +21,21 @@
 //! * `faderframe-audio-jack` — JACK (JACK2 or pipewire-jack).
 //! * `faderframe-audio-cpal` — WASAPI/ASIO (Windows), CoreAudio (macOS),
 //!   ALSA (Linux).
+//! * `faderframe-audio-aes67` — AES67 network streams on a PTP clock (as
+//!   the audio system, or joined to another backend's device through
+//!   [`follow`]).
 //!
 //! What a backend lets the user choose is [`Capabilities`]; a request is
 //! checked against its devices with [`resolve`] before a stream opens.
+//! Backends that open devices themselves join several into one stream with
+//! [`follow`]: one device's clock drives the engine, the others follow it
+//! through drift-steered resamplers ([`AudioStream::devices`] says how each
+//! is getting on).
 
 #![forbid(unsafe_code)]
 
 pub mod dummy;
+pub mod follow;
 mod owned;
 mod setup;
 
@@ -118,6 +126,49 @@ pub struct DeviceInfo {
     /// capture); `None`: not known.
     pub clock: Option<String>,
     pub is_default: bool,
+}
+
+/// One device of a running stream and how it is getting on: the clock
+/// master (its callback drives the engine) or a device that follows it
+/// (see [`follow`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceStatus {
+    pub id: String,
+    pub name: String,
+    pub master: bool,
+    /// Connected and delivering now.
+    pub present: bool,
+    /// The stream's input channels it records into, and output channels it
+    /// plays.
+    pub inputs: Vec<u16>,
+    pub outputs: Vec<u16>,
+    /// The rate it runs at (a follower's may differ from the stream's: it
+    /// is resampled).
+    pub sample_rate: u32,
+    /// Latency beyond the stream's buffer, in the stream's frames, as
+    /// [`StreamInfo::input_latency`] and [`StreamInfo::output_latency`] but
+    /// for this device's channels (a follower's include its ring and
+    /// resampler).
+    pub input_latency: u32,
+    pub output_latency: u32,
+    /// A follower's clock against the master's (parts per million;
+    /// positive: it runs fast).
+    pub drift_ppm: f64,
+    /// A follower's drift loop has settled (always for the master).
+    pub locked: bool,
+    /// Gaps in a follower's audio (its ring ran dry or over, it went away
+    /// and came back).
+    pub gaps: u64,
+}
+
+/// The latency beyond the buffer of the stream's input `channel` (frames):
+/// its device's where the stream says ([`AudioStream::devices`]), else the
+/// stream's.
+pub fn channel_input_latency(devices: &[DeviceStatus], info: &StreamInfo, channel: u16) -> u32 {
+    devices
+        .iter()
+        .find(|d| d.inputs.contains(&channel))
+        .map_or(info.input_latency, |d| d.input_latency)
 }
 
 /// Requested stream parameters. `None` means "backend default".
@@ -347,6 +398,14 @@ pub trait AudioStream: Send {
     /// it), for threads that do part of the callback's work to join.
     fn io_workgroup(&self) -> Option<faderframe_realtime::Workgroup> {
         None
+    }
+
+    /// The devices the stream joins, the clock master first, with their
+    /// channels, latencies and (followers) drift — empty where the stream
+    /// is one device or the backend keeps devices in step itself (its
+    /// [`Self::info`] then holds for every channel). Control side.
+    fn devices(&self) -> Vec<DeviceStatus> {
+        Vec::new()
     }
 }
 

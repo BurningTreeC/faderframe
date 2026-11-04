@@ -12,7 +12,7 @@ pub mod fft;
 pub mod refine;
 pub mod render;
 
-pub use refine::{Heard, pitch_tracks};
+pub use refine::{Followed, Heard, follow, pitch_tracks};
 pub use render::{Moved, frame_size, render, spans, together, window_for};
 
 /// Hz of a MIDI pitch (A4 = 440).

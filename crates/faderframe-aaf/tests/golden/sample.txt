@@ -1,0 +1,532 @@
+Header
+  ByteOrder = 18761
+  LastModified = 8 bytes
+  Content:
+    ContentStorage
+      Mobs: 6 items
+        CompositionMob
+          MobID = mob
+          Name = "Sample"
+          Slots: 5 items
+            TimelineMobSlot
+              SlotID = 1
+              SlotName = "TC1"
+              PhysicalTrackNumber = 1
+              EditRate = 25/1
+              Origin = 0
+              Segment:
+                Timecode
+                  DataDefinition -> 01030201-0100-0000-060e-2b3404010101
+                  Length = 76
+                  Start = 90000
+                  FPS = 25
+                  Drop = 0
+            TimelineMobSlot
+              SlotID = 2
+              SlotName = "Music.L"
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                Sequence
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 144000
+                  Components: 3 items
+                    Filler
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 52800
+                    Transition
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 4800
+                      OperationGroup:
+                        OperationGroup
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 4800
+                          Operation -> 0c3bea41-fc05-11d2-8a29-0050040ef7d2
+                          Parameters: 1 items
+                            VaryingValue
+                              Definition = e4962320-2267-11d3-8a4c-0050040ef7d2
+                              Interpolation -> 5b6c85a4-0ede-11d3-80a9-006008143e6f
+                              PointList: 9 items
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 0/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 1/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 2/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 3/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 4/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 5/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 6/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 7/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 8/8
+                                  EditHint = 1
+                      CutPoint = 0
+                    OperationGroup
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 96000
+                      Operation -> 9d2ea894-0968-11d3-8a38-0050040ef7d2
+                      InputSegments: 1 items
+                        SourceClip
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 96000
+                          StartTime = 0
+                          SourceID = mob
+                          SourceMobSlotID = 1
+                      Parameters: 1 items
+                        ConstantValue
+                          Definition = e4962321-2267-11d3-8a4c-0050040ef7d2
+                          Value = 25 bytes
+            TimelineMobSlot
+              SlotID = 3
+              SlotName = "Music.R"
+              PhysicalTrackNumber = 2
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                Sequence
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 144000
+                  Components: 3 items
+                    Filler
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 52800
+                    Transition
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 4800
+                      OperationGroup:
+                        OperationGroup
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 4800
+                          Operation -> 0c3bea41-fc05-11d2-8a29-0050040ef7d2
+                          Parameters: 1 items
+                            VaryingValue
+                              Definition = e4962320-2267-11d3-8a4c-0050040ef7d2
+                              Interpolation -> 5b6c85a4-0ede-11d3-80a9-006008143e6f
+                              PointList: 9 items
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 0/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 1/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 2/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 3/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 4/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 5/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 6/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 7/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 8/8
+                                  EditHint = 1
+                      CutPoint = 0
+                    OperationGroup
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 96000
+                      Operation -> 9d2ea894-0968-11d3-8a38-0050040ef7d2
+                      InputSegments: 1 items
+                        SourceClip
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 96000
+                          StartTime = 0
+                          SourceID = mob
+                          SourceMobSlotID = 2
+                      Parameters: 1 items
+                        ConstantValue
+                          Definition = e4962321-2267-11d3-8a4c-0050040ef7d2
+                          Value = 25 bytes
+            TimelineMobSlot
+              SlotID = 4
+              SlotName = "FX"
+              PhysicalTrackNumber = 3
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                Sequence
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 110400
+                  Components: 4 items
+                    Filler
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 24000
+                    SourceClip
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 48000
+                      StartTime = 0
+                      SourceID = mob
+                      SourceMobSlotID = 1
+                    Transition
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 9600
+                      OperationGroup:
+                        OperationGroup
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 9600
+                          Operation -> 0c3bea41-fc05-11d2-8a29-0050040ef7d2
+                          Parameters: 1 items
+                            VaryingValue
+                              Definition = e4962320-2267-11d3-8a4c-0050040ef7d2
+                              Interpolation -> 5b6c85a4-0ede-11d3-80a9-006008143e6f
+                              PointList: 9 items
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 0/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 1/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 2/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 3/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 4/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 5/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 6/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 7/8
+                                  EditHint = 1
+                                ControlPoint
+                                  Value = 25 bytes
+                                  Time = 8/8
+                                  EditHint = 1
+                      CutPoint = 4800
+                    OperationGroup
+                      DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                      Length = 48000
+                      Operation -> 9d2ea894-0968-11d3-8a38-0050040ef7d2
+                      InputSegments: 1 items
+                        SourceClip
+                          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                          Length = 48000
+                          StartTime = 12000
+                          SourceID = mob
+                          SourceMobSlotID = 1
+                      Parameters: 1 items
+                        VaryingValue
+                          Definition = e4962321-2267-11d3-8a4c-0050040ef7d2
+                          Interpolation -> 5b6c85a4-0ede-11d3-80a9-006008143e6f
+                          PointList: 3 items
+                            ControlPoint
+                              Value = 25 bytes
+                              Time = 0/48000
+                              EditHint = 1
+                            ControlPoint
+                              Value = 25 bytes
+                              Time = 24000/48000
+                              EditHint = 1
+                            ControlPoint
+                              Value = 25 bytes
+                              Time = 48000/48000
+                              EditHint = 1
+            EventMobSlot
+              SlotID = 1005
+              SlotName = "Markers"
+              EditRate = 48000/1
+              Segment:
+                Sequence
+                  DataDefinition -> 01030201-1000-0000-060e-2b3404010101
+                  Components: 2 items
+                    DescriptiveMarker
+                      DataDefinition -> 01030201-1000-0000-060e-2b3404010101
+                      Length = 1
+                      Position = 48000
+                      Comment = "Verse"
+                      CommentMarkerUser = "FaderFrame"
+                    DescriptiveMarker
+                      DataDefinition -> 01030201-1000-0000-060e-2b3404010101
+                      Length = 1
+                      Position = 120000
+                      Comment = "Hit"
+                      CommentMarkerUser = "FaderFrame"
+                      CommentMarkerColor = 6 bytes
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+          UsageCode = 0d010102-0101-0700-060e-2b3404010101
+        SourceMob
+          MobID = mob
+          Name = "Music.A1"
+          Slots: 1 items
+            TimelineMobSlot
+              SlotID = 1
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 200000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 0
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+          EssenceDescription:
+            PCMDescriptor
+              SampleRate = 48000/1
+              Length = 200000
+              ContainerFormat -> 4313b571-d8ba-11d2-809b-006008143e6f
+              AudioSamplingRate = 48000/1
+              Channels = 1
+              QuantizationBits = 24
+              BlockAlign = 3
+              AverageBPS = 144000
+        SourceMob
+          MobID = mob
+          Name = "Music.A2"
+          Slots: 1 items
+            TimelineMobSlot
+              SlotID = 1
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 200000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 0
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+          EssenceDescription:
+            PCMDescriptor
+              SampleRate = 48000/1
+              Length = 200000
+              ContainerFormat -> 4313b571-d8ba-11d2-809b-006008143e6f
+              AudioSamplingRate = 48000/1
+              Channels = 1
+              QuantizationBits = 24
+              BlockAlign = 3
+              AverageBPS = 144000
+        MasterMob
+          MobID = mob
+          Name = "Music"
+          Slots: 2 items
+            TimelineMobSlot
+              SlotID = 1
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 200000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 1
+            TimelineMobSlot
+              SlotID = 2
+              PhysicalTrackNumber = 2
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 200000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 1
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+        SourceMob
+          MobID = mob
+          Name = "Door"
+          Slots: 1 items
+            TimelineMobSlot
+              SlotID = 1
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 100000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 0
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+          EssenceDescription:
+            PCMDescriptor
+              SampleRate = 48000/1
+              Length = 100000
+              ContainerFormat -> 4313b571-d8ba-11d2-809b-006008143e6f
+              AudioSamplingRate = 48000/1
+              Channels = 1
+              QuantizationBits = 24
+              BlockAlign = 3
+              AverageBPS = 144000
+        MasterMob
+          MobID = mob
+          Name = "Door"
+          Slots: 1 items
+            TimelineMobSlot
+              SlotID = 1
+              PhysicalTrackNumber = 1
+              EditRate = 48000/1
+              Origin = 0
+              Segment:
+                SourceClip
+                  DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+                  Length = 100000
+                  StartTime = 0
+                  SourceID = mob
+                  SourceMobSlotID = 1
+          LastModified = 8 bytes
+          CreationTime = 8 bytes
+      EssenceData: 3 items
+        EssenceData
+          MobID = mob
+          Data = stream of 600000 bytes
+        EssenceData
+          MobID = mob
+          Data = stream of 600000 bytes
+        EssenceData
+          MobID = mob
+          Data = stream of 300000 bytes
+  Dictionary:
+    Dictionary
+      OperationDefinitions: 2 items
+        OperationDefinition
+          Identification = 9d2ea894-0968-11d3-8a38-0050040ef7d2
+          Name = "Mono Audio Gain"
+          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+          IsTimeWarp = 0
+          OperationCategory = 0d010102-0101-0100-060e-2b3404010101
+          NumberInputs = 1
+          Bypass = 1
+          ParametersDefined -> 1 references
+        OperationDefinition
+          Identification = 0c3bea41-fc05-11d2-8a29-0050040ef7d2
+          Name = "Mono Audio Dissolve"
+          DataDefinition -> 01030202-0200-0000-060e-2b3404010101
+          IsTimeWarp = 0
+          OperationCategory = 0d010102-0101-0100-060e-2b3404010101
+          NumberInputs = 2
+          Bypass = 1
+          ParametersDefined -> 1 references
+      ParameterDefinitions: 2 items
+        ParameterDefinition
+          Identification = e4962321-2267-11d3-8a4c-0050040ef7d2
+          Name = "Amplitude"
+          Type -> 03010100-0000-0000-060e-2b3401040101
+          DisplayUnits = "factor"
+        ParameterDefinition
+          Identification = e4962320-2267-11d3-8a4c-0050040ef7d2
+          Name = "Level"
+          Type -> 03010100-0000-0000-060e-2b3401040101
+          DisplayUnits = "factor"
+      DataDefinitions: 6 items
+        DataDefinition
+          Identification = 01030202-0100-0000-060e-2b3404010101
+          Name = "Picture"
+          Description = "Picture data"
+        DataDefinition
+          Identification = 01030202-0200-0000-060e-2b3404010101
+          Name = "Sound"
+          Description = "Sound data"
+        DataDefinition
+          Identification = 01030201-0100-0000-060e-2b3404010101
+          Name = "Timecode"
+          Description = "Timecode data"
+        DataDefinition
+          Identification = 01030201-1000-0000-060e-2b3404010101
+          Name = "DescriptiveMetadata"
+          Description = "Descriptive metadata"
+        DataDefinition
+          Identification = 78e1ebe1-6cef-11d2-807d-006008143e6f
+          Name = "LegacySound"
+          Description = "Sound data (legacy)"
+        DataDefinition
+          Identification = 7f275e81-77e5-11d2-807f-006008143e6f
+          Name = "LegacyTimecode"
+          Description = "Timecode data (legacy)"
+      ContainerDefinitions: 3 items
+        ContainerDefinition
+          Identification = 4313b572-d8ba-11d2-809b-006008143e6f
+          Name = "External"
+        ContainerDefinition
+          Identification = 4313b571-d8ba-11d2-809b-006008143e6f
+          Name = "AAF"
+        ContainerDefinition
+          Identification = 0d011301-0101-0100-060e-2b3404010106
+          Name = "RIFFWAVE"
+      InterpolationDefinitions: 2 items
+        InterpolationDefinition
+          Identification = 5b6c85a4-0ede-11d3-80a9-006008143e6f
+          Name = "LinearInterp"
+        InterpolationDefinition
+          Identification = 5b6c85a5-0ede-11d3-80a9-006008143e6f
+          Name = "ConstantInterp"
+  Version = 2 bytes
+  IdentificationList: 1 items
+    Identification
+      CompanyName = "FaderFrame"
+      ProductName = "FaderFrame"
+      ProductVersion = 9 bytes
+      ProductVersionString = "0.36.0"
+      ProductID = 4f7a1c2e-5b8d-4e61-9a03-f4dc8e21b6a7
+      Date = 8 bytes
+      Platform = "test"
+      GenerationAUID = eb0354df-4a45-434e-9f0f-9924a3016430
+  ObjectModelVersion = 1
+  OperationalPattern = 0d011201-0100-0000-060e-2b3404010105

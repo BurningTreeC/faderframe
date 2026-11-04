@@ -15,11 +15,14 @@
 //! controller lanes (mod wheel, pitch bend, sustain, any CC: freehand,
 //! lines, erase), ghost notes of the track's other clips, auditioning,
 //! step input from a MIDI keyboard, live keys on the keyboard, clip-length
-//! handle, inspector with numeric entry, follow playhead.
+//! handle, inspector with numeric entry, follow playhead; an articulation
+//! lane and notes' articulations, drum maps' sounds by name in drum mode
+//! (see [`maps`]).
 
 #![forbid(unsafe_code)]
 
 mod edit;
+mod maps;
 mod paint;
 mod toolbar;
 mod tools;
@@ -112,6 +115,8 @@ pub enum LaneKind {
     Controller(MidiController),
     /// Per-note expression (MPE) of the selected notes.
     Expression(ExpressionKind),
+    /// The track's articulations (see [`maps`]).
+    Articulation,
 }
 
 impl LaneKind {
@@ -120,6 +125,7 @@ impl LaneKind {
             LaneKind::Velocity => "Velocity".into(),
             LaneKind::Controller(c) => c.label(),
             LaneKind::Expression(k) => k.label().into(),
+            LaneKind::Articulation => "Articulations".into(),
         }
     }
 }
@@ -157,10 +163,11 @@ enum Drag {
     /// Eraser or mute tool sweeping over notes.
     Sweep { hit: Vec<NoteId> },
     /// Dragging a velocity stem.
+    /// A note's velocity at MIDI 2.0's 16 bits.
     Velocity {
         note: MidiNote,
         origin_y: f32,
-        value: u8,
+        value: u16,
     },
     /// Drawing a velocity line across notes.
     VelocityLine { from: Point, to: Point },
@@ -217,8 +224,13 @@ pub struct PianoRollView {
     hover: Option<Point>,
     /// Length of the last drawn or resized note ("Last" note length).
     last_length: MusicalTime,
-    /// Visible keys, top to bottom (all 128, or folded).
+    /// Visible keys, top to bottom (all 128, folded, or a drum map's
+    /// sounds in its order).
     rows: Vec<u8>,
+    /// Each key's row (`None`: not shown).
+    row_index: Vec<Option<u16>>,
+    /// The rows are a drum map's sounds (drum mode with a map).
+    pub(crate) drum_rows: bool,
     /// Rows the toolbar wraps into at the current width.
     toolbar_rows: usize,
     /// The harmony strip under the ruler: a key row, a chord row (shown
@@ -233,6 +245,10 @@ pub struct PianoRollView {
     value_drag: Option<tools::ValueDrag>,
     /// Notes are diamonds where they start (a drum grid), not bars.
     pub(crate) diamonds: bool,
+    /// The clip's track plays a scale other than twelve-tone equal
+    /// temperament: its rows are labelled with degrees and cents, and
+    /// folding to the scale keeps the keys the tuning plays.
+    pub(crate) tuning: Option<faderframe_session::tuning::PianoTuning>,
 }
 
 /// The regions of the view.
@@ -276,6 +292,8 @@ impl PianoRollView {
             hover: None,
             last_length: MusicalTime::from_quarters(0.25),
             rows: (0..=127u8).rev().collect(),
+            row_index: (0..128u16).map(|k| Some(127 - k)).collect(),
+            drum_rows: false,
             toolbar_rows: 1,
             harmony_rows: (false, false),
             tools_open: false,
@@ -284,6 +302,7 @@ impl PianoRollView {
             last_generator: faderframe_project::midi_tools::Tool::Euclid,
             value_drag: None,
             diamonds: false,
+            tuning: None,
         }
     }
 
@@ -372,8 +391,11 @@ impl PianoRollView {
 
     /// Row index of a key (`None`: folded away).
     fn row_of(&self, key: u8) -> Option<usize> {
-        // Rows are sorted descending.
-        self.rows.binary_search_by(|k| key.cmp(k)).ok()
+        self.row_index
+            .get(usize::from(key))
+            .copied()
+            .flatten()
+            .map(usize::from)
     }
 
     /// Top y of a key's row.
@@ -395,7 +417,8 @@ impl PianoRollView {
     /// below), when they are shown next to it.
     pub fn keyboard_key_at(&self, pos: Point, keys: Rect) -> u8 {
         let key = self.key_at(pos.y);
-        if !is_black(key) || pos.x < keys.x + keys.w * BLACK_KEY_W {
+        // A drum map's names are rows, not keys.
+        if self.drum_rows || !is_black(key) || pos.x < keys.x + keys.w * BLACK_KEY_W {
             return key;
         }
         let Some(y) = self.y_of(key) else {
@@ -425,9 +448,48 @@ impl PianoRollView {
     /// are drawn.
     fn update_rows(&mut self, model: &Session, m: &MidiClip) {
         self.diamonds = model.editor_clip().is_some_and(|c| model.piano_diamonds(c));
+        self.tuning = model.editor_clip().and_then(|c| model.piano_tuning(c));
         let pr = &model.editor.piano;
+        // Drum mode with a drum map: its sounds in its order (only those
+        // played when folding to used keys), then keys it has no sound on
+        // that notes use.
+        let drums = model.editor_drum_map().filter(|_| self.diamonds);
+        self.drum_rows = drums.is_some();
+        if let Some(map) = drums {
+            let used: std::collections::BTreeSet<u8> = m.notes.iter().map(|n| n.key).collect();
+            let mut rows: Vec<u8> = map
+                .order()
+                .into_iter()
+                .filter(|k| pr.fold != KeyFold::Used || used.contains(k))
+                .collect();
+            let mut rest: Vec<u8> = used
+                .iter()
+                .copied()
+                .filter(|k| map.sound(*k).is_none())
+                .collect();
+            rest.sort_unstable_by(|a, b| b.cmp(a));
+            rows.extend(rest);
+            if rows.is_empty() {
+                rows = map.order();
+            }
+            if rows.is_empty() {
+                rows = (36..=51u8).rev().collect();
+            }
+            self.set_rows(rows);
+            return;
+        }
         let mut rows: Vec<u8> = match pr.fold {
             KeyFold::Off => (0..=127u8).collect(),
+            // In a tuning of its own: the keys it plays (a keyboard mapping
+            // can leave keys out), and the clip's notes.
+            KeyFold::Scale if self.tuning.is_some() => {
+                let tuning = self.tuning.as_ref();
+                let mut v: Vec<u8> = (0..=127u8)
+                    .filter(|k| tuning.is_some_and(|t| t.in_scale(*k)))
+                    .collect();
+                v.extend(m.notes.iter().map(|n| n.key));
+                v
+            }
             KeyFold::Scale => {
                 // Every key the clip's scales (key track) use, and its notes.
                 let mut v: Vec<u8> = match Self::clip(model) {
@@ -448,7 +510,30 @@ impl PianoRollView {
         }
         rows.sort_unstable_by(|a, b| b.cmp(a));
         rows.dedup();
-        self.rows = rows;
+        self.set_rows(rows);
+    }
+
+    fn set_rows(&mut self, rows: Vec<u8>) {
+        let mut index = vec![None; 128];
+        let mut kept = Vec::with_capacity(rows.len());
+        for k in rows {
+            let k = k.min(127);
+            if index[usize::from(k)].is_none() {
+                index[usize::from(k)] = Some(kept.len() as u16);
+                kept.push(k);
+            }
+        }
+        self.rows = kept;
+        self.row_index = index;
+    }
+
+    /// A key's name: its note name, or in a tuning of its own its degree
+    /// and cents ("3 · 386¢"; an unmapped key keeps its note name).
+    pub(crate) fn key_label(&self, key: u8) -> String {
+        self.tuning
+            .as_ref()
+            .and_then(|t| t.label(key))
+            .unwrap_or_else(|| note_name(key))
     }
 
     fn content_h(&self) -> f32 {
@@ -573,13 +658,16 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
                 note_name(n.key),
                 tl.format_bbt(at),
                 n.length.quarters(),
-                n.velocity
+                n.velocity_text()
             );
             if n.channel > 0 {
                 label.push_str(&format!(", channel {}", n.channel + 1));
             }
             if n.muted {
                 label.push_str(", muted");
+            }
+            if n.time_locked {
+                label.push_str(", locked to time");
             }
             let transpose = |by: i32| Action::NoteOperation {
                 clip: id,

@@ -16,16 +16,67 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 /// What to load: per slot a file (the sampler has one, an audio file or an
-/// SFZ; the drum sampler one per pad).
+/// SFZ; the drum sampler one per pad; the Wavetable one per oscillator,
+/// the Granular one).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SampleDoc {
     #[serde(default)]
     pub files: Vec<Option<String>>,
+    /// Per slot the samples a wavetable frame has (0: from the file's
+    /// `clm ` chunk, else guessed); only the Wavetable reads it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycles: Vec<u32>,
+    /// Where the sampler's sample is cut into slices (frames of the
+    /// sample at its own rate, ascending, none at 0: the first slice
+    /// starts at the sample's start). In slice mode each key from the
+    /// first slice key plays one ([`crate::devices::sampler::id::SLICES`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<u64>,
 }
 
 impl SampleDoc {
     pub fn file(&self, slot: usize) -> Option<&str> {
         self.files.get(slot).and_then(|f| f.as_deref())
+    }
+
+    /// Slot `slot`'s wavetable frame size (0: from the file).
+    pub fn cycle(&self, slot: usize) -> u32 {
+        self.cycles.get(slot).copied().unwrap_or(0)
+    }
+
+    pub fn set_cycle(&mut self, slot: usize, samples: u32) {
+        if self.cycles.len() <= slot {
+            self.cycles.resize(slot + 1, 0);
+        }
+        self.cycles[slot] = samples;
+        while self.cycles.last() == Some(&0) {
+            self.cycles.pop();
+        }
+    }
+
+    /// Cut the sample at `points` (sorted, without 0 and repeats).
+    pub fn set_slices(&mut self, mut points: Vec<u64>) {
+        points.retain(|&p| p > 0);
+        points.sort_unstable();
+        points.dedup();
+        self.slices = points;
+    }
+
+    /// The slices of a sample `frames` long: start and end frame of each
+    /// (points past its end are left out; none: no slices).
+    pub fn slice_regions(&self, frames: usize) -> Vec<(u64, u64)> {
+        if self.slices.is_empty() || frames == 0 {
+            return Vec::new();
+        }
+        let n = frames as u64;
+        let starts: Vec<u64> = std::iter::once(0)
+            .chain(self.slices.iter().copied().filter(|&p| p > 0 && p < n))
+            .collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| (a, starts.get(i + 1).copied().unwrap_or(n)))
+            .collect()
     }
 
     pub fn set(&mut self, slot: usize, file: Option<String>) {
@@ -72,6 +123,9 @@ pub struct Sample {
     pub frames: usize,
     pub data: [Vec<f32>; 2],
     pub stereo: bool,
+    /// The third and fourth channels, if the file has them (a true-stereo
+    /// impulse response's right input); the samplers play the first two.
+    pub extra: Vec<Vec<f32>>,
     /// Its loudest sample.
     pub peak: f32,
     /// Minimum and maximum (both channels) per stretch of frames, at most
@@ -83,9 +137,20 @@ pub struct Sample {
 const OVERVIEW_POINTS: usize = 4096;
 
 impl Sample {
-    pub fn from_channels(name: String, rate: f64, channels: Vec<Vec<f32>>) -> Self {
+    pub fn from_channels(name: String, rate: f64, mut channels: Vec<Vec<f32>>) -> Self {
         let frames = channels.iter().map(Vec::len).min().unwrap_or(0);
         let stereo = channels.len() > 1;
+        let extra: Vec<Vec<f32>> = if channels.len() >= 4 {
+            channels
+                .drain(2..4)
+                .map(|mut c| {
+                    c.truncate(frames);
+                    c
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut it = channels.into_iter();
         let mut left = it.next().unwrap_or_default();
         left.truncate(frames);
@@ -116,6 +181,7 @@ impl Sample {
             frames,
             data: [left, right],
             stereo,
+            extra,
             peak,
             overview,
         }
@@ -164,7 +230,13 @@ fn decode(
     let mut channels: Vec<Vec<f32>> = Vec::new();
     let info = run(&cancel, &mut |_| Ok(()), &mut |block, frames| {
         if channels.is_empty() {
-            channels = vec![Vec::new(); block.len().clamp(1, 2)];
+            // Four for a true-stereo impulse response (more are left out).
+            let n = match block.len() {
+                0 | 1 => 1,
+                2 | 3 => 2,
+                _ => 4,
+            };
+            channels = vec![Vec::new(); n];
         }
         for (c, ch) in channels.iter_mut().enumerate() {
             if ch.len() < MAX_FRAMES {
@@ -289,6 +361,12 @@ pub struct SampleSet {
     pub keyswitch_keys: u128,
     /// Zones a controller's move can trigger (`on_cc`; usually none).
     pub cc_zones: Vec<u32>,
+    /// Per document slot, the wavetable made of its sample (the
+    /// Wavetable's [`Prepare`] makes them; empty for the others).
+    pub tables: Vec<Option<Arc<super::wavetable::table::Table>>>,
+    /// The first slot's sample cut into slices: start and end frame of
+    /// each ([`SampleDoc::slices`]; empty: not sliced).
+    pub slices: Vec<(f64, f64)>,
 }
 
 impl SampleSet {
@@ -359,6 +437,10 @@ pub struct Contents {
     pub set: Arc<SampleSet>,
 }
 
+/// What a device makes of a loaded set before its processor gets it (on
+/// the loading thread, never the audio thread): the Wavetable's tables.
+pub type Prepare = fn(&SampleDoc, &mut SampleSet);
+
 /// An instance's side of its samples: the document, the set shared with
 /// the processor, and a set waiting to be swapped in.
 pub struct SampleHost {
@@ -371,6 +453,7 @@ pub struct SampleHost {
     background: bool,
     /// Where a document loading in the background arrives.
     loading: Option<std::sync::mpsc::Receiver<SampleSet>>,
+    prepare: Option<Prepare>,
 }
 
 impl Default for SampleHost {
@@ -382,14 +465,29 @@ impl Default for SampleHost {
             pending: None,
             background: false,
             loading: None,
+            prepare: None,
         }
     }
 }
 
 impl SampleHost {
+    /// A host whose sets `prepare` finishes before the processor gets
+    /// them.
+    pub fn with_prepare(prepare: Prepare) -> Self {
+        Self {
+            prepare: Some(prepare),
+            ..Self::default()
+        }
+    }
+
     /// Load documents that read from disk in the background from now on.
     pub fn set_background(&mut self, on: bool) {
         self.background = on;
+    }
+
+    /// Whether documents load in the background (a live session's).
+    pub fn background(&self) -> bool {
+        self.background
     }
 
     /// Whether a document is still loading.
@@ -410,17 +508,18 @@ impl SampleHost {
         if self.background && !loads_from_cache(&self.doc) {
             let (tx, rx) = std::sync::mpsc::channel();
             let doc = self.doc.clone();
+            let prepare = self.prepare;
             let spawned = std::thread::Builder::new()
                 .name("faderframe-samples".into())
                 .spawn(move || {
-                    let _ = tx.send(load(&doc));
+                    let _ = tx.send(load_with(&doc, prepare));
                 });
             if spawned.is_ok() {
                 self.loading = Some(rx);
                 return;
             }
         }
-        let set = Arc::new(load(&self.doc));
+        let set = Arc::new(load_with(&self.doc, self.prepare));
         self.hand_over(set, tap);
     }
 
@@ -476,6 +575,15 @@ impl SampleHost {
     }
 }
 
+/// Load a document and let `prepare` finish the set.
+pub fn load_with(doc: &SampleDoc, prepare: Option<Prepare>) -> SampleSet {
+    let mut set = load(doc);
+    if let Some(p) = prepare {
+        p(doc, &mut set);
+    }
+    set
+}
+
 /// Load a document: SFZ files become zones, other files plain samples.
 pub fn load(doc: &SampleDoc) -> SampleSet {
     let mut set = SampleSet::default();
@@ -508,6 +616,13 @@ pub fn load(doc: &SampleDoc) -> SampleSet {
                 set.slots.push(None);
             }
         }
+    }
+    if let Some(first) = set.slot(0) {
+        set.slices = doc
+            .slice_regions(first.frames)
+            .into_iter()
+            .map(|(a, b)| (a as f64, b as f64))
+            .collect();
     }
     set.index();
     set
@@ -597,6 +712,36 @@ mod tests {
         assert!(unpack(&[0; 12]).is_none(), "a plain parameter block");
         doc.set(2, None);
         assert!(doc.files.is_empty());
+    }
+
+    #[test]
+    fn slices_cut_the_first_sample_from_its_start() {
+        let mut doc = SampleDoc::default();
+        doc.set_slices(vec![300, 0, 100, 100, 5_000]);
+        assert_eq!(
+            doc.slices,
+            vec![100, 300, 5_000],
+            "sorted, no 0, no repeats"
+        );
+        assert_eq!(
+            doc.slice_regions(1_000),
+            vec![(0, 100), (100, 300), (300, 1_000)],
+            "a point past the end is left out"
+        );
+        let packed = pack(&[9], &doc);
+        assert_eq!(unpack(&packed).unwrap().1, doc, "kept in the state");
+        // Older states have none.
+        let old = pack(&[9], &SampleDoc::default());
+        assert!(!String::from_utf8_lossy(&old).contains("slices"));
+        let d = fixtures::dir("slices");
+        let file = fixtures::tone(&d.join("t.wav"), 440.0, 48_000, 0.1);
+        doc.files = vec![Some(file)];
+        let set = load(&doc);
+        assert_eq!(
+            set.slices,
+            vec![(0.0, 100.0), (100.0, 300.0), (300.0, 4_800.0)]
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

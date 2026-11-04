@@ -834,6 +834,7 @@ impl Session {
                             pitch: None,
                             effects: None,
                             spectral: None,
+                            envelope: None,
                         }),
                     });
                     opened = Some((source.id, take.path.clone(), take.peaks));
@@ -966,7 +967,7 @@ impl Session {
         let due = self.recording.as_ref().and_then(|r| {
             let end = r.slot?.end?;
             // Captured that much after it was heard.
-            let late = r.latency.max(r.midi.as_ref().map_or(0, |m| m.shift));
+            let late = r.latest().max(r.midi.as_ref().map_or(0, |m| m.shift));
             Some(end + late)
         });
         if let Some(due) = due
@@ -998,7 +999,8 @@ impl Session {
         let pos = self.engine.transport_snapshot().position.max(0);
         let here = tl.to_musical(pos, rate);
         let length = match q {
-            Quantize::None => MusicalTime::from_quarters(0.25),
+            // (An exact sample: no quantum; a sixteenth as without one.)
+            Quantize::None | Quantize::At(_) => MusicalTime::from_quarters(0.25),
             Quantize::Beat => {
                 let sig = tl.meter.signature_of_bar(tl.meter.bar_at(here));
                 MusicalTime::from_quarters(4.0 / f64::from(sig.denominator.max(1)))

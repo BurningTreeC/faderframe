@@ -13,7 +13,7 @@
 #![forbid(unsafe_code)]
 
 use faderframe_core::{ClipId, NoteId};
-use faderframe_project::{ExpressionKind, MidiController};
+use faderframe_project::{ExpressionKind, MidiController, steps_text};
 use faderframe_session::editing::{format_position, parse_position};
 use faderframe_session::midi_events::{
     EventField, EventKind, EventRef, EventRow, EventValue, NewEvent, parse_sysex,
@@ -22,7 +22,7 @@ use faderframe_session::{Action, NoteOp, SelectMode, Session, TransportAction};
 use faderframe_timeline::{MusicalTime, TICKS_PER_QUARTER};
 use faderframe_ui_canvas::{
     Cursor, EventCx, FontFamily, HostRequest, Key, MenuItem, Painter, Point, PointerButton, Rect,
-    ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
+    ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent, controls,
 };
 
 const HEADER_H: f32 = 34.0;
@@ -53,9 +53,12 @@ pub enum Column {
     Mute,
     /// The controller's or program's name; a SysEx message's bytes.
     Info,
+    /// A note placed in time (a padlock: tempo changes keep it where it
+    /// sounds).
+    Lock,
 }
 
-const COLUMNS: [(Column, &str, f32); 11] = [
+const COLUMNS: [(Column, &str, f32); 12] = [
     (Column::Locate, "", 26.0),
     (Column::Position, "Position", 108.0),
     (Column::Type, "Type", 118.0),
@@ -66,6 +69,7 @@ const COLUMNS: [(Column, &str, f32); 11] = [
     (Column::End, "End", 108.0),
     (Column::Release, "Off Vel.", 60.0),
     (Column::Mute, "M", 26.0),
+    (Column::Lock, "", 26.0),
     (Column::Info, "", 0.0),
 ];
 
@@ -80,6 +84,7 @@ impl Column {
             Column::End => EventField::End,
             Column::Release => EventField::Release,
             Column::Mute => EventField::Muted,
+            Column::Lock => EventField::TimeLocked,
             Column::Info => EventField::Bytes,
             Column::Locate | Column::Type => return None,
         })
@@ -110,6 +115,8 @@ impl Filter {
             EventKind::Controller(_) => self.controllers,
             EventKind::Expression(_) => self.expression,
             EventKind::Sysex => self.sysex,
+            // The articulation lane belongs to the notes.
+            EventKind::Articulation => self.notes,
         }
     }
 }
@@ -368,15 +375,23 @@ impl EventsView {
 
     /// The text of a cell (with a dragged value in place).
     fn cell_text(&self, row: &EventRow, col: Column, model: &Session) -> String {
-        let dragged = self.dragged(row, col).map(|v| v.round() as i64);
+        let dragged_full = self.dragged(row, col);
+        let dragged = dragged_full.map(|v| v.round() as i64);
         let number = |stored: Option<u16>| dragged.or(stored.map(i64::from));
+        // MIDI 2.0's resolution: MIDI 1.0 steps with their fraction, cut to
+        // two decimals.
+        let fine = |stored: Option<f64>| {
+            dragged_full
+                .filter(|v| v.fract() != 0.0)
+                .or(if dragged_full.is_some() { None } else { stored })
+        };
         let position = |at: MusicalTime| {
             let p = model.project();
             let samples = p.timeline.to_samples(at, f64::from(p.sample_rate.max(1)));
             format_position(p, samples, model.editor.main_counter)
         };
         match col {
-            Column::Locate | Column::Mute => String::new(),
+            Column::Locate | Column::Mute | Column::Lock => String::new(),
             Column::Position => position(row.at),
             Column::Type => kind_label(row.kind),
             Column::Channel => dragged
@@ -394,9 +409,10 @@ impl EventsView {
                 _ => String::new(),
             },
             Column::Data2 => match row.kind {
-                EventKind::Controller(MidiController::PitchBend) => {
-                    number(row.data2).map_or_else(String::new, |v| bend_text(v - 8192))
-                }
+                EventKind::Controller(MidiController::PitchBend) => match fine(row.fine) {
+                    Some(v) => fine_bend_text(v - 8192.0),
+                    None => number(row.data2).map_or_else(String::new, |v| bend_text(v - 8192)),
+                },
                 EventKind::Controller(MidiController::Program) => {
                     number(row.data2).map_or_else(String::new, |v| (v + 1).to_string())
                 }
@@ -406,14 +422,19 @@ impl EventsView {
                     .or(row.amount)
                     .map_or_else(String::new, |v| kind.format(v)),
                 EventKind::Sysex => format!("{} bytes", row.bytes.len()),
-                _ => number(row.data2).map_or_else(String::new, |v| v.to_string()),
+                _ => match fine(row.fine) {
+                    Some(v) => steps_text(v),
+                    None => number(row.data2).map_or_else(String::new, |v| v.to_string()),
+                },
             },
             Column::Length => row.length.map_or_else(String::new, length_text),
             Column::End => row
                 .length
                 .map_or_else(String::new, |l| position(row.at + l)),
             Column::Release => match (row.kind, dragged.or(row.release.map(i64::from))) {
-                (EventKind::Note, Some(v)) => v.to_string(),
+                (EventKind::Note, Some(v)) => {
+                    fine(row.release_fine).map_or_else(|| v.to_string(), steps_text)
+                }
                 (EventKind::Note, None) => "–".into(),
                 _ => String::new(),
             },
@@ -436,6 +457,15 @@ impl EventsView {
                         .map_or_else(String::new, |n| format!("GM: {n}"))
                 }
                 EventKind::Sysex => hex(&row.bytes),
+                // A note's articulation or a direction, by name.
+                EventKind::Note | EventKind::Articulation => row
+                    .articulation
+                    .and_then(|a| {
+                        let clip = model.project().clip(Self::clip(model)?)?;
+                        let map = model.project().track_articulation_map(clip.track)?;
+                        Some(map.get(a)?.name.clone())
+                    })
+                    .unwrap_or_default(),
                 _ => String::new(),
             },
         }
@@ -474,9 +504,12 @@ impl EventsView {
             (Column::Channel, _) => row.channel.map(f64::from),
             (Column::Data1, _) => row.data1.map(f64::from),
             (Column::Data2, EventKind::Expression(_)) => row.amount.map(f64::from),
-            (Column::Data2, _) => row.data2.map(f64::from),
+            // With MIDI 2.0's fraction where there is one.
+            (Column::Data2, _) => row.fine.or(row.data2.map(f64::from)),
             // A release velocity not set starts from the usual 64.
-            (Column::Release, EventKind::Note) => Some(f64::from(row.release.unwrap_or(64))),
+            (Column::Release, EventKind::Note) => row
+                .release_fine
+                .or(Some(f64::from(row.release.unwrap_or(64)))),
             _ => None,
         }
     }
@@ -485,6 +518,8 @@ impl EventsView {
     fn drag_value(kind: EventKind, v: f64) -> EventValue {
         match kind {
             EventKind::Expression(_) => EventValue::Amount(v as f32),
+            // A velocity or value with MIDI 2.0's fraction keeps it.
+            EventKind::Note | EventKind::Controller(_) if v.fract() != 0.0 => EventValue::Fine(v),
             _ => EventValue::Number(v.round() as i64),
         }
     }
@@ -503,7 +538,7 @@ impl EventsView {
                 )
                 | (Column::Data2, K::Note | K::Controller(_) | K::Expression(_))
                 | (
-                    Column::Length | Column::End | Column::Release | Column::Mute,
+                    Column::Length | Column::End | Column::Release | Column::Mute | Column::Lock,
                     K::Note
                 )
                 | (Column::Info, K::Sysex)
@@ -552,9 +587,13 @@ impl EventsView {
                     _ => i64::from(parse_key(text)?),
                 }),
                 Column::Data2 => match kind {
-                    EventKind::Controller(MidiController::PitchBend) => {
-                        EventValue::Number(parse_signed(text)?.clamp(-8192, 8191) + 8192)
-                    }
+                    // A fraction: MIDI 2.0's resolution.
+                    EventKind::Controller(MidiController::PitchBend) => match parse_steps(text)? {
+                        v if v.fract() != 0.0 => {
+                            EventValue::Fine((v + 8192.0).clamp(0.0, 16383.99))
+                        }
+                        v => EventValue::Number((v as i64).clamp(-8192, 8191) + 8192),
+                    },
                     EventKind::Controller(MidiController::Program) => {
                         let p = int(text)?;
                         (1..=128)
@@ -562,11 +601,18 @@ impl EventsView {
                             .then_some(EventValue::Number(p - 1))?
                     }
                     EventKind::Expression(k) => EventValue::Amount(parse_amount(k, text)?),
+                    EventKind::Note | EventKind::Controller(_) => match parse_steps(text)? {
+                        v if v.fract() != 0.0 => EventValue::Fine(v),
+                        v => EventValue::Number(v as i64),
+                    },
                     _ => EventValue::Number(int(text)?),
                 },
                 Column::Release => match text.trim() {
                     "" | "-" | "–" | "—" => EventValue::Number(-1),
-                    t => EventValue::Number(int(t).filter(|v| (0..=127).contains(v))?),
+                    t => match parse_steps(t).filter(|v| (0.0..128.0).contains(v))? {
+                        v if v.fract() != 0.0 => EventValue::Fine(v),
+                        v => EventValue::Number(v as i64),
+                    },
                 },
                 Column::Info => EventValue::Bytes(parse_sysex(text)?),
                 _ => return None,
@@ -761,6 +807,58 @@ impl EventsView {
                     .collect(),
             ));
         }
+        // Articulations: the notes' (with the track's map), or another of
+        // a direction's group.
+        let articulations: Vec<MenuItem<Action>> = if !notes.is_empty() {
+            model
+                .articulation_choices(clip, &notes)
+                .into_iter()
+                .map(|c| {
+                    let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                    if c.group_start {
+                        item.separated()
+                    } else {
+                        item
+                    }
+                })
+                .collect()
+        } else if let (EventKind::Articulation, Some(now)) = (row.kind, row.articulation) {
+            let start = model
+                .project()
+                .clip(clip)
+                .map_or(MusicalTime::ZERO, |c| c.start);
+            model
+                .project()
+                .clip(clip)
+                .and_then(|c| model.project().track_articulation_map(c.track))
+                .map(|map| {
+                    let group = map.get(now).map(|a| a.group);
+                    map.articulations
+                        .iter()
+                        .filter(|a| {
+                            a.kind == faderframe_project::articulation::ArticulationKind::Direction
+                                && Some(a.group) == group
+                        })
+                        .map(|a| {
+                            MenuItem::new(
+                                a.name.clone(),
+                                Action::Maps(faderframe_session::maps::MapOp::SetDirection {
+                                    clip,
+                                    at: row.at - start,
+                                    articulation: Some(a.id),
+                                }),
+                            )
+                            .checked(a.id == now)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !articulations.is_empty() {
+            items.push(MenuItem::submenu("Articulation", articulations));
+        }
         let note = match row.event {
             EventRef::Note(id) | EventRef::Expression { note: id, .. } => {
                 Some((id, row.data1.unwrap_or(60) as u8))
@@ -842,12 +940,15 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                     Column::Length => format!("length {t}"),
                     Column::End => format!("ends at {t}"),
                     Column::Release => format!("release velocity {t}"),
-                    Column::Locate | Column::Mute => continue,
+                    Column::Locate | Column::Mute | Column::Lock => continue,
                 };
                 parts.push(said);
             }
             if r.muted {
                 parts.push("muted".into());
+            }
+            if r.time_locked {
+                parts.push("locked to time".into());
             }
             AccessNode::new(
                 access_id(&[21, i as u64, r.at.ticks() as u64]),
@@ -934,6 +1035,9 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
         p.hline(0.0, size.w, HEADER_H + COLUMNS_H - 0.5, th.ui.border);
         for (col, label, _) in COLUMNS {
             let r = Self::cell(col, names);
+            if col == Column::Lock {
+                controls::lock_glyph(p, r.centered(7.0, 10.0), th.ui.text_dim);
+            }
             if !label.is_empty() {
                 let style = TextStyle::new(th.fonts.small, th.ui.text_dim).bold();
                 let style = if col == Column::Mute {
@@ -1026,6 +1130,16 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                     )
                     .center(),
                 );
+            }
+            // A note placed in time: a padlock, lit when locked.
+            if row.kind == EventKind::Note {
+                let l = Self::cell(Column::Lock, r).centered(8.0, 11.0);
+                let c = if row.time_locked {
+                    th.arranger.time_lock
+                } else {
+                    th.ui.text_faint.with_alpha(0.5)
+                };
+                controls::lock_glyph(p, l, c);
             }
             let ink = if row.muted {
                 th.ui.text_faint
@@ -1126,6 +1240,16 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                     });
                     return true;
                 }
+                // The padlock: lock the note to time or free it.
+                if col == Column::Lock && row.kind == EventKind::Note {
+                    cx.emit(Action::EditMidiEvents {
+                        clip,
+                        events: vec![row.event],
+                        field: EventField::TimeLocked,
+                        value: EventValue::Number(i64::from(!row.time_locked)),
+                    });
+                    return true;
+                }
                 if clicks >= 2 && Self::editable(row, col) {
                     let cell = Self::cell(col, self.row_rect(i, size));
                     if let Some(req) = self.text_input(row, col, cell, model) {
@@ -1217,7 +1341,11 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                 let col = Self::column_at(pos.x);
                 let cursor = match hover.map(|i| &rows[i]) {
                     Some(r) if col.numeric() && Self::editable(r, col) => Cursor::ResizeVertical,
-                    Some(r) if col == Column::Mute && Self::editable(r, col) => Cursor::Pointer,
+                    Some(r)
+                        if matches!(col, Column::Mute | Column::Lock) && Self::editable(r, col) =>
+                    {
+                        Cursor::Pointer
+                    }
                     Some(_) if col == Column::Locate => Cursor::Pointer,
                     _ => Cursor::Default,
                 };
@@ -1346,6 +1474,17 @@ impl faderframe_ui_canvas::CanvasView<Session, Action> for EventsView {
                     "Click to mute the note".into()
                 }
             }
+            Column::Lock if editable => {
+                if row.time_locked {
+                    "Locked to time: tempo changes keep it where it sounds · click to let it \
+                     follow the music"
+                        .into()
+                } else {
+                    "Click to lock the note to time (a hit point: tempo changes keep it where \
+                     it sounds)"
+                        .into()
+                }
+            }
             Column::Info if editable => {
                 format!(
                     "{} · double-click to type its bytes in hex",
@@ -1404,13 +1543,14 @@ fn kind_label(kind: EventKind) -> String {
         EventKind::Controller(MidiController::Program) => "Program Change".into(),
         EventKind::Expression(k) => format!("Note {}", k.label()),
         EventKind::Sysex => "SysEx".into(),
+        EventKind::Articulation => "Articulation".into(),
     }
 }
 
 fn kind_color(kind: EventKind, th: &Theme) -> faderframe_ui_canvas::Color {
     match kind {
         EventKind::Note => th.ui.text,
-        EventKind::Controller(_) => th.ui.accent,
+        EventKind::Controller(_) | EventKind::Articulation => th.ui.accent,
         EventKind::Expression(_) | EventKind::Sysex => th.ui.text_dim,
     }
 }
@@ -1465,17 +1605,32 @@ pub fn parse_key(text: &str) -> Option<u8> {
 }
 
 /// A pitch bend offset from the centre ("0", "+512", "−300").
+/// A pitch bend with MIDI 2.0's fraction, from the centre ("+12.25").
+fn fine_bend_text(d: f64) -> String {
+    let t = steps_text(d.abs());
+    if d > 0.0 {
+        format!("+{t}")
+    } else if d < 0.0 {
+        format!("−{t}")
+    } else {
+        t
+    }
+}
+
+/// A number in MIDI 1.0 steps, perhaps with a fraction (MIDI 2.0's
+/// resolution) and a sign.
+pub fn parse_steps(text: &str) -> Option<f64> {
+    let t = text.trim().replace('−', "-").replace(',', ".");
+    let t = t.strip_prefix('+').unwrap_or(&t);
+    t.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 fn bend_text(d: i64) -> String {
     match d {
         0 => "0".into(),
         d if d > 0 => format!("+{d}"),
         d => format!("−{}", -d),
     }
-}
-
-fn parse_signed(text: &str) -> Option<i64> {
-    let t = text.trim().replace('−', "-");
-    t.strip_prefix('+').unwrap_or(&t).parse().ok()
 }
 
 /// A typed expression value in its kind's unit: "+1.5 st", "−3 dB", pan as

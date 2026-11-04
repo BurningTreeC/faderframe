@@ -248,3 +248,121 @@ fn the_spectrogram_reads_a_sine_at_its_level() {
     assert!(far < -60.0, "100 Hz reads {far:.1}");
     assert!((s.hz_at(s.row_at(3000.0)) - 3000.0).abs() < 1.0);
 }
+
+/// Hiss with a tune in it from 1 s (two notes on and off), the hiss alone
+/// before: learn there, remove everywhere.
+#[test]
+fn learned_noise_is_removed_from_the_whole_source() {
+    let frames = (RATE * 5.0) as usize;
+    let hiss = noise(0.03, frames, 77);
+    let tune: Vec<f32> = (0..frames)
+        .map(|i| {
+            let t = i as f64 / RATE;
+            if t < 1.0 {
+                return 0.0;
+            }
+            let f = if ((t * 2.0) as usize).is_multiple_of(2) {
+                330.0
+            } else {
+                440.0
+            };
+            (0.3 * (std::f64::consts::TAU * f * t).sin()) as f32
+        })
+        .collect();
+    let input: Vec<f32> = hiss.iter().zip(&tune).map(|(a, b)| a + b).collect();
+    let edit = SpectralEdit::new(
+        SpectralShape::Rect {
+            start: (0.1 * RATE) as i64,
+            end: (0.9 * RATE) as i64,
+            low: 20.0,
+            high: 24_000.0,
+        },
+        SpectralOp::Denoise { reduction_db: 24.0 },
+    );
+    let out = run(std::slice::from_ref(&edit), std::slice::from_ref(&input));
+    let snr = |x: &[f32], from: usize| {
+        let (mut s, mut e) = (0.0f64, 0.0f64);
+        for i in from..frames {
+            s += f64::from(tune[i]).powi(2);
+            e += f64::from(x[i] - tune[i]).powi(2);
+        }
+        10.0 * (s / e).log10()
+    };
+    let from = (1.5 * RATE) as usize;
+    let before = snr(&input, from);
+    let after = snr(&out[0], from);
+    assert!(after > before + 10.0, "SNR {before:.1} → {after:.1} dB");
+    // The hiss alone is turned down by about the reduction.
+    let quiet = |x: &[f32]| {
+        x[1_000..40_000]
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+    };
+    let down = 10.0 * (quiet(&out[0]) / quiet(&input)).log10();
+    assert!(down < -18.0, "hiss {down:.1} dB");
+}
+
+/// A long source in chunks: the joins do not show, and an edit after the
+/// de-noise (a Remove across a chunk's edge) still works.
+#[test]
+fn a_denoised_source_is_seamless_across_chunks() {
+    let frames = (RATE * 45.0) as usize;
+    let hiss = noise(0.02, frames, 5);
+    let tone = sine(523.25, 0.25, frames);
+    let input: Vec<f32> = hiss.iter().zip(&tone).map(|(a, b)| a + b).collect();
+    let mut silence_hiss = input.clone();
+    // The first half second is hiss alone (to learn from).
+    for (v, h) in silence_hiss
+        .iter_mut()
+        .zip(&hiss)
+        .take((0.5 * RATE) as usize)
+    {
+        *v = *h;
+    }
+    let denoise = SpectralEdit::new(
+        SpectralShape::Rect {
+            start: 0,
+            end: (0.45 * RATE) as i64,
+            low: 20.0,
+            high: 24_000.0,
+        },
+        SpectralOp::Denoise { reduction_db: 18.0 },
+    );
+    let edge = (CHUNK_SECONDS * RATE) as i64;
+    let remove = SpectralEdit::new(
+        SpectralShape::Rect {
+            start: edge - 4_800,
+            end: edge + 4_800,
+            low: 400.0,
+            high: 700.0,
+        },
+        SpectralOp::Remove,
+    );
+    let out = run(&[denoise, remove], &[silence_hiss]);
+    let x = &out[0];
+    // Around the chunk join at 40 s: no step in the level (50 ms windows).
+    let level = |a: usize| {
+        let w = (0.05 * RATE) as usize;
+        10.0 * (x[a..a + w]
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            / w as f64)
+            .log10()
+    };
+    let join = (2.0 * CHUNK_SECONDS * RATE) as usize;
+    let (before, after) = (level(join - 2_400), level(join));
+    assert!((before - after).abs() < 0.5, "{before:.2} vs {after:.2} dB");
+    // The tone is gone where the Remove is, across the first join.
+    let mid = edge as usize;
+    let rms = |a: usize, b: usize| {
+        (x[a..b].iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / (b - a) as f64).sqrt()
+    };
+    assert!(
+        rms(mid - 1_000, mid + 1_000) < 0.02,
+        "{}",
+        rms(mid - 1_000, mid + 1_000)
+    );
+    assert!(rms(join, join + 4_800) > 0.12);
+}

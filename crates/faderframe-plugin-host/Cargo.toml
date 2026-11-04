@@ -10,7 +10,12 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# A PluginFactory hosting faderframe-ara's mock ARA plug-in (tests).
+ara-mock = ["faderframe-ara/mock"]
+
 [dependencies]
+faderframe-ara.workspace = true
 faderframe-circuit.workspace = true
 faderframe-guitar.workspace = true
 tracing.workspace = true
@@ -22,6 +27,8 @@ faderframe-automation.workspace = true
 faderframe-realtime.workspace = true
 faderframe-audio-files.workspace = true
 faderframe-stretch.workspace = true
+faderframe-restore.workspace = true
+faderframe-analysis.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

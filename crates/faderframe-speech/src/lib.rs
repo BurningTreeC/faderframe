@@ -10,18 +10,22 @@
 //! decoding with timestamps under Whisper's timestamp rules (they come in
 //! pairs, never go back, the first within a second) — each window's
 //! segments placed by their timestamps, the next window starting where
-//! the last complete segment ended.
+//! the last complete segment ended. With [`Options::word_timestamps`]
+//! each segment also carries its words and where each is heard
+//! ([`timing`]: the alignment heads' attention, warped through the text).
 
 #![forbid(unsafe_code)]
 
 pub mod files;
 pub mod mel;
 pub mod model;
+pub mod timing;
 pub mod tokens;
 
 use model::{Dims, Model};
 use std::collections::HashMap;
 use std::path::Path;
+pub use timing::Word;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpeechError {
@@ -32,11 +36,13 @@ pub enum SpeechError {
 }
 
 /// A transcribed stretch: seconds from the start and its text.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Segment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// Its words and their times (with [`Options::word_timestamps`]).
+    pub words: Vec<Word>,
 }
 
 /// How to transcribe.
@@ -44,7 +50,13 @@ pub struct Segment {
 pub struct Options {
     /// Language code ("en", "de", …); `None` detects it.
     pub language: Option<String>,
+    /// Time every word too (one more decoder pass a window).
+    pub word_timestamps: bool,
 }
+
+/// Languages written without spaces between words (their words are
+/// timed character by character).
+const UNSPACED: [&str; 6] = ["zh", "ja", "th", "lo", "my", "yue"];
 
 /// Special tokens.
 struct Special {
@@ -58,6 +70,9 @@ struct Special {
     suppress: Vec<u32>,
     begin_suppress: Vec<u32>,
     max_initial_timestamp: u32,
+    /// The cross-attention heads (decoder layer, head) that follow the
+    /// audio: the checkpoint's, else every head of the upper half.
+    alignment_heads: Vec<(usize, usize)>,
 }
 
 pub struct Whisper {
@@ -116,6 +131,22 @@ impl Whisper {
                     .collect()
             })
             .unwrap_or_default();
+        let mut alignment_heads: Vec<(usize, usize)> = gen_cfg["alignment_heads"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        Some((p.get(0)?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
+                    })
+                    .filter(|&(l, h)| l < dims.decoder_layers && h < dims.heads)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if alignment_heads.is_empty() {
+            alignment_heads = (dims.decoder_layers / 2..dims.decoder_layers)
+                .flat_map(|l| (0..dims.heads).map(move |h| (l, h)))
+                .collect();
+        }
         let special = Special {
             sot: u("decoder_start_token_id").unwrap_or(50258),
             eot: u("eos_token_id").unwrap_or(50257),
@@ -128,6 +159,7 @@ impl Whisper {
             suppress: ids(&gen_cfg["suppress_tokens"]),
             begin_suppress: ids(&gen_cfg["begin_suppress_tokens"]),
             max_initial_timestamp: u("max_initial_timestamp_index").unwrap_or(50),
+            alignment_heads,
         };
         Ok(Self {
             model,
@@ -159,8 +191,8 @@ impl Whisper {
     }
 
     /// Greedy decoding of one window under the timestamp rules; the
-    /// sampled tokens.
-    fn decode(&self, encoded: &[f32], language: Option<u32>) -> Vec<u32> {
+    /// sampled tokens and how likely each was.
+    fn decode(&self, encoded: &[f32], language: Option<u32>) -> (Vec<u32>, Vec<f32>) {
         let sp = &self.special;
         let mut prompt = vec![sp.sot];
         prompt.extend(language);
@@ -168,6 +200,7 @@ impl Whisper {
         let mut cache = self.model.cache(encoded);
         let mut logits = self.model.step(&prompt, &mut cache);
         let mut out: Vec<u32> = Vec::new();
+        let mut likely: Vec<f32> = Vec::new();
         let tb = sp.timestamp_begin as usize;
         for _ in 0..SAMPLE_LEN {
             if cache.len >= self.model.dims.context {
@@ -254,9 +287,48 @@ impl Whisper {
                 break;
             }
             out.push(next);
+            likely.push((logits[next as usize] - all).exp());
             logits = self.model.step(&[next], &mut cache);
         }
-        out
+        (out, likely)
+    }
+
+    /// The words of a window's text tokens and where each is heard
+    /// (seconds from `offset`; `frames`: mel frames of audio in the
+    /// window).
+    fn time_words(
+        &self,
+        encoded: &[f32],
+        language: Option<u32>,
+        text: &[u32],
+        probabilities: &[f32],
+        frames: usize,
+        offset: f64,
+    ) -> Vec<Word> {
+        let sp = &self.special;
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut tokens = vec![sp.sot];
+        tokens.extend(language);
+        tokens.push(sp.transcribe);
+        let prompt = tokens.len();
+        tokens.push(sp.no_timestamps);
+        tokens.extend_from_slice(text);
+        tokens.push(sp.eot);
+        // Encoder positions are two mel frames each.
+        let positions = (frames / 2).max(1);
+        let scores = self
+            .model
+            .cross_scores(&tokens, encoded, &sp.alignment_heads, positions);
+        let starts = timing::token_starts(&scores, tokens.len(), positions, prompt);
+        let pieces: Vec<Vec<u8>> = text.iter().map(|t| self.text.piece(*t).to_vec()).collect();
+        let spaced = !language.is_some_and(|l| {
+            sp.languages
+                .iter()
+                .any(|(code, id)| *id == l && UNSPACED.contains(&code.as_str()))
+        });
+        timing::words(&pieces, &starts, probabilities, spaced, offset)
     }
 
     /// Transcribe 16 kHz mono `audio` (see the module docs); `progress`
@@ -290,7 +362,7 @@ impl Whisper {
             if language.is_none() {
                 language = self.detect_language(&encoded);
             }
-            let tokens = self.decode(&encoded, language);
+            let (tokens, likely) = self.decode(&encoded, language);
             let offset = secs(seek);
             let ts = |t: u32| f64::from(t - sp.timestamp_begin) * 0.02;
             let is_ts: Vec<bool> = tokens.iter().map(|t| *t >= sp.timestamp_begin).collect();
@@ -299,15 +371,16 @@ impl Whisper {
             let consecutive: Vec<usize> = (1..tokens.len())
                 .filter(|i| is_ts[*i] && is_ts[i - 1])
                 .collect();
-            let mut push = |seg_tokens: &[u32], start: f64, end: f64| {
-                let words: Vec<u32> = seg_tokens.iter().copied().filter(|t| *t < sp.eot).collect();
-                let text = self.text.decode(&words).trim().to_string();
-                if !text.is_empty() {
-                    segments.push(Segment {
-                        start: offset + start,
-                        end: offset + end.max(start),
-                        text,
-                    });
+            // This window's segments: their text tokens (with how likely
+            // each was) and times.
+            let mut found: Vec<(Vec<u32>, Vec<f32>, f64, f64)> = Vec::new();
+            let mut push = |range: std::ops::Range<usize>, start: f64, end: f64| {
+                let (words, p): (Vec<u32>, Vec<f32>) = range
+                    .filter(|&i| tokens[i] < sp.eot)
+                    .map(|i| (tokens[i], likely[i]))
+                    .unzip();
+                if !self.text.decode(&words).trim().is_empty() {
+                    found.push((words, p, offset + start, offset + end.max(start)));
                 }
             };
             if !consecutive.is_empty() {
@@ -322,7 +395,7 @@ impl Whisper {
                         && *a >= sp.timestamp_begin
                         && *b >= sp.timestamp_begin
                     {
-                        push(part, ts(*a), ts(*b));
+                        push(last..s, ts(*a), ts(*b));
                     }
                     last = s;
                 }
@@ -338,8 +411,36 @@ impl Whisper {
                     .rev()
                     .find(|t| **t > sp.timestamp_begin)
                     .map_or(secs(size), |t| ts(*t));
-                push(&tokens, 0.0, duration);
+                push(0..tokens.len(), 0.0, duration);
                 seek += size;
+            }
+            let mut words = if options.word_timestamps {
+                let text: Vec<u32> = found.iter().flat_map(|f| f.0.iter().copied()).collect();
+                let p: Vec<f32> = found.iter().flat_map(|f| f.1.iter().copied()).collect();
+                self.time_words(&encoded, language, &text, &p, size, offset)
+                    .into_iter()
+            } else {
+                Vec::new().into_iter()
+            }
+            .peekable();
+            for (text, _, start, end) in found {
+                let line = self.text.decode(&text).trim().to_string();
+                // The segment's words: as many tokens' worth as it has.
+                let mut mine = Vec::new();
+                let mut bytes = 0;
+                let want: usize = text.iter().map(|t| self.text.piece(*t).len()).sum();
+                while bytes < want
+                    && let Some(w) = words.next()
+                {
+                    bytes += w.text.len();
+                    mine.push(w);
+                }
+                segments.push(Segment {
+                    start,
+                    end,
+                    text: line,
+                    words: mine,
+                });
             }
         }
         progress(1.0);

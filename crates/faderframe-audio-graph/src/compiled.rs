@@ -1390,7 +1390,10 @@ impl<C> CompiledGraph<C> {
     /// For every node in `self` whose [`NodeKey`] also exists in `old`, the
     /// processors are swapped: the running instance moves into `self` and
     /// the freshly built one ends up in `old`, which is then dropped on the
-    /// control thread. Only pointer swaps and binary searches — no
+    /// control thread. The delay lines compensating its inputs carry on
+    /// too, wherever the same source (by key and port) arrives through one
+    /// just as long, so a rebuild while playing leaves no gap on a delayed
+    /// path. Only pointer swaps, binary searches and short scans — no
     /// allocation. Returns the number of adopted processors.
     pub fn adopt_state_from(&mut self, old: &mut CompiledGraph<C>) -> usize {
         if old.config.sample_rate != self.config.sample_rate
@@ -1411,6 +1414,34 @@ impl<C> CompiledGraph<C> {
                     // Its place in this graph may sit later (or earlier).
                     if let Some(info) = self.info.get(idx as usize) {
                         new.processor.set_input_latency(info.arrival);
+                    }
+                    let key_new = |i: u32| self.info.get(i as usize).and_then(|n| n.key);
+                    let key_old = |i: u32| old.info.get(i as usize).and_then(|n| n.key);
+                    for s in &mut new.audio_sources {
+                        let (Some(d), Some(k)) = (&s.delay, key_new(s.from_node)) else {
+                            continue;
+                        };
+                        if let Some(o) = prev.audio_sources.iter_mut().find(|o| {
+                            o.to_port == s.to_port
+                                && o.from_port == s.from_port
+                                && key_old(o.from_node) == Some(k)
+                                && o.delay.as_ref().is_some_and(|od| od.same_shape(d))
+                        }) {
+                            std::mem::swap(&mut s.delay, &mut o.delay);
+                        }
+                    }
+                    for s in &mut new.event_sources {
+                        let (Some(d), Some(k)) = (&s.delay, key_new(s.from_node)) else {
+                            continue;
+                        };
+                        if let Some(o) = prev.event_sources.iter_mut().find(|o| {
+                            o.to_port == s.to_port
+                                && o.from_port == s.from_port
+                                && key_old(o.from_node) == Some(k)
+                                && o.delay.as_ref().is_some_and(|od| od.same_shape(d))
+                        }) {
+                            std::mem::swap(&mut s.delay, &mut o.delay);
+                        }
                     }
                     adopted += 1;
                 }

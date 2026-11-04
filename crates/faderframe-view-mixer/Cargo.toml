@@ -20,3 +20,5 @@ faderframe-view-surround.workspace = true
 
 [dev-dependencies]
 faderframe-engine.workspace = true
+faderframe-audio-files.workspace = true
+faderframe-timeline.workspace = true

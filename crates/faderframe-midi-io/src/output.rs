@@ -8,7 +8,8 @@
 //! capture port.
 //! SysEx comes from the control thread instead ([`MidiOutputs::send_sysex`]),
 //! scheduled ahead with its due time; scheduled SysEx can be cancelled (the
-//! transport stopped or jumped).
+//! transport stopped or jumped). Show mode's gear changes are timed the same
+//! way on schedules of their own ([`Schedule`]), each cancelled alone.
 
 use crate::{CLIENT_NAME, UmpClient, ump_ports};
 use faderframe_midi::ump::Midi1ToMidi2;
@@ -138,8 +139,22 @@ impl Ord for Pending {
     }
 }
 
-/// Scheduled SysEx: (due, sequence, port, generation, bytes).
-type PendingSysex = (u64, u64, u16, u64, Vec<u8>);
+/// Scheduled SysEx: (due, sequence, port, schedule, generation, bytes).
+type PendingSysex = (u64, u64, u16, usize, u64, Vec<u8>);
+
+/// Who timed a message from the control side: each schedule is cancelled
+/// on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Schedule {
+    /// The clips' SysEx ([`MidiOutputs::send_sysex`]).
+    Clips = 0,
+    /// A show's gear changes sent when it stands on a song.
+    ShowCue = 1,
+    /// A show's gear changes timed on a song's first frame.
+    ShowStart = 2,
+}
+
+const SCHEDULES: usize = 3;
 
 struct Known {
     key: String,
@@ -158,9 +173,11 @@ pub struct MidiOutputs {
     clock: MidiClock,
     queues: Sender<rtrb::Consumer<MidiOutputEvent>>,
     sysex: Sender<PendingSysex>,
-    /// Scheduled SysEx of older generations is dropped.
-    generation: Arc<AtomicU64>,
+    /// Scheduled messages of older generations (per schedule) are dropped.
+    generation: Arc<[AtomicU64; SCHEDULES]>,
     sysex_seq: u64,
+    /// Messages handed to the sender per schedule.
+    scheduled: [u64; SCHEDULES],
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -168,7 +185,7 @@ pub struct MidiOutputs {
 struct Channels {
     queues: Receiver<rtrb::Consumer<MidiOutputEvent>>,
     sysex: Receiver<PendingSysex>,
-    generation: Arc<AtomicU64>,
+    generation: Arc<[AtomicU64; SCHEDULES]>,
 }
 
 fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
@@ -190,7 +207,6 @@ fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
         while let Ok(x) = ch.sysex.try_recv() {
             sysex.push(Reverse(x));
         }
-        let generation = ch.generation.load(Ordering::Acquire);
         if let Some(rx) = rx.as_mut() {
             while let Ok(m) = rx.pop() {
                 seq += 1;
@@ -213,14 +229,15 @@ fn run(sinks: Sinks, clock: MidiClock, ch: Channels, stop: Arc<AtomicBool>) {
                     sink.send_event(now, &p.event);
                 }
             }
-            while let Some(Reverse((due, _, port, g, _))) = sysex.peek() {
+            while let Some(Reverse((due, _, port, schedule, g, _))) = sysex.peek() {
                 if *due > now + 200_000 {
                     break;
                 }
-                let (port, g) = (*port, *g);
+                let (port, schedule, g) = (*port, *schedule, *g);
                 let Some(Reverse((.., data))) = sysex.pop() else {
                     break;
                 };
+                let generation = ch.generation[schedule].load(Ordering::Acquire);
                 if g == generation
                     && let Some(sink) = s.get_mut(&port)
                 {
@@ -246,7 +263,7 @@ impl MidiOutputs {
         let sinks: Sinks = Arc::new(Mutex::new(HashMap::new()));
         let (queues, rx) = channel();
         let (sysex, sysex_rx) = channel();
-        let generation = Arc::new(AtomicU64::new(0));
+        let generation = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (sinks, stop) = (Arc::clone(&sinks), Arc::clone(&stop));
@@ -272,6 +289,7 @@ impl MidiOutputs {
             sysex,
             generation,
             sysex_seq: 0,
+            scheduled: [0; SCHEDULES],
             stop,
             thread,
         }
@@ -280,9 +298,27 @@ impl MidiOutputs {
     /// Send a SysEx message (`F0 … F7`) to output `port` at `due_ns` on the
     /// MIDI clock (now if it is past).
     pub fn send_sysex(&mut self, port: u16, due_ns: u64, data: Vec<u8>) {
+        self.send_timed(Schedule::Clips, port, due_ns, data);
+    }
+
+    /// Send any complete message (`bytes`) to output `port` at `due_ns`
+    /// on the MIDI clock (now if it is past), on `schedule`.
+    pub fn send_timed(&mut self, schedule: Schedule, port: u16, due_ns: u64, bytes: Vec<u8>) {
         self.sysex_seq += 1;
-        let g = self.generation.load(Ordering::Acquire);
-        let _ = self.sysex.send((due_ns, self.sysex_seq, port, g, data));
+        self.scheduled[schedule as usize] += 1;
+        let s = schedule as usize;
+        let g = self.generation[s].load(Ordering::Acquire);
+        let _ = self.sysex.send((due_ns, self.sysex_seq, port, s, g, bytes));
+    }
+
+    /// How many messages were handed to the sender on `schedule` so far.
+    pub fn scheduled(&self, schedule: Schedule) -> u64 {
+        self.scheduled[schedule as usize]
+    }
+
+    /// Drop every message `schedule` timed that is not sent yet.
+    pub fn cancel(&self, schedule: Schedule) {
+        self.generation[schedule as usize].fetch_add(1, Ordering::AcqRel);
     }
 
     /// Send a message to output `port` now, past the timed queue (full-
@@ -295,14 +331,21 @@ impl MidiOutputs {
         }
     }
 
+    /// Does `port` speak MIDI 2.0 (notes carry their own pitch there)?
+    pub fn is_ump(&self, port: u16) -> bool {
+        self.sinks
+            .lock()
+            .is_ok_and(|s| matches!(s.get(&port), Some(Sink::Ump(..) | Sink::UmpCapture(..))))
+    }
+
     /// How many SysEx messages were handed to the sender so far.
     pub fn sysex_scheduled(&self) -> u64 {
-        self.sysex_seq
+        self.scheduled(Schedule::Clips)
     }
 
     /// Drop every SysEx message scheduled so far that is not sent yet.
     pub fn cancel_sysex(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.cancel(Schedule::Clips);
     }
 
     pub fn clock(&self) -> MidiClock {
@@ -390,20 +433,15 @@ impl MidiOutputs {
             return false;
         }
         let lister = self.lister.as_ref();
-        let ump_clients: HashSet<u8> = self
-            .ump
-            .as_ref()
-            .map(|c| c.ump_clients().into_iter().collect())
-            .unwrap_or_default();
+        // MIDI 2.0 devices are written as such, not again as MIDI 1.0.
+        let claimed = self.ump.as_ref().map(|c| c.claimed()).unwrap_or_default();
         let mut listed = Vec::new();
         let ports = lister.map(midir::MidiOutput::ports).unwrap_or_default();
         for p in ports {
             let Some(Ok(full)) = lister.map(|l| l.port_name(&p)) else {
                 continue;
             };
-            if full.starts_with(CLIENT_NAME)
-                || ump_ports::sequencer_client(&full).is_some_and(|c| ump_clients.contains(&c))
-            {
+            if full.starts_with(CLIENT_NAME) || claimed.contains(&full) {
                 continue;
             }
             listed.push((full, p));

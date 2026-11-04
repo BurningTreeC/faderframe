@@ -7,21 +7,23 @@
 //! meter and key over the clip, and the clip's name, as flex data.
 //!
 //! Import reads MIDI 2.0 and MIDI 1.0 messages alike into one clip on a new
-//! instrument track: per-note controllers and pitch, and poly pressure
-//! while its note sounds, become note expression; controllers become lanes
-//! at MIDI 1.0's resolution; tempo, meter and key go to the project when it
-//! is imported at the start of an empty one.
+//! instrument track: notes keep their 16-bit velocities and attributes,
+//! controllers become lanes keeping their 32 bits ([`MidiNote::velocity16`],
+//! [`ControllerPoint::value32`]); per-note controllers and pitch, and poly
+//! pressure while its note sounds, become note expression; tempo, meter
+//! and key go to the project when it is imported at the start of an empty
+//! one.
 
 use crate::midi::{RecExpression, RecNote, native_expressions};
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_core::{ClipId, TrackId};
-use faderframe_midi::MidiEvent;
 use faderframe_midi::clipfile::ClipFile;
 use faderframe_midi::theory::{Key, Scale};
 use faderframe_midi::ump::{
-    Flex, Form, Message, Ump, Voice2, per_note_expression, per_note_message, scale_down, scale_up,
-    sysex7, text_of, text_pieces, unit_of,
+    Flex, Form, Message, Ump, Voice2, per_note_expression, per_note_message, sysex7, text_of,
+    text_pieces, unit_of,
 };
+use faderframe_midi::{Fine, MidiEvent};
 use faderframe_project::harmony::KeyChange;
 use faderframe_project::{
     Clip, ClipContent, Command, ControllerLane, ControllerPoint, ExpressionKind, MidiClip,
@@ -95,8 +97,9 @@ fn key_of_signature(sharps: i8, tonic: u8) -> Option<Key> {
     find(&LETTER_OF_PC_MINOR).map(|pc| Key::new(pc as u8, Scale::Minor))
 }
 
-/// Notes sounding: (channel, key) → (start, velocity), oldest first.
-type Open = HashMap<(u8, u8), Vec<(i64, u8)>>;
+/// Notes sounding: (channel, key) → (start, velocity, its MIDI 2.0
+/// resolution), oldest first.
+type Open = HashMap<(u8, u8), Vec<(i64, u8, Fine)>>;
 
 fn close(
     open: &mut Open,
@@ -104,12 +107,12 @@ fn close(
     channel: u8,
     key: u8,
     end: i64,
-    release: Option<u8>,
+    release: Option<(u8, Fine)>,
 ) {
     let Some(v) = open.get_mut(&(channel, key)).filter(|v| !v.is_empty()) else {
         return;
     };
-    let (start, velocity) = v.remove(0);
+    let (start, velocity, on) = v.remove(0);
     notes.push(RecNote {
         start,
         end: end.max(start + 1),
@@ -117,7 +120,9 @@ fn close(
         velocity,
         channel,
         pass: 0,
-        release,
+        release: release.map(|r| r.0),
+        on,
+        off: release.map_or(Fine::NONE, |r| r.1),
     });
 }
 
@@ -131,6 +136,7 @@ fn add_point(
     channel: u8,
     time: MusicalTime,
     value: u16,
+    fine: Option<u32>,
 ) {
     let i = match lanes
         .iter()
@@ -142,7 +148,7 @@ fn add_point(
             lanes.len() - 1
         }
     };
-    lanes[i].points.push(ControllerPoint { time, value });
+    lanes[i].points.push(ControllerPoint { time, value, fine });
 }
 
 /// What the import holds while it reads.
@@ -154,8 +160,9 @@ struct Reading {
 }
 
 impl Reading {
-    /// A MIDI 1.0 channel message at `pos` (`time` in the clip).
-    fn midi1(&mut self, ev: MidiEvent, pos: i64, time: MusicalTime) {
+    /// A channel message at `pos` (`time` in the clip) in its MIDI 1.0
+    /// form, with its MIDI 2.0 resolution.
+    fn midi1(&mut self, ev: MidiEvent, fine: Fine, pos: i64, time: MusicalTime) {
         match ev {
             MidiEvent::NoteOn {
                 channel,
@@ -165,7 +172,7 @@ impl Reading {
                 .open
                 .entry((channel, key))
                 .or_default()
-                .push((pos, velocity)),
+                .push((pos, velocity, fine)),
             MidiEvent::NoteOn { channel, key, .. } => {
                 close(&mut self.open, &mut self.notes, channel, key, pos, None)
             }
@@ -179,11 +186,11 @@ impl Reading {
                 channel,
                 key,
                 pos,
-                Some(velocity),
+                Some((velocity, fine)),
             ),
             ev => {
-                if let Some((c, ch, v)) = MidiController::of_event(ev) {
-                    add_point(&mut self.lanes, c, ch, time, v);
+                if let Some((c, ch, v, fine)) = MidiController::of_event_fine(ev, fine) {
+                    add_point(&mut self.lanes, c, ch, time, v, fine);
                 }
             }
         }
@@ -335,7 +342,7 @@ impl Session {
         let mut by_id = HashMap::new();
         for n in m.notes.iter().filter(|n| !n.muted && n.start < m.length) {
             by_id.insert(n.id, *n);
-            let attribute = faderframe_midi::ump::Attribute::default();
+            // At full resolution: 16-bit velocities, the note's attribute.
             events.push((
                 tick(n.start),
                 2,
@@ -343,8 +350,8 @@ impl Session {
                     n.channel,
                     Voice2::NoteOn {
                         note: n.key,
-                        velocity: scale_up(u32::from(n.velocity.clamp(1, 127)), 7, 16) as u16,
-                        attribute,
+                        velocity: n.velocity16(),
+                        attribute: n.attribute(),
                     },
                 ),
             ));
@@ -356,9 +363,8 @@ impl Session {
                     n.channel,
                     Voice2::NoteOff {
                         note: n.key,
-                        velocity: scale_up(u32::from(n.release.unwrap_or(0).min(127)), 7, 16)
-                            as u16,
-                        attribute,
+                        velocity: n.release16().unwrap_or(0),
+                        attribute: faderframe_midi::ump::Attribute::default(),
                     },
                 ),
             ));
@@ -400,16 +406,16 @@ impl Session {
             let ch = lane.channel;
             for pt in lane.points.iter().filter(|pt| pt.time < m.length) {
                 let v = u32::from(pt.value);
+                // At 32 bits.
+                let wide = pt.value32(lane.controller);
                 let voice = match lane.controller {
                     MidiController::Cc { number: 0 | 32 } => continue,
                     MidiController::Cc { number } => Voice2::ControlChange {
                         index: number,
-                        value: scale_up(v.min(127), 7, 32),
+                        value: wide,
                     },
-                    MidiController::PitchBend => Voice2::PitchBend(scale_up(v.min(0x3FFF), 14, 32)),
-                    MidiController::ChannelPressure => {
-                        Voice2::ChannelPressure(scale_up(v.min(127), 7, 32))
-                    }
+                    MidiController::PitchBend => Voice2::PitchBend(wide),
+                    MidiController::ChannelPressure => Voice2::ChannelPressure(wide),
                     MidiController::Program => Voice2::ProgramChange {
                         program: v.min(127) as u8,
                         bank: match (bank(ch, 0, pt.time), bank(ch, 32, pt.time)) {
@@ -419,7 +425,7 @@ impl Session {
                     },
                     MidiController::PolyPressure { key } => Voice2::PolyPressure {
                         note: key,
-                        value: scale_up(v.min(127), 7, 32),
+                        value: wide,
                     },
                 };
                 events.push((tick(pt.time), 1, midi2(ch, voice)));
@@ -471,17 +477,20 @@ impl Session {
             match Message::parse(&p) {
                 Message::Midi1 { bytes, .. } => {
                     if let Some(ev) = MidiEvent::from_bytes(&bytes[..channel_len(bytes[0])]) {
-                        r.midi1(ev, pos, time);
+                        r.midi1(ev, Fine::NONE, pos, time);
                     }
                 }
                 Message::Midi2 { channel, voice, .. } => match voice {
                     Voice2::NoteOn {
-                        note,
-                        velocity,
-                        attribute,
+                        note, attribute, ..
                     } => {
-                        let v = (scale_down(u32::from(velocity), 16, 7) as u8).max(1);
-                        r.open.entry((channel, note)).or_default().push((pos, v));
+                        // 16 bits and the attribute (pitch 7.9 as the
+                        // note's tuning, below).
+                        if let Some((b, n, fine)) = voice.to_midi1_fine(channel)
+                            && let Some(ev) = MidiEvent::from_bytes(&b[..n])
+                        {
+                            r.midi1(ev, fine, pos, time);
+                        }
                         if let Some(pitch) = attribute.pitch() {
                             expression.push((
                                 pos,
@@ -493,14 +502,17 @@ impl Session {
                             ));
                         }
                     }
-                    Voice2::NoteOff { note, velocity, .. } => close(
-                        &mut r.open,
-                        &mut r.notes,
-                        channel,
-                        note,
-                        pos,
-                        Some(scale_down(u32::from(velocity), 16, 7) as u8),
-                    ),
+                    Voice2::NoteOff { note, velocity, .. } => {
+                        let (v, fine) = Fine::of_velocity(velocity, false);
+                        close(
+                            &mut r.open,
+                            &mut r.notes,
+                            channel,
+                            note,
+                            pos,
+                            Some((v, fine)),
+                        )
+                    }
                     // Poly pressure while its note sounds: the note's.
                     Voice2::PolyPressure { note, value } if sounding(&r.open, channel, note) => {
                         expression.push((
@@ -523,11 +535,16 @@ impl Session {
                                 value as f32,
                                 0,
                             ));
+                        } else if let Some((b, n, fine)) = v.to_midi1_fine(channel) {
+                            // Controllers, pressure and bend at 32 bits.
+                            if let Some(ev) = MidiEvent::from_bytes(&b[..n]) {
+                                r.midi1(ev, fine, pos, time);
+                            }
                         } else {
                             let (msgs, n) = v.to_midi1(channel);
                             for b in &msgs[..n] {
                                 if let Some(ev) = MidiEvent::from_bytes(&b[..channel_len(b[0])]) {
-                                    r.midi1(ev, pos, time);
+                                    r.midi1(ev, Fine::NONE, pos, time);
                                 }
                             }
                         }
@@ -618,7 +635,7 @@ impl Session {
             .zip(&ids)
             .map(|(n, &id)| {
                 let start = musical(n.start as u64);
-                MidiNote {
+                let mut note = MidiNote {
                     id,
                     start,
                     length: (musical(n.end as u64) - start).max(MusicalTime(1)),
@@ -627,7 +644,12 @@ impl Session {
                     channel: n.channel,
                     muted: false,
                     release: n.release,
-                }
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
+                };
+                n.keep_fine(&mut note);
+                note
             })
             .collect();
         let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
@@ -693,6 +715,7 @@ impl Session {
                     controllers: lanes,
                     expressions,
                     sysex,
+                    articulations: Vec::new(),
                 }),
             }),
         });

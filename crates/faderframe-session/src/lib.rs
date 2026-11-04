@@ -15,6 +15,8 @@
 #![forbid(unsafe_code)]
 
 pub mod adr;
+pub mod ambix;
+pub mod ara;
 pub mod automation;
 pub mod media;
 mod meters;
@@ -38,10 +40,12 @@ mod aliases;
 pub mod align;
 pub mod analysis;
 pub mod audio_device;
+pub mod bisect;
 pub mod capture;
 pub mod cleanup;
 pub mod clip_fx;
 pub mod clipboard;
+pub mod codec;
 pub mod compare;
 pub mod conform;
 pub mod console;
@@ -61,12 +65,14 @@ mod freeze;
 pub mod groove;
 mod groups;
 pub mod hardware;
+pub mod headtrack;
 pub mod hits;
 pub mod iamf;
 pub mod lanes;
 pub mod launcher;
 pub mod leadsheet;
 pub mod listening;
+pub mod lyric_comp;
 mod merge;
 pub mod metronome;
 pub mod mix;
@@ -77,19 +83,26 @@ mod redraw;
 pub mod samples;
 pub mod sampling;
 mod sandbox;
+pub mod scenes;
 pub mod scratch;
+pub mod self_freeze;
 pub mod speech;
 pub mod to_midi;
 pub mod vinyl;
 pub use groups::GroupMenuEntry;
+pub mod instruments;
+pub mod maps;
 mod midi2file;
 mod midifile;
 pub mod presets;
+pub mod qc;
 pub mod record;
 pub mod references;
 pub mod render;
 pub mod ripple;
 mod selection;
+pub mod separate;
+pub mod show_gear;
 pub mod shuttle;
 pub mod slip;
 pub mod snapping;
@@ -99,6 +112,9 @@ mod take_audition;
 pub mod templates;
 mod time_lock;
 mod transients;
+pub mod tuning;
+pub mod undo_tree;
+pub mod version_merge;
 pub mod versions;
 pub mod video;
 pub mod voice;
@@ -109,6 +125,27 @@ pub use faderframe_engine::{
 pub use midi2file::is_midi2_clip_file;
 pub use midifile::is_midi_file;
 pub mod warping;
+
+pub mod aaf;
+pub mod adaptive;
+pub mod audio_capture;
+pub mod av_calibration;
+pub mod batch;
+pub mod browser;
+pub mod clip_envelope;
+pub mod collab;
+pub mod dawproject;
+pub mod device_states;
+pub mod musicxml;
+pub mod object_tracking;
+pub mod score;
+pub mod script;
+pub mod slicing;
+pub mod sphere;
+pub mod strip_silence;
+pub mod timing_align;
+pub mod web_remote;
+pub use dawproject::{InterchangeReport, is_dawproject_file};
 pub use editing::{
     ClipEdge, CounterUnit, EditFlag, EditMode, EditRange, EditTool, GridMode, NudgeTarget,
     NudgeValue, ZoomRequest, format_position, format_timecode_length, parse_position,
@@ -116,6 +153,7 @@ pub use editing::{
 pub use faderframe_workspace::{
     DEFAULT_INSERT_SLOTS, INSERT_SLOTS_RANGE, MeterMode, STRIP_WIDTH_RANGE, VU_REFERENCE, ViewPlace,
 };
+pub use musicxml::is_musicxml_file;
 pub use ripple::{RippleMenuEntry, RippleOp, RippleScope, RippleSettings, RippleShift};
 pub use snapping::{SnapHit, SnapObject, SnapSkip};
 pub use sync::{MANUAL_SPEED_RANGE, MtcRate, SyncSettings, SyncSource, SyncStatus, Timecode};
@@ -125,7 +163,9 @@ pub use selection::{SelectMode, Selection};
 
 pub use audio_device::{Applied, AudioDeviceStatus, AudioHealth, BackendFactory};
 pub use automation::{AutomationParam, ParamKind};
-use faderframe_audio::{AudioBackend, AudioError, AudioStream, StreamInfo, StreamStatus};
+use faderframe_audio::{
+    AudioBackend, AudioError, AudioStream, DeviceStatus, StreamInfo, StreamStatus,
+};
 use faderframe_audio_files::PeakCache;
 pub use faderframe_automation::{AutomationMode, AutomationTarget};
 use faderframe_core::{AudioSourceId, ClipId, NoteId, TrackId};
@@ -1224,6 +1264,244 @@ pub enum Action {
     Compare(compare::CompareOp),
     /// Reference tracks: the list, which is compared, EQ Match.
     Reference(references::ReferenceOp),
+    /// Go to any step of the undo history tree (undo to the common
+    /// ancestor, redo down its branch; the engine synced once).
+    HistoryToNode(u64),
+    /// Go to the newest step of a branch of the undo history (1: the first
+    /// line of steps).
+    HistoryBranch(u32),
+    /// Hear the project as it is in a step of the history (any branch)
+    /// beside the mix as it is (see [`compare`]).
+    AuditionNode(u64),
+    /// Audio Bisect: find the edit that made the mix worse (see
+    /// [`bisect`]).
+    Bisect(bisect::BisectOp),
+    /// The codec monitor (the master through a lossy codec at a streaming
+    /// platform's loudness) and platform previews ([`codec`]).
+    Codec(codec::CodecOp),
+    /// Mix scenes: store, recall, crossfade, morph, compare (see
+    /// [`scenes`]).
+    MixScene(scenes::SceneOp),
+    /// Write the QC report of the last delivery (a render, an album
+    /// export) checked against the spec with this id: a PDF at `path`
+    /// and the JSON beside it ([`qc`]).
+    SaveQcReport {
+        path: PathBuf,
+        spec: String,
+    },
+    /// Null-test the last stems render against the mix ([`qc`]).
+    NullTestStems,
+    /// Keep every track using this plugin (by plugin id) playing live,
+    /// never from a self-freeze cache — or let them be cached again (see
+    /// [`self_freeze`]).
+    KeepPluginLive {
+        plugin: String,
+        on: bool,
+    },
+    /// Stem separation (see [`separate`]): a clip's or a track's audio
+    /// split into `stems` on new tracks (`model`: `None` = the one chosen
+    /// in the settings; a model not yet here is downloaded first).
+    SeparateStems {
+        target: separate::StemTarget,
+        model: Option<String>,
+        stems: Vec<separate::Stem>,
+    },
+    /// Download a separation model (`None`: the one chosen).
+    DownloadSeparationModel(Option<String>),
+    /// Stop the separations running.
+    CancelSeparations,
+    /// Comping by lyric: hear a take folder's words, comp word by word,
+    /// use the suggested takes (see [`lyric_comp`]).
+    LyricComp(lyric_comp::LyricCompOp),
+    /// Articulation and drum maps: make, edit, use, import, save; notes'
+    /// articulations and the articulation lane (see [`maps`]).
+    Maps(maps::MapOp),
+    /// Open a clip with an ARA plug-in (`Some`: put on the clip's track
+    /// first and bound to ARA; `None`: the track's own ARA plug-in), and
+    /// show its editor on the clip (see [`ara`]).
+    OpenWithAra {
+        clip: ClipId,
+        plugin: Option<PluginRef>,
+    },
+    /// The notes the clip's ARA plug-in found, as a MIDI clip on a new
+    /// instrument track.
+    AraNotesToMidi(ClipId),
+    /// The listener's head on headphones: turned by hand, recentred,
+    /// head tracking set up (see [`headtrack`]).
+    Head(headtrack::HeadOp),
+    /// Import ambisonic files (AmbiX, or first-order FuMa converted), each
+    /// onto a new track of its order at `at` (see [`ambix`]).
+    ImportAmbisonic {
+        files: Vec<PathBuf>,
+        at: MusicalTime,
+        kind: ambix::AmbiFile,
+    },
+    /// Read a Scala scale (and keyboard mapping) into the project's tuning
+    /// (`track: None`) or a track's (see [`tuning`]).
+    LoadTuning {
+        track: Option<TrackId>,
+        scale: PathBuf,
+        mapping: Option<PathBuf>,
+    },
+    /// Play the tuning in use (the track's, else the project's) through
+    /// the keyboard mapping in this `.kbm` file (`None`: the standard
+    /// one).
+    LoadKeyboardMapping {
+        track: Option<TrackId>,
+        mapping: Option<PathBuf>,
+    },
+    /// Ask for a Scala file ([`UiRequest::ChooseTuning`]).
+    PromptTuning {
+        track: Option<TrackId>,
+        file: tuning::TuningFile,
+    },
+    /// Merge a version of the project into it (`base`: the version both
+    /// come from; `None`: found by where they come from) — one undo step,
+    /// conflicts listed (see [`version_merge`]).
+    MergeVersion {
+        theirs: PathBuf,
+        base: Option<PathBuf>,
+    },
+    /// Merge a project file from elsewhere (someone else's copy).
+    MergeProjectFile(PathBuf),
+    /// Ask for a project file to merge ([`UiRequest::MergeProjectFile`]).
+    PromptMergeProjectFile,
+    /// Another choice for a conflict of the last merge (by
+    /// [`faderframe_project::merge::Conflict::key`]).
+    ResolveMergeConflict {
+        key: String,
+        resolution: faderframe_project::merge::Resolution,
+    },
+    /// Hear the last merge with another choice for a conflict against the
+    /// project as merged (the A/B compare stage).
+    AuditionMergeConflict {
+        key: String,
+    },
+    /// Done with the last merge's conflicts (its step stays).
+    CloseMerge,
+    /// Read a DX7 SysEx file for an FM instrument: its voices become the
+    /// bank its editor lists (a single voice loads at once; see
+    /// [`instruments`]).
+    ImportDx7 {
+        plugin: faderframe_core::PluginInstanceId,
+        path: PathBuf,
+    },
+    /// Load voice `index` of an FM instrument's bank (one undo step).
+    LoadDx7Voice {
+        plugin: faderframe_core::PluginInstanceId,
+        index: usize,
+    },
+    /// How many samples a frame of a Wavetable's user table in `slot` (its
+    /// oscillator) has (0: as the file's `clm ` chunk says, else guessed);
+    /// one undo step.
+    SetWavetableCycle {
+        plugin: faderframe_core::PluginInstanceId,
+        slot: usize,
+        samples: u32,
+    },
+    /// Align the timing of `dubs` (audio clips) to the `guide` track's
+    /// audio over each: they become warped, in one step "Align Timing",
+    /// once the analysis is done (see [`timing_align`]). `tightness` 0
+    /// (phrases) … 1 (syllables); pitch and consonants as the editor's
+    /// [`EditorSettings::timing_align`] says.
+    AlignTiming {
+        guide: TrackId,
+        dubs: Vec<ClipId>,
+        tightness: f32,
+    },
+    /// The editor's alignment settings (not undoable).
+    SetTimingAlign(timing_align::TimingAlignSettings),
+    /// Slice audio — a span of an audio track, or a sampler's sample — at
+    /// its transients, on the grid, into equal parts or at the clips'
+    /// cuts, onto Drum Sampler pads or a Sampler's keys, with a MIDI clip
+    /// playing the slices in the original rhythm when `midi` (see
+    /// [`slicing`]).
+    Slice {
+        source: slicing::SliceSource,
+        by: slicing::SliceBy,
+        target: slicing::SliceTarget,
+        midi: bool,
+    },
+    /// A Sampler's slice points by hand (frames of its sample; empty:
+    /// none). One undo step.
+    SetSampleSlices {
+        plugin: faderframe_core::PluginInstanceId,
+        slices: Vec<u64>,
+    },
+    /// A MIDI clip at the playhead playing a sliced Sampler's slices as
+    /// recorded, one after another.
+    SlicesToMidi(faderframe_core::PluginInstanceId),
+    /// A device editor's header: A/B compare, level matching, the
+    /// device's own undo (see [`device_states`]).
+    Device(device_states::DeviceOp),
+    /// Show (and edit) a clip envelope lane on the arranger's audio clips
+    /// (`None`: hide them).
+    ShowClipEnvelope(Option<faderframe_project::clip_envelope::EnvelopeLane>),
+    /// Replace one lane of an audio clip's envelope (clip frames at the
+    /// project rate). Drags send it inside a gesture: one undo step.
+    SetClipEnvelope {
+        clip: ClipId,
+        lane: faderframe_project::clip_envelope::EnvelopeLane,
+        points: Vec<faderframe_project::clip_envelope::EnvelopePoint>,
+    },
+    /// Clear a lane (`None`: every lane) of the clips' envelopes.
+    ClearClipEnvelope {
+        clips: Vec<ClipId>,
+        lane: Option<faderframe_project::clip_envelope::EnvelopeLane>,
+    },
+    /// Strip Silence: open its dialog, change settings, apply, close.
+    StripSilence(strip_silence::StripSilenceOp),
+    /// Turn what the kept tracks played last into takes, recording or
+    /// not (see [`audio_capture`]).
+    CaptureAudio,
+    /// Write the project as a DAWproject file (in the background; see
+    /// [`dawproject`]).
+    ExportDawProject(PathBuf),
+    /// Read a DAWproject file as a new project (the shell asks about
+    /// unsaved changes first).
+    ImportDawProject(PathBuf),
+    /// Stop writing or reading a DAWproject file.
+    CancelDawProject,
+    /// Import a MusicXML score (`.musicxml`, `.xml`, `.mxl`) as new
+    /// instrument tracks at `at`, with its keys, chords and words (with
+    /// `tempo`: and its tempo and metre; see [`musicxml`]).
+    ImportMusicXml {
+        path: PathBuf,
+        at: MusicalTime,
+        tempo: bool,
+    },
+    /// Scripts and macros: run, the console, prompts' answers, the macro
+    /// recorder ([`script`]).
+    Script(script::ScriptOp),
+    /// Export the project as an AAF file (media embedded or linked; see
+    /// [`aaf`]).
+    ExportAaf {
+        path: PathBuf,
+        media: aaf::AafMedia,
+    },
+    /// Read an AAF file's composition into the project as new tracks.
+    ImportAaf(PathBuf),
+    /// Look for an AAF import's missing media in a folder (`None`: import
+    /// without them; they stay offline).
+    RelinkAaf(Option<PathBuf>),
+    /// Stop the AAF exports and imports under way.
+    CancelAaf,
+    /// The media browser: places, search and filters, previews, tags and
+    /// ratings, Find Similar, files placed with the project's tempo and
+    /// key (see [`browser`]).
+    Browser(browser::BrowserOp),
+    /// The phone/web remote: on/off, port, pairing codes, paired devices
+    /// (not undoable; see [`web_remote`]).
+    WebRemote(web_remote::RemoteOp),
+    /// The score editor: what it shows, note entry and score edits (see
+    /// [`score`]).
+    Score(score::ScoreOp),
+    /// Live collaboration: host, join, leave, chat, Listen Along (see
+    /// [`collab`]).
+    Collab(collab::CollabOp),
+    /// The interactive score (music for a game): its edits, its preview,
+    /// its export (see [`adaptive`]).
+    Adaptive(adaptive::AdaptiveOp),
 }
 
 /// Editing preferences shared by the arranger and the piano roll.
@@ -1278,6 +1556,11 @@ pub struct EditorSettings {
     /// Ripple editing: whether the other modes ripple too, on which tracks
     /// and what of the timeline moves along ([`ripple`]).
     pub ripple: ripple::RippleSettings,
+    /// How dubs are aligned to a guide (tightness, pitch, consonants).
+    pub timing_align: timing_align::TimingAlignSettings,
+    /// The clip envelope lane shown and edited on audio clips
+    /// ([`clip_envelope`]; `None`: hidden).
+    pub clip_envelope: Option<faderframe_project::clip_envelope::EnvelopeLane>,
 }
 
 impl Default for EditorSettings {
@@ -1311,6 +1594,8 @@ impl Default for EditorSettings {
             quantize: QuantizeSettings::default(),
             humanize: groove::HumanizeSettings::default(),
             ripple: ripple::RippleSettings::default(),
+            timing_align: timing_align::TimingAlignSettings::default(),
+            clip_envelope: None,
         }
     }
 }
@@ -1443,11 +1728,31 @@ struct ActiveRecording {
     tracks: Vec<TrackId>,
     /// Input + output latency compensation in frames.
     latency: i64,
+    /// Armed tracks whose inputs come later than the stream's (a device
+    /// following another's clock: its ring and resampler), by how much.
+    later: Vec<(TrackId, i64)>,
     /// The transport has reported recording at least once.
     seen: bool,
     /// Recording into a clip-launcher slot (one track) instead of the
     /// arrangement.
     slot: Option<launcher::SlotRecording>,
+}
+
+impl ActiveRecording {
+    /// The compensation for `track`'s take: the stream's (`latency`), and
+    /// what its inputs add (`later`).
+    fn latency_for(latency: i64, later: &[(TrackId, i64)], track: TrackId) -> i64 {
+        latency
+            + later
+                .iter()
+                .find(|(t, _)| *t == track)
+                .map_or(0, |(_, l)| *l)
+    }
+
+    /// The largest compensation of any take.
+    fn latest(&self) -> i64 {
+        self.latency + self.later.iter().map(|(_, l)| *l).max().unwrap_or(0).max(0)
+    }
 }
 
 /// What the arranger draws while recording.
@@ -1565,6 +1870,8 @@ pub struct Session {
     imports: Vec<ImportJob>,
     peak_jobs: Vec<media::PeakJob>,
     sample_jobs: Vec<samples::SampleJob>,
+    /// FM instruments' DX7 banks (`instruments`).
+    dx7_banks: std::collections::HashMap<faderframe_core::PluginInstanceId, instruments::Dx7Bank>,
     pub record: RecordSettings,
     recording: Option<ActiveRecording>,
     finishing: Vec<ActiveRecording>,
@@ -1611,11 +1918,16 @@ pub struct Session {
     /// Polyphonic pitch edits: detections and renders.
     poly: polypitch::PolyState,
     clip_analyses: detect::ClipAnalyses,
+    /// Strip Silence: settings, measured sources, the dialog's preview.
+    strip_silence: strip_silence::StripSilenceState,
     structure_jobs: structure::StructureJobs,
     auto_align: align::AlignState,
     /// Mix Intelligence: its analysis, results, cache and audition.
     mix: mix::MixState,
     show: setlist::ShowState,
+    /// Mix scenes: the one recalled last, a crossfade, morph or compare
+    /// under way and what it holds unrecorded.
+    scenes: scenes::SceneState,
     conversions: to_midi::Conversions,
     lead_sheets: leadsheet::LeadSheets,
     clip_fx: clip_fx::ClipFxState,
@@ -1630,8 +1942,12 @@ pub struct Session {
     rttime_checked: Option<std::time::Instant>,
     rttime_demotions: u64,
     speech: speech::SpeechState,
+    /// Stem separations, the model's download, their settings.
+    separation: separate::SeparationState,
     launcher: launcher::LauncherState,
     control: control::ControlState,
+    /// The listener's head: a tracker over OSC or set by hand.
+    head: headtrack::HeadState,
     /// The audio clip the pitch editor shows.
     pitch_clip: Option<ClipId>,
     /// Track renders for freezing and bouncing.
@@ -1694,6 +2010,51 @@ pub struct Session {
     voice: voice::VoiceState,
     /// A/B listening: the undo history auditioned, reference tracks.
     compare: compare::CompareState,
+    /// Audio Bisect (see [`bisect`]).
+    bisect: bisect::BisectState,
+    /// The codec monitor and platform previews.
+    codec: codec::CodecState,
+    /// Delivery QC: the last delivery, its report and null test.
+    qc: qc::QcState,
+    /// Tracks played from caches of their chains ([`self_freeze`]).
+    self_freeze: self_freeze::SelfFreezeState,
+    /// Comping by lyric: hearing jobs, the words' measurements.
+    lyric_comp: lyric_comp::LyricCompState,
+    /// What MIDI Tuning Standard told external devices ([`tuning`]).
+    tuning: tuning::TuningState,
+    /// Where the project comes from, the last merge of versions
+    /// ([`version_merge`]).
+    merging: version_merge::MergeState,
+    /// Timing alignments of dubs under way ([`timing_align`]).
+    timing_align: timing_align::TimingAlignState,
+    /// Slicings under way ([`slicing`]).
+    slicings: Vec<slicing::PendingSlice>,
+    /// Devices' A/B level matching and own undo ([`device_states`]).
+    device_states: device_states::DeviceStates,
+    /// The inputs kept for Capture Audio ([`audio_capture`]).
+    audio_capture: audio_capture::AudioCaptureState,
+    /// DAWproject files being written or read ([`dawproject`]).
+    interchange: dawproject::InterchangeState,
+    /// Scripts, their timers and prompts, the console, the macro recorder
+    /// ([`script`]).
+    scripts: script::ScriptState,
+    /// AAF exports and imports under way ([`aaf`]).
+    aaf: aaf::AafState,
+    /// The media browser ([`browser`]).
+    browser: browser::BrowserState,
+    /// The phone/web remote: its server, clients and gestures
+    /// ([`web_remote`]).
+    web_remote: web_remote::WebRemoteState,
+    /// The score editor's view of the project, cursor and settings
+    /// ([`score`]).
+    score: score::ScoreState,
+    /// A live session with others ([`collab`]).
+    collab: collab::CollabState,
+    /// The interactive score's preview and export ([`adaptive`]).
+    adaptive: adaptive::AdaptiveState,
+    /// The map editor: the map it shows, a drum sound learning its pitch
+    /// ([`maps::editor`]).
+    map_editor: maps::editor::MapEditorState,
 }
 
 /// Where a plugin chosen in the browser goes.
@@ -1775,6 +2136,32 @@ pub enum UiRequest {
     },
     /// Show the Auto-Align window ([`Session::auto_align`]).
     AutoAlign,
+    /// Ask for a mix scene's new name.
+    RenameMixScene(faderframe_core::MixSceneId),
+    /// Pick a `.syx` file whose messages a setlist song sends to its gear
+    /// (then [`setlist::SetlistOp::GearSysexFile`]).
+    ImportGearSysex { song: usize },
+    /// Pick a Scala scale or keyboard mapping for the project's tuning
+    /// (`track: None`) or a track's, then send [`Action::LoadTuning`] or
+    /// [`Action::LoadKeyboardMapping`].
+    ChooseTuning {
+        track: Option<TrackId>,
+        file: tuning::TuningFile,
+    },
+    /// Choose a project file to merge (then [`Action::MergeProjectFile`]).
+    MergeProjectFile,
+    /// Show the last merge's conflicts ([`Session::merge_status`]).
+    MergeConflicts,
+    /// Show the Strip Silence dialog ([`Session::strip_silence_preview`]).
+    StripSilence,
+    /// Ask a script's question (then [`script::ScriptOp::Answer`]).
+    ScriptPrompt(script::Prompt),
+    /// An AAF import's linked media were not found: ask for a folder to
+    /// look in (then [`Action::RelinkAaf`]).
+    RelinkAaf { file: PathBuf, missing: Vec<String> },
+    /// Ask for a tag to give these files in the media browser (then
+    /// [`browser::BrowserOp::Tag`]).
+    NewBrowserTag(Vec<PathBuf>),
 }
 
 /// What a picked colour is for.
@@ -1815,7 +2202,9 @@ fn removes_plugins(cmd: &Command) -> bool {
         Command::RemovePlugin { .. }
         | Command::RemoveTrack { .. }
         | Command::SetPreamp { .. }
-        | Command::SetInstrument { .. } => true,
+        | Command::SetInstrument { .. }
+        // An insert leaving ARA is made anew: its document's archive first.
+        | Command::SetAraSlot { on: false, .. } => true,
         Command::Batch { commands, .. } => commands.iter().any(removes_plugins),
         _ => false,
     }
@@ -1910,6 +2299,7 @@ impl Session {
             imports: Vec::new(),
             peak_jobs: Vec::new(),
             sample_jobs: Vec::new(),
+            dx7_banks: std::collections::HashMap::new(),
             record: RecordSettings::default(),
             recording: None,
             finishing: Vec::new(),
@@ -1936,10 +2326,12 @@ impl Session {
             pitch: pitch::PitchCache::default(),
             poly: polypitch::PolyState::default(),
             clip_analyses: detect::ClipAnalyses::default(),
+            strip_silence: strip_silence::StripSilenceState::default(),
             structure_jobs: structure::StructureJobs::default(),
             auto_align: align::AlignState::default(),
             mix: mix::MixState::default(),
             show: setlist::ShowState::default(),
+            scenes: scenes::SceneState::default(),
             conversions: to_midi::Conversions::default(),
             lead_sheets: leadsheet::LeadSheets::default(),
             clip_fx: clip_fx::ClipFxState::default(),
@@ -1950,8 +2342,10 @@ impl Session {
             rttime_checked: None,
             rttime_demotions: 0,
             speech: speech::SpeechState::default(),
+            separation: separate::SeparationState::default(),
             launcher: launcher::LauncherState::default(),
             control: control::ControlState::default(),
+            head: headtrack::HeadState::default(),
             pitch_clip: None,
             gesture_base: HashMap::new(),
             grouped_targets: None,
@@ -1984,6 +2378,26 @@ impl Session {
             midi,
             voice: voice::VoiceState::default(),
             compare: compare::CompareState::default(),
+            bisect: bisect::BisectState::default(),
+            codec: codec::CodecState::default(),
+            qc: Default::default(),
+            self_freeze: self_freeze::SelfFreezeState::default(),
+            lyric_comp: lyric_comp::LyricCompState::default(),
+            tuning: tuning::TuningState::default(),
+            merging: version_merge::MergeState::default(),
+            timing_align: timing_align::TimingAlignState::default(),
+            slicings: Vec::new(),
+            device_states: device_states::DeviceStates::default(),
+            audio_capture: Default::default(),
+            interchange: dawproject::InterchangeState::default(),
+            scripts: script::ScriptState::default(),
+            aaf: aaf::AafState::default(),
+            browser: browser::BrowserState::default(),
+            web_remote: web_remote::WebRemoteState::default(),
+            score: score::ScoreState::default(),
+            collab: collab::CollabState::default(),
+            adaptive: adaptive::AdaptiveState::default(),
+            map_editor: Default::default(),
         };
         s.rescan_track_presets();
         s.render_sources();
@@ -2209,7 +2623,8 @@ impl Session {
         const MAX_QUEUED: usize = 1024;
         let now = Instant::now();
         let rate = f64::from(self.engine.sample_rate().max(1));
-        let device = f64::from(self.engine.device_latency());
+        // (The codec monitor's delay too, while it is heard.)
+        let device = f64::from(self.engine.heard_latency());
         // The cue mixes' own channels are metered like tracks.
         let channels: Vec<TrackId> = self
             .project
@@ -2366,7 +2781,11 @@ impl Session {
     }
 
     pub fn is_dirty(&self) -> bool {
+        // Edits made in an ARA plug-in change its document, not the
+        // history.
         self.history.revision() != self.saved_revision
+            || self.engine.ara_unsaved()
+            || self.collab_unsaved()
     }
 
     pub fn title(&self) -> String {
@@ -2383,6 +2802,27 @@ impl Session {
 
     pub fn stream_status(&self) -> Option<StreamStatus> {
         self.audio.as_ref().map(|a| a.stream.status())
+    }
+
+    /// The devices the running stream joins (the clock master first, then
+    /// the devices following it, with their channels, latencies and drift);
+    /// empty when the stream is one device or its audio system keeps the
+    /// devices in step itself.
+    pub fn stream_devices(&self) -> Vec<DeviceStatus> {
+        self.audio
+            .as_ref()
+            .map(|a| a.stream.devices())
+            .unwrap_or_default()
+    }
+
+    /// The latency beyond the buffer of the stream's input `channel`
+    /// (frames): its device's — a device following another's clock comes
+    /// later than the master's — else the stream's (0 without a stream).
+    pub fn input_latency_of(&self, channel: u16) -> u32 {
+        let Some(info) = self.stream_info() else {
+            return 0;
+        };
+        faderframe_audio::channel_input_latency(&self.stream_devices(), &info, channel)
     }
 
     pub fn backend_name(&self) -> Option<&'static str> {
@@ -2424,6 +2864,8 @@ impl Session {
             || !self.peak_jobs.is_empty()
             || self.recording.is_some()
             || !self.finishing.is_empty()
+            || self.separating()
+            || self.separation_download().is_some()
     }
 
     /// The recording in progress, if any (record mode is on).
@@ -2507,6 +2949,7 @@ impl Session {
         self.engine.set_binaural(listen.binaural);
         self.engine.set_mono_check(self.mono_check)?;
         self.engine.set_bass_management(self.bass)?;
+        self.reapply_head();
         self.engine.set_low_latency_monitoring(low_latency);
         self.apply_talkback()?;
         self.apply_low_latency_limit();
@@ -2553,6 +2996,7 @@ impl Session {
         if rate == self.engine.sample_rate() {
             return Ok(());
         }
+        self.self_freeze_rate_changing();
         self.engine.set_sample_rate(rate);
         self.engine_config.sample_rate = rate;
         self.render_sources();
@@ -2760,6 +3204,7 @@ impl Session {
         &mut self,
         plugins: &std::collections::HashSet<faderframe_core::PluginInstanceId>,
     ) {
+        self.note_plugins_being_edited(plugins);
         if self.render_ahead.is_none() {
             return;
         }
@@ -2837,12 +3282,18 @@ impl Session {
     ) -> std::result::Result<render::RenderJob, render::RenderError> {
         // A Mix Intelligence candidate is never rendered.
         self.end_mix_audition();
+        // The console as a mix scene's work leaves it.
+        if let Err(e) = self.settle_scenes() {
+            tracing::warn!("mix scenes: {e}");
+        }
         if matches!(settings.channels, render::RenderChannels::Binaural(_))
             && settings.head.is_none()
         {
             settings.head = Some(self.head().clone());
         }
-        render::start(self.render_copy(), settings)
+        let copy = self.render_copy();
+        self.note_render(&copy, &settings);
+        render::start(copy, settings)
     }
 
     /// The project as a render needs it: plugin states captured (the render
@@ -2960,15 +3411,18 @@ impl Session {
             self.priority_failures = failures;
         }
         self.tick_rttime();
+        self.tick_collab();
         self.tick_metronome();
         self.poll_jobs();
         self.poll_bounces();
         self.poll_adm_imports();
         self.poll_samples();
+        self.poll_slicings();
         self.poll_video();
         self.poll_album();
         self.poll_ddp();
         self.poll_compare();
+        self.tick_codec();
         self.poll_analysis(dt);
         self.pump_idle();
         self.poll_recording();
@@ -3043,11 +3497,14 @@ impl Session {
             self.revision += 1;
         }
         self.care_for_plugins();
+        self.tick_ara();
         self.tick_programs();
         // Moves in plugins' own editors write automation like ours do.
         let edits = self.engine.take_plugin_edits();
         let edits = self.clip_fx_editor_edits(edits);
+        self.note_device_editor_edits(&edits);
         self.plugin_editor_edits(edits);
+        self.tick_device_states(dt);
         if was_playing && !self.transport.playing {
             // Stopped (by the user, the end of a bounce, a dropped stream):
             // Latch/Write automation ends here.
@@ -3099,15 +3556,21 @@ impl Session {
             self.last_metrics = Instant::now();
         }
         self.tick_performance();
+        self.tick_self_freeze();
         self.tick_midi();
         self.tick_voice();
+        self.tick_audio_capture();
         self.tick_mtc_out();
         // A manual varispeed waits for the stream.
         if self.manual_speed().is_some() && !self.engine.varispeed() {
             self.apply_manual_speed();
         }
         self.tick_control();
+        self.tick_head();
         self.tick_audio_device();
+        self.tick_scripts();
+        self.tick_browser();
+        self.tick_web_remote();
     }
 
     // --- project lifecycle ---------------------------------------------------
@@ -3247,13 +3710,22 @@ impl Session {
         self.poll_auto_align();
         self.poll_mix();
         self.tick_show();
+        self.tick_adaptive();
+        self.tick_scenes();
         self.poll_conversions();
         self.poll_lead_sheets();
         self.poll_clip_fx();
         self.poll_merges();
+        self.poll_qc();
         self.poll_spectral();
         self.poll_redraws();
         self.poll_speech();
+        self.poll_separations();
+        self.poll_lyric_comp();
+        self.poll_timing_alignment();
+        self.poll_strip_silence();
+        self.poll_dawproject();
+        self.poll_aaf();
         let mut i = 0;
         while i < self.peak_jobs.len() {
             if self.peak_jobs[i].is_finished() {
@@ -3350,11 +3822,21 @@ impl Session {
         plugin: faderframe_core::PluginInstanceId,
         doc: &faderframe_plugin_host::devices::samples::SampleDoc,
     ) -> Result<()> {
+        self.apply_samples_as(plugin, doc, "Load Samples")
+    }
+
+    /// [`Self::apply_samples`] as an undo step called `label`.
+    pub(crate) fn apply_samples_as(
+        &mut self,
+        plugin: faderframe_core::PluginInstanceId,
+        doc: &faderframe_plugin_host::devices::samples::SampleDoc,
+        label: &str,
+    ) -> Result<()> {
         let Some((track, owner)) = self.plugin_owner(plugin) else {
             return Ok(());
         };
-        let parameters = owner.parameters.clone();
-        let params = match self.plugin_tap(plugin) {
+        let mut parameters = owner.parameters.clone();
+        let mut params = match self.plugin_tap(plugin) {
             Some(tap) => tap.params.save(),
             None => owner
                 .state
@@ -3365,11 +3847,21 @@ impl Session {
                 })
                 .unwrap_or_default(),
         };
+        samples::plays_the_file(owner, doc, &mut params, &mut parameters);
+        // A Convolution Reverb's file is its impulse response (a caller's
+        // own label stays).
+        let label = if label == "Load Samples"
+            && owner.plugin.id == faderframe_core::builtin::CONVOLUTION_REVERB
+        {
+            "Load Impulse Response"
+        } else {
+            label
+        };
         let state = faderframe_engine::encode_state(
             &faderframe_plugin_host::devices::samples::pack(&params, doc),
         );
         self.edit(Command::Batch {
-            label: "Load Samples".into(),
+            label: label.into(),
             commands: vec![Command::SetPluginState {
                 track,
                 plugin,
@@ -3412,6 +3904,7 @@ impl Session {
 
     fn finish_import(&mut self, job: ImportJob) -> Result<()> {
         let target = job.target.clone();
+        let ambisonic = job.ambisonic;
         let results = job.join();
         let mut commands = Vec::new();
         let mut clips = Vec::new();
@@ -3435,6 +3928,27 @@ impl Session {
                     continue;
                 }
             };
+            // An ambisonic file: its own track of its order.
+            let field = match ambisonic {
+                Some(kind) => match faderframe_core::AmbiOrder::from_channels(audio.channels) {
+                    Some(o) => Some(o),
+                    None => {
+                        failures.push(format!(
+                            "{}: {} channels is no {} order (4, 9 or 16)",
+                            audio.original.display(),
+                            audio.channels,
+                            kind.label()
+                        ));
+                        let _ = std::fs::remove_file(&audio.path);
+                        let _ = std::fs::remove_file(&audio.peaks_path);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if field.is_some() {
+                reuse = None;
+            }
             let source = AudioSource {
                 id: p.ids.allocate(),
                 name: audio.name.clone(),
@@ -3450,10 +3964,10 @@ impl Session {
                 Some(t) => t,
                 None => {
                     let id: TrackId = p.ids.allocate();
-                    let layout = if audio.channels == 1 {
-                        faderframe_core::ChannelLayout::Mono
-                    } else {
-                        faderframe_core::ChannelLayout::Stereo
+                    let layout = match field {
+                        Some(o) => faderframe_core::ChannelLayout::Ambisonic(o),
+                        None if audio.channels == 1 => faderframe_core::ChannelLayout::Mono,
+                        None => faderframe_core::ChannelLayout::Stereo,
                     };
                     let t = Track::new(
                         id,
@@ -3490,6 +4004,7 @@ impl Session {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             };
             clips.push(clip.id);
@@ -3546,6 +4061,11 @@ impl Session {
         // A take still being recorded belongs to neither project.
         self.end_recordings_for_close();
         self.forget_video();
+        self.forget_scenes();
+        self.device_states_project_replaced();
+        self.scripts.scanned = None;
+        // A merge's choices belong to the project it was made in.
+        self.merging.pending = None;
         self.project = project;
         match workspace {
             Some(ws) => self.workspace = ws,
@@ -3574,6 +4094,9 @@ impl Session {
         self.engine.transport(TransportCommand::Stop)?;
         self.engine.transport(TransportCommand::Locate(0))?;
         self.reset_launcher()?;
+        self.self_freeze_project_replaced();
+        self.audio_capture_project_replaced();
+        self.map_editor_project_replaced();
         self.engine
             .sync(&self.project, &self.sources, Impact::Graph)?;
         self.update_loader();
@@ -3598,6 +4121,7 @@ impl Session {
         self.path = None;
         self.media_dir = media::new_unsaved_media_dir();
         self.unsaved_media = true;
+        self.merging.set_lineage(None);
         self.replace_project(project, None)
     }
 
@@ -3645,6 +4169,7 @@ impl Session {
         self.media_dir = dir.unwrap_or_default().join(MEDIA_FOLDER);
         self.unsaved_media = false;
         self.replace_project(project, loaded.workspace)?;
+        self.merging.set_lineage(loaded.extras.lineage);
         for n in notes.iter().chain(&adopted) {
             self.notify(NoticeLevel::Warning, n.clone());
         }
@@ -3655,6 +4180,8 @@ impl Session {
     pub fn save_as(&mut self, path: &Path) -> Result<()> {
         // A Mix Intelligence candidate is never saved.
         self.end_mix_audition();
+        // A mix scene's work is settled into an undo step first.
+        self.settle_scenes()?;
         let mut path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         if path.extension().is_none() {
             path.set_extension(file::FILE_EXTENSION);
@@ -3664,14 +4191,20 @@ impl Session {
         // Redrawn audio in the clips first (its files are in the media
         // folder that may move).
         self.wait_for_redraws();
+        // Self-freeze caches go along (out of a scratch folder before it
+        // is removed).
+        self.move_self_freeze_cache(&dir);
         if self.unsaved_media {
             self.consolidate_media(&project_media);
         }
         self.capture_plugin_states();
         // The project is named after its file (the window's title shows
         // it), unless it was given a name of its own.
+        // (Not while shared live: the name is everyone's, changed only by
+        // an edit.)
         if let Some(name) = file_name(&path)
             && self.named_after_its_file()
+            && !self.collaborating()
         {
             self.project.name = name;
             self.revision += 1;
@@ -3686,11 +4219,15 @@ impl Session {
         for v in stored.video.sources.values_mut() {
             v.path = media::to_stored(&v.path, Some(&dir));
         }
-        file::save(&path, &stored, Some(&self.workspace_to_save()))?;
+        // Stamped as a state of the project's line (see `version_merge`).
+        let extras = self.stamp_for_save(&dir);
+        file::save_with(&path, &stored, Some(&self.workspace_to_save()), &extras)?;
         self.media_dir = project_media;
         self.unsaved_media = false;
         self.path = Some(path.clone());
+        self.note_saved_state(&path, &extras);
         self.saved_revision = self.history.revision();
+        self.collab_saved();
         self.notify(NoticeLevel::Info, format!("saved {}", path.display()));
         Ok(())
     }
@@ -3786,6 +4323,9 @@ impl Session {
         if impact >= Impact::Params {
             self.remap_sample_paths();
         }
+        // A cached track whose chain would now make something else plays
+        // its chain again in this very sync.
+        impact = self.self_freeze_before_sync(impact);
         // The monitored album song is gone (removed, undone): stop hearing
         // its inserts.
         if self
@@ -3820,6 +4360,9 @@ impl Session {
         self.selection.clips.retain(|c| live.clip(*c).is_some());
         self.open_takes
             .retain(|c| live.clip(*c).is_some_and(|c| c.as_takes().is_some()));
+        // Devices shown in editor windows: a change is a step of their own
+        // history.
+        self.follow_device_histories();
         Ok(())
     }
 
@@ -3829,6 +4372,9 @@ impl Session {
         if self.mix.auditioning() {
             self.end_mix_audition();
         }
+        // Nor a mix scene's work under way (unless the edit leaves the
+        // console alone).
+        self.scenes_before_edit(&cmd);
         // A clip effect in an editor window of its own: an edit of its
         // chain, whatever the window sent.
         if let Some(edits) = self.clip_fx_commands(&cmd) {
@@ -3895,11 +4441,18 @@ impl Session {
     }
 
     pub fn dispatch(&mut self, action: Action) -> Result<()> {
+        // The macro recorder hears what the user does (once, outermost).
+        if self.macro_hears(&action) {
+            return self.dispatch_heard(action);
+        }
         // A Mix Intelligence audition ends before anything that edits the
         // project (edits of its own candidate stay in it).
         let Some(action) = self.mix_before(action)? else {
             return Ok(());
         };
+        // A mix scene's crossfade, morph or compare ends before anything
+        // that edits the project.
+        self.scenes_before(&action)?;
         // Edits of clips in a folder group reach the clips at the same
         // place on the group's other tracks.
         let action = self.grouped_action(action);
@@ -4276,6 +4829,7 @@ impl Session {
             Action::Cue(op) => self.cue_op(op)?,
             Action::Talkback(op) => self.talk(op)?,
             Action::Show(op) => self.show_op(op)?,
+            Action::Maps(op) => self.map_op(op)?,
             Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
             Action::MakeTab { of } => self.make_tab(of)?,
@@ -4296,6 +4850,7 @@ impl Session {
             Action::AnswerReplace { question, replace } => {
                 self.answer_replace(question, replace)?;
             }
+            a @ (Action::SaveQcReport { .. } | Action::NullTestStems) => self.qc_action(a)?,
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
             Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
             Action::OpenClipEffectEditor {
@@ -4306,6 +4861,10 @@ impl Session {
             Action::ImportAdm(path) => self.start_adm_import(path),
             Action::SetMonoCheck(on) => self.set_mono_check(on)?,
             Action::SetBassManagement(b) => self.set_bass_management(b)?,
+            Action::Head(op) => self.head_op(op)?,
+            Action::ImportAmbisonic { files, at, kind } => {
+                self.import_ambisonic(files, ImportTarget { track: None, at }, kind);
+            }
             Action::SetLowLatencyMonitoring(on) => self.set_low_latency_monitoring(on)?,
             Action::SetLowLatencyLimit(ms) => self.set_low_latency_limit(ms)?,
             Action::SaveSpeakerLayout { replace, layout } => {
@@ -4486,6 +5045,7 @@ impl Session {
                         controllers: Vec::new(),
                         expressions: Vec::new(),
                         sysex: Vec::new(),
+                        articulations: Vec::new(),
                     }),
                 };
                 self.edit(Command::AddClip {
@@ -4511,6 +5071,9 @@ impl Session {
                     channel: 0,
                     muted: false,
                     release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
                 };
                 self.edit(Command::AddNote { clip, note })?;
                 self.selection.select_notes(&[id], SelectMode::Replace);
@@ -4784,10 +5347,18 @@ impl Session {
                 self.import_midi_file(&path, at, tempo)?;
             }
             Action::ImportFiles { files, track, at } => {
-                // MIDI files become instrument tracks; the rest is audio.
+                // MIDI files and scores become instrument tracks; the rest
+                // is audio.
                 let (midi, audio): (Vec<PathBuf>, Vec<PathBuf>) =
                     files.into_iter().partition(|f| is_midi_file(f));
+                let (scores, audio): (Vec<PathBuf>, Vec<PathBuf>) =
+                    audio.into_iter().partition(|f| is_musicxml_file(f));
                 let empty = self.project.clips.is_empty();
+                for f in scores {
+                    if let Err(e) = self.import_musicxml(&f, at, empty && at == MusicalTime::ZERO) {
+                        self.notify(NoticeLevel::Error, e.to_string());
+                    }
+                }
                 for f in midi {
                     if let Err(e) = self.import_midi_file(&f, at, empty && at == MusicalTime::ZERO)
                     {
@@ -4986,6 +5557,103 @@ impl Session {
             Action::AuditionHistory(done) => self.audition_history(done)?,
             Action::Compare(op) => self.compare_op(op)?,
             Action::Reference(op) => self.reference_op(op)?,
+            Action::HistoryToNode(id) => self.history_to_node(id)?,
+            Action::HistoryBranch(n) => self.history_branch(n)?,
+            Action::AuditionNode(id) => self.audition_node(id)?,
+            Action::Bisect(op) => self.bisect_op(op)?,
+            Action::Codec(op) => self.codec_op(op)?,
+            Action::MixScene(op) => self.scene_op(op)?,
+            Action::KeepPluginLive { plugin, on } => self.keep_plugin_live(plugin, on),
+            Action::SeparateStems {
+                target,
+                model,
+                stems,
+            } => self.separate_stems(target, model, stems)?,
+            Action::DownloadSeparationModel(model) => {
+                self.download_separation_model(model.as_deref())?;
+            }
+            Action::CancelSeparations => self.cancel_separations(),
+            Action::LyricComp(op) => self.lyric_comp_op(op)?,
+            Action::OpenWithAra { clip, plugin } => self.open_with_ara(clip, plugin)?,
+            Action::AraNotesToMidi(clip) => {
+                self.ara_notes_to_midi(clip)?;
+            }
+            Action::LoadTuning {
+                track,
+                scale,
+                mapping,
+            } => self.load_tuning_files(track, &scale, mapping.as_deref())?,
+            Action::LoadKeyboardMapping { track, mapping } => {
+                self.load_keyboard_mapping(track, mapping.as_deref())?;
+            }
+            Action::PromptTuning { track, file } => self.prompt_tuning(track, file),
+            Action::MergeVersion { theirs, base } => {
+                self.merge_version(&theirs, base.as_deref())?;
+            }
+            Action::MergeProjectFile(path) => self.merge_project_file(&path)?,
+            Action::PromptMergeProjectFile => {
+                self.ui_requests.push(UiRequest::MergeProjectFile);
+            }
+            Action::ResolveMergeConflict { key, resolution } => {
+                self.resolve_merge_conflict(&key, resolution)?;
+            }
+            Action::AuditionMergeConflict { key } => self.audition_merge_conflict(&key)?,
+            Action::CloseMerge => self.close_merge(),
+            Action::ImportDx7 { plugin, path } => self.import_dx7(plugin, &path)?,
+            Action::LoadDx7Voice { plugin, index } => self.load_dx7_voice(plugin, index)?,
+            Action::SetWavetableCycle {
+                plugin,
+                slot,
+                samples,
+            } => self.set_wavetable_cycle(plugin, slot, samples)?,
+            Action::AlignTiming {
+                guide,
+                dubs,
+                tightness,
+            } => self.align_timing(guide, &dubs, tightness)?,
+            Action::SetTimingAlign(settings) => {
+                self.editor.timing_align = settings;
+                self.revision += 1;
+            }
+            Action::Slice {
+                source,
+                by,
+                target,
+                midi,
+            } => self.start_slice(source, by, target, midi)?,
+            Action::SetSampleSlices { plugin, slices } => {
+                self.set_sample_slices(plugin, slices)?;
+            }
+            Action::SlicesToMidi(plugin) => self.slices_to_midi(plugin)?,
+            Action::Device(op) => self.device_op(op)?,
+            Action::ShowClipEnvelope(lane) => {
+                self.editor.clip_envelope = lane;
+                self.revision += 1;
+            }
+            Action::SetClipEnvelope { clip, lane, points } => {
+                self.set_clip_envelope_lane(clip, lane, points)?;
+            }
+            Action::ClearClipEnvelope { clips, lane } => {
+                self.clear_clip_envelopes(&clips, lane)?;
+            }
+            Action::StripSilence(op) => self.strip_silence(op)?,
+            Action::CaptureAudio => self.capture_audio()?,
+            Action::ExportDawProject(path) => self.export_dawproject(&path)?,
+            Action::ImportDawProject(path) => self.import_dawproject(&path)?,
+            Action::CancelDawProject => self.cancel_dawproject(),
+            Action::ImportMusicXml { path, at, tempo } => {
+                self.import_musicxml(&path, at, tempo)?;
+            }
+            Action::Script(op) => self.script_op(op)?,
+            Action::ExportAaf { path, media } => self.export_aaf(path, media)?,
+            Action::ImportAaf(path) => self.import_aaf(path),
+            Action::RelinkAaf(folder) => self.relink_aaf(folder)?,
+            Action::CancelAaf => self.cancel_aaf(),
+            Action::Browser(op) => self.browser_op(op)?,
+            Action::WebRemote(op) => self.web_remote_op(op)?,
+            Action::Score(op) => self.score_op(op)?,
+            Action::Collab(op) => self.collab_op(op)?,
+            Action::Adaptive(op) => self.adaptive_op(op)?,
         }
         Ok(())
     }
@@ -5780,6 +6448,7 @@ impl Session {
         for id in slots {
             self.capture_plugin_state(id);
         }
+        self.capture_ara_archives();
     }
 
     /// Take one plugin's current state (and the values its own editor set)
@@ -5922,8 +6591,10 @@ impl Session {
     }
 
     /// The channel formats a track can have (audio tracks, buses, auxes and
-    /// the master): mono, stereo and each surround bed. Tracks feeding a
-    /// bed are panned into it, a bed feeding a smaller format is folded.
+    /// the master): mono, stereo, each surround bed and the ambisonic
+    /// orders. Tracks feeding a bed are panned into it, a bed feeding a
+    /// smaller format is folded; tracks feeding a field are encoded into
+    /// it, a field feeding speakers is decoded.
     pub fn format_choices(&self, track: TrackId) -> Vec<InputChoice> {
         use faderframe_core::{ChannelLayout, SurroundFormat};
         let Some(t) = self.project.track(track) else {
@@ -5971,6 +6642,19 @@ impl Session {
             push(
                 format!("{} ({} channels)", f.name(), f.channels()),
                 ChannelLayout::Surround(f),
+                i == 0,
+            );
+        }
+        // Ambisonic fields (AmbiX), first to third order.
+        for (i, o) in faderframe_core::AmbiOrder::ALL.into_iter().enumerate() {
+            push(
+                format!(
+                    "AmbiX{} ({}, {} channels)",
+                    o.order(),
+                    o.name(),
+                    o.channels()
+                ),
+                ChannelLayout::Ambisonic(o),
                 i == 0,
             );
         }

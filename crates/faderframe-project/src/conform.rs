@@ -231,6 +231,7 @@ mod tests {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         };
         t.clips.push(id);
@@ -260,6 +261,7 @@ mod tests {
                 id: p.ids.allocate(),
                 position: at(s),
                 name: format!("m{n}"),
+                time_base: Default::default(),
             });
         }
         p.clips.insert(id, clip);

@@ -11,29 +11,36 @@
 //! samples. The streams live on a control thread that owns them, so the
 //! returned stream is `Send` on every platform.
 //!
-//! Capture comes from the device asked for, else from the output device
+//! Capture comes from the devices asked for, else from the output device
 //! itself where it records (one clock), else from the system's default
-//! input. Two devices run on two clocks and nothing here resamples between
-//! them: the ring then slowly fills or empties, and each overflow or gap
-//! is counted as an xrun (an aggregate device made by the system — macOS
-//! Audio MIDI Setup — or one interface for both directions avoids it).
-//! Latencies come from cpal's callback timestamps.
+//! input. Several devices join into one stream (`faderframe_audio::follow`):
+//! the first output device is the clock master — its playback callback
+//! drives the engine, its own capture comes through the plain ring above —
+//! and every other device (more outputs, inputs other than the master
+//! itself) follows it: a stream of its own on its own thread, its frames
+//! carried through a ring and a resampler steered by a drift loop, at its
+//! own rate where it does not run at the master's ([`followers`]). A
+//! follower that fails or is unplugged only silences its channels; the
+//! control thread opens it again when it is back. Latencies come from
+//! cpal's callback timestamps.
 //!
 //! No cpal type escapes this crate: the engine only sees
 //! [`faderframe_audio::DeviceBuffers`].
 
 #![forbid(unsafe_code)]
 
+mod followers;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, SupportedBufferSize};
+use faderframe_audio::follow::{Direction, FollowerSpec, Followers, Place};
 use faderframe_audio::{
     AudioBackend, AudioCallback, AudioError, AudioStream, Capabilities, DeviceBuffers, DeviceInfo,
-    MAX_BUFFER_SIZE, RateControl, STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo, StreamMonitor,
-    StreamRouting, StreamStatus,
+    DeviceStatus, MAX_BUFFER_SIZE, RateControl, STANDARD_SAMPLE_RATES, StreamConfig, StreamInfo,
+    StreamMonitor, StreamRouting, StreamStatus,
 };
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -236,10 +243,12 @@ impl AudioBackend for CpalBackend {
             rate: RateControl::Device,
             live_buffer_size: false,
             live_sample_rate: false,
-            output_devices: 1,
-            // An ASIO driver records from itself.
-            input_devices: usize::from(!self.api.duplex()),
+            // More devices follow the first output's clock; an ASIO driver
+            // is one device (and records from itself).
+            output_devices: if self.api.duplex() { 1 } else { 4 },
+            input_devices: if self.api.duplex() { 0 } else { 4 },
             clocked_by_server: false,
+            resamples_followers: !self.api.duplex(),
             follows_devices: false,
             free_channel_counts: false,
             force_format: false,
@@ -303,10 +312,31 @@ impl AudioBackend for CpalBackend {
         let thread = std::thread::Builder::new()
             .name("audio-control".into())
             .spawn(move || match open(api, &config, callback) {
-                Ok((streams, info, monitor, workgroup, routing)) => {
-                    let _ = ready_tx.send(Ok((info, monitor, workgroup, routing)));
-                    // Keep the streams until asked to stop.
-                    let _ = stop_rx.recv();
+                Ok(opened) => {
+                    let Opened {
+                        streams,
+                        info,
+                        monitor,
+                        workgroup,
+                        routing,
+                        joining,
+                        watcher,
+                    } = opened;
+                    let _ = ready_tx.send(Ok((info, monitor, workgroup, routing, joining)));
+                    // Keep the streams until asked to stop; meanwhile bring
+                    // followers that went away back.
+                    match watcher {
+                        Some(mut w) => {
+                            while let Err(mpsc::RecvTimeoutError::Timeout) =
+                                stop_rx.recv_timeout(Duration::from_millis(250))
+                            {
+                                w.tick();
+                            }
+                        }
+                        None => {
+                            let _ = stop_rx.recv();
+                        }
+                    }
                     drop(streams);
                 }
                 Err(e) => {
@@ -314,7 +344,7 @@ impl AudioBackend for CpalBackend {
                 }
             })
             .map_err(stream_err)?;
-        let (info, monitor, workgroup, routing) =
+        let (info, monitor, workgroup, routing, joining) =
             match ready_rx.recv_timeout(Duration::from_secs(10)) {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
@@ -331,19 +361,36 @@ impl AudioBackend for CpalBackend {
             monitor,
             workgroup,
             routing,
+            joining,
         }))
     }
 }
 
-/// What `open` returns: the streams to keep, their description, the
-/// stream monitor, the device's audio workgroup and the devices used.
-type Opened = (
-    Vec<cpal::Stream>,
-    StreamInfo,
-    Arc<StreamMonitor>,
-    Option<faderframe_realtime::Workgroup>,
-    StreamRouting,
-);
+/// What `open` returns: the streams to keep (the master's; followers' are
+/// in the watcher), their description, the stream monitor, the device's
+/// audio workgroup, the devices used, and with followers what the stream
+/// handle and the control thread keep of them.
+struct Opened {
+    streams: Vec<cpal::Stream>,
+    info: StreamInfo,
+    monitor: Arc<StreamMonitor>,
+    workgroup: Option<faderframe_realtime::Workgroup>,
+    routing: StreamRouting,
+    joining: Option<Joining>,
+    watcher: Option<followers::Watcher>,
+}
+
+/// A stream's followers as its handle sees them.
+struct Joining {
+    followers: Arc<Mutex<Followers>>,
+    /// Per follower: not there now.
+    away: Vec<Arc<AtomicBool>>,
+    inputs: Vec<Place>,
+    outputs: Vec<Place>,
+    /// The master device (id, name; its channels and latencies are filled
+    /// in when asked).
+    master: (String, String),
+}
 
 /// A device by id (or name) among `devices`.
 fn find(mut devices: impl Iterator<Item = cpal::Device>, wanted: &str) -> Option<cpal::Device> {
@@ -354,7 +401,8 @@ fn find(mut devices: impl Iterator<Item = cpal::Device>, wanted: &str) -> Option
         .cloned()
 }
 
-/// Open playback (and capture) on the calling thread.
+/// Open playback (and capture) on the calling thread, and the devices
+/// that follow it.
 fn open(
     api: Api,
     config: &StreamConfig,
@@ -368,14 +416,52 @@ fn open(
             .default_output_device()
             .ok_or_else(|| AudioError::DeviceNotFound("no default output device".into()))?,
     };
+    let master_id = device_id(&device);
+    // Devices that follow the master's clock: further output devices, and
+    // capture from any device but the master itself (an ASIO driver is one
+    // duplex device).
+    let mut more_outputs: Vec<cpal::Device> = Vec::new();
+    if !api.duplex() {
+        for id in config.output_devices.iter().skip(1) {
+            let d = find(host.output_devices().map_err(stream_err)?, id)
+                .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
+            let did = device_id(&d);
+            if did != master_id && !more_outputs.iter().any(|o| device_id(o) == did) {
+                more_outputs.push(d);
+            }
+        }
+    }
+    let mut inputs: Vec<cpal::Device> = Vec::new();
+    if api.duplex() {
+        inputs.push(device.clone());
+    } else if !config.input_devices.is_empty() {
+        for id in &config.input_devices {
+            let d = find(host.input_devices().map_err(stream_err)?, id)
+                .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?;
+            let did = device_id(&d);
+            if !inputs.iter().any(|i| device_id(i) == did) {
+                inputs.push(d);
+            }
+        }
+    } else if device.supports_input() {
+        inputs.push(device.clone());
+    } else if let Some(d) = host.default_input_device() {
+        inputs.push(d);
+    }
+    let joined = !more_outputs.is_empty() || inputs.iter().any(|d| device_id(d) != master_id);
     let default = device.default_output_config().map_err(stream_err)?;
     let wanted_rate = config.sample_rate.unwrap_or(default.sample_rate());
     let ranges: Vec<_> = device
         .supported_output_configs()
         .map_err(stream_err)?
         .collect();
-    // As many channels as the stream wants where the device has them.
-    let wanted_outputs = config.output_channels.max(default.channels());
+    // As many channels as the stream wants where the device has them;
+    // joined, all it has (the followers' come after them).
+    let wanted_outputs = if joined {
+        ranges.iter().map(|c| c.channels()).max().unwrap_or(2)
+    } else {
+        config.output_channels.max(default.channels())
+    };
     let range = pick_config(&ranges, wanted_rate, wanted_outputs).ok_or_else(|| {
         AudioError::UnsupportedConfig(format!(
             "{} cannot run at {wanted_rate} Hz in a supported sample format",
@@ -403,29 +489,16 @@ fn open(
     };
     let monitor = StreamMonitor::new(wanted_rate, nominal);
 
-    // Capture: the device asked for; else the output device itself where
-    // it records (one clock, no drift); else the system's default input
-    // (a clock of its own: see `Rt::run`). An ASIO driver is one duplex
-    // device.
+    // Capture from the master device itself: one clock, through the plain
+    // ring (see `Rt::run`).
     let mut streams = Vec::new();
     let mut input_channels = 0u16;
     let mut input_rx = None;
-    let input = if api.duplex() {
-        Some(device.clone())
-    } else if let Some(id) = config.input_devices.first() {
-        Some(
-            find(host.input_devices().map_err(stream_err)?, id)
-                .ok_or_else(|| AudioError::DeviceNotFound(id.clone()))?,
-        )
-    } else if device.supports_input() {
-        Some(device.clone())
-    } else {
-        host.default_input_device()
-    };
+    let own = inputs.iter().find(|d| device_id(d) == master_id).cloned();
     let hw_input_latency = Arc::new(AtomicU32::new(0));
     let mut input_name = None;
     if config.input_channels > 0
-        && let Some(input) = input
+        && let Some(input) = own
         && let Ok(in_default) = input.default_input_config()
     {
         let in_ranges: Vec<_> = input
@@ -433,11 +506,15 @@ fn open(
             .into_iter()
             .flatten()
             .collect();
-        let (in_channels, in_format) =
-            match pick_config(&in_ranges, wanted_rate, config.input_channels) {
-                Some(c) => (c.channels(), c.sample_format()),
-                None => (in_default.channels(), in_default.sample_format()),
-            };
+        let wanted_in = if joined {
+            in_ranges.iter().map(|c| c.channels()).max().unwrap_or(2)
+        } else {
+            config.input_channels
+        };
+        let (in_channels, in_format) = match pick_config(&in_ranges, wanted_rate, wanted_in) {
+            Some(c) => (c.channels(), c.sample_format()),
+            None => (in_default.channels(), in_default.sample_format()),
+        };
         let in_config = cpal::StreamConfig {
             channels: in_channels,
             sample_rate: wanted_rate,
@@ -465,36 +542,173 @@ fn open(
     }
 
     let output_name = device_name(&device);
+    // The stream's channels: the master's outputs, then the other output
+    // devices'; inputs in the order asked for.
+    let mut out_places: Vec<Place> = (0..channels).map(Place::Master).collect();
+    let mut in_places: Vec<Place> = Vec::new();
+    let mut specs: Vec<FollowerSpec> = Vec::new();
+    let mut follower_devices: Vec<(cpal::Device, followers::Opening)> = Vec::new();
+    let mut add_follower =
+        |d: &cpal::Device, direction: Direction, places: &mut Vec<Place>| match followers::opening(
+            d,
+            direction,
+            wanted_rate,
+            nominal,
+            wanted_rate,
+        ) {
+            Ok(open) => {
+                let k = specs.len() as u16;
+                places.extend((0..open.channels).map(|channel| Place::Follower {
+                    follower: k,
+                    channel,
+                }));
+                specs.push(FollowerSpec {
+                    device: device_id(d),
+                    name: device_name(d),
+                    direction,
+                    channels: open.channels,
+                    sample_rate: open.sample_rate,
+                    block: open.block,
+                });
+                follower_devices.push((d.clone(), open));
+            }
+            Err(e) => tracing::warn!("{}: left out ({e})", device_name(d)),
+        };
+    for d in &more_outputs {
+        add_follower(d, Direction::Output, &mut out_places);
+    }
+    for d in &inputs {
+        if device_id(d) == master_id {
+            in_places.extend((0..input_channels).map(Place::Master));
+        } else {
+            add_follower(d, Direction::Input, &mut in_places);
+        }
+    }
+    let names: Vec<String> = std::iter::once(output_name.clone())
+        .chain(specs.iter().map(|s| s.name.clone()))
+        .chain(input_name.clone())
+        .fold(Vec::new(), |mut v, n| {
+            if !v.contains(&n) {
+                v.push(n);
+            }
+            v
+        });
     let info = StreamInfo {
         backend: if api.duplex() { "asio" } else { "system" },
-        device: match &input_name {
-            Some(i) if *i != output_name => format!("{output_name} + {i}"),
-            _ => output_name.clone(),
-        },
+        device: names.join(" + "),
         sample_rate: wanted_rate,
         buffer_size: nominal,
-        input_channels,
-        output_channels: channels,
+        input_channels: if specs.is_empty() {
+            input_channels
+        } else {
+            in_places.len() as u16
+        },
+        output_channels: if specs.is_empty() {
+            channels
+        } else {
+            out_places.len() as u16
+        },
         input_latency: 0,
         output_latency: 0,
     };
-    let routing = StreamRouting {
-        outputs: (1..=channels)
-            .map(|c| Some(format!("{output_name} · {c}")))
-            .collect(),
-        inputs: (1..=input_channels)
-            .map(|c| input_name.as_ref().map(|n| format!("{n} · {c}")))
-            .collect(),
-        missing: Vec::new(),
-        devices: std::iter::once(output_name.clone())
-            .chain(input_name.clone().filter(|i| *i != output_name))
-            .collect(),
+    let follower_name = |k: u16| specs.get(usize::from(k)).map(|s| s.name.clone());
+    let place_name = |p: &Place, own: Option<&String>| match p {
+        Place::Master(c) => own.map(|n| format!("{n} · {}", c + 1)),
+        Place::Follower { follower, channel } => {
+            follower_name(*follower).map(|n| format!("{n} · {}", channel + 1))
+        }
+    };
+    let routing = if specs.is_empty() {
+        StreamRouting {
+            outputs: (1..=channels)
+                .map(|c| Some(format!("{output_name} · {c}")))
+                .collect(),
+            inputs: (1..=input_channels)
+                .map(|c| input_name.as_ref().map(|n| format!("{n} · {c}")))
+                .collect(),
+            missing: Vec::new(),
+            devices: names.clone(),
+        }
+    } else {
+        StreamRouting {
+            outputs: out_places
+                .iter()
+                .map(|p| place_name(p, Some(&output_name)))
+                .collect(),
+            inputs: in_places
+                .iter()
+                .map(|p| place_name(p, input_name.as_ref()))
+                .collect(),
+            missing: Vec::new(),
+            devices: names.clone(),
+        }
     };
     let mut callback = callback;
-    callback.prepare(&info);
+    let mut joining = None;
+    let mut watcher = None;
+    if !specs.is_empty() {
+        let master_info = StreamInfo {
+            input_channels,
+            output_channels: channels,
+            ..info.clone()
+        };
+        let (joined, followers, ends) = faderframe_audio::follow::join(
+            callback,
+            &master_info,
+            in_places.clone(),
+            out_places.clone(),
+            specs.clone(),
+        );
+        callback = Box::new(joined);
+        let mut kept = Vec::new();
+        let mut away = Vec::new();
+        for (k, (end, (d, open))) in ends.into_iter().zip(follower_devices).enumerate() {
+            let failed = Arc::new(AtomicBool::new(false));
+            let gone = Arc::new(AtomicBool::new(false));
+            let stream = match followers::start(&d, &open, end, &failed) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("{}: did not start ({e}); tried again", device_name(&d));
+                    gone.store(true, Ordering::Relaxed);
+                    None
+                }
+            };
+            away.push(Arc::clone(&gone));
+            kept.push(followers::FollowerStream {
+                index: k,
+                device: specs[k].device.clone(),
+                direction: specs[k].direction,
+                stream,
+                failed,
+                away: gone,
+                last_try: std::time::Instant::now(),
+            });
+        }
+        let followers = Arc::new(Mutex::new(followers));
+        watcher = Some(followers::Watcher {
+            host: api.host()?,
+            streams: kept,
+            followers: Arc::clone(&followers),
+            master_rate: wanted_rate,
+            master_block: nominal,
+        });
+        joining = Some(Joining {
+            followers,
+            away,
+            inputs: in_places,
+            outputs: out_places,
+            master: (master_id.clone(), output_name.clone()),
+        });
+    }
+    let master_info = StreamInfo {
+        input_channels,
+        output_channels: channels,
+        ..info.clone()
+    };
+    callback.prepare(&master_info);
     let rt = Rt {
         callback,
-        info: info.clone(),
+        info: master_info,
         monitor: Arc::clone(&monitor),
         inputs: vec![vec![0.0; MAX_BUFFER_SIZE as usize]; input_channels as usize],
         outputs: vec![vec![0.0; MAX_BUFFER_SIZE as usize]; channels as usize],
@@ -525,7 +739,15 @@ fn open(
     if workgroup.is_some() {
         tracing::debug!("the DSP workers join the device's audio workgroup");
     }
-    Ok((streams, info, monitor, workgroup, routing))
+    Ok(Opened {
+        streams,
+        info,
+        monitor,
+        workgroup,
+        routing,
+        joining,
+        watcher,
+    })
 }
 
 fn on_error(monitor: &StreamMonitor, e: cpal::Error) {
@@ -772,6 +994,7 @@ struct CpalStream {
     monitor: Arc<StreamMonitor>,
     workgroup: Option<faderframe_realtime::Workgroup>,
     routing: StreamRouting,
+    joining: Option<Joining>,
 }
 
 impl AudioStream for CpalStream {
@@ -790,11 +1013,81 @@ impl AudioStream for CpalStream {
     }
 
     fn routing(&self) -> StreamRouting {
-        self.routing.clone()
+        let mut r = self.routing.clone();
+        let Some(j) = &self.joining else {
+            return r;
+        };
+        // A follower away: its channels are not connected now.
+        let followers = j.followers.lock().unwrap_or_else(|e| e.into_inner());
+        let away = |k: u16| {
+            j.away
+                .get(usize::from(k))
+                .is_some_and(|a| a.load(Ordering::Relaxed))
+        };
+        for (places, names) in [(&j.inputs, &mut r.inputs), (&j.outputs, &mut r.outputs)] {
+            for (p, name) in places.iter().zip(names.iter_mut()) {
+                if let Place::Follower { follower, .. } = p
+                    && away(*follower)
+                {
+                    *name = None;
+                }
+            }
+        }
+        for (k, a) in j.away.iter().enumerate() {
+            if a.load(Ordering::Relaxed)
+                && let Some(spec) = followers.spec(k)
+                && !r.missing.contains(&spec.name)
+            {
+                r.missing.push(spec.name.clone());
+            }
+        }
+        r
     }
 
     fn io_workgroup(&self) -> Option<faderframe_realtime::Workgroup> {
         self.workgroup.clone()
+    }
+
+    fn devices(&self) -> Vec<DeviceStatus> {
+        let Some(j) = &self.joining else {
+            return Vec::new();
+        };
+        let info = self.info();
+        let mine = |places: &[Place]| {
+            places
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p, Place::Master(_)))
+                .map(|(c, _)| c as u16)
+                .collect()
+        };
+        let master = DeviceStatus {
+            id: j.master.0.clone(),
+            name: j.master.1.clone(),
+            master: true,
+            present: !self.monitor.status().shut_down,
+            inputs: mine(&j.inputs),
+            outputs: mine(&j.outputs),
+            sample_rate: info.sample_rate,
+            input_latency: info.input_latency,
+            output_latency: info.output_latency,
+            drift_ppm: 0.0,
+            locked: true,
+            gaps: 0,
+        };
+        let followers = j.followers.lock().unwrap_or_else(|e| e.into_inner());
+        let away: Vec<(String, bool)> = (0..followers.len())
+            .filter_map(|k| {
+                let spec = followers.spec(k)?;
+                Some((
+                    spec.device.clone(),
+                    j.away.get(k).is_some_and(|a| a.load(Ordering::Relaxed)),
+                ))
+            })
+            .collect();
+        followers.describe(master, &j.inputs, &j.outputs, |id| {
+            away.iter().any(|(d, a)| d == id && *a)
+        })
     }
 }
 

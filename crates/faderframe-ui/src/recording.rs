@@ -582,6 +582,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     help.set_xalign(0.0);
     help.add_css_class("dim-label");
     g.attach(&help, 0, 10, 2, 1);
+    crate::capture_audio::page_rows(app, &g, 11, &row);
 
     let update = {
         let weak = Rc::downgrade(app);

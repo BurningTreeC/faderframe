@@ -12,4 +12,5 @@ workspace = true
 
 [dependencies]
 faderframe-project.workspace = true
+faderframe-restore.workspace = true
 realfft.workspace = true

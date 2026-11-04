@@ -77,6 +77,7 @@ fn session(latency: u32, dir: &std::path::Path) -> (Session, TrackId) {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })
@@ -303,6 +304,7 @@ fn a_meter_shows_its_track_when_it_is_heard() {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })
@@ -429,6 +431,7 @@ fn the_analyser_reads_its_track_when_it_is_heard() {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })

@@ -25,12 +25,22 @@
 //!   rearrangement leaves where it was keeps its sample.
 //! * **Duplicating a track** keeps its time base.
 //!
+//! Notes, markers and sections can be placed in time on their own, on any
+//! track: a locked note (a hit inside a musical cue) keeps its samples
+//! while its clip and the other notes follow the beats; a locked marker
+//! (a picture cut: the cuts found in the picture and the shots a conform
+//! adds are locked) or section (a scene, a reel) keeps its samples. The
+//! piano roll and the event list lock notes (`NoteOp::SetTimeLocked`,
+//! `NoteOp::ToggleTimeLocked`); Quantize and Humanize leave locked notes'
+//! timing alone. The marker and arranger lanes' menus lock markers and
+//! sections ([`Session::marker_time_lock`], [`Session::section_time_lock`]).
+//!
 //! [`Session::edit`]: crate::Session::edit
 
 use crate::{Action, InputChoice, Result, Session};
-use faderframe_core::TrackId;
+use faderframe_core::{ClipId, MarkerId, NoteId, SectionId, TrackId};
 use faderframe_project::time_lock::TimeLock;
-use faderframe_project::{Command, Impact, TimeBase, TrackKind};
+use faderframe_project::{Command, Impact, Marker, Section, TimeBase, TrackKind};
 
 impl Session {
     /// The time-locked material an edit changes, worked out before it
@@ -59,6 +69,90 @@ impl Session {
             .is_some_and(|t| t.is_time_locked())
     }
 
+    /// The `index`-th note (from 0) of a track's MIDI clips in time order
+    /// (notes in a clip by start, then key): its clip and id.
+    pub fn track_note(&self, track: TrackId, index: usize) -> Option<(ClipId, NoteId)> {
+        let p = &self.project;
+        let mut clips = p.clips_of(track);
+        clips.sort_by_key(|c| (c.start, c.id));
+        clips
+            .into_iter()
+            .filter_map(|c| c.as_midi().map(|m| (c.id, m)))
+            .flat_map(|(id, m)| {
+                let mut notes: Vec<_> = m.notes.iter().collect();
+                notes.sort_by_key(|n| (n.start, n.key, n.id));
+                notes.into_iter().map(move |n| (id, n.id))
+            })
+            .nth(index)
+    }
+
+    /// How many of a track's notes are placed in time.
+    pub fn time_locked_notes(&self, track: TrackId) -> usize {
+        self.project
+            .clips_of(track)
+            .iter()
+            .filter_map(|c| c.as_midi())
+            .map(|m| m.notes.iter().filter(|n| n.time_locked).count())
+            .sum()
+    }
+
+    /// Unlock every note of a track from time (one undo step; `None`:
+    /// none is locked).
+    pub fn unlock_track_notes(&self, track: TrackId) -> Option<Action> {
+        let commands: Vec<Command> = self
+            .project
+            .clips_of(track)
+            .into_iter()
+            .filter_map(|c| {
+                let m = c.as_midi()?;
+                m.notes.iter().any(|n| n.time_locked).then(|| {
+                    let mut m = m.clone();
+                    m.notes.iter_mut().for_each(|n| n.time_locked = false);
+                    Command::SetClipContent {
+                        clip: c.id,
+                        start: c.start,
+                        content: Box::new(faderframe_project::ClipContent::Midi(m)),
+                    }
+                })
+            })
+            .collect();
+        (!commands.is_empty()).then(|| {
+            Action::Edit(Command::Batch {
+                label: "Unlock Notes from Time".into(),
+                commands,
+            })
+        })
+    }
+
+    /// The edit placing a marker in time (`locked`) or with the music
+    /// (`None`: no such marker, or it is so already). Locking it puts it
+    /// on a whole sample.
+    pub fn marker_time_lock(&self, marker: MarkerId, locked: bool) -> Option<Action> {
+        let m = self.project.markers.iter().find(|m| m.id == marker)?;
+        (m.is_time_locked() != locked).then(|| {
+            Action::Edit(Command::UpdateMarker {
+                marker: Marker {
+                    time_base: base_of(locked),
+                    ..m.clone()
+                },
+            })
+        })
+    }
+
+    /// The edit placing a section in time or with the music (as
+    /// [`Self::marker_time_lock`]).
+    pub fn section_time_lock(&self, section: SectionId, locked: bool) -> Option<Action> {
+        let s = self.project.sections.iter().find(|s| s.id == section)?;
+        (s.is_time_locked() != locked).then(|| {
+            Action::Edit(Command::UpdateSection {
+                section: Section {
+                    time_base: base_of(locked),
+                    ..s.clone()
+                },
+            })
+        })
+    }
+
     /// The time bases a track can have (the track menus' Time Base:
     /// Musical / Time-locked; none for folders, which hold no material).
     pub fn time_base_choices(&self, track: TrackId) -> Vec<InputChoice> {
@@ -77,5 +171,13 @@ impl Session {
                 group_start: false,
             })
             .collect()
+    }
+}
+
+fn base_of(locked: bool) -> TimeBase {
+    if locked {
+        TimeBase::TimeLocked
+    } else {
+        TimeBase::Musical
     }
 }

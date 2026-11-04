@@ -304,6 +304,7 @@ impl Session {
                             pitch: None,
                             effects: None,
                             spectral: None,
+                            envelope: None,
                         }),
                     }),
                 });

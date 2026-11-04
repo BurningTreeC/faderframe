@@ -320,6 +320,9 @@ impl Session {
                     channel: 0,
                     muted: false,
                     release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
                 }
             })
             .collect();
@@ -377,6 +380,7 @@ impl Session {
                         controllers: Vec::new(),
                         expressions: Vec::new(),
                         sysex: Vec::new(),
+                        articulations: Vec::new(),
                     }),
                 }),
             },

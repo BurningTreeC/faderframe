@@ -1,7 +1,8 @@
 //! Audio → Listen: speakers or headphones (the master rendered
 //! binaurally, with a room), whose ears (a built-in head or a SOFA file),
 //! the headphone correction, bass management of the speakers — all
-//! remembered — and the mono check (per session). Listening only: renders
+//! remembered — the mono check (per session) and head tracking
+//! ([`crate::head_tracking`]). Listening only: renders
 //! stay as mixed.
 
 use crate::prefs::Preferences;
@@ -204,6 +205,11 @@ pub fn menu() -> gio::Menu {
     ab.append(Some("Stop Comparing"), Some("app.compare-off"));
     ab.append(Some("Reference Tracks…"), Some("app.show-reference"));
     m.append_section(None, &ab);
+    // The master as listeners get it: a lossy codec, a platform's
+    // loudness.
+    let codec = gio::Menu::new();
+    codec.append_submenu(Some("Codec Monitor"), &crate::codec_monitor::menu());
+    m.append_section(None, &codec);
     let heads = gio::Menu::new();
     let dummies = gio::Menu::new();
     let people = gio::Menu::new();
@@ -226,6 +232,8 @@ pub fn menu() -> gio::Menu {
     );
     more.append_submenu(Some("Headphone Correction"), &correction);
     m.append_section(None, &more);
+    // The head turned by a tracker (or straightened by hand).
+    m.append_section(None, &crate::head_tracking::menu());
     m
 }
 
@@ -242,6 +250,7 @@ pub fn apply_preferences(session: &mut faderframe_session::Session, prefs: &Pref
     {
         tracing::warn!("headphone correction: {e}");
     }
+    crate::codec_monitor::apply_preferences(session, prefs);
 }
 
 thread_local! {
@@ -296,6 +305,7 @@ pub fn follow(app: &Rc<AppState>) {
     {
         a.set_state(&bass.enabled.to_variant());
     }
+    crate::codec_monitor::follow(app);
     // Saved when it changed (the file is read only then).
     if LAST_BASS.with(|l| l.replace(Some(bass))) != Some(bass) {
         let mut p = Preferences::load();

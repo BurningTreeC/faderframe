@@ -113,7 +113,7 @@ impl Session {
                     .extend(l.points.iter().filter(|pt| pt.time < m.length).map(|pt| {
                         faderframe_project::ControllerPoint {
                             time: pt.time + shift,
-                            value: pt.value,
+                            ..*pt
                         }
                     }));
             }
@@ -310,6 +310,7 @@ impl Session {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             }),
         });

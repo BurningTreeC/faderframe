@@ -34,7 +34,7 @@ use faderframe_project::{OutputRouting, Project, TrackKind};
 use std::collections::{BTreeSet, HashMap};
 
 /// Top-level project fields that do not change what any track sounds like.
-pub(super) const PRESENTATION: [&str; 20] = [
+pub(super) const PRESENTATION: [&str; 22] = [
     "name",
     "markers",
     "loop_range",
@@ -57,6 +57,10 @@ pub(super) const PRESENTATION: [&str; 20] = [
     // Reference tracks are heard instead of the mix, never in it (their
     // comparison has its own key).
     "references",
+    // A device's other A/B side is kept, not heard.
+    "device_compare",
+    // How the score writes MIDI clips (what they play is the notes').
+    "notation",
 ];
 /// Track fields that do not change what it sounds like in a render.
 pub(super) const TRACK_PRESENTATION: [&str; 7] = [

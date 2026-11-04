@@ -2,8 +2,9 @@
 //!
 //! Tracks, buses and graph ports carry an explicit layout. Nothing in the DAW
 //! may assume "everything is stereo". Surround beds are
-//! [`ChannelLayout::Surround`] (see [`crate::surround`]); [`ChannelLayout::Discrete`]
-//! covers arbitrary multichannel routing.
+//! [`ChannelLayout::Surround`] (see [`crate::surround`]), ambisonic sound
+//! fields [`ChannelLayout::Ambisonic`] (see [`crate::ambisonics`]);
+//! [`ChannelLayout::Discrete`] covers arbitrary multichannel routing.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,9 @@ pub enum ChannelLayout {
     Discrete(u16),
     /// A surround bed (5.1, 7.1.4, …).
     Surround(crate::surround::SurroundFormat),
+    /// An ambisonic sound field (AmbiX: ACN order, SN3D), first to third
+    /// order.
+    Ambisonic(crate::ambisonics::AmbiOrder),
 }
 
 impl ChannelLayout {
@@ -27,7 +31,18 @@ impl ChannelLayout {
             ChannelLayout::Stereo => 2,
             ChannelLayout::Discrete(n) => n as usize,
             ChannelLayout::Surround(f) => f.channels(),
+            ChannelLayout::Ambisonic(o) => o.channels(),
         }
+    }
+
+    /// Whether it is spatial: a surround bed or an ambisonic field (what
+    /// mono and stereo sources are panned into, and what folds or decodes
+    /// into other layouts).
+    pub fn is_spatial(self) -> bool {
+        matches!(
+            self,
+            ChannelLayout::Surround(_) | ChannelLayout::Ambisonic(_)
+        )
     }
 
     /// Short label for UI display.
@@ -37,6 +52,7 @@ impl ChannelLayout {
             ChannelLayout::Stereo => "Stereo".into(),
             ChannelLayout::Discrete(n) => format!("{n}ch"),
             ChannelLayout::Surround(f) => f.name().into(),
+            ChannelLayout::Ambisonic(o) => o.short_name().into(),
         }
     }
 
@@ -64,5 +80,18 @@ mod tests {
             ChannelLayout::from_channel_count(8),
             ChannelLayout::Discrete(8)
         );
+        let third = ChannelLayout::Ambisonic(crate::AmbiOrder::Third);
+        assert_eq!(third.channel_count(), 16);
+        assert!(third.is_spatial() && !ChannelLayout::Discrete(16).is_spatial());
+    }
+
+    /// Ambisonic layouts are written by their order and read back.
+    #[test]
+    fn ambisonic_layouts_in_files() {
+        let first = ChannelLayout::Ambisonic(crate::AmbiOrder::First);
+        let json = serde_json::to_string(&first).unwrap();
+        assert_eq!(json, r#"{"ambisonic":1}"#);
+        assert_eq!(serde_json::from_str::<ChannelLayout>(&json).unwrap(), first);
+        assert!(serde_json::from_str::<ChannelLayout>(r#"{"ambisonic":5}"#).is_err());
     }
 }

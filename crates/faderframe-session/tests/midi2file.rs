@@ -51,7 +51,11 @@ fn a_clip_goes_through_a_midi2_file_and_back() {
         let mut l = ControllerLane::new(c, 0);
         l.points = points
             .iter()
-            .map(|&(t, value)| ControllerPoint { time: q(t), value })
+            .map(|&(t, value)| ControllerPoint {
+                time: q(t),
+                value,
+                fine: None,
+            })
             .collect();
         l
     };

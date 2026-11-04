@@ -56,6 +56,8 @@ pub enum Key {
     F(u8),
     Char(char),
     Other,
+    /// The context-menu key.
+    Menu,
 }
 
 /// Toolkit-independent input event in view-local logical pixels.

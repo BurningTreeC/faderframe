@@ -119,18 +119,18 @@ fn folder_layout(rect: Rect) -> FolderLayout {
     }
 }
 
-/// The bed `t` is placed into by the surround panner (its strip shows the
-/// room); `None` also for a stereo track balanced into a bed (its strip
-/// shows the balance knob).
-/// In a cue mix (the mixer's cue mode) nothing: its sends pan into the
-/// cue mix's stereo.
-fn room_panned(model: &Session, t: &Track) -> Option<faderframe_core::SurroundFormat> {
+/// The bed (or ambisonic field) `t` is placed into by the surround panner
+/// (its strip shows the room, or a field's circle of directions); `None`
+/// also for a stereo track balanced into one (its strip shows the balance
+/// knob). In a cue mix (the mixer's cue mode) nothing: its sends pan into
+/// the cue mix's stereo.
+fn room_panned(model: &Session, t: &Track) -> Option<faderframe_core::ChannelLayout> {
     if model.mixer_cue().is_some() {
         return None;
     }
     model
         .project()
-        .surround_panned(t)
+        .spatially_panned(t)
         .filter(|_| !model.project().balanced_into_bed(t))
 }
 
@@ -1279,13 +1279,17 @@ impl MixerView {
             // A bed: it passes into its destination as it is (or folded).
             controls::engraved(p, f.name(), l.pan_knob, th, Align::Center);
             controls::readout(p, l.pan_readout, "BED", th);
-        } else if let Some(format) = bed {
+        } else if let faderframe_core::ChannelLayout::Ambisonic(o) = t.layout {
+            // A field: it passes into a field, or is decoded into speakers.
+            controls::engraved(p, o.short_name(), l.pan_knob, th, Align::Center);
+            controls::readout(p, l.pan_readout, "FIELD", th);
+        } else if let Some(dest) = bed {
             // Into a surround bed: where it sits, seen from above.
             let pan = model.shown_surround(t);
             let meter = model.meter(t.id);
             let levels: Vec<f32> = meter.shown().iter().map(|c| c.level_db).collect();
             faderframe_view_surround::room::Room {
-                format,
+                dest,
                 source: t.layout,
                 pan,
                 levels: &levels,
@@ -1297,7 +1301,7 @@ impl MixerView {
             controls::readout(
                 p,
                 l.pan_readout,
-                &faderframe_view_surround::room::format_place(&pan),
+                &faderframe_view_surround::room::format_place_into(&pan, dest),
                 th,
             );
         } else if dual_shown(model, t) {
@@ -1671,6 +1675,9 @@ impl MixerView {
         if let (Some(label), Some(slots)) = (l.inserts_label, &l.inserts) {
             let title = if t.freeze.is_some() {
                 "INSERTS · FROZEN"
+            } else if model.is_self_frozen(t.id) {
+                // Played from its self-freeze cache: the devices rest.
+                "INSERTS · CACHED"
             } else {
                 "INSERTS"
             };
@@ -2272,6 +2279,35 @@ impl MixerView {
                         Action::ReloadPlugin(s.id),
                     ));
                 }
+                // A plugin that hears the room, rolls dice or follows the
+                // clock: its tracks never play from a self-freeze cache.
+                let kept = model.plugin_kept_live(&s.plugin.id);
+                items.push(
+                    MenuItem::new(
+                        "Keep Tracks Using This Plugin Live",
+                        Action::KeepPluginLive {
+                            plugin: s.plugin.id.clone(),
+                            on: !kept,
+                        },
+                    )
+                    .checked(kept),
+                );
+                // An ARA plug-in: it renders the track's clips from its own
+                // model (bound anew), or is an ordinary insert.
+                let bound = model.project().ara.slots.contains(&s.id);
+                if bound || (t.kind == TrackKind::Audio && model.ara_plugins().contains(&s.plugin))
+                {
+                    items.push(
+                        MenuItem::new(
+                            "Render the Track's Clips (ARA)",
+                            Action::Edit(Command::SetAraSlot {
+                                slot: s.id,
+                                on: !bound,
+                            }),
+                        )
+                        .checked(bound),
+                    );
+                }
                 items.push(MenuItem::new(
                     "Remove",
                     Action::Edit(Command::RemovePlugin {
@@ -2503,6 +2539,22 @@ impl MixerView {
         // The microphones of one source in time and polarity; the
         // track's own delay back to none.
         items.extend(model.auto_align_menu(t.id).into_iter().map(menu_item));
+        // Mix scenes: store, recall, the track safe from each.
+        let scenes: Vec<MenuItem<Action>> = model
+            .mix_scene_menu(t.id)
+            .into_iter()
+            .map(menu_item)
+            .collect();
+        items.push(MenuItem::submenu("Mix Scenes", scenes).separated());
+        // Its audio split into vocals, drums, bass and the rest.
+        let stems: Vec<MenuItem<Action>> = model
+            .stems_menu(faderframe_session::separate::StemTarget::Track(t.id))
+            .into_iter()
+            .map(menu_item)
+            .collect();
+        if !stems.is_empty() {
+            items.push(MenuItem::submenu("Separate Stems", stems));
+        }
         let formats: Vec<MenuItem<Action>> = model
             .format_choices(t.id)
             .into_iter()
@@ -2544,6 +2596,37 @@ impl MixerView {
         if !bases.is_empty() {
             items.push(MenuItem::submenu("Time Base", bases));
         }
+        // Played from a cache of its devices' output while nobody touches
+        // it, or always live.
+        let auto: Vec<MenuItem<Action>> = model
+            .self_freeze_choices(t.id)
+            .into_iter()
+            .map(|c| MenuItem::new(c.label, c.action).checked(c.checked))
+            .collect();
+        if !auto.is_empty() {
+            items.push(MenuItem::submenu("Self-Freeze", auto));
+        }
+
+        // What its notes play by: articulation and drum maps.
+        for (title, list) in [
+            ("Articulation Map", model.articulation_map_choices(t.id)),
+            ("Drum Map", model.drum_map_choices(t.id)),
+        ] {
+            let maps: Vec<MenuItem<Action>> = list
+                .into_iter()
+                .map(|c| {
+                    let item = MenuItem::new(c.label, c.action).checked(c.checked);
+                    if c.group_start {
+                        item.separated()
+                    } else {
+                        item
+                    }
+                })
+                .collect();
+            if !maps.is_empty() {
+                items.push(MenuItem::submenu(title, maps));
+            }
+        }
         let choices = |list: Vec<faderframe_session::InputChoice>| -> Vec<MenuItem<Action>> {
             list.into_iter()
                 .map(|c| {
@@ -2559,6 +2642,19 @@ impl MixerView {
         let render = choices(model.binaural_render_choices(t.id));
         if !render.is_empty() {
             items.push(MenuItem::submenu("Headphone Render (Dolby)", render));
+        }
+        // The tuning it plays and how its plugins are told it.
+        let mut tunings = choices(model.tuning_choices(Some(t.id)));
+        if !tunings.is_empty() {
+            tunings.push(MenuItem::submenu(
+                "More Equal Temperaments",
+                choices(model.more_tuning_choices(Some(t.id))),
+            ));
+            tunings.push(
+                MenuItem::submenu("Retune Plugins", choices(model.retune_choices(t.id)))
+                    .separated(),
+            );
+            items.push(MenuItem::submenu("Tuning", tunings));
         }
         if t.kind == TrackKind::Master {
             let mut listen = choices(model.listen_choices());
@@ -3427,11 +3523,11 @@ impl MixerView {
             // Panned into a surround bed: the room's parameters, each its
             // own submenu.
             Hit::Pan(id) => Self::track(model, id).map(|t| match room_panned(model, t) {
-                Some(format) => {
+                Some(dest) => {
                     let pan = model.project().effective_surround(t);
                     let items = faderframe_core::SurroundParam::ALL
                         .into_iter()
-                        .filter(|p| p.applies(t.layout, format, &pan))
+                        .filter(|p| p.applies_into(t.layout, dest, &pan))
                         .map(|p| {
                             Self::learn_submenu(
                                 model,
@@ -3595,10 +3691,13 @@ impl MixerView {
             Hit::Pan(id) => {
                 let t = Self::track(model, id)?;
                 match room_panned(model, t) {
-                    Some(f) => format!(
+                    Some(dest) => format!(
                         "Surround {} ({}) · Drag to move (Shift/Ctrl: fine) · Double-click: the panner",
-                        faderframe_view_surround::room::format_place(&model.shown_surround(t)),
-                        f.name()
+                        faderframe_view_surround::room::format_place_into(
+                            &model.shown_surround(t),
+                            dest
+                        ),
+                        faderframe_view_surround::room::dest_name(dest)
                     ),
                     None if model.project().balanced_into_bed(t) => format!(
                         "Balance {} into the bed's L and R · Double-click to centre",
@@ -4114,9 +4213,19 @@ impl MixerView {
                         from,
                         size,
                     }) => {
-                        let object =
-                            Self::track(model, track).is_some_and(|t| model.project().is_object(t));
-                        let pan = if faderframe_view_surround::room::by_direction(&from, object) {
+                        let (object, dest) = Self::track(model, track).map_or(
+                            (false, faderframe_core::ChannelLayout::Stereo),
+                            |t| {
+                                (
+                                    model.project().is_object(t),
+                                    room_panned(model, t)
+                                        .unwrap_or(faderframe_core::ChannelLayout::Stereo),
+                                )
+                            },
+                        );
+                        let pan = if faderframe_view_surround::room::by_direction_into(
+                            &from, object, dest,
+                        ) {
                             // VBAP: across moves round (a dual pan's pair
                             // together), half the room's width a half turn;
                             // fine: a quarter as far.
@@ -4329,9 +4438,11 @@ impl MixerView {
                         if let Some(t) = Self::track(model, id) {
                             use faderframe_core::SurroundParam as P;
                             let from = model.shown_surround(t);
-                            let pan = if faderframe_view_surround::room::by_direction(
+                            let pan = if faderframe_view_surround::room::by_direction_into(
                                 &from,
                                 model.project().is_object(t),
+                                room_panned(model, t)
+                                    .unwrap_or(faderframe_core::ChannelLayout::Stereo),
                             ) {
                                 let by = if modifiers.fine() { 1.0 } else { 5.0 } * steps;
                                 let pan = P::Azimuth.set(from, from.azimuth + by);

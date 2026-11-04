@@ -2,7 +2,9 @@
 //! clip's region, a logarithmic frequency axis), regions drawn on it — a
 //! rectangle, a time range, a frequency band, a lasso, a brush stroke —
 //! and turned into edits with Attenuate (down to the sound around it),
-//! Heal (replaced by it), Remove or Gain. Edits show as outlines: a click
+//! Heal (replaced by it), Remove, Gain or De-noise (learn the noise in the
+//! region drawn — noise alone — and take it out of the whole clip in that
+//! band: "Learn Noise and Remove"). Edits show as outlines: a click
 //! selects one, a drag moves it, Delete removes it; the buttons change the
 //! selected one's operation, the Soft values its feather. "Original" shows
 //! the unedited audio. Ctrl+wheel zooms in time, the wheel scrolls.
@@ -72,8 +74,11 @@ impl Tool {
     }
 }
 
-/// The operations the buttons apply (Gain at its value).
-const OPS: [&str; 4] = ["Attenuate", "Heal", "Remove", "Gain"];
+/// The operations the buttons apply (Gain at its value, De-noise at its
+/// reduction).
+const OPS: [&str; 5] = ["Attenuate", "Heal", "Remove", "Gain", "De-noise"];
+/// The De-noise button's reduction (dB).
+pub const DENOISE_DB: f32 = 12.0;
 
 /// A number set by dragging.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +143,7 @@ struct Layout {
     area: Rect,
     edits: Rect,
     tools: [Rect; 5],
-    ops: [Rect; 4],
+    ops: [Rect; 5],
     gain: Rect,
     feather_ms: Rect,
     feather_st: Rect,
@@ -226,6 +231,7 @@ impl SpectralView {
             next(50.0, 2.0),
             next(64.0, 2.0),
             next(46.0, 2.0),
+            next(74.0, 2.0),
         ];
         let gain = next(62.0, 44.0);
         let feather_ms = next(64.0, 2.0);
@@ -489,7 +495,10 @@ impl SpectralView {
             0 => SpectralOp::Attenuate,
             1 => SpectralOp::Heal,
             2 => SpectralOp::Remove,
-            _ => SpectralOp::Gain { db: self.gain_db },
+            3 => SpectralOp::Gain { db: self.gain_db },
+            _ => SpectralOp::Denoise {
+                reduction_db: DENOISE_DB,
+            },
         }
     }
 
@@ -611,6 +620,7 @@ impl SpectralView {
             SpectralOp::Heal => m.green,
             SpectralOp::Remove => m.red,
             SpectralOp::Gain { .. } => m.yellow,
+            SpectralOp::Denoise { .. } => m.green.mix(self.theme.ui.accent, 0.5),
         }
     }
 
@@ -1294,6 +1304,8 @@ impl CanvasView<Session, Action> for SpectralView {
                             std::mem::discriminant(&e.op) == std::mem::discriminant(&edits[i].op);
                         let label = if k == 3 {
                             format!("Gain {:+.1} dB", self.gain_db).replace('-', "−")
+                        } else if k == 4 {
+                            self.op(k).label()
                         } else {
                             (*label).to_string()
                         };
@@ -1419,6 +1431,7 @@ impl CanvasView<Session, Action> for SpectralView {
             "Replace the region by the sound around it in time (dropouts, longer noises)",
             "Silence the region",
             "Make the region louder or quieter by the value beside it",
+            "Learn Noise and Remove: the region drawn is noise alone; it is taken out of the whole clip in that band",
         ];
         if let Some(i) = l.ops.iter().position(|r| r.contains(pos)) {
             return Some(format!(

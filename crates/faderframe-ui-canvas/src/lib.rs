@@ -31,7 +31,9 @@ mod theme;
 mod themes;
 mod view;
 
-pub use access::{AccessNode, AccessRole, AccessValue, access_id, access_id_str};
+pub use access::{
+    AccessKey, AccessNode, AccessPress, AccessRole, AccessValue, access_id, access_id_str,
+};
 pub use color::Color;
 pub use event::{Cursor, Key, Modifiers, PointerButton, ViewEvent};
 pub use flow::{Flow, FlowMetrics};

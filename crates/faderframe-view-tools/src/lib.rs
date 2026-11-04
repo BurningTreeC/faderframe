@@ -9,19 +9,32 @@
 //!   K-System scale.
 //! * Phase — goniometer (mid up, side across) and correlation.
 //! * Spectrum — FFT of the mid signal on a log axis with peak hold.
+//! * Codec (while the codec monitor is on: Audio › Listen › Codec Monitor)
+//!   — what is heard (the decoded master, the original, the difference),
+//!   the platform's gain and where it comes from, the true peak after
+//!   decoding with the frames over full scale, the level of the codec's
+//!   artefacts, the delay it adds to listening.
 //!
-//! The figures come from [`Session::analyzer`], fed every UI tick.
+//! The figures come from [`Session::analyzer`], fed every UI tick, and
+//! [`Session::codec_status`].
+//!
+//! "Announce Limits" (a toggle of the view) has screen readers told when
+//! a reading crosses a limit: the true peak over −1 dBTP, the integrated
+//! loudness reaching or leaving the target (±1 LU), the correlation going
+//! below zero, the codec's decoded peaks over full scale ([`access`]).
 
 use faderframe_analysis::{FLOOR_DB, Level};
 use faderframe_core::TrackId;
 use faderframe_project::TrackKind;
 use faderframe_session::analysis::{LOUDNESS_TARGETS, LevelScale};
+use faderframe_session::codec::{CodecHear, CodecOp, CodecStatus};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Paint, Painter, Path, Point,
-    PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, CanvasView, Color, Cursor, EventCx, HostRequest, MenuItem, Paint,
+    Painter, Path, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
 };
 
+mod access;
 #[cfg(test)]
 mod tests;
 
@@ -43,12 +56,22 @@ pub enum Hit {
     Target,
     Scale,
     ResetOnPlay,
+    /// Screen readers told when readings cross their limits.
+    Announce,
     Reset,
     Loudness,
     Level,
     Phase,
     Spectrum,
+    /// The codec pane: what it plays, its codec or platform, a reset.
+    CodecHear(CodecHear),
+    CodecChoose,
+    CodecReset,
+    Codec,
 }
+
+/// The codec bitrates and platforms the pane's menu offers.
+const CODEC_BITRATES: [u32; 6] = [64, 96, 128, 160, 256, 320];
 
 /// Rectangles of the view.
 struct Layout {
@@ -57,15 +80,32 @@ struct Layout {
     target: Rect,
     scale: Rect,
     reset_on_play: Rect,
+    announce: Rect,
     reset: Rect,
     loudness: Rect,
     level: Rect,
     phase: Rect,
     spectrum: Rect,
+    /// The codec pane (while the codec monitor is on) and its controls.
+    codec: Option<CodecLayout>,
+}
+
+struct CodecLayout {
+    pane: Rect,
+    hear: [(CodecHear, Rect); 3],
+    choose: Rect,
+    reset: Rect,
+    rows: Rect,
 }
 
 pub struct ToolsView {
     theme: Theme,
+    /// The codec pane is shown (the monitor was on when last painted).
+    codec_shown: bool,
+    /// Screen readers are told when readings cross their limits.
+    announce: bool,
+    /// The readings' side of each limit as last seen.
+    limits: Option<access::Limits>,
 }
 
 /// "−14.2", "−∞".
@@ -87,10 +127,20 @@ fn format_hz(hz: f64) -> String {
 
 impl ToolsView {
     pub fn new(theme: Theme) -> Self {
-        Self { theme }
+        Self {
+            theme,
+            codec_shown: false,
+            announce: false,
+            limits: None,
+        }
     }
 
     fn layout(&self, size: Size) -> Layout {
+        self.layout_with(size, self.codec_shown)
+    }
+
+    /// The layout with or without the codec pane.
+    fn layout_with(&self, size: Size, codec_shown: bool) -> Layout {
         let t = &self.theme.tools;
         let full = Rect::from_size(size);
         let (toolbar, body) = full.split_top(t.toolbar_height);
@@ -105,6 +155,7 @@ impl ToolsView {
         let target = button(200.0);
         let scale = button(90.0);
         let reset_on_play = button(110.0);
+        let announce = button(124.0);
         let reset = Rect::new(bar.right() - 70.0, bar.y, 70.0, bar.h);
         let body = body.inset(PAD);
         let w = body.w - 3.0 * GAP;
@@ -120,6 +171,7 @@ impl ToolsView {
         let loudness = pane(loudness_w);
         let level = pane(level_w);
         let phase = pane(phase_w);
+        let codec = codec_shown.then(|| codec_layout(pane((w * 0.22).clamp(230.0, 300.0))));
         let spectrum = Rect::new(x, body.y, (body.right() - x).max(0.0), body.h);
         Layout {
             toolbar,
@@ -127,21 +179,38 @@ impl ToolsView {
             target,
             scale,
             reset_on_play,
+            announce,
             reset,
             loudness,
             level,
             phase,
             spectrum,
+            codec,
         }
     }
 
     pub fn hit(&self, pos: Point, size: Size) -> Option<Hit> {
         let l = self.layout(size);
+        if let Some(c) = &l.codec
+            && c.pane.contains(pos)
+        {
+            if let Some((h, _)) = c.hear.iter().find(|(_, r)| r.contains(pos)) {
+                return Some(Hit::CodecHear(*h));
+            }
+            if c.choose.contains(pos) {
+                return Some(Hit::CodecChoose);
+            }
+            if c.reset.contains(pos) {
+                return Some(Hit::CodecReset);
+            }
+            return Some(Hit::Codec);
+        }
         [
             (l.source, Hit::Source),
             (l.target, Hit::Target),
             (l.scale, Hit::Scale),
             (l.reset_on_play, Hit::ResetOnPlay),
+            (l.announce, Hit::Announce),
             (l.reset, Hit::Reset),
             (l.loudness, Hit::Loudness),
             (l.level, Hit::Level),
@@ -202,6 +271,7 @@ impl ToolsView {
             false,
         );
         self.button(p, l.reset_on_play, "Reset on Play", settings.reset_on_play);
+        self.button(p, l.announce, "Announce Limits", self.announce);
         self.button(p, l.reset, "Reset", false);
     }
 
@@ -661,7 +731,139 @@ impl ToolsView {
         p.pop_clip();
     }
 
+    fn paint_codec(&self, p: &mut dyn Painter, c: &CodecLayout, st: &CodecStatus) {
+        let t = &self.theme;
+        let tt = &t.tools;
+        self.pane(p, c.pane, "CODEC MONITOR");
+        for (h, r) in &c.hear {
+            self.button(p, *r, h.label(), st.hear == *h);
+        }
+        let choose = match st.platform {
+            Some(pl) => format!("{} ▾", pl.name),
+            None => format!("Opus {} ▾", st.kbps),
+        };
+        self.button(p, c.choose, &choose, false);
+        self.button(p, c.reset, "Reset", false);
+        let db = |v: Option<f64>, unit: &str| match v {
+            Some(v) if v.is_finite() => format!("{} {unit}", format!("{v:+.1}").replace('-', "−")),
+            Some(_) => format!("−∞ {unit}"),
+            None => "—".into(),
+        };
+        let peak_color = match st.true_peak {
+            Some(v) if v > 0.0 => tt.level_over,
+            Some(v) if v > -1.0 => tt.level_warn,
+            _ => tt.readout,
+        };
+        let state = if !st.ready || st.heard < 1.0 {
+            "starting…".to_string()
+        } else {
+            format!("{:.1} ms later than the mix", st.delay_ms)
+        };
+        let rows = [
+            ("Codec", st.title.clone(), t.ui.text_dim, true),
+            (
+                "Platform gain",
+                db(Some(st.gain_db), "dB"),
+                tt.readout,
+                false,
+            ),
+            ("", st.gain_text.clone(), t.ui.text_faint, true),
+            (
+                "True peak decoded",
+                db(st.true_peak, "dBTP"),
+                peak_color,
+                false,
+            ),
+            (
+                "Over full scale",
+                format!("{} frames", st.overs),
+                if st.overs > 0 {
+                    tt.level_over
+                } else {
+                    tt.readout
+                },
+                false,
+            ),
+            (
+                "Artefacts (3 s)",
+                db(st.artefacts_now_db, "dB"),
+                tt.readout,
+                false,
+            ),
+            (
+                "Artefacts since reset",
+                db(st.artefacts_db, "dB"),
+                tt.readout,
+                false,
+            ),
+            ("Heard", state, t.ui.text_dim, false),
+        ];
+        let row_h = 15.0;
+        let mut y = c.rows.y;
+        for (name, value, color, wide) in rows {
+            if y + row_h > c.rows.bottom() {
+                break;
+            }
+            let r = Rect::new(c.rows.x, y, c.rows.w, row_h);
+            if wide {
+                // A line of its own (the codec's name, where the gain
+                // comes from).
+                p.push_clip(r);
+                p.text(&value, r, &TextStyle::new(t.fonts.tiny, color));
+                p.pop_clip();
+            } else {
+                p.text(name, r, &TextStyle::new(t.fonts.small, t.ui.text_dim));
+                p.text(
+                    &value,
+                    r,
+                    &TextStyle::new(t.fonts.small, color).right().bold(),
+                );
+            }
+            y += row_h;
+        }
+        if let Some(e) = &st.error {
+            let r = Rect::new(c.rows.x, c.rows.bottom() - row_h, c.rows.w, row_h);
+            p.text(e, r, &TextStyle::new(t.fonts.tiny, tt.level_over));
+        }
+    }
+
     // --- menus ---------------------------------------------------------------------
+
+    /// The codec pane's menu: off, Opus at a bitrate, a platform, measuring
+    /// the song.
+    fn codec_menu(model: &Session, at: Point) -> HostRequest<Action> {
+        let st = model.codec_status();
+        let mut items = vec![MenuItem::new("Off", Action::Codec(CodecOp::Off)).checked(!st.on)];
+        for (i, k) in CODEC_BITRATES.iter().enumerate() {
+            let item = MenuItem::new(
+                format!("Opus {k} kb/s"),
+                Action::Codec(CodecOp::Opus {
+                    kbps: *k,
+                    vbr: st.vbr,
+                }),
+            )
+            .checked(st.on && st.platform.is_none() && st.kbps == *k);
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        for (i, pl) in faderframe_codec::PLATFORMS.iter().enumerate() {
+            let item = MenuItem::new(
+                format!("{} · {}", pl.name, pl.codec_text()),
+                Action::Codec(CodecOp::Platform(pl.id.to_string())),
+            )
+            .checked(st.on && st.platform.is_some_and(|p| p.id == pl.id));
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        items.push(
+            MenuItem::new("Variable Bitrate", Action::Codec(CodecOp::Vbr(!st.vbr)))
+                .checked(st.vbr)
+                .separated(),
+        );
+        items.push(MenuItem::new(
+            "Measure the Song's Loudness",
+            Action::Codec(CodecOp::Measure),
+        ));
+        HostRequest::ContextMenu { at, items }
+    }
 
     fn source_menu(model: &Session, at: Point) -> HostRequest<Action> {
         let current = model.analysis_source();
@@ -720,10 +922,55 @@ impl ToolsView {
     }
 }
 
+/// The codec pane's controls within `pane`.
+fn codec_layout(pane: Rect) -> CodecLayout {
+    let body = pane.inset_xy(8.0, 4.0);
+    let top = body.y + 18.0;
+    let w = ((body.w - 8.0) / 3.0).max(0.0);
+    let hear = std::array::from_fn(|i| {
+        let h = CodecHear::ALL[i];
+        (h, Rect::new(body.x + i as f32 * (w + 4.0), top, w, 22.0))
+    });
+    let bottom = body.bottom() - 22.0;
+    let reset = Rect::new(body.right() - 60.0, bottom, 60.0, 22.0);
+    let choose = Rect::new(body.x, bottom, (body.w - 66.0).max(0.0), 22.0);
+    let rows = Rect::new(body.x, top + 30.0, body.w, (bottom - top - 36.0).max(0.0));
+    CodecLayout {
+        pane,
+        hear,
+        choose,
+        reset,
+        rows,
+    }
+}
+
 impl CanvasView<Session, Action> for ToolsView {
     /// Analysers, meters and curves redrawn every frame.
     fn dense(&self) -> bool {
         true
+    }
+
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Tools".into())
+    }
+
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        self.press(id, press, size, model, cx)
+    }
+
+    fn access_news(&mut self, model: &Session) -> Vec<String> {
+        self.news(model)
     }
 
     fn set_theme(&mut self, theme: &Theme) {
@@ -731,6 +978,7 @@ impl CanvasView<Session, Action> for ToolsView {
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        self.codec_shown = model.codec_monitor_on();
         let l = self.layout(size);
         p.fill(Rect::from_size(size), theme.tools.background);
         self.paint_toolbar(p, &l, model);
@@ -742,6 +990,9 @@ impl CanvasView<Session, Action> for ToolsView {
         }
         if l.phase.w > 0.0 {
             self.paint_phase(p, l.phase, model);
+        }
+        if let Some(c) = &l.codec {
+            self.paint_codec(p, c, &model.codec_status());
         }
         if l.spectrum.w > 60.0 {
             self.paint_spectrum(p, l.spectrum, model);
@@ -761,6 +1012,7 @@ impl CanvasView<Session, Action> for ToolsView {
                 button: PointerButton::Primary,
                 ..
             } => {
+                self.codec_shown = model.codec_monitor_on();
                 let Some(hit) = self.hit(pos, size) else {
                     return false;
                 };
@@ -781,8 +1033,19 @@ impl CanvasView<Session, Action> for ToolsView {
                     Hit::ResetOnPlay => cx.emit(Action::SetResetOnPlay(
                         !model.analysis_settings().reset_on_play,
                     )),
+                    Hit::Announce => self.toggle_announce(cx),
                     Hit::Reset | Hit::Loudness => cx.emit(Action::ResetAnalysis),
-                    Hit::Level | Hit::Phase | Hit::Spectrum => return false,
+                    Hit::CodecHear(h) => cx.emit(Action::Codec(CodecOp::Hear(h))),
+                    Hit::CodecChoose => {
+                        if let Some(c) = &l.codec {
+                            cx.request(Self::codec_menu(
+                                model,
+                                Point::new(c.choose.x, c.choose.bottom()),
+                            ));
+                        }
+                    }
+                    Hit::CodecReset => cx.emit(Action::Codec(CodecOp::ResetMeters)),
+                    Hit::Level | Hit::Phase | Hit::Spectrum | Hit::Codec => return false,
                 }
                 cx.redraw();
                 true
@@ -790,7 +1053,17 @@ impl CanvasView<Session, Action> for ToolsView {
             ViewEvent::PointerMove { pos, .. } => {
                 let clickable = matches!(
                     self.hit(pos, size),
-                    Some(Hit::Source | Hit::Target | Hit::Scale | Hit::ResetOnPlay | Hit::Reset)
+                    Some(
+                        Hit::Source
+                            | Hit::Target
+                            | Hit::Scale
+                            | Hit::ResetOnPlay
+                            | Hit::Announce
+                            | Hit::Reset
+                            | Hit::CodecHear(_)
+                            | Hit::CodecChoose
+                            | Hit::CodecReset
+                    )
                 );
                 cx.set_cursor(if clickable {
                     Cursor::Pointer
@@ -814,6 +1087,9 @@ impl CanvasView<Session, Action> for ToolsView {
                 Hit::Target => "Delivery loudness target (integrated LUFS)",
                 Hit::Scale => "Level meter scale: dBFS or a K-System scale",
                 Hit::ResetOnPlay => "Starting playback starts a new measurement",
+                Hit::Announce => {
+                    "Screen readers say when a reading crosses its limit: the true peak over −1 dBTP, the integrated loudness reaching or leaving the target (±1 LU), the correlation below zero, the codec's peaks over full scale"
+                }
                 Hit::Reset => "Start a new measurement (integrated, range, maxima)",
                 Hit::Loudness => {
                     "EBU R128 / ITU-R BS.1770: integrated (gated), short-term (3 s), momentary (400 ms), loudness range and true peak · Click to reset"
@@ -823,6 +1099,22 @@ impl CanvasView<Session, Action> for ToolsView {
                     "Goniometer (mid up, side across) and correlation: +1 mono, 0 wide, below 0 out of phase"
                 }
                 Hit::Spectrum => "FFT spectrum of the mid signal (8192 points) with peak hold",
+                Hit::CodecHear(CodecHear::Codec) => {
+                    "Hear the master coded and decoded (at the platform's loudness)"
+                }
+                Hit::CodecHear(CodecHear::Original) => {
+                    "Hear the master as it is, as late as the codec (a lossless tier)"
+                }
+                Hit::CodecHear(CodecHear::Difference) => {
+                    "Hear what the codec removed or added, alone"
+                }
+                Hit::CodecChoose => "The codec and bitrate, or a streaming platform",
+                Hit::CodecReset => "Start the codec's measurements anew",
+                Hit::Codec => {
+                    "The codec monitor: the master as listeners get it — the platform's gain from \
+                     the song's loudness, the true peak after decoding, what the codec changes. \
+                     Listening only: renders and meters never hear it"
+                }
             }
             .into(),
         )

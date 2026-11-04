@@ -57,6 +57,9 @@ pub fn describe_bundle(bundle: &Path) -> Result<Vec<ScannedPlugin>, ScanError> {
         .get_plugin_factory()
         .ok_or_else(|| ScanError::NoFactory(bundle.to_path_buf()))?;
     let info = host_info().map_err(|e| ScanError::Scanner(e.to_string()))?;
+    // Plugins the entry's ARA factory names are ARA plugins even when
+    // their features do not say so.
+    let ara_ids = crate::ara::plugin_ids(&entry);
     let mut out = Vec::new();
     for d in factory.plugin_descriptors() {
         let Some(id) = d.id() else { continue };
@@ -64,10 +67,18 @@ pub fn describe_bundle(bundle: &Path) -> Result<Vec<ScannedPlugin>, ScanError> {
             c.map(|c| c.to_string_lossy().to_string())
                 .unwrap_or_default()
         };
-        let features: Vec<String> = d
+        let mut features: Vec<String> = d
             .features()
             .map(|f| f.to_string_lossy().to_string())
             .collect();
+        let id_text = id.to_string_lossy();
+        if ara_ids.iter().any(|a| *a == id_text)
+            && !features
+                .iter()
+                .any(|f| f == crate::ara::FEATURE || f == crate::ara::FEATURE_REQUIRED)
+        {
+            features.push(crate::ara::FEATURE.into());
+        }
         let mut p = ScannedPlugin {
             id: id.to_string_lossy().to_string(),
             name: text(d.name()),

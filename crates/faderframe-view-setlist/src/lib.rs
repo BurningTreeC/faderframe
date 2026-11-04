@@ -4,7 +4,9 @@
 //! or the edit selection) with where they are, how long, what comes after
 //! each (stop, the next song after a gap, play on) and the performer's
 //! notes — renamed and annotated with a double-click, reordered and removed
-//! from a row's menu or the keyboard.
+//! from a row's menu or the keyboard — and the external gear each song
+//! changes (program changes, controller snapshots, patch dumps: the Gear
+//! column, edited as text with a double-click, more in its menu).
 //!
 //! In show mode it is the stage screen (full screen): the song playing or
 //! stood on in large type, its time and what is left, the part of the song
@@ -15,7 +17,7 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_project::setlist::{AfterSong, SetSong};
+use faderframe_project::setlist::{AfterSong, GearTiming, SetSong, SongGear};
 use faderframe_session::setlist::{SetlistOp, ShowOp};
 use faderframe_session::{Action, Session, TransportAction};
 use faderframe_ui_canvas::{
@@ -28,14 +30,18 @@ const COLUMNS_H: f32 = 22.0;
 const ROW_H: f32 = 26.0;
 
 /// The list's columns: (title, width; 0 = what is left).
-const COLUMNS: [(&str, f32); 6] = [
+const COLUMNS: [(&str, f32); 7] = [
     ("#", 34.0),
     ("Song", 0.0),
     ("Start", 90.0),
     ("Length", 70.0),
     ("Then", 170.0),
     ("Notes", 0.0),
+    ("Gear", 170.0),
 ];
+
+/// The Gear column.
+pub const GEAR: usize = 6;
 
 /// What a click in the list or the stage screen hits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +157,106 @@ impl SetlistView {
         .collect()
     }
 
+    /// The mix scene recalled when the show stands on song `i`.
+    fn scene_items(
+        model: &Session,
+        i: usize,
+        now: Option<faderframe_core::MixSceneId>,
+    ) -> Vec<MenuItem<Action>> {
+        let mut items = vec![
+            MenuItem::new("None", Action::Setlist(SetlistOp::Scene(i, None)))
+                .checked(now.is_none()),
+        ];
+        for (k, scene) in model.mix_scenes().scenes.iter().enumerate() {
+            let item = MenuItem::new(
+                scene.name.clone(),
+                Action::Setlist(SetlistOp::Scene(i, Some(scene.id))),
+            )
+            .checked(now == Some(scene.id));
+            items.push(if k == 0 { item.separated() } else { item });
+        }
+        items
+    }
+
+    /// What song `i` sends to external gear: its changes, when they go,
+    /// sending them now, a patch dump from a file, a controller snapshot of
+    /// a track, clearing them.
+    pub fn gear_items(model: &Session, i: usize) -> Vec<MenuItem<Action>> {
+        let Some(song) = model.setlist().songs.get(i) else {
+            return Vec::new();
+        };
+        let gear = &song.gear;
+        let mut items: Vec<MenuItem<Action>> = gear
+            .changes
+            .iter()
+            .map(|c| {
+                let output = faderframe_project::midi_port_display(&c.output);
+                MenuItem::disabled(format!("{} → {output}", c.message.describe()))
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(MenuItem::disabled(
+                "No changes yet (double-click the Gear cell: pc 5 bank 1; cc 7=100; sysex F0 … F7)",
+            ));
+        }
+        for (k, timing) in [GearTiming::Cue, GearTiming::Start].into_iter().enumerate() {
+            let item = MenuItem::new(
+                format!("Sent {}", timing.label()),
+                Action::Setlist(SetlistOp::GearTiming(i, timing)),
+            )
+            .checked(gear.timing == timing);
+            items.push(if k == 0 { item.separated() } else { item });
+        }
+        items.push(if gear.changes.is_empty() {
+            MenuItem::disabled("Send Now").separated()
+        } else {
+            MenuItem::new("Send Now", Action::Show(ShowOp::SendGear(i))).separated()
+        });
+        items.push(MenuItem::new(
+            "Add Patch Dump (.syx)…",
+            Action::Setlist(SetlistOp::ChooseGearSysex(i)),
+        ));
+        let tracks: Vec<MenuItem<Action>> = model
+            .project()
+            .tracks
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    faderframe_project::TrackKind::Instrument | faderframe_project::TrackKind::Midi
+                )
+            })
+            .map(|t| {
+                MenuItem::new(
+                    t.name.clone(),
+                    Action::Setlist(SetlistOp::GearSnapshot {
+                        song: i,
+                        track: t.id,
+                    }),
+                )
+            })
+            .collect();
+        if !tracks.is_empty() {
+            items.push(MenuItem::submenu("Add Controller Snapshot of", tracks));
+        }
+        if !gear.changes.is_empty() {
+            items.push(
+                MenuItem::new(
+                    "Clear Gear Changes",
+                    Action::Setlist(SetlistOp::Gear(
+                        i,
+                        SongGear {
+                            changes: Vec::new(),
+                            timing: gear.timing,
+                        },
+                    )),
+                )
+                .separated(),
+            );
+        }
+        items
+    }
+
     fn row_menu(model: &Session, i: usize) -> Vec<MenuItem<Action>> {
         let songs = &model.setlist().songs;
         let Some(song) = songs.get(i) else {
@@ -162,6 +268,8 @@ impl SetlistView {
                 Action::Transport(TransportAction::Locate(song.start)),
             ),
             MenuItem::submenu("Then", Self::then_items(i, song.then)).separated(),
+            MenuItem::submenu("Mix Scene", Self::scene_items(model, i, song.scene)),
+            MenuItem::submenu("External Gear", Self::gear_items(model, i)),
         ];
         if i > 0 {
             items.push(
@@ -260,13 +368,27 @@ impl SetlistView {
             }
             let style = TextStyle::new(th.fonts.small, th.ui.text);
             let dim = TextStyle::new(th.fonts.small, th.ui.text_dim);
-            let cells: [(String, &TextStyle); 6] = [
+            let gear = match (song.gear.changes.is_empty(), song.gear.timing) {
+                (true, _) => String::new(),
+                (false, GearTiming::Cue) => song.gear.summary(),
+                (false, GearTiming::Start) => format!("▸ {}", song.gear.summary()),
+            };
+            let cells: [(String, &TextStyle); 7] = [
                 (format!("{}", i + 1), &dim),
                 (song.name.clone(), &style),
                 (tl.format_bbt(song.start), &dim),
                 (mmss(model.song_seconds(song)), &dim),
-                (song.then.label(), &dim),
+                (
+                    match song.scene {
+                        Some(id) => {
+                            format!("{} · ‘{}’", song.then.label(), model.mix_scene_name(id))
+                        }
+                        None => song.then.label(),
+                    },
+                    &dim,
+                ),
                 (song.notes.lines().next().unwrap_or("").to_string(), &dim),
+                (gear, &dim),
             ];
             for (c, (text, style)) in cells.iter().enumerate() {
                 let s = if c == 2 || c == 3 {
@@ -602,6 +724,17 @@ impl SetlistView {
         }
     }
 
+    /// The song's gear changes typed: one line, changes apart with "; ".
+    fn gear(&self, i: usize, song: &SetSong, size: Size) -> HostRequest<Action> {
+        HostRequest::TextInput {
+            at: Self::cell(GEAR, self.row_rect(i, size)),
+            initial: song.gear.to_text().replace('\n', "; "),
+            commit: Box::new(move |text: &str| {
+                Some(Action::Setlist(SetlistOp::GearText(i, text.to_string())))
+            }),
+        }
+    }
+
     fn notes(&self, i: usize, song: &SetSong, size: Size) -> HostRequest<Action> {
         HostRequest::TextInput {
             at: Self::cell(5, self.row_rect(i, size)),
@@ -796,6 +929,11 @@ impl CanvasView<Session, Action> for SetlistView {
                         match (c, clicks) {
                             (1, 2) => cx.request(self.rename(i, song, size)),
                             (5, 2) => cx.request(self.notes(i, song, size)),
+                            (GEAR, 2) => cx.request(self.gear(i, song, size)),
+                            (GEAR, _) => cx.request(HostRequest::ContextMenu {
+                                at: pos,
+                                items: Self::gear_items(model, i),
+                            }),
                             (4, _) => cx.request(HostRequest::ContextMenu {
                                 at: pos,
                                 items: Self::then_items(i, song.then),
@@ -909,6 +1047,9 @@ impl CanvasView<Session, Action> for SetlistView {
                 Hit::Column(_, 1) => "Double-click to rename",
                 Hit::Column(_, 4) => "What happens when the song ends",
                 Hit::Column(_, 5) => "Double-click for the performer's notes (lines with \" / \")",
+                Hit::Column(_, GEAR) => {
+                    "External gear the song changes: double-click to type them (pc 5 bank 1; cc 7=100 ch 2; sysex F0 … F7; wait 200; on \"output\"), click for more"
+                }
                 Hit::Column(..) => "Double-click to go there · Right-click for more",
                 Hit::Song(_) => "Click to stand on it, double-click to play it",
                 Hit::Previous => "The previous song (←)",

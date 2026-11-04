@@ -63,6 +63,7 @@ fn audio(source: faderframe_core::AudioSourceId, length: usize) -> ClipContent {
         pitch: None,
         effects: None,
         spectral: None,
+        envelope: None,
     })
 }
 
@@ -252,6 +253,9 @@ fn a_launched_midi_clip_plays_and_releases_the_arrangements_notes() {
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     // A long note in the arrangement, a short one in the launched clip.
     let held = note(&mut tp, 0.0, 32.0);

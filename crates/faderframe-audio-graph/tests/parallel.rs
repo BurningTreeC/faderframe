@@ -80,6 +80,7 @@ impl Processor<Ctx> for Node {
                             key: (key + 1) % 128,
                             velocity,
                         },
+                        fine: Default::default(),
                     });
                 }
             }
@@ -91,6 +92,7 @@ impl Processor<Ctx> for Node {
                         key: (self.seed % 128) as u8,
                         velocity: 100,
                     },
+                    fine: Default::default(),
                 });
             }
         }

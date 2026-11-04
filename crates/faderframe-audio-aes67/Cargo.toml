@@ -1,0 +1,23 @@
+[package]
+name = "faderframe-audio-aes67"
+description = "AES67 network audio: PTPv2 clock, RTP streams, SDP/SAP discovery, as a backend and alongside other devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-audio.workspace = true
+faderframe-realtime.workspace = true
+serde.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rtrb.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -17,12 +17,14 @@
 //!   limiting). Right-click for more; Delete removes the selected song.
 //! * *Release…* edits the album's title, credits and UPC/EAN; *CD master*
 //!   adds a DDP fileset (with CD-Text, optionally digital copy permitted)
-//!   to the export.
+//!   to the export; *QC* chooses the delivery spec whose QC report (PDF
+//!   and JSON) every export writes beside its files, and shows the last
+//!   export's report (its checks, Save QC Report…).
 //! * The footer sums the album up, shows the export folder (click to
 //!   choose another) and the progress of a running job.
 //!
 //! Everything goes through `AlbumAction`s, each one undo step (drags are
-//! one gesture).
+//! one gesture). Screen readers and the keyboard: see [`access`].
 
 use faderframe_audio::{STANDARD_SAMPLE_RATES, format_sample_rate};
 use faderframe_audio_files::{Dither, WavFormat};
@@ -36,10 +38,12 @@ use faderframe_session::delivery::DELIVERY_PRESETS;
 use faderframe_session::vinyl::{self, Severity};
 use faderframe_session::{Action, PluginTarget, Session};
 use faderframe_ui_canvas::{
-    CanvasView, Color, Cursor, EventCx, FileChoice, HostRequest, Key, MenuItem, Paint, Painter,
-    Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, CanvasView, Color, Cursor, EventCx, FileChoice, HostRequest, Key,
+    MenuItem, Paint, Painter, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle,
+    Theme, ViewEvent,
 };
 
+mod access;
 #[cfg(test)]
 mod tests;
 
@@ -73,6 +77,7 @@ pub enum Button {
     Cd,
     Vinyl,
     Release,
+    Qc,
     Analyse,
     Export,
     Cancel,
@@ -167,6 +172,8 @@ pub struct AlbumView {
     selected: Option<SongId>,
     scroll: f32,
     drag: Option<Drag>,
+    /// What screen readers were last told ([`CanvasView::access_news`]).
+    told: Option<access::Told>,
 }
 
 fn minus(s: String) -> String {
@@ -227,6 +234,7 @@ impl AlbumView {
             selected: None,
             scroll: 0.0,
             drag: None,
+            told: None,
         }
     }
 
@@ -280,6 +288,14 @@ impl AlbumView {
             Button::Vinyl if s.vinyl.enabled => format!("Vinyl · {} ▾", s.vinyl.format.short()),
             Button::Vinyl => "Vinyl ▾".into(),
             Button::Release => "Release…".into(),
+            Button::Qc => match s
+                .qc_spec
+                .as_deref()
+                .and_then(faderframe_session::qc::DeliverySpec::by_id)
+            {
+                Some(spec) => format!("QC · {} ▾", spec.short),
+                None => "QC ▾".into(),
+            },
             Button::Analyse => "Analyse".into(),
             Button::Export => "Export".into(),
             Button::Cancel => "Cancel".into(),
@@ -303,6 +319,7 @@ impl AlbumView {
             Button::Cd,
             Button::Vinyl,
             Button::Release,
+            Button::Qc,
         ]
         .into_iter()
         .enumerate()
@@ -629,6 +646,37 @@ impl AlbumView {
             )
             .checked(s.copy_permitted),
         ];
+        HostRequest::ContextMenu { at, items }
+    }
+
+    /// The delivery spec of the export's QC report, and the last export's
+    /// report.
+    pub(crate) fn qc_menu(model: &Session, at: Point) -> HostRequest<Action> {
+        let s = &model.project().album.settings;
+        let set = |qc_spec: Option<String>| {
+            settings_action(AlbumSettings {
+                qc_spec,
+                ..s.clone()
+            })
+        };
+        let mut items = vec![MenuItem::new("No QC report", set(None)).checked(s.qc_spec.is_none())];
+        for (i, spec) in faderframe_session::qc::SPECS.iter().enumerate() {
+            let item = MenuItem::new(
+                format!("QC report: {}", spec.name),
+                set(Some(spec.id.to_string())),
+            )
+            .checked(s.qc_spec.as_deref() == Some(spec.id));
+            items.push(if i == 0 { item.separated() } else { item });
+        }
+        let report = if model.album_export().is_some() {
+            MenuItem::new(
+                "Show the Last Export's Report…",
+                Action::Album(AlbumAction::ShowReport),
+            )
+        } else {
+            MenuItem::disabled("Show the Last Export's Report… (export first)")
+        };
+        items.push(report.separated());
         HostRequest::ContextMenu { at, items }
     }
 
@@ -1011,22 +1059,25 @@ impl AlbumView {
             Button::Cd => cx.request(Self::cd_menu(s, at)),
             Button::Vinyl => cx.request(Self::vinyl_menu(s, at)),
             Button::Release => cx.emit(Action::Album(AlbumAction::Details(None))),
+            Button::Qc => cx.request(Self::qc_menu(model, at)),
             Button::Analyse => cx.emit(Action::Album(AlbumAction::Analyse)),
             Button::Export => cx.emit(Action::Album(AlbumAction::Export)),
             Button::Cancel => cx.emit(Action::Album(AlbumAction::Cancel)),
-            Button::PlayPause => {
-                let pb = model.album_playback();
-                cx.emit(Action::Album(match pb {
-                    Some(pb) if pb.playing => AlbumAction::Pause,
-                    // Resume where it was, or start from the selected song.
-                    Some(pb) if pb.preparing.is_none() => AlbumAction::Play(None),
-                    _ => AlbumAction::Play(self.selected),
-                }));
-            }
+            Button::PlayPause => cx.emit(self.play_action(model)),
             Button::Previous => cx.emit(Action::Album(AlbumAction::Skip(-1))),
             Button::Next => cx.emit(Action::Album(AlbumAction::Skip(1))),
             Button::BackToProject => cx.emit(Action::Album(AlbumAction::StopPlaying)),
         }
+    }
+
+    /// Play or pause: pause while playing, else resume where it was, or
+    /// start from the selected song.
+    fn play_action(&self, model: &Session) -> Action {
+        Action::Album(match model.album_playback() {
+            Some(pb) if pb.playing => AlbumAction::Pause,
+            Some(pb) if pb.preparing.is_none() => AlbumAction::Play(None),
+            _ => AlbumAction::Play(self.selected),
+        })
     }
 
     /// The player strip: its buttons are drawn with the others; here what
@@ -1538,6 +1589,50 @@ impl CanvasView<Session, Action> for AlbumView {
         self.theme = theme.clone();
     }
 
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Album".into())
+    }
+
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        self.press(id, press, size, model, cx)
+    }
+
+    fn access_news(&mut self, model: &Session) -> Vec<String> {
+        self.news(model)
+    }
+
+    /// The song list scrolls (no scrollbar: the wheel and the keyboard).
+    fn scroll_info(&self, axis: ScrollAxis, size: Size, model: &Session) -> Option<ScrollInfo> {
+        if axis != ScrollAxis::Vertical {
+            return None;
+        }
+        let l = self.layout(size, model);
+        Some(ScrollInfo {
+            content: model.project().album.songs.len() as f32 * ROW_H + 8.0,
+            viewport: l.list.h,
+            offset: self.scroll,
+            start: l.list.y,
+            end: (size.h - l.list.bottom()).max(0.0),
+        })
+    }
+
+    fn set_scroll(&mut self, axis: ScrollAxis, offset: f32) {
+        if axis == ScrollAxis::Vertical {
+            self.scroll = offset.max(0.0);
+        }
+    }
+
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, _theme: &Theme) {
         let l = self.layout(size, model);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll(&l, model));
@@ -1595,23 +1690,7 @@ impl CanvasView<Session, Action> for AlbumView {
                             .map_or(*pos, |(_, r)| Point::new(r.x, r.bottom()));
                         self.press_button(b, model, at, cx);
                     }
-                    Hit::Folder => {
-                        let s = model.project().album.settings.clone();
-                        cx.request(HostRequest::ChooseFiles {
-                            choice: FileChoice::Folder {
-                                title: "Export the Album to".into(),
-                                initial: Some(model.album_folder()),
-                            },
-                            commit: Box::new(move |mut paths| {
-                                paths.pop().map(|p| {
-                                    settings_action(AlbumSettings {
-                                        output: Some(p),
-                                        ..s.clone()
-                                    })
-                                })
-                            }),
-                        });
-                    }
+                    Hit::Folder => Self::choose_folder(model, cx),
                     Hit::Cell(i, column) => {
                         let Some(song) = songs.get(i) else {
                             return false;
@@ -1767,11 +1846,21 @@ impl CanvasView<Session, Action> for AlbumView {
                     }
                     (Key::Up, Some(i)) if i > 0 => {
                         self.selected = Some(songs[i - 1].id);
+                        self.keep_in_view(&l, i - 1, model);
                         cx.redraw();
                         true
                     }
                     (Key::Down, Some(i)) if i + 1 < songs.len() => {
                         self.selected = Some(songs[i + 1].id);
+                        self.keep_in_view(&l, i + 1, model);
+                        cx.redraw();
+                        true
+                    }
+                    // Nothing selected: the arrows start at an end.
+                    (Key::Up | Key::Down, None) if !songs.is_empty() => {
+                        let i = if *key == Key::Up { songs.len() - 1 } else { 0 };
+                        self.selected = Some(songs[i].id);
+                        self.keep_in_view(&l, i, model);
                         cx.redraw();
                         true
                     }
@@ -1811,6 +1900,7 @@ impl CanvasView<Session, Action> for AlbumView {
                     Button::Cd => "Also write a CD master for replication: a DDP 2.00 fileset at 44.1 kHz/16-bit with PQ codes (ISRC, UPC/EAN), CD-Text and checksums, verified after writing",
                     Button::Vinyl => "Also write a vinyl premaster: one continuous 24-bit file per side (the songs at the digital release's balance, peaks brought to the vinyl level without limiting), each song's file and a cutting sheet. Sides follow the album's order; the checks look at side lengths, out-of-phase bass, esses and the inner grooves",
                     Button::Release => "The album's title, performer and other credits, and its UPC/EAN",
+                    Button::Qc => "The delivery spec (EBU R128, streaming, CD, …) the QC report checks the files against: with one, every export writes the report (PDF and JSON, with each file's SHA-256) beside the files; and the last export's report",
                     Button::Analyse => "Render and measure every song",
                     Button::Export => "Write every song (and the album file) to the export folder",
                     Button::Cancel => "Stop the analysis or export",

@@ -218,6 +218,9 @@ fn synth_track(tp: &mut TestProject, velocity: u8) -> (faderframe_core::TrackId,
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     let id = tp.project.ids.allocate();
     tp.project.clips.insert(
@@ -235,6 +238,7 @@ fn synth_track(tp: &mut TestProject, velocity: u8) -> (faderframe_core::TrackId,
                 controllers: Vec::new(),
                 expressions: Vec::new(),
                 sysex: Vec::new(),
+                articulations: Vec::new(),
             }),
         },
     );

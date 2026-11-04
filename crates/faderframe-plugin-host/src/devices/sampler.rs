@@ -59,6 +59,12 @@ pub mod id {
     /// Where playing stops (0–1 of the sample; the start to here plays,
     /// backwards when reversed).
     pub const END: u32 = 23;
+    /// Slice mode: each key from [`SLICE_KEY`] plays one slice of the
+    /// sample ([`super::super::samples::SampleDoc::slices`]) as recorded,
+    /// start to end (0: the sample across the keyboard).
+    pub const SLICES: u32 = 24;
+    /// The key playing the first slice.
+    pub const SLICE_KEY: u32 = 25;
 }
 
 /// Published: voices sounding, the newest voice's key and where it plays
@@ -88,6 +94,7 @@ pub fn key_held(value: impl Fn(usize) -> f32, key: u8) -> bool {
 pub const FILTERS: [&str; 4] = ["LP 12", "LP 24", "Band", "High"];
 pub const LOOPS: [&str; 3] = ["Off", "Loop", "While Held"];
 pub const PITCH_MODES: [&str; 2] = ["Repitch", "Keep Length"];
+pub const SLICE_MODES: [&str; 2] = ["Off", "A Key Each"];
 
 const MAX_VOICES: usize = 64;
 
@@ -132,7 +139,16 @@ pub fn parameters() -> Vec<ParameterInfo> {
         stepped(id::KEY_TRACK, "Key Tracking", 1.0, 1.0),
         stepped(id::PITCH_MODE, "Pitch", 1.0, 0.0),
         param(id::END, "End", 0.0, 1.0, 1.0, Percent),
+        stepped(id::SLICES, "Slices", 1.0, 0.0),
+        ranged(id::SLICE_KEY, "First Slice Key", 0.0, 127.0, 36.0),
     ]
+}
+
+/// The slice `key` plays in slice mode (`first`: the first slice's key),
+/// of `count`.
+pub fn slice_of_key(key: u8, first: f64, count: usize) -> Option<usize> {
+    let k = i64::from(key) - first.round() as i64;
+    usize::try_from(k).ok().filter(|&k| k < count)
 }
 
 pub fn format(pid: ParameterId, v: f64) -> Option<String> {
@@ -140,6 +156,8 @@ pub fn format(pid: ParameterId, v: f64) -> Option<String> {
         id::FILTER_TYPE => pick(&FILTERS, v),
         id::LOOP => pick(&LOOPS, v),
         id::PITCH_MODE => pick(&PITCH_MODES, v),
+        id::SLICES => pick(&SLICE_MODES, v),
+        id::SLICE_KEY => crate::devices::note_name(v.round() as i32),
         id::REVERSE | id::KEY_TRACK => on_off(v),
         id::ROOT => crate::devices::note_name(v.round() as i32),
         id::TRANSPOSE => format!("{:+.0} st", v.round()).replace("+0 st", "0 st"),
@@ -780,6 +798,9 @@ pub struct SamplerProcessor {
     meters: [MeterTap; 2],
     /// Stretchers for Keep Length (made when the mode is on).
     keep: Option<KeepLength>,
+    /// What each key sounds (the track's tuning): zones are still chosen
+    /// by key, their pitch follows the key's.
+    tuning: faderframe_midi::tuning::TuningTable,
 }
 
 impl SamplerProcessor {
@@ -815,6 +836,7 @@ impl SamplerProcessor {
                 .then(|| KeepLength::new(sr, block))
                 .flatten(),
             params,
+            tuning: faderframe_midi::tuning::TuningTable::STANDARD,
         }
     }
 
@@ -863,7 +885,8 @@ impl SamplerProcessor {
         self.controls.last_keyswitch = set.zones.iter().find_map(|z| z.sw_default);
     }
 
-    /// Start a voice on `zone` (or the single sample) of `set`.
+    /// Start a voice on `zone` (or the single sample, or of it the slice
+    /// `slice`: start and end frame) of `set`.
     #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
@@ -875,6 +898,7 @@ impl SamplerProcessor {
         key: u8,
         velocity: u8,
         kind: NoteKind,
+        slice: Option<(f64, f64)>,
     ) {
         let Some(s) = set.samples.get(sample) else {
             return;
@@ -912,8 +936,9 @@ impl SamplerProcessor {
         let frames = s.frames as f64;
         let single = zone.is_none();
         let root = zone.map_or(self.get(id::ROOT).round(), |z| z.root);
+        // A slice plays as recorded, whatever its key.
         let keytrack = zone.map_or(
-            if self.get(id::KEY_TRACK) >= 0.5 {
+            if self.get(id::KEY_TRACK) >= 0.5 && slice.is_none() {
                 100.0
             } else {
                 0.0
@@ -930,7 +955,7 @@ impl SamplerProcessor {
             + pitch_rand
             + self.get(id::TUNE)
             + 100.0 * self.get(id::TRANSPOSE).round();
-        let semis = (f64::from(key) - root) * keytrack / 100.0 + tune / 100.0;
+        let semis = (self.tuning.pitch_or_key(key) - root) * keytrack / 100.0 + tune / 100.0;
         // A wavetable's one cycle sounds at the root key's pitch.
         let rate = match zone {
             Some(z) if z.oscillator => 440.0 * 2f64.powf((root - 69.0) / 12.0) * frames,
@@ -944,6 +969,7 @@ impl SamplerProcessor {
         };
         let loop_mode = match zone.and_then(|z| z.loop_mode) {
             Some(m) => m,
+            None if slice.is_some() => LoopMode::NoLoop,
             None if single => match self.get(id::LOOP).round() as i64 {
                 1 => LoopMode::Continuous,
                 2 => LoopMode::Sustain,
@@ -960,7 +986,11 @@ impl SamplerProcessor {
         let mut end = zone
             .and_then(|z| z.end)
             .map_or(frames, |e| ((e + 1) as f64).min(frames));
-        let start = if single {
+        let start = if let Some((a, b)) = slice {
+            // A slice: its own stretch of the sample.
+            end = b.clamp(1.0, frames);
+            a.clamp(0.0, (end - 1.0).max(0.0))
+        } else if single {
             // The region between the start and end markers.
             let a = self.get(id::START).clamp(0.0, 0.99) * frames;
             end = (self.get(id::END).clamp(0.0, 1.0) * frames)
@@ -1260,7 +1290,26 @@ impl SamplerProcessor {
             if kind == NoteKind::Attack
                 && let Some(Some(sample)) = set.slots.first()
             {
-                self.start(set, None, usize::MAX, *sample, channel, key, velocity, kind);
+                // Slice mode: the key's slice (keys outside play nothing).
+                let slice = if self.get(id::SLICES) >= 0.5 && !set.slices.is_empty() {
+                    match slice_of_key(key, self.get(id::SLICE_KEY), set.slices.len()) {
+                        Some(k) => Some(set.slices[k]),
+                        None => return,
+                    }
+                } else {
+                    None
+                };
+                self.start(
+                    set,
+                    None,
+                    usize::MAX,
+                    *sample,
+                    channel,
+                    key,
+                    velocity,
+                    kind,
+                    slice,
+                );
             }
             return;
         }
@@ -1313,7 +1362,7 @@ impl SamplerProcessor {
             if z.seq_length > 1 && round % z.seq_length + 1 != z.seq_position {
                 continue;
             }
-            self.start(set, Some(z), i, z.sample, channel, key, vel, kind);
+            self.start(set, Some(z), i, z.sample, channel, key, vel, kind, None);
         }
     }
 
@@ -1357,6 +1406,7 @@ impl SamplerProcessor {
                     key,
                     100,
                     NoteKind::Controller,
+                    None,
                 );
             }
         }
@@ -1401,6 +1451,8 @@ impl SamplerProcessor {
 
     fn handle(&mut self, set: Option<&super::samples::SampleSet>, event: MidiEvent) {
         match event {
+            // A key the tuning leaves out plays nothing.
+            MidiEvent::NoteOn { key, .. } if !self.tuning.is_mapped(key) => {}
             MidiEvent::NoteOn {
                 channel,
                 key,
@@ -1980,6 +2032,10 @@ impl PluginProcessor for SamplerProcessor {
             pool.release_all();
         }
     }
+
+    fn set_tuning(&mut self, tuning: &faderframe_midi::tuning::TuningTable) {
+        self.tuning = *tuning;
+    }
 }
 
 #[cfg(test)]
@@ -2076,6 +2132,53 @@ pub(crate) mod tests {
         (Play::new(p), host)
     }
 
+    /// The sample plays at the pitch the tuning gives its key (relative to
+    /// its root's own pitch); keys the tuning leaves out are silent.
+    #[test]
+    fn a_sample_plays_at_the_pitch_the_tuning_gives_its_key() {
+        use faderframe_midi::tuning::{KeyboardMap, Tuning};
+        let d = fixtures::dir("sampler-tuning");
+        let mut doc = SampleDoc::default();
+        doc.set(
+            0,
+            Some(fixtures::tone(&d.join("a.wav"), 440.0, 44_100, 1.0)),
+        );
+        let plain = || sampler(doc.clone(), &[(id::ROOT, 69.0), (id::VOLUME, 0.0)]);
+        // 24-EDO: key 70 is ten quarter tones above middle C (F4's
+        // 349.2 Hz), where twelve-tone keys put B♭4 (466.2 Hz).
+        let (mut s, _host) = plain();
+        s.p.set_tuning(&Tuning::equal(24).table(440.0));
+        s.send(on(70, 127));
+        let (l, _, _) = s.run(0.4);
+        let want = 261.625_565_3 * 2f64.powf(10.0 / 24.0);
+        let twelve = 440.0 * 2f64.powf(1.0 / 12.0);
+        assert!(
+            bin_db(&l, want) > bin_db(&l, twelve) + 10.0,
+            "{want} Hz: {} vs {}",
+            bin_db(&l, want),
+            bin_db(&l, twelve)
+        );
+        // The reference pitch moves the root key too.
+        let (mut s, _host) = plain();
+        s.p.set_tuning(&Tuning::twelve_tet().table(432.0));
+        s.send(on(69, 127));
+        let (l, _, _) = s.run(0.4);
+        assert!(bin_db(&l, 432.0) > bin_db(&l, 440.0) + 6.0);
+        // An unmapped key plays nothing.
+        let mut map = KeyboardMap::standard(12);
+        map.size = 2;
+        map.map = vec![None, Some(0)];
+        map.octave_degree = 1;
+        map.reference_key = 61;
+        let t = Tuning::equal(12).with_mapping(Some(map)).unwrap();
+        assert!(!t.table(440.0).is_mapped(70));
+        let (mut s, _host) = plain();
+        s.p.set_tuning(&t.table(440.0));
+        s.send(on(70, 127));
+        let (l, _, _) = s.run(0.2);
+        assert!(l.iter().all(|v| v.abs() < 1e-9));
+    }
+
     #[test]
     fn a_sample_plays_at_the_pitch_of_the_key_and_loops() {
         let d = fixtures::dir("sampler");
@@ -2114,6 +2217,76 @@ pub(crate) mod tests {
         s.send(off(69));
         let (_, _, status) = s.run(2.0);
         assert_eq!(status, ProcessStatus::Sleep);
+    }
+
+    /// Slice mode: each key from the first slice key plays its slice as
+    /// recorded (its pitch whatever the key, start to end, no loop); keys
+    /// past the slices play nothing.
+    #[test]
+    fn slices_play_a_key_each_as_recorded() {
+        let d = fixtures::dir("sampler-slices");
+        let path = d.join("four.wav");
+        let tones = [220.0, 440.0, 660.0, 880.0];
+        let x: Vec<f32> = (0..48_000)
+            .map(|i| {
+                let f = tones[i / 12_000];
+                (0.5 * (std::f64::consts::TAU * f * i as f64 / 48_000.0).sin()) as f32
+            })
+            .collect();
+        faderframe_audio_files::write_wav(
+            &path,
+            &[x],
+            48_000,
+            faderframe_audio_files::WavFormat::Float32,
+            false,
+        )
+        .unwrap();
+        let mut doc = SampleDoc::default();
+        doc.set(0, Some(path.to_string_lossy().into_owned()));
+        doc.set_slices(vec![12_000, 24_000, 36_000]);
+        let play = |key: u8, set: &[(u32, f64)]| {
+            let mut all = vec![
+                (id::SLICES, 1.0),
+                (id::SLICE_KEY, 48.0),
+                (id::RELEASE, 5.0),
+                (id::VOLUME, 0.0),
+                (id::LOOP, 1.0),
+            ];
+            all.extend_from_slice(set);
+            let (mut s, _host) = sampler(doc.clone(), &all);
+            s.send(on(key, 127));
+            let (l, _, _) = s.run(0.6);
+            let last = l
+                .iter()
+                .rposition(|v| v.abs() > 1e-4)
+                .map_or(0.0, |i| i as f64 / SR);
+            (l, last)
+        };
+        for (k, f) in tones.iter().enumerate() {
+            let (l, length) = play(48 + k as u8, &[]);
+            assert!((length - 0.25).abs() < 0.01, "slice {k}: {length} s");
+            let others = tones.iter().filter(|o| *o != f);
+            for o in others {
+                assert!(
+                    bin_db(&l[..10_000], *f) > bin_db(&l[..10_000], *o) + 30.0,
+                    "slice {k} plays {f} Hz, not {o}"
+                );
+            }
+        }
+        // Past the slices, or below the first key: nothing.
+        for key in [47, 52] {
+            let (l, _) = play(key, &[]);
+            assert!(l.iter().all(|v| v.abs() < 1e-9), "key {key}");
+        }
+        // Reversed: the slice backwards, still its own.
+        let (l, length) = play(49, &[(id::REVERSE, 1.0)]);
+        assert!((length - 0.25).abs() < 0.01, "{length}");
+        assert!(bin_db(&l[..10_000], 440.0) > bin_db(&l[..10_000], 220.0) + 30.0);
+        // Slice mode off: the sample across the keyboard again (past the
+        // first slice's end, into the third quarter).
+        let (l, length) = play(60, &[(id::SLICES, 0.0), (id::LOOP, 0.0), (id::ROOT, 60.0)]);
+        assert!(length > 0.59, "{length}");
+        assert!(bin_db(&l[25_000..28_000], 660.0) > -12.0);
     }
 
     #[test]

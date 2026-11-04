@@ -237,11 +237,14 @@ pub struct SlotKey {
 }
 
 impl SlotKey {
-    /// A stable number for the engine (below 2^63: the engine's status
-    /// flags take the top bit).
+    /// A stable number for the engine (below 2^63 − 1: the engine's
+    /// status flags take the top bit, and 2^63 − 1 stands for the
+    /// arrangement).
     pub fn hash(self) -> u64 {
-        (self.track.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.scene.raw().rotate_left(29))
-            >> 1
+        // (The engine keeps 2^63 − 1 for "the arrangement".)
+        ((self.track.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.scene.raw().rotate_left(29))
+            >> 1)
+            .min((1 << 63) - 2)
     }
 }
 
@@ -591,6 +594,7 @@ mod tests {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         };
         let mut tl = Timeline::default();

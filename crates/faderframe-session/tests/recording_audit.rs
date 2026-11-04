@@ -209,6 +209,7 @@ fn a_frozen_armed_track_is_left_out_and_the_others_record() {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     }))

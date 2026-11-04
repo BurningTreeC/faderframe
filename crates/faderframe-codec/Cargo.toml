@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-codec"
+description = "Lossy codec monitoring for FaderFrame: Opus coded and decoded in real time with an exact delay, streaming platforms' loudness normalisation, delivery previews"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+faderframe-analysis.workspace = true
+faderframe-core.workspace = true
+thiserror.workspace = true
+
+# libopus (bundled, built with CMake); left out of SDK-less cross-checks.
+[target.'cfg(not(faderframe_check_only))'.dependencies]
+opus = "0.4"

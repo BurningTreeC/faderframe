@@ -19,7 +19,7 @@ use crate::wire::{expression_index, expression_kind};
 use faderframe_audio_graph::AudioBuffer;
 use faderframe_automation::ParameterEvent;
 use faderframe_core::{ChannelLayout, ParameterId};
-use faderframe_midi::{ExpressionValue, MidiBuffer, MidiEvent, TimedMidiEvent};
+use faderframe_midi::{ExpressionValue, Fine, MidiBuffer, MidiEvent, TimedMidiEvent};
 use faderframe_plugin_host::{NoteParamMod, ParamMod, ProcessStatus};
 use faderframe_timeline::TimeSignature;
 use faderframe_transport::{LoopRange, TransportInfo};
@@ -43,12 +43,13 @@ pub const MAX_NOTE_MODS: usize = 256;
 /// Bytes of SysEx per block (to the plugin).
 pub const MAX_SYSEX: usize = 16 * 1024;
 const MAGIC: u32 = 0x4646_5348;
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// A SysEx event: `value` holds the start of its bytes in `sysex_in`
 /// (low 16 bits) and their count (high 16 bits).
 const SYSEX_KIND: u8 = 9;
 
-/// A MIDI event or note expression at a frame offset.
+/// A MIDI event or note expression at a frame offset, with its MIDI 2.0
+/// resolution ([`Fine`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WireEvent {
@@ -58,6 +59,12 @@ pub struct WireEvent {
     pub a: u8,
     pub b: u8,
     pub value: i32,
+    /// The value at MIDI 2.0's width (when `has_fine` is 1).
+    pub fine: u32,
+    pub has_fine: u8,
+    /// A note's attribute (type, data).
+    pub attribute: u8,
+    pub attribute_data: u16,
 }
 
 impl WireEvent {
@@ -65,6 +72,10 @@ impl WireEvent {
         let mut w = WireEvent {
             offset: e.sample_offset,
             channel: e.event.channel(),
+            fine: e.fine.value.unwrap_or(0),
+            has_fine: u8::from(e.fine.value.is_some()),
+            attribute: e.fine.attribute.kind,
+            attribute_data: e.fine.attribute.data,
             ..Self::default()
         };
         match e.event {
@@ -135,7 +146,14 @@ impl WireEvent {
             },
             _ => return None,
         };
-        Some(TimedMidiEvent::new(self.offset, event))
+        let fine = Fine {
+            value: (self.has_fine == 1).then_some(self.fine),
+            attribute: faderframe_midi::ump::Attribute {
+                kind: self.attribute,
+                data: self.attribute_data,
+            },
+        };
+        Some(TimedMidiEvent::with_fine(self.offset, event, fine))
     }
 }
 
@@ -836,6 +854,20 @@ mod tests {
             let t = TimedMidiEvent::new(i as u32, e);
             assert_eq!(WireEvent::encode(&t).decode(), Some(t));
         }
+        // MIDI 2.0's resolution crosses too.
+        let (velocity, fine) = Fine::of_velocity(0x1234, true);
+        let t = TimedMidiEvent::with_fine(
+            7,
+            MidiEvent::NoteOn {
+                channel: 2,
+                key: 64,
+                velocity,
+            },
+            fine.with_attribute(faderframe_midi::ump::Attribute { kind: 1, data: 9 }),
+        );
+        let back = WireEvent::encode(&t).decode().unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.full_value(), Some(0x1234));
         let garbage = WireEvent {
             kind: 99,
             ..WireEvent::default()

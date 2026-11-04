@@ -3,10 +3,12 @@
 //! small in a mixer strip. The room panner draws the room box (positions
 //! `x`, `y`); VBAP draws the circle of directions around the listener
 //! (front up, left on the left; speakers above ear level and a source's
-//! elevation closer to the middle, by the cosine of their elevation).
+//! elevation closer to the middle, by the cosine of their elevation). An
+//! ambisonic field has no speakers: its sources are drawn on the circle
+//! by direction, nearer the middle inside the reference distance.
 
 use faderframe_core::surround::{StereoSource, SurroundPanner};
-use faderframe_core::{ChannelLayout, SurroundFormat, SurroundPan};
+use faderframe_core::{ChannelLayout, SurroundPan};
 use faderframe_ui_canvas::{Align, Color, Painter, Point, Rect, TextStyle, Theme};
 
 /// A place (`x` −1 left … 1 right, `y` −1 back … 1 front) in `room`.
@@ -53,6 +55,36 @@ pub fn by_direction(pan: &SurroundPan, object: bool) -> bool {
     pan.panner == SurroundPanner::Vbap && !object
 }
 
+/// Whether `pan` into `dest` is drawn (and dragged) as directions: an
+/// ambisonic field always, a bed by [`by_direction`].
+pub fn by_direction_into(pan: &SurroundPan, object: bool, dest: ChannelLayout) -> bool {
+    matches!(dest, ChannelLayout::Ambisonic(_)) || by_direction(pan, object)
+}
+
+/// How a stereo `layout` source goes into `dest` by `pan` (into a field
+/// dual pan always applies: directions are all a field has).
+pub fn stereo_mode_into(
+    pan: &SurroundPan,
+    layout: ChannelLayout,
+    object: bool,
+    dest: ChannelLayout,
+) -> StereoSource {
+    match dest {
+        ChannelLayout::Ambisonic(_) if layout == ChannelLayout::Stereo => pan.stereo,
+        ChannelLayout::Ambisonic(_) => StereoSource::Image,
+        _ => stereo_mode(pan, layout, object),
+    }
+}
+
+/// How a destination is named in readouts and titles ("5.1", "AmbiX 3").
+pub fn dest_name(dest: ChannelLayout) -> String {
+    match dest {
+        ChannelLayout::Surround(f) => f.name().to_string(),
+        ChannelLayout::Ambisonic(o) => o.short_name().to_string(),
+        other => other.short_name(),
+    }
+}
+
 /// How a stereo `layout` source goes in by `pan` (mono: as an image of one).
 pub fn stereo_mode(pan: &SurroundPan, layout: ChannelLayout, object: bool) -> StereoSource {
     if layout != ChannelLayout::Stereo || object {
@@ -81,7 +113,16 @@ pub fn sources(pan: &SurroundPan, layout: ChannelLayout) -> Vec<(f32, f32)> {
 /// VBAP: an image `30° × width` either side of its azimuth, dual pan's own
 /// two, or one.
 pub fn directions(pan: &SurroundPan, layout: ChannelLayout) -> Vec<(f32, f32)> {
-    match stereo_mode(pan, layout, false) {
+    directions_by(pan, layout, stereo_mode(pan, layout, false))
+}
+
+/// The directions a source's channels come from in `mode`.
+pub fn directions_by(
+    pan: &SurroundPan,
+    layout: ChannelLayout,
+    mode: StereoSource,
+) -> Vec<(f32, f32)> {
+    match mode {
         _ if layout != ChannelLayout::Stereo => vec![(pan.azimuth, pan.elevation)],
         StereoSource::Dual => vec![(pan.left, pan.elevation), (pan.right, pan.elevation)],
         _ => vec![
@@ -119,7 +160,8 @@ fn lit(db: f32) -> f32 {
 
 /// What to draw.
 pub struct Room<'a> {
-    pub format: SurroundFormat,
+    /// The bed (or the ambisonic field) the track is panned into.
+    pub dest: ChannelLayout,
     pub source: ChannelLayout,
     pub pan: SurroundPan,
     /// Each speaker's level (dBFS) in channel order; empty: unlit.
@@ -141,8 +183,12 @@ impl Room<'_> {
         let radius = if self.compact { 2.0 } else { 6.0 };
         p.fill_rounded(room, radius, &ground.into());
         p.stroke_rounded(room, radius, 1.0, line.with_alpha(0.7));
-        let circular = by_direction(&self.pan, self.object);
-        let mode = stereo_mode(&self.pan, self.source, self.object);
+        let circular = by_direction_into(&self.pan, self.object, self.dest);
+        let mode = stereo_mode_into(&self.pan, self.source, self.object, self.dest);
+        let field = matches!(self.dest, ChannelLayout::Ambisonic(_));
+        let speakers = faderframe_core::surround::speakers_of(self.dest)
+            .filter(|_| !field)
+            .unwrap_or(&[]);
         // The listener and the axes.
         let c = room.center();
         p.hline(room.x + 2.0, room.right() - 2.0, c.y, line.with_alpha(0.35));
@@ -157,6 +203,19 @@ impl Room<'_> {
             let mut ring = faderframe_ui_canvas::Path::new();
             ring.arc(c, r, 0.0, std::f32::consts::TAU, false);
             p.stroke_path(&ring, 1.0, line.with_alpha(0.6));
+            if field {
+                // A field covers the whole sphere: the 45° ring (above
+                // and below alike) and the reference distance.
+                let mut ring = faderframe_ui_canvas::Path::new();
+                ring.arc(
+                    c,
+                    r * std::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    std::f32::consts::TAU,
+                    false,
+                );
+                p.stroke_path(&ring, 1.0, line.with_alpha(0.3));
+            }
         } else if !self.compact {
             let mut ring = faderframe_ui_canvas::Path::new();
             ring.arc(c, room.w * 0.31, 0.0, std::f32::consts::TAU, false);
@@ -175,7 +234,14 @@ impl Room<'_> {
         // The speakers, lit by what they play.
         let dot = if self.compact { 1.8 } else { 7.0 };
         let out = if self.compact { 1.5 } else { dot + 5.0 };
-        for (i, s) in self.format.speakers().iter().enumerate() {
+        if field && !self.compact {
+            p.text(
+                &dest_name(self.dest),
+                Rect::new(room.x, room.bottom() + 18.0, room.w, 12.0),
+                &TextStyle::new(th.fonts.tiny, line.mix(bright, 0.6)).align(Align::Center),
+            );
+        }
+        for (i, s) in speakers.iter().enumerate() {
             if s.lfe {
                 continue;
             }
@@ -222,8 +288,8 @@ impl Room<'_> {
                 );
             }
         }
-        if !self.compact && self.format.has_lfe() {
-            let i = self.format.speakers().iter().position(|s| s.lfe);
+        if !self.compact && speakers.iter().any(|s| s.lfe) {
+            let i = speakers.iter().position(|s| s.lfe);
             let l = i
                 .and_then(|i| self.levels.get(i))
                 .map_or(0.0, |&db| lit(db));
@@ -240,7 +306,11 @@ impl Room<'_> {
             // Not placed: the left and right channels on L and R.
             if !self.compact {
                 p.text(
-                    "Balanced on L and R",
+                    if field {
+                        "Balanced at 30° left and right"
+                    } else {
+                        "Balanced on L and R"
+                    },
                     Rect::new(room.x, c.y + 8.0, room.w, 14.0),
                     &TextStyle::new(th.fonts.small, line.mix(bright, 0.6)).align(Align::Center),
                 );
@@ -249,10 +319,19 @@ impl Room<'_> {
         }
         // The track: spread as a halo, height as the puck's size (room) or
         // its distance from the circle (VBAP).
+        // Into a field, inside the reference distance nearer the middle.
+        let near = |at: Point| {
+            if field && self.pan.distance < 1.0 {
+                let k = self.pan.distance.max(0.0);
+                Point::new(c.x + (at.x - c.x) * k, c.y + (at.y - c.y) * k)
+            } else {
+                at
+            }
+        };
         let places: Vec<Point> = if circular {
-            directions(&self.pan, self.source)
+            directions_by(&self.pan, self.source, mode)
                 .into_iter()
-                .map(|(a, e)| direction_to_view(room, a, e))
+                .map(|(a, e)| near(direction_to_view(room, a, e)))
                 .collect()
         } else {
             sources(&self.pan, self.source)
@@ -261,7 +340,11 @@ impl Room<'_> {
                 .collect()
         };
         let centre = if circular {
-            direction_to_view(room, self.pan.azimuth, self.pan.elevation)
+            near(direction_to_view(
+                room,
+                self.pan.azimuth,
+                self.pan.elevation,
+            ))
         } else {
             to_view(room, self.pan.x, self.pan.y)
         };
@@ -347,6 +430,23 @@ pub fn format_direction(azimuth: f32, elevation: f32) -> String {
         format!("{across} ↓{:.0}°", -e)
     } else {
         across
+    }
+}
+
+/// [`format_place`] for a source into `dest`: into an ambisonic field
+/// always its direction (and its distance when not the reference).
+pub fn format_place_into(pan: &SurroundPan, dest: ChannelLayout) -> String {
+    if !matches!(dest, ChannelLayout::Ambisonic(_)) {
+        return format_place(pan);
+    }
+    let place = format_place(&SurroundPan {
+        panner: SurroundPanner::Vbap,
+        ..*pan
+    });
+    if (pan.distance - 1.0).abs() > 0.005 {
+        format!("{place} · {:.2}×", pan.distance)
+    } else {
+        place
     }
 }
 

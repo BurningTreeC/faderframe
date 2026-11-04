@@ -37,6 +37,8 @@ pub const PHRASE_GAP: u64 = 8 * 1_000_000_000;
 struct Played {
     time_ns: u64,
     event: MidiEvent,
+    /// Its MIDI 2.0 resolution.
+    fine: faderframe_midi::Fine,
     /// Timeline sample where it was heard (while playing).
     position: Option<i64>,
     /// Transport runs (a start or stop begins a new one).
@@ -186,6 +188,7 @@ impl Session {
             cap.played.push_back(Played {
                 time_ns: ev.time_ns,
                 event,
+                fine: ev.fine,
                 position,
                 run: cap.run,
                 pass: cap.pass,
@@ -293,6 +296,7 @@ impl Session {
                         position,
                         pass: p.pass,
                         event: p.event,
+                        fine: p.fine,
                     });
                 }
             }

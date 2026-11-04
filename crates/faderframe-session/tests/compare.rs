@@ -96,7 +96,7 @@ fn the_history_auditioned_is_the_project_as_undoing_makes_it() {
     let (then, now) = (info.then_lufs.unwrap(), info.now_lufs.unwrap());
     assert!(then > now + 0.5, "then {then} now {now}");
     let status = s.compare_status().unwrap();
-    assert_eq!(status.what, Comparing::History { done: 1 });
+    assert_eq!(status.what, Comparing::History { node: info.node });
     assert!(status.ready && status.matched && !status.hearing_other);
     let shared = std::sync::Arc::clone(s.compare_link().shared());
     assert!((shared.gain() - db_to_gain((now - then) as f32)).abs() < 1e-4);

@@ -1,4 +1,5 @@
-//! Samples for the built-in samplers: the files picked for a slot are
+//! Samples for the built-in samplers (and the Convolution Reverb's impulse
+//! response, kept the same way in its slot 0): the files picked for a slot are
 //! copied into the project's media folder (an SFZ instrument is referenced
 //! where it lies, with its samples) and decoded on a worker thread; once
 //! done, the sampler's new state is one undo step ("Load Samples"), and
@@ -16,10 +17,41 @@ use std::thread::JoinHandle;
 /// The subfolder of the media folder samples are copied to.
 pub const SAMPLES_FOLDER: &str = "Samples";
 
-/// Whether a slot holds one of the samplers.
+/// Whether a slot holds a built-in that plays files it loads the samplers'
+/// way (the samplers, the Convolution Reverb's impulse, the Wavetable's
+/// tables and the Granular's sample).
 pub fn is_sampler(slot: &PluginSlot) -> bool {
     slot.plugin.format == PluginFormat::Builtin
-        && matches!(slot.plugin.id.as_str(), builtin::SAMPLER | builtin::DRUMS)
+        && matches!(
+            slot.plugin.id.as_str(),
+            builtin::SAMPLER
+                | builtin::DRUMS
+                | builtin::CONVOLUTION_REVERB
+                | builtin::WAVETABLE
+                | builtin::GRANULAR
+        )
+}
+
+/// A Convolution Reverb given an impulse file plays it: its Space set to
+/// the file in the parameter block and the slot's explicit values.
+pub fn plays_the_file(
+    slot: &PluginSlot,
+    doc: &SampleDoc,
+    params: &mut Vec<u8>,
+    explicit: &mut [faderframe_project::SavedParameter],
+) {
+    use faderframe_plugin_host::devices::convolution::{id, parameters};
+    if slot.plugin.id != builtin::CONVOLUTION_REVERB || doc.file(0).is_none() {
+        return;
+    }
+    let space = faderframe_core::ParameterId(id::SPACE);
+    let values = faderframe_plugin_host::ParamValues::new(parameters());
+    if values.load(params).is_ok() && values.set_by_id(space, 0.0).is_ok() {
+        *params = values.save();
+    }
+    for p in explicit.iter_mut().filter(|p| p.id == space) {
+        p.value = 0.0;
+    }
 }
 
 /// The document a sampler's slot state carries (empty without one).
@@ -131,6 +163,7 @@ impl SampleJob {
                 // Decoded here, they wait in the cache for the instance.
                 let set = Arc::new(samples::load(&SampleDoc {
                     files: assigned.iter().map(|(_, f)| Some(f.clone())).collect(),
+                    ..SampleDoc::default()
                 }));
                 notes.extend(set.errors.iter().cloned());
                 Loaded {

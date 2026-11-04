@@ -998,6 +998,7 @@ fn hosts_a_plugin_with_separate_controller() {
                 key: 60,
                 velocity: 100,
             },
+            fine: Default::default(),
         })
         .unwrap();
     rig.events[0]
@@ -1008,6 +1009,7 @@ fn hosts_a_plugin_with_separate_controller() {
                 controller: 7,
                 value: 127,
             },
+            fine: Default::default(),
         })
         .unwrap();
     let out = rig.run(proc.as_mut(), &[]);
@@ -1022,6 +1024,7 @@ fn hosts_a_plugin_with_separate_controller() {
                 controller: 7,
                 value: 0,
             },
+            fine: Default::default(),
         })
         .unwrap();
     rig.events[0]
@@ -1032,6 +1035,7 @@ fn hosts_a_plugin_with_separate_controller() {
                 key: 60,
                 velocity: 0,
             },
+            fine: Default::default(),
         })
         .unwrap();
     let out = rig.run(proc.as_mut(), &[]);
@@ -1050,6 +1054,7 @@ fn hosts_a_plugin_with_separate_controller() {
             kind,
             value: ExpressionValue::new(v),
         },
+        fine: Default::default(),
     };
     let note = |at, key, on: bool| TimedMidiEvent {
         sample_offset: at,
@@ -1066,10 +1071,22 @@ fn hosts_a_plugin_with_separate_controller() {
                 velocity: 0,
             }
         },
+        fine: Default::default(),
     };
+    // Key 72 at MIDI 2.0's resolution: a 16-bit velocity.
+    let (v7, fine) = faderframe_midi::Fine::of_velocity(0xA001, true);
+    let fine_note = TimedMidiEvent::with_fine(
+        0,
+        MidiEvent::NoteOn {
+            channel: 0,
+            key: 72,
+            velocity: v7,
+        },
+        fine,
+    );
     for e in [
         note(0, 70, true),
-        note(0, 72, true),
+        fine_note,
         expr(1, 70, NoteExpressionKind::Tuning, 12.0),
         expr(2, 70, NoteExpressionKind::Volume, 0.0),
         expr(3, 72, NoteExpressionKind::Pressure, 0.5),
@@ -1098,6 +1115,13 @@ fn hosts_a_plugin_with_separate_controller() {
         let a = find(kNoteOnEvent as u32, 70).1;
         let b = find(kNoteOnEvent as u32, 72).1;
         assert!(a >= 0 && b >= 0 && a != b, "{seen:?}");
+        // Velocities as floats: MIDI 1.0's as they were, MIDI 2.0's 16 bits.
+        assert!((find(kNoteOnEvent as u32, 70).3 - 100.0 / 127.0).abs() < 1e-6);
+        let fine = find(kNoteOnEvent as u32, 72).3;
+        assert!(
+            (fine - f64::from(0xA001u16) / 65535.0).abs() < 1e-7,
+            "{fine}"
+        );
         let tuning = find(kNoteExpressionValueEvent as u32, kTuningTypeID as i32);
         assert_eq!(tuning.1, a);
         assert!((tuning.3 - 0.55).abs() < 1e-9, "{tuning:?}");
@@ -1267,6 +1291,7 @@ fn programs_and_double_precision() {
                 channel: 0,
                 program: 1,
             },
+            fine: Default::default(),
         })
         .unwrap();
     assert_eq!(rig.run(proc.as_mut(), &[])[0], 1.0, "Unity: gain 0.5");

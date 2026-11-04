@@ -30,6 +30,10 @@ pub struct VideoSource {
     /// Its sound streams (channels each), for "take the sound" choices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sound: Vec<u32>,
+    /// The picture is 360°, laid out so: from the file's metadata, or as
+    /// the user marked it (the video window then looks into it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spherical: Option<faderframe_core::spherical::Spherical>,
 }
 
 impl VideoSource {

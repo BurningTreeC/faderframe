@@ -135,10 +135,14 @@ impl Session {
             .map(|(i, q)| (hits[*i].0.id, *q))
             .collect();
         for m in &p.markers {
-            let position = landed
-                .iter()
-                .find(|(id, _)| *id == m.id)
-                .map_or_else(|| keep(m.position), |(_, q)| MusicalTime::from_quarters(*q));
+            let hit = landed.iter().find(|(id, _)| *id == m.id);
+            // A marker placed in time keeps its sample exactly
+            // (`Session::edit` keeps it).
+            if hit.is_none() && m.is_time_locked() {
+                continue;
+            }
+            let position =
+                hit.map_or_else(|| keep(m.position), |(_, q)| MusicalTime::from_quarters(*q));
             if position != m.position {
                 commands.push(Command::UpdateMarker {
                     marker: Marker {

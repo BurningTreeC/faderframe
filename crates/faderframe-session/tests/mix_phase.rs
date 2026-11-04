@@ -58,6 +58,7 @@ fn generated(p: &mut Project, name: &str, spec: GeneratorSpec, role: Option<Trac
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     t.clips.push(clip.id);

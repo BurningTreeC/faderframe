@@ -1,0 +1,20 @@
+[package]
+name = "faderframe-ara"
+description = "ARA 2 (Audio Random Access) hosting: the C API, the host's interfaces and the document model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# A plug-in side of ARA written in Rust (factory, document controller,
+# playback renderer) for tests of the host without a real plug-in.
+mock = []
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true

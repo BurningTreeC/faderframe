@@ -9,7 +9,9 @@
 //! by what it reaches so nothing of one meets the next), bracketed, the
 //! parts named at the left, notes sounding together one above the other,
 //! the bar lines through the system unless words are sung between
-//! staves; a system that does not fit the page starts the next. Chords
+//! staves; a grand staff (a piano's hands) is braced, named once and its
+//! bar lines run through both its staves; a system that does not fit the
+//! page starts the next. Chords
 //! stack their noteheads on one stem (a second's upper note beside it),
 //! their accidentals in columns. Tablature has a line a string (broken
 //! where a fret number stands), its clef and metre, and — standing alone —
@@ -96,6 +98,244 @@ pub struct Page {
     pub ink: Vec<Ink>,
 }
 
+/// Where an engraved sheet put its systems, bars and notes (points on its
+/// pages): what an editor points at.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Map {
+    /// The staff space (points).
+    pub space: f32,
+    pub systems: Vec<SystemMap>,
+    /// Each part's events: by bar, then event (the first voice's, then
+    /// the second's, as [`Measure::all_events`]); `None`: not drawn
+    /// (tablature).
+    pub events: Vec<Vec<Vec<Option<EventBox>>>>,
+}
+
+/// One system: its page, its bars and where its staves are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemMap {
+    pub page: usize,
+    pub bars: std::ops::Range<usize>,
+    /// Each part's staff: its top line's y.
+    pub staves: Vec<f32>,
+    /// Each part's staff height (from its top line to its bottom line).
+    pub heights: Vec<f32>,
+    pub spans: Vec<BarSpan>,
+    /// From the top of the first staff's room to the bottom of the last's.
+    pub top: f32,
+    pub bottom: f32,
+    /// Where the bars begin (after the clef, key and time) and end.
+    pub left: f32,
+    pub right: f32,
+}
+
+/// A bar of a system: where it is and where its times are drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BarSpan {
+    pub bar: usize,
+    pub x: f32,
+    pub width: f32,
+    /// The times something starts in it (divisions) and their x (a
+    /// notehead's middle there).
+    pub points: Vec<(u32, f32)>,
+    /// Its length (divisions).
+    pub length: u32,
+}
+
+impl BarSpan {
+    /// Where the bar's notes end: a little before its bar line.
+    fn end_x(&self, space: f32) -> f32 {
+        let last = self.points.last().map_or(self.x, |p| p.1);
+        (self.x + self.width - 0.8 * space).max(last)
+    }
+
+    /// The time (divisions) at `x`: between the drawn times in proportion.
+    pub fn time_at(&self, x: f32, space: f32) -> f32 {
+        let mut pts: Vec<(f32, f32)> = self.points.iter().map(|(t, px)| (*t as f32, *px)).collect();
+        pts.push((self.length as f32, self.end_x(space)));
+        if x <= pts[0].1 {
+            return pts[0].0;
+        }
+        for w in pts.windows(2) {
+            let ((t0, x0), (t1, x1)) = (w[0], w[1]);
+            if x < x1 {
+                let f = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+                return t0 + f * (t1 - t0);
+            }
+        }
+        self.length as f32
+    }
+
+    /// The x of time `at` (divisions): between the drawn times in
+    /// proportion.
+    pub fn x_at(&self, at: f32, space: f32) -> f32 {
+        let mut pts: Vec<(f32, f32)> = self.points.iter().map(|(t, px)| (*t as f32, *px)).collect();
+        pts.push((self.length as f32, self.end_x(space)));
+        if at <= pts[0].0 {
+            return pts[0].1;
+        }
+        for w in pts.windows(2) {
+            let ((t0, x0), (t1, x1)) = (w[0], w[1]);
+            if at < t1 {
+                let f = if t1 > t0 { (at - t0) / (t1 - t0) } else { 0.0 };
+                return x0 + f * (x1 - x0);
+            }
+        }
+        self.end_x(space)
+    }
+}
+
+/// A note (or chord) or a rest drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventBox {
+    pub page: usize,
+    pub system: usize,
+    /// Its noteheads' column (a rest's glyph): left edge and width.
+    pub x: f32,
+    pub w: f32,
+    /// Each pitch's notehead (as [`Event::pitches`]); a rest's middle.
+    pub heads: Vec<Head>,
+    /// The ink drawing it on its page (heads, accidentals, dots and
+    /// ledger lines; not stems or beams): from, to.
+    pub ink: (usize, usize),
+    /// 0: the first voice, 1: the second.
+    pub voice: u8,
+    pub rest: bool,
+}
+
+impl EventBox {
+    fn rest((x, w): (f32, f32), y: f32, from: usize, to: usize, voice: usize) -> Self {
+        Self {
+            page: 0,
+            system: 0,
+            x,
+            w,
+            heads: vec![Head {
+                x: x + w / 2.0,
+                y,
+                ink: from,
+                accidental: None,
+            }],
+            ink: (from, to),
+            voice: voice as u8,
+            rest: true,
+        }
+    }
+}
+
+/// A notehead drawn: its centre and its ink (and its accidental's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Head {
+    pub x: f32,
+    pub y: f32,
+    pub ink: usize,
+    pub accidental: Option<usize>,
+}
+
+/// What is pointed at: a part's event (by bar, then index as
+/// [`Measure::all_events`]) and which of its pitches (`None`: a rest).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pointed {
+    pub part: usize,
+    pub bar: usize,
+    pub event: usize,
+    pub pitch: Option<usize>,
+}
+
+/// A place on a staff: its system, part and bar, the time there (divisions
+/// into the bar, unrounded) and the staff step (half spaces above the
+/// bottom line).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub system: usize,
+    pub part: usize,
+    pub bar: usize,
+    pub at: f32,
+    pub step: i32,
+}
+
+impl Map {
+    /// The notehead or rest nearest `(x, y)` on `page`, within a staff
+    /// space and a half.
+    pub fn event_at(&self, page: usize, x: f32, y: f32) -> Option<Pointed> {
+        let reach = 1.5 * self.space;
+        let mut best: Option<(f32, Pointed)> = None;
+        for (part, bars) in self.events.iter().enumerate() {
+            for (bar, events) in bars.iter().enumerate() {
+                for (event, b) in events.iter().enumerate() {
+                    let Some(b) = b else { continue };
+                    if b.page != page {
+                        continue;
+                    }
+                    for (i, h) in b.heads.iter().enumerate() {
+                        let d = (h.x - x).hypot(h.y - y);
+                        if d <= reach && best.is_none_or(|(bd, _)| d < bd) {
+                            best = Some((
+                                d,
+                                Pointed {
+                                    part,
+                                    bar,
+                                    event,
+                                    pitch: (!b.rest).then_some(i),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// The staff and time under `(x, y)` on `page`: the system there, its
+    /// staff nearest, the bar under `x` (the first or last beyond them).
+    pub fn place_at(&self, page: usize, x: f32, y: f32) -> Option<Place> {
+        let sp = self.space;
+        let (system, sys) = self
+            .systems
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.page == page && y >= s.top && y < s.bottom)?;
+        let part = (0..sys.staves.len()).min_by(|a, b| {
+            let d = |i: usize| (sys.staves[i] + sys.heights[i] / 2.0 - y).abs();
+            d(*a).total_cmp(&d(*b))
+        })?;
+        let span = sys
+            .spans
+            .iter()
+            .find(|s| x < s.x + s.width)
+            .or(sys.spans.last())?;
+        let at = span.time_at(x.max(span.x), sp);
+        let step = ((sys.staves[part] + 4.0 * sp - y) / (0.5 * sp)).round() as i32;
+        Some(Place {
+            system,
+            part,
+            bar: span.bar,
+            at,
+            step,
+        })
+    }
+
+    /// Where time `at` (divisions) of bar `bar` is drawn on staff `part`:
+    /// its page, x, and the staff's top line and height.
+    pub fn x_of(&self, part: usize, bar: usize, at: f32) -> Option<(usize, f32, f32, f32)> {
+        let sys = self.systems.iter().find(|s| s.bars.contains(&bar))?;
+        let span = sys.spans.iter().find(|s| s.bar == bar)?;
+        Some((
+            sys.page,
+            span.x_at(at, self.space),
+            *sys.staves.get(part)?,
+            *sys.heights.get(part)?,
+        ))
+    }
+}
+
+/// The diatonic step (from C0, as [`Pitch::diatonic`]) on staff step
+/// `step` (half spaces above the bottom line) under `clef`.
+pub fn diatonic_at(step: i32, clef: Clef) -> i32 {
+    step - staff_step(0, clef)
+}
+
 /// The page and the staff's size.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
@@ -105,6 +345,10 @@ pub struct Layout {
     /// A staff space (points).
     pub space: f32,
     pub bars_per_system: usize,
+    /// One system of every bar, as wide as they need, on one page as
+    /// wide and as tall as it (a strip an editor scrolls along; no
+    /// heading).
+    pub continuous: bool,
 }
 
 impl Default for Layout {
@@ -116,6 +360,7 @@ impl Default for Layout {
             margin: 54.0,
             space: 6.5,
             bars_per_system: 4,
+            continuous: false,
         }
     }
 }
@@ -501,8 +746,7 @@ impl BarPlan {
         let mut points: Vec<u32> = staves
             .iter()
             .flat_map(|m| {
-                m.events
-                    .iter()
+                m.all_events()
                     .filter(|e| !e.bar_rest)
                     .map(|e| e.at)
                     .chain(m.chords.iter().map(|c| c.at))
@@ -518,7 +762,7 @@ impl BarPlan {
         // What each wants: its first step, the step after its last, room.
         let mut wants: Vec<(usize, usize, f32)> = Vec::new();
         for m in staves {
-            for e in &m.events {
+            for e in m.all_events() {
                 let a = if e.bar_rest { 0 } else { index(e.at) };
                 let b = if e.bar_rest { n } else { index(e.end()) };
                 wants.push((a, b.max(a + 1), room(e, sp)));
@@ -666,6 +910,11 @@ const NAME_SIZE: f32 = 10.0;
 const BRACKET_ROOM: f32 = 2.2;
 /// The bracket's thick line (staff spaces; Bravura's bracketThickness).
 const BRACKET_THICKNESS: f32 = 0.5;
+/// A grand staff's brace: its width, its swell and the room it takes
+/// left of the staves (staff spaces).
+const BRACE_WIDTH: f32 = 1.2;
+const BRACE_SWELL: f32 = 0.36;
+const BRACE_ROOM: f32 = 1.7;
 
 fn clef_glyph(clef: Clef) -> &'static str {
     match clef {
@@ -706,6 +955,55 @@ fn bracket(ink: &mut Vec<Ink>, x: f32, top: f32, bottom: f32, sp: f32) {
             Seg::C(c1.0, c1.1, c2.0, c2.1, tip.0, tip.1),
             Seg::C(d1.0, d1.1, d2.0, d2.1, back.0, back.1),
             Seg::L(foot.0, foot.1),
+            Seg::Z,
+        ]));
+    }
+}
+
+/// A grand staff's brace by its staves from `top` to `bottom` (their outer
+/// lines), its tips at `x`: two halves meeting in a point at the middle,
+/// each swelling from its tip and thinning to the point.
+fn brace(ink: &mut Vec<Ink>, x: f32, top: f32, bottom: f32, sp: f32) {
+    let h = (bottom - top) / 2.0;
+    let (w, th) = (BRACE_WIDTH * sp, BRACE_SWELL * sp);
+    for (tip, dir) in [(top, 1.0f32), (bottom, -1.0)] {
+        // `f` of the way from the tip to the middle.
+        let y = |f: f32| tip + dir * f * h;
+        let shank = x - 0.5 * w;
+        ink.push(Ink::Fill(vec![
+            Seg::M(x, y(0.0)),
+            Seg::C(
+                x - 0.55 * w - 0.2 * th,
+                y(0.02),
+                shank - th,
+                y(0.25),
+                shank - th,
+                y(0.45),
+            ),
+            Seg::C(
+                shank - th,
+                y(0.7),
+                x - 0.55 * w - 0.3 * th,
+                y(0.97),
+                x - w,
+                y(1.0),
+            ),
+            Seg::C(
+                x - 0.55 * w + 0.3 * th,
+                y(0.97),
+                shank + th,
+                y(0.7),
+                shank + th,
+                y(0.45),
+            ),
+            Seg::C(
+                shank + th,
+                y(0.25),
+                x - 0.55 * w + 0.2 * th,
+                y(0.02),
+                x,
+                y(0.0),
+            ),
             Seg::Z,
         ]));
     }
@@ -757,13 +1055,15 @@ impl Engraver<'_> {
     }
 
     /// Staff `pi` of system `si` drawn with its top line at y = 0 (its
-    /// notes noted in `placed`, by bar and event, on page 0).
+    /// notes noted in `placed` and everything drawn in `boxes`, by bar and
+    /// event, on page 0).
     fn staff(
         &self,
         pi: usize,
         sys: &System,
         si: usize,
         placed: &mut [Vec<Option<Placed>>],
+        boxes: &mut [Vec<Option<EventBox>>],
     ) -> Drawn {
         let sp = self.sp;
         let part = &self.sheet.parts[pi];
@@ -775,7 +1075,7 @@ impl Engraver<'_> {
         // Room for notes high or low on the staff.
         let (mut hi, mut lo) = (8i32, 0i32);
         for m in &part.measures[sys.bars.clone()] {
-            for e in &m.events {
+            for e in m.all_events() {
                 for p in e.pitches() {
                     let s = staff_step(p.diatonic(), clef);
                     hi = hi.max(s);
@@ -826,151 +1126,267 @@ impl Engraver<'_> {
             time_signature(&mut ink, first.time, x + 0.3 * sp, &step_y, sp);
         }
         let chord_y = -3.2 * sp - top_extra;
-        let lyric_y = 4.0 * sp + bottom_extra + 3.0 * sp + LYRIC_SIZE * 0.7;
+        // Dynamics under the staff, the words under them.
+        let dynamics = part.measures[sys.bars.clone()]
+            .iter()
+            .any(|m| m.all_events().any(|e| e.dynamic.is_some()));
+        let dynamic_y = 4.0 * sp + bottom_extra + 2.6 * sp;
+        let lyric_y = 4.0 * sp
+            + bottom_extra
+            + 3.0 * sp
+            + LYRIC_SIZE * 0.7
+            + if dynamics { 2.6 * sp } else { 0.0 };
         for (k, mi) in sys.bars.clone().enumerate() {
             let m = &part.measures[mi];
             let plan = &self.plans[mi];
-            let (mut bx, mut bw) = sys.spans[k];
             // A time change inside the system.
             if k > 0 && m.show_time {
+                let (bx, _) = sys.spans[k];
                 time_signature(&mut ink, m.time, bx + 0.4 * sp, &step_y, sp);
-                let tw = Self::time_w(m) * sp;
-                bx += tw;
-                bw -= tw;
             }
+            let (bx, bw) = self.frame(sys, k, mi);
             let xs = plan.xs(bx, bw, sp);
-            // Notes and rests.
-            for (ei, e) in m.events.iter().enumerate() {
-                let x0 = plan.x(&xs, e.at);
-                match e.pitch {
-                    None if e.bar_rest => {
-                        let gx = bx + bw / 2.0 - advance("restWhole") * sp / 2.0;
-                        put(&mut ink, "restWhole", gx, step_y(6), sp);
-                    }
-                    None => {
-                        let g = rest_glyph(e.duration.value);
-                        let s = if e.duration.value == Value::Whole {
-                            6
-                        } else {
-                            4
-                        };
-                        put(&mut ink, g, x0, step_y(s), sp);
-                        if e.duration.dots > 0 {
-                            put(
-                                &mut ink,
-                                "augmentationDot",
-                                x0 + (advance(g) + 0.4) * sp,
-                                step_y(5),
-                                sp,
-                            );
-                        }
-                    }
-                    Some(_) => {
-                        let pitches: Vec<Pitch> = e.pitches().copied().collect();
-                        let steps: Vec<i32> = pitches
-                            .iter()
-                            .map(|p| staff_step(p.diatonic(), clef))
-                            .collect();
-                        let (lo_s, hi_s) = (steps[0], steps[steps.len() - 1]);
-                        let up = lo_s + hi_s < 8;
-                        let head = notehead(e);
-                        let hw = advance(head) * sp;
-                        // A second's other note beside the stem: right of
-                        // it when the stem goes up, left when it goes down.
-                        let mut beside = vec![false; steps.len()];
-                        if up {
-                            for i in 1..steps.len() {
-                                if steps[i] - steps[i - 1] == 1 && !beside[i - 1] {
-                                    beside[i] = true;
-                                }
-                            }
-                        } else {
-                            for i in (0..steps.len().saturating_sub(1)).rev() {
-                                if steps[i + 1] - steps[i] == 1 && !beside[i + 1] {
-                                    beside[i] = true;
-                                }
-                            }
-                        }
-                        // Accidentals in columns before the noteheads.
-                        let (cols, ncols) = accidental_columns(&pitches, clef);
-                        let col_w = 1.15 * sp;
-                        let left_heads = !up && beside.iter().any(|b| *b);
-                        let mut nx = x0 + ncols as f32 * col_w;
-                        if left_heads {
-                            nx += hw;
-                        }
-                        for (i, p) in pitches.iter().enumerate() {
-                            if let (Some(c), Some(a)) = (cols[i], p.accidental) {
-                                let ax =
-                                    nx - if left_heads { hw } else { 0.0 } - (c + 1) as f32 * col_w;
-                                put(&mut ink, accidental_glyph(a), ax, step_y(steps[i]), sp);
-                            }
-                        }
-                        let ext = E::LEGER_LINE_EXTENSION * sp;
-                        let right_heads = up && beside.iter().any(|b| *b);
-                        for (i, s) in steps.iter().enumerate() {
-                            let hx = match (beside[i], up) {
-                                (true, true) => nx + hw,
-                                (true, false) => nx - hw,
-                                _ => nx,
+            let n1 = m.events.len();
+            let two = m.two_voices();
+            // Notes and rests, the first voice's then the second's (stems
+            // up and down while there are two).
+            for (voice, list) in [(0usize, &m.events), (1, &m.under)] {
+                let forced = two.then_some(voice == 0);
+                let base = if voice == 0 { 0 } else { n1 };
+                for (k, e) in list.iter().enumerate() {
+                    let ei = base + k;
+                    let x0 = plan.x(&xs, e.at);
+                    let from = ink.len();
+                    match e.pitch {
+                        None if e.bar_rest => {
+                            let w = advance("restWhole") * sp;
+                            let gx = bx + bw / 2.0 - w / 2.0;
+                            let s = match forced {
+                                Some(true) => 8,
+                                Some(false) => 2,
+                                None => 6,
                             };
-                            put(&mut ink, head, hx, step_y(*s), sp);
-                            // Ledger lines.
-                            let mut l = -2;
-                            while l >= *s {
-                                line(
-                                    &mut ink,
-                                    (hx - ext, step_y(l)),
-                                    (hx + hw + ext, step_y(l)),
-                                    E::LEGER_LINE_THICKNESS * sp,
-                                );
-                                l -= 2;
-                            }
-                            let mut l = 10;
-                            while l <= *s {
-                                line(
-                                    &mut ink,
-                                    (hx - ext, step_y(l)),
-                                    (hx + hw + ext, step_y(l)),
-                                    E::LEGER_LINE_THICKNESS * sp,
-                                );
-                                l += 2;
-                            }
-                            let dot_x = nx + hw * if right_heads { 2.0 } else { 1.0 };
-                            for d in 0..e.duration.dots {
-                                let dy = if s % 2 == 0 {
-                                    step_y(s + 1)
-                                } else {
-                                    step_y(*s)
+                            put(&mut ink, "restWhole", gx, step_y(s), sp);
+                            boxes[mi][ei] = Some(EventBox::rest(
+                                (gx, w),
+                                step_y(s) + 0.5 * sp,
+                                from,
+                                ink.len(),
+                                voice,
+                            ));
+                        }
+                        None => {
+                            let g = rest_glyph(e.duration.value);
+                            let whole = e.duration.value == Value::Whole;
+                            let s = if whole { 6 } else { 4 }
+                                + match forced {
+                                    Some(true) if whole => 2,
+                                    Some(true) => 4,
+                                    Some(false) => -4,
+                                    None => 0,
                                 };
+                            put(&mut ink, g, x0, step_y(s), sp);
+                            if e.duration.dots > 0 {
                                 put(
                                     &mut ink,
                                     "augmentationDot",
-                                    dot_x + (0.35 + 0.5 * f32::from(d)) * sp,
-                                    dy,
+                                    x0 + (advance(g) + 0.4) * sp,
+                                    step_y(s + 1),
                                     sp,
                                 );
                             }
+                            let mid = if whole {
+                                step_y(s) + 0.5 * sp
+                            } else {
+                                step_y(s)
+                            };
+                            boxes[mi][ei] = Some(EventBox::rest(
+                                (x0, advance(g) * sp),
+                                mid,
+                                from,
+                                ink.len(),
+                                voice,
+                            ));
                         }
-                        let mut heads = [0.0f32; MOST_HEADS];
-                        for (h, s) in heads.iter_mut().zip(&steps) {
-                            *h = step_y(*s);
+                        Some(_) => {
+                            let pitches: Vec<Pitch> = e.pitches().copied().collect();
+                            let steps: Vec<i32> = pitches
+                                .iter()
+                                .map(|p| staff_step(p.diatonic(), clef))
+                                .collect();
+                            let (lo_s, hi_s) = (steps[0], steps[steps.len() - 1]);
+                            let up = forced.unwrap_or(lo_s + hi_s < 8);
+                            let head = notehead(e);
+                            let hw = advance(head) * sp;
+                            // A second's other note beside the stem: right
+                            // of it when the stem goes up, left when it
+                            // goes down.
+                            let mut beside = vec![false; steps.len()];
+                            if up {
+                                for i in 1..steps.len() {
+                                    if steps[i] - steps[i - 1] == 1 && !beside[i - 1] {
+                                        beside[i] = true;
+                                    }
+                                }
+                            } else {
+                                for i in (0..steps.len().saturating_sub(1)).rev() {
+                                    if steps[i + 1] - steps[i] == 1 && !beside[i + 1] {
+                                        beside[i] = true;
+                                    }
+                                }
+                            }
+                            // Accidentals in columns before the noteheads.
+                            let (cols, ncols) = accidental_columns(&pitches, clef);
+                            let col_w = 1.15 * sp;
+                            let left_heads = !up && beside.iter().any(|b| *b);
+                            let mut nx = x0 + ncols as f32 * col_w;
+                            if left_heads {
+                                nx += hw;
+                            }
+                            let mut accidental_ink = vec![None; pitches.len()];
+                            for (i, p) in pitches.iter().enumerate() {
+                                if let (Some(c), Some(a)) = (cols[i], p.accidental) {
+                                    let ax = nx
+                                        - if left_heads { hw } else { 0.0 }
+                                        - (c + 1) as f32 * col_w;
+                                    accidental_ink[i] = Some(ink.len());
+                                    put(&mut ink, accidental_glyph(a), ax, step_y(steps[i]), sp);
+                                }
+                            }
+                            let ext = E::LEGER_LINE_EXTENSION * sp;
+                            let right_heads = up && beside.iter().any(|b| *b);
+                            let mut heads_box = Vec::with_capacity(steps.len());
+                            for (i, s) in steps.iter().enumerate() {
+                                let hx = match (beside[i], up) {
+                                    (true, true) => nx + hw,
+                                    (true, false) => nx - hw,
+                                    _ => nx,
+                                };
+                                heads_box.push(Head {
+                                    x: hx + hw / 2.0,
+                                    y: step_y(*s),
+                                    ink: ink.len(),
+                                    accidental: accidental_ink[i],
+                                });
+                                put(&mut ink, head, hx, step_y(*s), sp);
+                                // Ledger lines.
+                                let mut l = -2;
+                                while l >= *s {
+                                    line(
+                                        &mut ink,
+                                        (hx - ext, step_y(l)),
+                                        (hx + hw + ext, step_y(l)),
+                                        E::LEGER_LINE_THICKNESS * sp,
+                                    );
+                                    l -= 2;
+                                }
+                                let mut l = 10;
+                                while l <= *s {
+                                    line(
+                                        &mut ink,
+                                        (hx - ext, step_y(l)),
+                                        (hx + hw + ext, step_y(l)),
+                                        E::LEGER_LINE_THICKNESS * sp,
+                                    );
+                                    l += 2;
+                                }
+                                let dot_x = nx + hw * if right_heads { 2.0 } else { 1.0 };
+                                for d in 0..e.duration.dots {
+                                    let dy = if s % 2 == 0 {
+                                        step_y(s + 1)
+                                    } else {
+                                        step_y(*s)
+                                    };
+                                    put(
+                                        &mut ink,
+                                        "augmentationDot",
+                                        dot_x + (0.35 + 0.5 * f32::from(d)) * sp,
+                                        dy,
+                                        sp,
+                                    );
+                                }
+                            }
+                            let mut heads = [0.0f32; MOST_HEADS];
+                            for (h, s) in heads.iter_mut().zip(&steps) {
+                                *h = step_y(*s);
+                            }
+                            placed[mi][ei] = Some(Placed {
+                                page: 0,
+                                system: si,
+                                x: nx,
+                                w: hw,
+                                y: step_y(lo_s),
+                                top: step_y(hi_s),
+                                heads,
+                                count: steps.len().min(MOST_HEADS),
+                                up,
+                            });
+                            boxes[mi][ei] = Some(EventBox {
+                                page: 0,
+                                system: si,
+                                x: nx,
+                                w: hw,
+                                heads: heads_box,
+                                ink: (from, ink.len()),
+                                voice: voice as u8,
+                                rest: false,
+                            });
                         }
-                        placed[mi][ei] = Some(Placed {
-                            page: 0,
-                            system: si,
-                            x: nx,
-                            w: hw,
-                            y: step_y(lo_s),
-                            top: step_y(hi_s),
-                            heads,
-                            count: steps.len().min(MOST_HEADS),
-                            up,
-                        });
                     }
                 }
             }
-            stems_and_beams(&mut ink, m, &mut placed[mi], &step_y, sp);
+            let (one, two_list) = placed[mi].split_at_mut(n1);
+            stems_and_beams(&mut ink, &m.events, one, two.then_some(true), &step_y, sp);
+            stems_and_beams(&mut ink, &m.under, two_list, Some(false), &step_y, sp);
+            // Articulations and dynamics.
+            for (voice, list) in [(0usize, &m.events), (1, &m.under)] {
+                let base = if voice == 0 { 0 } else { n1 };
+                for (k, e) in list.iter().enumerate() {
+                    if e.tied_from {
+                        continue;
+                    }
+                    if let Some(d) = e.dynamic {
+                        let mut gx = plan.x(&xs, e.at);
+                        for g in d.glyphs() {
+                            put(&mut ink, g, gx, dynamic_y, sp);
+                            gx += advance(g) * sp * 0.9;
+                        }
+                    }
+                    let Some(pl) = placed[mi][base + k] else {
+                        continue;
+                    };
+                    if e.marks.is_empty() {
+                        continue;
+                    }
+                    // Opposite the stem; with two voices on the voice's
+                    // side, clear of the stems and the staff.
+                    let below = if two { voice == 1 } else { pl.up };
+                    let cx = pl.x + pl.w / 2.0;
+                    let mut edge = match (two, below) {
+                        (true, true) => (pl.y + 4.0 * sp).max(4.6 * sp),
+                        (true, false) => (pl.top - 4.0 * sp).min(-0.6 * sp),
+                        (false, true) => pl.y + 0.9 * sp,
+                        (false, false) => pl.top - 0.9 * sp,
+                    };
+                    for (above, _) in e.marks.glyphs() {
+                        let name = if below {
+                            above.replace("Above", "Below")
+                        } else {
+                            above.to_string()
+                        };
+                        let Some(g) = glyph(&name) else { continue };
+                        let gx = cx - (g.bbox[0] + g.bbox[2]) / 2.0 * sp;
+                        let height = (g.bbox[3] - g.bbox[1]) * sp;
+                        if below {
+                            put(&mut ink, &name, gx, edge + g.bbox[3] * sp, sp);
+                            edge += height + 0.3 * sp;
+                        } else {
+                            put(&mut ink, &name, gx, edge + g.bbox[1] * sp, sp);
+                            edge -= height + 0.3 * sp;
+                        }
+                    }
+                }
+            }
             // Chords over the bar (the top staff's).
             for c in &m.chords {
                 draw_chord(&mut ink, c, plan.x(&xs, c.at), chord_y);
@@ -982,6 +1398,19 @@ impl Engraver<'_> {
             top_extra,
             bottom_extra,
         }
+    }
+
+    /// Where bar `mi` (the `k`th of `sys`) puts its notes: its left edge
+    /// and width, less a time signature changing inside the system.
+    fn frame(&self, sys: &System, k: usize, mi: usize) -> (f32, f32) {
+        let (mut bx, mut bw) = sys.spans[k];
+        let m = &self.sheet.parts[0].measures[mi];
+        if k > 0 && m.show_time {
+            let tw = Self::time_w(m) * self.sp;
+            bx += tw;
+            bw -= tw;
+        }
+        (bx, bw)
     }
 
     /// A tablature staff of system `si` with its top line at y = 0: a line
@@ -1307,13 +1736,23 @@ fn tab_rhythm(ink: &mut Vec<Ink>, m: &Measure, centre: &[f32], (top, end): (f32,
 }
 
 pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
+    engrave_mapped(sheet, layout).0
+}
+
+/// [`engrave`], and where everything went ([`Map`]).
+pub fn engrave_mapped(sheet: &LeadSheet, layout: &Layout) -> (Vec<Page>, Map) {
     let sp = layout.space;
     let left = layout.margin;
     let right = layout.width - layout.margin;
     let parts = &sheet.parts;
     let n = parts.len();
     let bars = parts.iter().map(|p| p.measures.len()).min().unwrap_or(0);
-    let score = n > 1;
+    // Instruments (a grand staff's two staves are one): a score has
+    // several, named and bracketed; grand staves are braced.
+    let instruments = sheet.instruments();
+    let score = instruments.len() > 1;
+    let braced = instruments.iter().any(|(_, k)| *k == 2);
+    let brace_room = if braced { BRACE_ROOM } else { 0.0 };
     let en = Engraver {
         sheet,
         sp,
@@ -1344,13 +1783,13 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
     };
     let indent = |first: bool| {
         if !score {
-            return 0.0;
+            return brace_room * sp;
         }
         parts
             .iter()
             .map(|p| text_width(&label(p, first), Font::Serif, NAME_SIZE))
             .fold(0.0, f32::max)
-            + BRACKET_ROOM * sp
+            + (BRACKET_ROOM + brace_room) * sp
     };
     // Each bar's least width.
     let widths: Vec<f32> = en.plans.iter().map(|p| p.width(sp)).collect();
@@ -1358,6 +1797,33 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
     let time_of = |k: usize| &parts[0].measures[k];
     let mut systems: Vec<System> = Vec::new();
     let mut i = 0;
+    if layout.continuous && bars > 0 {
+        // One system of every bar at its own width (a little roomier),
+        // a time change's signature in the bar it starts.
+        let sys_left = left + indent(true);
+        let pre = en.prefix(true, time_of(0));
+        let mut x = sys_left + pre;
+        let spans = (0..bars)
+            .map(|k| {
+                let extra = if k > 0 && time_of(k).show_time {
+                    Engraver::time_w(time_of(k)) * sp
+                } else {
+                    0.0
+                };
+                let w = widths[k] * 1.25 + extra;
+                let s = (x, w);
+                x += w;
+                s
+            })
+            .collect();
+        systems.push(System {
+            bars: 0..bars,
+            left: sys_left,
+            spans,
+            prefix: pre,
+        });
+        i = bars;
+    }
     while i < bars {
         let first = systems.is_empty();
         let sys_left = left + indent(first);
@@ -1416,8 +1882,8 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
         ink: Vec::new(),
     }];
     let mut y = layout.margin;
-    // The heading.
-    {
+    // The heading (none on a strip).
+    if !layout.continuous {
         let ink = &mut pages[0].ink;
         ink.push(Ink::Text {
             text: sheet.title.clone(),
@@ -1456,16 +1922,26 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
         .map(|p| {
             p.measures
                 .iter()
-                .map(|m| vec![None; m.events.len()])
+                .map(|m| vec![None; m.events.len() + m.under.len()])
                 .collect()
         })
         .collect();
+    let mut boxes: Vec<Vec<Vec<Option<EventBox>>>> = parts
+        .iter()
+        .map(|p| {
+            p.measures
+                .iter()
+                .map(|m| vec![None; m.events.len() + m.under.len()])
+                .collect()
+        })
+        .collect();
+    let mut system_maps: Vec<SystemMap> = Vec::new();
     let joined = sheet.bar_lines_joined();
     // Where each system's bars' notes begin and where it ends.
     let mut system_edges: Vec<(f32, f32)> = Vec::new();
     for (si, sys) in systems.iter().enumerate() {
         let drawn: Vec<Drawn> = (0..n)
-            .map(|pi| en.staff(pi, sys, si, &mut placed[pi]))
+            .map(|pi| en.staff(pi, sys, si, &mut placed[pi], &mut boxes[pi]))
             .collect();
         // Each staff's room above and below its lines: what it reaches,
         // and at least room for the chords over the top staff, for the
@@ -1502,7 +1978,8 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
             height += above + heights[pi] + below;
         }
         // A system that does not fit goes on the next page (whole).
-        if y + height > layout.height - layout.margin
+        if !layout.continuous
+            && y + height > layout.height - layout.margin
             && !pages.last().is_some_and(|p| p.ink.is_empty())
         {
             pages.push(Page {
@@ -1518,6 +1995,7 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
         }
         let ink = &mut pages[page].ink;
         for (pi, d) in drawn.into_iter().enumerate() {
+            let base = ink.len();
             ink.extend(shifted(d.ink, tops[pi]));
             for mi in sys.bars.clone() {
                 for pl in placed[pi][mi].iter_mut().flatten() {
@@ -1528,8 +2006,46 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
                     }
                     pl.page = page;
                 }
+                for b in boxes[pi][mi].iter_mut().flatten() {
+                    b.page = page;
+                    b.ink = (b.ink.0 + base, b.ink.1 + base);
+                    for h in &mut b.heads {
+                        h.y += tops[pi];
+                        h.ink += base;
+                        h.accidental = h.accidental.map(|a| a + base);
+                    }
+                }
             }
         }
+        system_maps.push(SystemMap {
+            page,
+            bars: sys.bars.clone(),
+            staves: tops.clone(),
+            heights: heights.clone(),
+            spans: sys
+                .bars
+                .clone()
+                .enumerate()
+                .map(|(k, mi)| {
+                    let (bx, bw) = en.frame(sys, k, mi);
+                    let plan = &en.plans[mi];
+                    // Times are where their noteheads' middles are.
+                    let half = advance("noteheadBlack") * sp / 2.0;
+                    let xs = plan.xs(bx, bw, sp).into_iter().map(|x| x + half);
+                    BarSpan {
+                        bar: mi,
+                        x: sys.spans[k].0,
+                        width: sys.spans[k].1,
+                        points: plan.points.iter().copied().zip(xs).collect(),
+                        length: time_of(mi).length(),
+                    }
+                })
+                .collect(),
+            top: y,
+            bottom: y + height,
+            left: sys.left + sys.prefix,
+            right: sys.spans.last().map_or(sys.left, |(x, w)| x + w),
+        });
         let (top, bottom) = (tops[0], tops[n - 1] + heights[n - 1]);
         // The line that joins the staves at the left; a score's bracket and
         // its parts' names.
@@ -1539,14 +2055,27 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
             (sys.left, bottom),
             E::THIN_BARLINE_THICKNESS * sp,
         );
+        // A grand staff's brace, by its staves.
+        for &(pi, k) in &instruments {
+            if k == 2 {
+                brace(
+                    ink,
+                    sys.left - 0.35 * sp,
+                    tops[pi],
+                    tops[pi + 1] + heights[pi + 1],
+                    sp,
+                );
+            }
+        }
         if score {
-            let bx = sys.left - 1.1 * sp;
+            let bx = sys.left - (1.1 + brace_room) * sp;
             bracket(ink, bx, top, bottom, sp);
-            for (pi, p) in parts.iter().enumerate() {
+            for &(pi, k) in &instruments {
+                let (a, z) = (tops[pi], tops[pi + k - 1] + heights[pi + k - 1]);
                 ink.push(Ink::Text {
-                    text: label(p, si == 0),
-                    x: sys.left - BRACKET_ROOM * sp,
-                    y: tops[pi] + heights[pi] / 2.0 + NAME_SIZE * 0.35,
+                    text: label(&parts[pi], si == 0),
+                    x: sys.left - (BRACKET_ROOM + brace_room) * sp,
+                    y: (a + z) / 2.0 + NAME_SIZE * 0.35,
                     size: NAME_SIZE,
                     font: Font::Serif,
                     anchor: Anchor::End,
@@ -1554,14 +2083,22 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
             }
         }
         // The bar lines: through the system when its parts are joined,
-        // else staff by staff.
+        // else instrument by instrument (a grand staff's through both its
+        // staves unless words are sung under the upper one).
         let runs: Vec<(f32, f32)> = if joined {
             vec![(top, bottom)]
         } else {
-            tops.iter()
-                .zip(&heights)
-                .map(|(t, h)| (*t, t + h))
-                .collect()
+            let mut runs = Vec::new();
+            for &(pi, k) in &instruments {
+                if k == 2 && !parts[pi].has_lyrics() {
+                    runs.push((tops[pi], tops[pi + 1] + heights[pi + 1]));
+                } else {
+                    for i in pi..pi + k {
+                        runs.push((tops[i], tops[i] + heights[i]));
+                    }
+                }
+            }
+            runs
         };
         for (k, mi) in sys.bars.clone().enumerate() {
             let (bx, bw) = sys.spans[k];
@@ -1591,62 +2128,84 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
             continue;
         }
         let placed = &placed[pi];
-        let flat: Vec<(usize, usize)> = part
-            .measures
-            .iter()
-            .enumerate()
-            .take(bars)
-            .flat_map(|(mi, m)| (0..m.events.len()).map(move |ei| (mi, ei)))
-            .collect();
-        for (k, &(mi, ei)) in flat.iter().enumerate() {
-            let e = &part.measures[mi].events[ei];
-            if !e.tie {
-                continue;
-            }
-            let Some(a) = placed[mi][ei] else { continue };
-            let Some(&(nm, ne)) = flat.get(k + 1) else {
-                continue;
-            };
-            let Some(b) = placed[nm][ne] else { continue };
-            // A tie a note: a single note's against its stem, a chord's
-            // upper half up and lower half down.
-            for h in 0..a.count.min(b.count).max(1) {
-                let up = if a.count <= 1 {
-                    !a.up
-                } else {
-                    h >= a.count / 2
+        // Each voice's events in order: (bar, index in its events, the
+        // event; with two voices in its bar, which way its ties bow).
+        let voice = |second: bool| -> Vec<(usize, usize, &Event, Option<bool>)> {
+            part.measures
+                .iter()
+                .enumerate()
+                .take(bars)
+                .flat_map(move |(mi, m)| {
+                    let (list, base) = if second {
+                        (&m.under, m.events.len())
+                    } else {
+                        (&m.events, 0)
+                    };
+                    let bow = m.two_voices().then_some(!second);
+                    list.iter()
+                        .enumerate()
+                        .map(move |(k, e)| (mi, base + k, e, bow))
+                })
+                .collect()
+        };
+        for flat in [voice(false), voice(true)] {
+            for (k, &(mi, ei, e, bow)) in flat.iter().enumerate() {
+                if !e.tie {
+                    continue;
+                }
+                let Some(a) = placed[mi][ei] else { continue };
+                let Some(&(nm, ne, _, _)) = flat.get(k + 1) else {
+                    continue;
                 };
-                let (ay, by) = (a.heads[h], b.heads[h]);
-                let dy = if up { -0.55 * sp } else { 0.55 * sp };
-                let from = (a.x + a.w + 0.15 * sp, ay + dy);
-                if a.system == b.system {
-                    tie(
-                        &mut pages[a.page].ink,
-                        from,
-                        (b.x - 0.15 * sp, by + dy),
-                        up,
-                        sp,
-                    );
-                } else {
-                    let (_, end) = system_edges[a.system];
-                    tie(
-                        &mut pages[a.page].ink,
-                        from,
-                        (end - 0.3 * sp, ay + dy),
-                        up,
-                        sp,
-                    );
-                    let (start, _) = system_edges[b.system];
-                    tie(
-                        &mut pages[b.page].ink,
-                        (start, by + dy),
-                        (b.x - 0.15 * sp, by + dy),
-                        up,
-                        sp,
-                    );
+                let Some(b) = placed[nm][ne] else { continue };
+                // A tie a note: a single note's against its stem, a chord's
+                // upper half up and lower half down; with two voices the first
+                // voice's up, the second's down.
+                for h in 0..a.count.min(b.count).max(1) {
+                    let up = match bow {
+                        Some(up) => up,
+                        None if a.count <= 1 => !a.up,
+                        None => h >= a.count / 2,
+                    };
+                    let (ay, by) = (a.heads[h], b.heads[h]);
+                    let dy = if up { -0.55 * sp } else { 0.55 * sp };
+                    let from = (a.x + a.w + 0.15 * sp, ay + dy);
+                    if a.system == b.system {
+                        tie(
+                            &mut pages[a.page].ink,
+                            from,
+                            (b.x - 0.15 * sp, by + dy),
+                            up,
+                            sp,
+                        );
+                    } else {
+                        let (_, end) = system_edges[a.system];
+                        tie(
+                            &mut pages[a.page].ink,
+                            from,
+                            (end - 0.3 * sp, ay + dy),
+                            up,
+                            sp,
+                        );
+                        let (start, _) = system_edges[b.system];
+                        tie(
+                            &mut pages[b.page].ink,
+                            (start, by + dy),
+                            (b.x - 0.15 * sp, by + dy),
+                            up,
+                            sp,
+                        );
+                    }
                 }
             }
         }
+    }
+    // A strip's page is as wide and as tall as its system.
+    if layout.continuous
+        && let (Some(page), Some(last)) = (pages.first_mut(), system_maps.last())
+    {
+        page.width = last.right + layout.margin;
+        page.height = y + layout.margin;
     }
     // Page numbers after the first.
     let count = pages.len();
@@ -1660,7 +2219,14 @@ pub fn engrave(sheet: &LeadSheet, layout: &Layout) -> Vec<Page> {
             anchor: Anchor::Middle,
         });
     }
-    pages
+    (
+        pages,
+        Map {
+            space: sp,
+            systems: system_maps,
+            events: boxes,
+        },
+    )
 }
 
 fn time_signature(
@@ -1700,31 +2266,34 @@ fn time_signature(
 }
 
 /// Stems, flags, beams and triplet numbers for a bar's notes.
+/// A voice's stems, flags and beams (`forced`: its stems' direction while
+/// there are two voices).
 fn stems_and_beams(
     ink: &mut Vec<Ink>,
-    m: &Measure,
+    events: &[Event],
     placed: &mut [Option<Placed>],
+    forced: Option<bool>,
     step_y: &impl Fn(i32) -> f32,
     sp: f32,
 ) {
     let stem_w = E::STEM_THICKNESS * sp;
     let middle = step_y(4);
-    let n = m.events.len();
+    let n = events.len();
     // Beamed runs share a direction (away from the notes furthest out).
     let mut i = 0;
     while i < n {
-        let e = &m.events[i];
+        let e = &events[i];
         if e.beams[0] == Some(Beam::Begin) {
             let mut j = i;
-            while j < n && m.events[j].beams[0].is_some() {
+            while j < n && events[j].beams[0].is_some() {
                 j += 1;
-                if m.events[j - 1].beams[0] == Some(Beam::End) {
+                if events[j - 1].beams[0] == Some(Beam::End) {
                     break;
                 }
             }
             let run: Vec<usize> = (i..j).filter(|k| placed[*k].is_some()).collect();
             if run.len() >= 2 {
-                beam_run(ink, m, placed, &run, middle, sp, stem_w);
+                beam_run(ink, events, placed, &run, forced, middle, sp, stem_w);
             }
             i = j;
             continue;
@@ -1779,7 +2348,7 @@ fn stems_and_beams(
             // An unbeamed triplet's bracket and number.
             if e.tuplet == Some(Tuplet::Start) && e.duration.triplet {
                 let mut k = i + 1;
-                while k < n && m.events[k].tuplet == Some(Tuplet::Middle) {
+                while k < n && events[k].tuplet == Some(Tuplet::Middle) {
                     k += 1;
                 }
                 if let (Some(a), Some(b)) = (placed[i], placed.get(k).copied().flatten()) {
@@ -1805,11 +2374,13 @@ fn stems_and_beams(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn beam_run(
     ink: &mut Vec<Ink>,
-    m: &Measure,
+    events: &[Event],
     placed: &mut [Option<Placed>],
     run: &[usize],
+    forced: Option<bool>,
     middle: f32,
     sp: f32,
     stem_w: f32,
@@ -1817,7 +2388,7 @@ fn beam_run(
     let notes: Vec<Placed> = run.iter().filter_map(|k| placed[*k]).collect();
     // Up when the notes sit lower on average.
     let below: f32 = notes.iter().map(|p| (p.y + p.top) / 2.0 - middle).sum();
-    let up = below > 0.0;
+    let up = forced.unwrap_or(below > 0.0);
     // A chord's stem runs from its far note to the beam past its near one.
     let near = |p: &Placed| if up { p.top } else { p.y };
     let far = |p: &Placed| if up { p.y } else { p.top };
@@ -1829,10 +2400,10 @@ fn beam_run(
             p.x + g.map_or(0.0, |g| g.stem_down[0]) * sp + stem_w / 2.0
         }
     };
-    let first = (stem_x(&notes[0], &m.events[run[0]]), near(&notes[0]));
+    let first = (stem_x(&notes[0], &events[run[0]]), near(&notes[0]));
     let last_i = notes.len() - 1;
     let last = (
-        stem_x(&notes[last_i], &m.events[run[last_i]]),
+        stem_x(&notes[last_i], &events[run[last_i]]),
         near(&notes[last_i]),
     );
     // The beam's slope follows the notes, gently.
@@ -1841,14 +2412,14 @@ fn beam_run(
     let dir = if up { -1.0 } else { 1.0 };
     let levels = run
         .iter()
-        .map(|k| m.events[*k].duration.value.beams())
+        .map(|k| events[*k].duration.value.beams())
         .max()
         .unwrap_or(1);
     let reach = (3.25 + 0.5 * f32::from(levels.saturating_sub(1))) * sp;
     // Start so every stem is long enough.
     let mut y0 = first.1 + dir * reach;
     for (p, k) in notes.iter().zip(run) {
-        let x = stem_x(p, &m.events[*k]);
+        let x = stem_x(p, &events[*k]);
         let need = near(p) + dir * reach;
         let at = y0 + slope * (x - first.0);
         if up && at > need {
@@ -1863,7 +2434,7 @@ fn beam_run(
     let gap = (E::BEAM_THICKNESS + E::BEAM_SPACING) * sp;
     // Stems to the beam.
     for (idx, (p, k)) in notes.iter().zip(run).enumerate() {
-        let e = &m.events[*k];
+        let e = &events[*k];
         let x = stem_x(p, e);
         let head = glyph(notehead(e));
         let ay = head.map_or(0.0, |g| if up { g.stem_up[1] } else { g.stem_down[1] });
@@ -1888,14 +2459,14 @@ fn beam_run(
     };
     band(ink, first.0 - stem_w / 2.0, last.0 + stem_w / 2.0, 0);
     for (idx, k) in run.iter().enumerate() {
-        let e = &m.events[*k];
+        let e = &events[*k];
         let x = stem_x(&notes[idx], e);
         match e.beams[1] {
             Some(Beam::Begin) => {
                 if let Some(end) =
-                    (idx + 1..run.len()).find(|j| m.events[run[*j]].beams[1] == Some(Beam::End))
+                    (idx + 1..run.len()).find(|j| events[run[*j]].beams[1] == Some(Beam::End))
                 {
-                    let xe = stem_x(&notes[end], &m.events[run[end]]);
+                    let xe = stem_x(&notes[end], &events[run[end]]);
                     band(ink, x - stem_w / 2.0, xe + stem_w / 2.0, 1);
                 }
             }
@@ -1906,7 +2477,7 @@ fn beam_run(
     }
     // A beamed triplet's number: over the beam when the stems go up, over
     // the noteheads when they go down (the words are under the staff).
-    if m.events[run[0]].tuplet == Some(Tuplet::Start) && m.events[run[0]].duration.triplet {
+    if events[run[0]].tuplet == Some(Tuplet::Start) && events[run[0]].duration.triplet {
         let mid = (first.0 + last.0) / 2.0;
         let y = if up {
             beam_y(mid) - 1.0 * sp
@@ -1967,6 +2538,97 @@ mod tests {
         }
         // One staff: no names, no bracket.
         assert!(!texts.contains(&"Voice"));
+    }
+
+    /// A grand staff is braced, its bar lines run through both staves, and
+    /// alone it is not named; in a score it is named once, between its
+    /// staves.
+    #[test]
+    fn a_grand_staff_is_braced_and_barred_through() {
+        let sheet = crate::musicxml::tests::piano_sample(false);
+        let layout = Layout::for_staves(sheet.parts.len());
+        let sp = layout.space;
+        let pages = engrave(&sheet, &layout);
+        let staves = staves_of(&pages[0], sp);
+        assert_eq!(staves.len() % 2, 0);
+        let (top, bottom, left) = (staves[0].0, staves[1].1, staves[0].2);
+        let texts: Vec<&str> = pages[0]
+            .ink
+            .iter()
+            .filter_map(|i| match i {
+                Ink::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!texts.contains(&"Piano"), "one instrument: no names");
+        // The brace's halves: left of the staves, from the top line to the
+        // middle and from the middle to the bottom line.
+        let halves: Vec<(f32, f32, f32, f32)> = pages[0]
+            .ink
+            .iter()
+            .filter_map(|i| match i {
+                Ink::Fill(p) => {
+                    let pts: Vec<(f32, f32)> = p
+                        .iter()
+                        .flat_map(|s| match *s {
+                            Seg::M(x, y) | Seg::L(x, y) => vec![(x, y)],
+                            Seg::C(a, b, c, d, e, f) => vec![(a, b), (c, d), (e, f)],
+                            Seg::Z => vec![],
+                        })
+                        .collect();
+                    let (x0, x1) = pts
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+                    let (y0, y1) = pts
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+                    Some((x0, x1, y0, y1))
+                }
+                _ => None,
+            })
+            .filter(|(x0, x1, _, _)| *x1 < left && *x0 > left - 2.0 * sp)
+            .collect();
+        let mid = (top + bottom) / 2.0;
+        assert!(
+            halves
+                .iter()
+                .any(|h| (h.2 - top).abs() < 0.5 && (h.3 - mid).abs() < 0.5),
+            "{halves:?}"
+        );
+        assert!(
+            halves
+                .iter()
+                .any(|h| (h.2 - mid).abs() < 0.5 && (h.3 - bottom).abs() < 0.5)
+        );
+        // Bar lines from the upper staff's top to the lower's bottom.
+        let through = pages[0]
+            .ink
+            .iter()
+            .filter(|i| {
+                matches!(i, Ink::Line { a, b, .. }
+                    if (a.0 - b.0).abs() < 1e-3 && (a.1 - top).abs() < 0.01 && (b.1 - bottom).abs() < 0.01)
+            })
+            .count();
+        assert!(through >= 4, "{through}");
+        // With a voice above: named, the piano once a system.
+        let score = crate::musicxml::tests::piano_sample(true);
+        let pages = engrave(&score, &Layout::for_staves(score.parts.len()));
+        let texts: Vec<&str> = pages[0]
+            .ink
+            .iter()
+            .filter_map(|i| match i {
+                Ink::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.iter().filter(|t| **t == "Piano").count(), 1);
+        assert!(texts.contains(&"Voice"));
+        if let Ok(dir) = std::env::var("FADERFRAME_LEADSHEET_OUT") {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join("grand.pdf"),
+                crate::pdf::write(&pages, &score.title),
+            );
+        }
     }
 
     #[test]
@@ -2123,5 +2785,130 @@ mod tests {
             let pdf = crate::pdf::write(&pages, &sheet.title);
             let _ = std::fs::write(std::path::Path::new(&dir).join("score.pdf"), pdf);
         }
+    }
+
+    fn notated(notes: Vec<crate::notate::Written>, bars: usize) -> LeadSheet {
+        use crate::notate::{ScoreInput, ScoreStaff, notate};
+        notate(&ScoreInput {
+            title: "Map".into(),
+            bars: (0..bars)
+                .map(|i| crate::build::Bar {
+                    start: 4.0 * i as f64,
+                    time: (4, 4),
+                })
+                .collect(),
+            key: Some(faderframe_midi::theory::Key::new(
+                0,
+                faderframe_midi::theory::Scale::Major,
+            )),
+            staves: vec![ScoreStaff {
+                notes,
+                ..ScoreStaff::default()
+            }],
+            ..ScoreInput::default()
+        })
+        .sheet
+    }
+
+    /// The map says where each note was drawn: pointing at a notehead
+    /// finds its event and pitch, pointing at the staff its bar, time and
+    /// line, and a time's x lies between its neighbours'.
+    #[test]
+    fn the_map_finds_what_was_drawn() {
+        use crate::notate::Written;
+        let notes = vec![
+            Written::new(1, 0.0, 1.0, 60),
+            Written::new(2, 1.0, 2.0, 64),
+            Written::new(3, 2.0, 4.0, 67),
+            Written::new(4, 4.0, 8.0, 72),
+        ];
+        let sheet = notated(notes, 2);
+        let (pages, map) = engrave_mapped(&sheet, &Layout::default());
+        assert_eq!(pages.len(), 1);
+        assert_eq!(map.systems.len(), 1);
+        let boxes = &map.events[0];
+        for (bar, events) in boxes.iter().enumerate() {
+            for (event, b) in events.iter().enumerate() {
+                let b = b.as_ref().unwrap();
+                let h = b.heads[0];
+                let hit = map.event_at(0, h.x + 0.5, h.y - 0.5).unwrap();
+                assert_eq!((hit.bar, hit.event), (bar, event));
+                // Its notehead is ink of its page.
+                assert!(matches!(pages[0].ink[h.ink], Ink::Fill(_)));
+                assert!(b.ink.0 <= h.ink && h.ink < b.ink.1);
+            }
+        }
+        // Middle C sits a step below the treble staff's first ledger line.
+        let c = boxes[0][0].as_ref().unwrap().heads[0];
+        let place = map.place_at(0, c.x, c.y).unwrap();
+        assert_eq!((place.bar, place.part), (0, 0));
+        assert_eq!(diatonic_at(place.step, Clef::Treble), 28);
+        assert!(place.at < 1.0, "{}", place.at);
+        let e = boxes[0][1].as_ref().unwrap().heads[0];
+        let place = map.place_at(0, e.x, e.y).unwrap();
+        assert!((place.at - 12.0).abs() < 1.0, "{}", place.at);
+        let (_, x6, _, _) = map.x_of(0, 0, 6.0).unwrap();
+        assert!(x6 > c.x && x6 < e.x);
+        // The second bar.
+        let w = boxes[1][0].as_ref().unwrap().heads[0];
+        assert_eq!(map.place_at(0, w.x, w.y).unwrap().bar, 1);
+    }
+
+    /// A strip is one system on a page as wide and as tall as it, without
+    /// a heading.
+    #[test]
+    fn a_strip_is_one_system_as_wide_as_its_bars() {
+        use crate::notate::Written;
+        let notes: Vec<Written> = (0..64)
+            .map(|i| Written::new(i, i as f64 * 0.5, i as f64 * 0.5 + 0.5, 60 + (i % 12) as u8))
+            .collect();
+        let sheet = notated(notes, 8);
+        let strip = Layout {
+            continuous: true,
+            ..Layout::default()
+        };
+        let (pages, map) = engrave_mapped(&sheet, &strip);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(map.systems.len(), 1);
+        assert_eq!(map.systems[0].bars, 0..8);
+        assert!(pages[0].width > Layout::default().width);
+        assert!(
+            pages[0].height < Layout::default().height / 3.0,
+            "{}",
+            pages[0].height
+        );
+        let texts = pages[0]
+            .ink
+            .iter()
+            .filter(|i| matches!(i, Ink::Text { text, .. } if text == "Map"))
+            .count();
+        assert_eq!(texts, 0, "no heading on a strip");
+    }
+
+    /// Two voices: the first voice's stems up, the second's down, and the
+    /// second voice's notes are in the map as voice 1.
+    #[test]
+    fn two_voices_share_a_staff() {
+        use crate::notate::Written;
+        let mut notes = vec![Written::new(1, 0.0, 4.0, 60)];
+        notes.extend((0..4).map(|i| Written::new(2 + i, i as f64, i as f64 + 1.0, 67 + i as u8)));
+        let sheet = notated(notes, 1);
+        let (pages, map) = engrave_mapped(&sheet, &Layout::default());
+        let events = &map.events[0][0];
+        assert_eq!(events.len(), 5);
+        assert!(events[..4].iter().all(|b| b.as_ref().unwrap().voice == 0));
+        assert_eq!(events[4].as_ref().unwrap().voice, 1);
+        // Stems: each voice-1 note's stem rises from its head, the whole
+        // note has none.
+        let sp = Layout::default().space;
+        let up_stems = pages[0]
+            .ink
+            .iter()
+            .filter(|i| {
+                matches!(i, Ink::Line { a, b, .. } if (a.0 - b.0).abs() < 0.01
+                    && (a.1 - b.1).abs() > 2.5 * sp)
+            })
+            .count();
+        assert!(up_stems >= 4, "{up_stems}");
     }
 }

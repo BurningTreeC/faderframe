@@ -4,6 +4,9 @@ use crate::BinauralError;
 use crate::correction::{Compiled, Correction};
 use crate::head::Head;
 use faderframe_core::ChannelLayout;
+use faderframe_core::ambisonics::{self, AmbiOrder, Orientation, Rotator};
+use faderframe_core::surround::{MAX_SPEAKERS, Speaker};
+use faderframe_core::vbap::Vbap;
 use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
@@ -135,16 +138,64 @@ impl Fdn {
     }
 }
 
+/// The baked directions the renderer convolves.
+const DIRS: usize = crate::DIRECTIONS.len();
+
+/// What the renderer's input channels are.
+enum Input {
+    /// Speakers (a bed, stereo, mono): each main channel a direction in
+    /// the ambisonic frame; the LFE (and discrete channels) none.
+    Speakers {
+        dirs: Box<[Option<[f32; 3]>; MAX_SPEAKERS]>,
+    },
+    /// An ambisonic field: decoded onto the baked directions (AllRAD,
+    /// direction × channel), after the head's turn.
+    Field {
+        order: AmbiOrder,
+        decode: Box<[[f32; ambisonics::MAX_CHANNELS]; DIRS]>,
+        rotator: Box<Rotator>,
+    },
+}
+
 /// Renders the channels of a layout to two ears.
+///
+/// Every input channel reaches the ears through the baked directions:
+/// its share of each direction's feed (a weight per direction and
+/// channel — a speaker at a baked direction is that direction alone, one
+/// between them a VBAP blend, an ambisonic field its AllRAD decode),
+/// each direction's feed convolved with its measured pair. Turning the
+/// listener's head ([`Renderer::turn`]) turns the scene the other way:
+/// the speakers' directions relative to the head move over the baked
+/// directions, a field is rotated before its decode — only the weights
+/// change (glided over each block, the head's orientation smoothed), the
+/// measured filters never.
 pub struct Renderer {
     block: usize,
     parts: usize,
-    /// Per channel: the direction's filters per ear and partition (`None`:
-    /// the LFE).
+    rate: f32,
+    input: Input,
+    /// The baked directions as speakers, for VBAP when the head turns.
+    baked: Box<Vbap>,
+    /// Per direction: its filters per ear and partition (`None`: the head
+    /// has no measurement there — never the case for a complete set).
     filters: Vec<Option<[Vec<Vec<Complex32>>; 2]>>,
-    /// Per channel: the last `parts` input spectra (a ring).
+    /// Per direction: the last `parts` input spectra (a ring).
     fdl: Vec<Vec<Vec<Complex32>>>,
+    /// Per direction: blocks its feed has been silent (its ring is all
+    /// zeros once this reaches `parts`: nothing to multiply).
+    quiet: Vec<usize>,
     ring: usize,
+    /// Each direction's weight of each channel: now, wanted for the next
+    /// block, and with the head straight.
+    weights: Box<[[f32; MAX_SPEAKERS]; DIRS]>,
+    wanted: Box<[[f32; MAX_SPEAKERS]; DIRS]>,
+    straight: Box<[[f32; MAX_SPEAKERS]; DIRS]>,
+    /// The head: where it is (smoothed) and where it is going, the
+    /// smoothing time (s), and the orientation the weights were made for.
+    head: Orientation,
+    target: Orientation,
+    smoothing: f32,
+    made_for: Option<Orientation>,
     fft: Arc<dyn RealToComplex<f32>>,
     ifft: Arc<dyn ComplexToReal<f32>>,
     frame: Vec<f32>,
@@ -153,8 +204,10 @@ pub struct Renderer {
     time: Vec<f32>,
     scratch_f: Vec<Complex32>,
     scratch_i: Vec<Complex32>,
-    /// Per channel: the previous block and the one being filled.
-    prev: Vec<Vec<f32>>,
+    /// Per direction: the previous block of its feed and this one.
+    feed_prev: Vec<Vec<f32>>,
+    feed: Vec<Vec<f32>>,
+    /// Per channel: the block being filled.
     fill_in: Vec<Vec<f32>>,
     fill: usize,
     out: [Vec<f32>; 2],
@@ -162,6 +215,8 @@ pub struct Renderer {
     lfe: [[f32; 4]; 1],
     lfe_coef: [f32; 5],
     lfe_buf: Vec<f32>,
+    /// Which channels are the LFE.
+    lfe_channels: [bool; MAX_SPEAKERS],
     room: Option<Fdn>,
     mono_buf: Vec<f32>,
     /// The headphone correction: a gain, biquads and a FIR per ear.
@@ -204,6 +259,23 @@ impl Fir {
     }
 }
 
+/// The baked directions as speakers (for VBAP over them).
+pub(crate) fn baked_speakers() -> Vec<Speaker> {
+    crate::DIRECTIONS
+        .iter()
+        .map(|&(azimuth, elevation)| Speaker {
+            label: "",
+            mask: 0,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            azimuth,
+            elevation,
+            lfe: false,
+        })
+        .collect()
+}
+
 impl Renderer {
     /// For `layout` at `rate` through `head`'s ears with `room`, evened
     /// out for the headphones by `correction`.
@@ -215,7 +287,7 @@ impl Renderer {
         correction: Option<&Correction>,
     ) -> Result<Self, BinauralError> {
         let set = head.at(rate)?;
-        if set.pairs.len() < crate::DIRECTIONS.len() {
+        if set.pairs.len() < DIRS {
             return Err(BinauralError::Data);
         }
         let block = if rate > 50_000 { 128 } else { 64 };
@@ -224,7 +296,7 @@ impl Renderer {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(n);
         let ifft = planner.plan_fft_inverse(n);
-        let channels = layout.channel_count();
+        let channels = layout.channel_count().min(MAX_SPEAKERS);
         let spectrum = |taps: &[f32], p: usize| -> Vec<Complex32> {
             let mut t = vec![0.0f32; n];
             for (i, v) in taps.iter().skip(p * block).take(block).enumerate() {
@@ -234,32 +306,57 @@ impl Renderer {
             let _ = fft.process(&mut t, &mut s);
             s
         };
-        // Each channel's filter: its direction's pair, or a blend of the
-        // pairs it is panned over (`weights`; spectra add linearly).
-        let filters = (0..channels)
-            .map(|c| {
-                let w = crate::weights(layout, c);
-                if w.is_empty() || w.iter().any(|(d, _)| set.pairs.get(*d).is_none()) {
-                    return None;
-                }
-                let ear = |right: bool| -> Vec<Vec<Complex32>> {
-                    (0..parts)
-                        .map(|p| {
-                            let mut sum = vec![Complex32::default(); block + 1];
-                            for &(d, g) in &w {
-                                let pair = &set.pairs[d];
-                                let taps = if right { &pair.right } else { &pair.left };
-                                for (o, v) in sum.iter_mut().zip(spectrum(taps, p)) {
-                                    *o += v * g;
-                                }
-                            }
-                            sum
-                        })
-                        .collect()
+        // Each direction's measured pair, partitioned.
+        let filters = (0..DIRS)
+            .map(|d| {
+                let pair = set.pairs.get(d)?;
+                let ear = |taps: &[f32]| -> Vec<Vec<Complex32>> {
+                    (0..parts).map(|p| spectrum(taps, p)).collect()
                 };
-                Some([ear(false), ear(true)])
+                Some([ear(&pair.left), ear(&pair.right)])
             })
             .collect();
+        let baked_list = baked_speakers();
+        let baked = Box::new(Vbap::new(&baked_list).map_err(|_| BinauralError::Data)?);
+        // Each channel's weights with the head straight: its direction's
+        // own pair, or the blend of those it is panned over (`weights`);
+        // a field's decode.
+        let mut straight = Box::new([[0.0f32; MAX_SPEAKERS]; DIRS]);
+        let mut lfe_channels = [false; MAX_SPEAKERS];
+        let input = match layout {
+            ChannelLayout::Ambisonic(order) => {
+                let decoder = ambisonics::Decoder::allrad(order, &baked_list, &baked);
+                let mut decode = Box::new([[0.0f32; ambisonics::MAX_CHANNELS]; DIRS]);
+                for (row, g) in decode.iter_mut().zip(decoder.gains()) {
+                    *row = *g;
+                }
+                for (d, row) in straight.iter_mut().enumerate() {
+                    row[..order.channels()].copy_from_slice(&decode[d][..order.channels()]);
+                }
+                Input::Field {
+                    order,
+                    decode,
+                    rotator: Box::new(Rotator::new()),
+                }
+            }
+            _ => {
+                let mut dirs = Box::new([None; MAX_SPEAKERS]);
+                let speakers = faderframe_core::surround::speakers_of(layout);
+                for c in 0..channels {
+                    let w = crate::weights(layout, c);
+                    // No direction (the LFE, discrete channels): low-passed
+                    // to both ears.
+                    lfe_channels[c] = w.is_empty();
+                    for (d, g) in w {
+                        straight[d][c] = g;
+                    }
+                    if let Some(s) = speakers.and_then(|s| s.get(c)).filter(|_| !lfe_channels[c]) {
+                        dirs[c] = Some(ambisonics::direction(s.azimuth, s.elevation));
+                    }
+                }
+                Input::Speakers { dirs }
+            }
+        };
         let lfe_coef = lowpass(120.0, rate as f32);
         let eq = correction.map(|c| c.compile(rate)).unwrap_or(Compiled {
             gain: 1.0,
@@ -277,9 +374,20 @@ impl Renderer {
         Ok(Self {
             block,
             parts,
+            rate: rate as f32,
+            input,
+            baked,
             filters,
-            fdl: vec![vec![vec![Complex32::default(); block + 1]; parts]; channels],
+            fdl: vec![vec![vec![Complex32::default(); block + 1]; parts]; DIRS],
+            quiet: vec![parts; DIRS],
             ring: 0,
+            weights: straight.clone(),
+            wanted: straight.clone(),
+            straight,
+            head: Orientation::IDENTITY,
+            target: Orientation::IDENTITY,
+            smoothing: 0.0,
+            made_for: Some(Orientation::IDENTITY),
             frame: vec![0.0; n],
             spec: vec![Complex32::default(); block + 1],
             acc: [
@@ -291,7 +399,8 @@ impl Renderer {
             scratch_i: ifft.make_scratch_vec(),
             fft,
             ifft,
-            prev: vec![vec![0.0; block]; channels],
+            feed_prev: vec![vec![0.0; block]; DIRS],
+            feed: vec![vec![0.0; block]; DIRS],
             fill_in: vec![vec![0.0; block]; channels],
             fill: 0,
             out: [vec![0.0; block], vec![0.0; block]],
@@ -299,6 +408,7 @@ impl Renderer {
             lfe: [[0.0; 4]],
             lfe_coef,
             lfe_buf: vec![0.0; block],
+            lfe_channels,
             room: room
                 .settings()
                 .map(|(wet, rt, pre)| Fdn::new(rate as f32, wet, rt, pre)),
@@ -313,6 +423,23 @@ impl Renderer {
     /// Frames of delay the render adds (one block).
     pub fn latency(&self) -> usize {
         self.block
+    }
+
+    /// Turn the listener's head towards `head` (from the next block on),
+    /// gliding there with a time constant of `smoothing` seconds (0: in
+    /// one block). Allocation-free.
+    pub fn turn(&mut self, head: Orientation, smoothing: f32) {
+        self.target = head;
+        self.smoothing = if smoothing.is_finite() {
+            smoothing.clamp(0.0, 2.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Where the listener's head is now (smoothed).
+    pub fn head(&self) -> Orientation {
+        self.head
     }
 
     /// Render `frames` frames of `input` (one slice per channel, at least
@@ -338,49 +465,152 @@ impl Renderer {
         }
     }
 
+    /// The head's next step towards its target, and the weights for it.
+    fn steer(&mut self) {
+        if self.head != self.target {
+            let t = if self.smoothing <= 0.0 {
+                1.0
+            } else {
+                1.0 - (-(self.block as f32) / (self.smoothing * self.rate)).exp()
+            };
+            self.head = self.head.slerp(self.target, t);
+            if self.head.angle_to(&self.target) < 0.01 {
+                self.head = self.target;
+            }
+        }
+        if self.made_for == Some(self.head) {
+            return;
+        }
+        self.made_for = Some(self.head);
+        if self.head.is_identity() {
+            *self.wanted = *self.straight;
+            return;
+        }
+        // The scene relative to the head: turned the other way.
+        let back = self.head.inverse();
+        match &self.input {
+            Input::Speakers { dirs } => {
+                let mut g = [0.0f32; MAX_SPEAKERS];
+                for row in self.wanted.iter_mut() {
+                    row.fill(0.0);
+                }
+                for (c, dir) in dirs.iter().enumerate().take(self.fill_in.len()) {
+                    let Some(dir) = dir else { continue };
+                    let (az, el) = ambisonics::angles(back.rotate(*dir));
+                    self.baked.gains(az, el, &mut g[..DIRS]);
+                    for (row, v) in self.wanted.iter_mut().zip(&g) {
+                        row[c] = *v;
+                    }
+                }
+            }
+            Input::Field {
+                order,
+                decode,
+                rotator,
+            } => {
+                let mut m = [[0.0f32; ambisonics::MAX_CHANNELS]; ambisonics::MAX_CHANNELS];
+                rotator.matrix(*order, &back, &mut m);
+                let n = order.channels();
+                for (row, dec) in self.wanted.iter_mut().zip(decode.iter()) {
+                    for (j, w) in row.iter_mut().enumerate().take(n) {
+                        *w = (0..n).map(|k| dec[k] * m[k][j]).sum();
+                    }
+                }
+            }
+        }
+    }
+
     fn run_block(&mut self) {
         let b = self.block;
         let n = 2 * b;
         let parts = self.parts;
+        self.steer();
         self.ring = (self.ring + parts - 1) % parts;
         for a in &mut self.acc {
             a.iter_mut().for_each(|v| *v = Complex32::default());
         }
         self.lfe_buf.iter_mut().for_each(|v| *v = 0.0);
         self.mono_buf.iter_mut().for_each(|v| *v = 0.0);
+        // The LFE (low-passed, to both ears) and the room's mono feed:
+        // a bed's main channels summed, a field's W.
         for c in 0..self.fill_in.len() {
-            match &self.filters[c] {
-                None => {
-                    // The LFE: low-passed, to both ears.
-                    for (i, &x) in self.fill_in[c].iter().enumerate() {
-                        self.lfe_buf[i] += biquad(&mut self.lfe[0], &self.lfe_coef, x);
-                    }
+            if self.lfe_channels[c] {
+                for (i, &x) in self.fill_in[c].iter().enumerate() {
+                    self.lfe_buf[i] += biquad(&mut self.lfe[0], &self.lfe_coef, x);
                 }
-                Some(f) => {
-                    // Overlap-save: the previous block then this one.
-                    self.frame[..b].copy_from_slice(&self.prev[c]);
-                    self.frame[b..n].copy_from_slice(&self.fill_in[c]);
-                    for (m, &x) in self.mono_buf.iter_mut().zip(&self.fill_in[c]) {
-                        *m += x;
+                continue;
+            }
+            let into_room = match self.input {
+                Input::Speakers { .. } => self.straight.iter().any(|row| row[c] != 0.0),
+                Input::Field { .. } => c == 0,
+            };
+            if into_room {
+                for (m, &x) in self.mono_buf.iter_mut().zip(&self.fill_in[c]) {
+                    *m += x;
+                }
+            }
+        }
+        // Each direction's feed: its channels by their weights, glided
+        // from the last block's to this one's.
+        let step = 1.0 / b as f32;
+        for d in 0..DIRS {
+            let feed = &mut self.feed[d];
+            feed.fill(0.0);
+            let mut sounding = false;
+            for (c, x) in self.fill_in.iter().enumerate() {
+                let (from, to) = (self.weights[d][c], self.wanted[d][c]);
+                if from == 0.0 && to == 0.0 {
+                    continue;
+                }
+                sounding = true;
+                if from == to {
+                    for (f, &v) in feed.iter_mut().zip(x) {
+                        *f += v * to;
                     }
-                    let _ = self.fft.process_with_scratch(
-                        &mut self.frame,
-                        &mut self.spec,
-                        &mut self.scratch_f,
-                    );
-                    self.fdl[c][self.ring].copy_from_slice(&self.spec);
-                    for (ear, acc) in self.acc.iter_mut().enumerate() {
-                        for (p, h) in f[ear].iter().enumerate() {
-                            let x = &self.fdl[c][(self.ring + p) % parts];
-                            for ((a, &xv), &hv) in acc.iter_mut().zip(x).zip(h) {
-                                *a += xv * hv;
-                            }
-                        }
+                } else {
+                    let delta = (to - from) * step;
+                    for (i, (f, &v)) in feed.iter_mut().zip(x).enumerate() {
+                        *f += v * (from + delta * (i + 1) as f32);
                     }
                 }
             }
-            std::mem::swap(&mut self.prev[c], &mut self.fill_in[c]);
+            let Some(filter) = &self.filters[d] else {
+                continue;
+            };
+            if !sounding {
+                // Silent: its ring fills with zeros; once all of it is,
+                // there is nothing to add.
+                self.fdl[d][self.ring]
+                    .iter_mut()
+                    .for_each(|v| *v = Complex32::default());
+                self.feed_prev[d].fill(0.0);
+                self.quiet[d] = (self.quiet[d] + 1).min(parts);
+                if self.quiet[d] >= parts {
+                    continue;
+                }
+            } else {
+                self.quiet[d] = 0;
+                // Overlap-save: the previous block then this one.
+                self.frame[..b].copy_from_slice(&self.feed_prev[d]);
+                self.frame[b..n].copy_from_slice(&self.feed[d]);
+                let _ = self.fft.process_with_scratch(
+                    &mut self.frame,
+                    &mut self.spec,
+                    &mut self.scratch_f,
+                );
+                self.fdl[d][self.ring].copy_from_slice(&self.spec);
+                std::mem::swap(&mut self.feed_prev[d], &mut self.feed[d]);
+            }
+            for (ear, acc) in self.acc.iter_mut().enumerate() {
+                for (p, h) in filter[ear].iter().enumerate() {
+                    let x = &self.fdl[d][(self.ring + p) % parts];
+                    for ((a, &xv), &hv) in acc.iter_mut().zip(x).zip(h) {
+                        *a += xv * hv;
+                    }
+                }
+            }
         }
+        *self.weights = *self.wanted;
         let scale = 1.0 / n as f32;
         for ear in 0..2 {
             // The inverse transform needs real DC and Nyquist bins.
@@ -766,6 +996,150 @@ mod tests {
         let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
         r.process(&input, &mut l, &mut rr, n);
         assert!(level(&l) > 1.3 * level(&rr), "{} {}", level(&l), level(&rr));
+    }
+
+    /// Turned 30° to the left, the left speaker of a stereo master is
+    /// straight ahead: heard through the front's measured pair exactly,
+    /// alike in both ears; turned back, as before.
+    #[test]
+    fn turning_the_head_turns_the_scene() {
+        use faderframe_core::ambisonics::Orientation;
+        let head = Head::default();
+        let set = head.at(48_000).unwrap();
+        let n = 2048 + set.taps;
+        let mut x = vec![0.0f32; n];
+        x[1000] = 1.0;
+        let silent = vec![0.0f32; n];
+        let mut r = ku100(ChannelLayout::Stereo, Room::Near);
+        r.turn(Orientation::from_ypr(30.0, 0.0, 0.0), 0.0);
+        let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+        r.process(&[&x, &silent], &mut l, &mut rr, n);
+        assert!(r.head().angle_to(&Orientation::from_ypr(30.0, 0.0, 0.0)) < 1e-3);
+        let at = 1000 + r.latency();
+        let front = &set.pairs[0];
+        for k in 0..set.taps.min(n - at) {
+            assert!(
+                (l[at + k] - front.left[k]).abs() < 1e-3
+                    && (rr[at + k] - front.right[k]).abs() < 1e-3,
+                "at {k}"
+            );
+        }
+        // The right speaker is now 60° to the right: louder on the right.
+        let mut r = ku100(ChannelLayout::Stereo, Room::Near);
+        r.turn(Orientation::from_ypr(30.0, 0.0, 0.0), 0.0);
+        let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+        r.process(&[&silent, &x], &mut l, &mut rr, n);
+        assert!(level(&rr) > 1.5 * level(&l), "{} {}", level(&l), level(&rr));
+    }
+
+    /// An ambisonic field is heard where its sources are: a plane wave
+    /// from the left louder on the left ear, from ahead alike; and
+    /// turning the head by an angle is the field turned the other way —
+    /// the same output, sample for sample.
+    #[test]
+    fn a_field_is_heard_where_it_comes_from_and_turns_with_the_head() {
+        use faderframe_core::AmbiOrder;
+        use faderframe_core::ambisonics::{Orientation, encode};
+        let n = 8192;
+        let tone: Vec<f32> = (0..n).map(|i| (i as f32 * 0.05).sin() * 0.25).collect();
+        let field = |order: AmbiOrder, az: f32| -> Vec<Vec<f32>> {
+            let mut g = [0.0f32; 16];
+            encode(order, az, 0.0, &mut g);
+            (0..order.channels())
+                .map(|k| tone.iter().map(|v| v * g[k]).collect())
+                .collect()
+        };
+        let render = |order: AmbiOrder, az: f32, head: Orientation| {
+            let layout = ChannelLayout::Ambisonic(order);
+            let mut r = ku100(layout, Room::Near);
+            r.turn(head, 0.0);
+            let input = field(order, az);
+            let refs: Vec<&[f32]> = input.iter().map(Vec::as_slice).collect();
+            let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+            r.process(&refs, &mut l, &mut rr, n);
+            (l, rr)
+        };
+        for order in AmbiOrder::ALL {
+            let (l, r) = render(order, 80.0, Orientation::IDENTITY);
+            assert!(
+                level(&l) > 1.5 * level(&r),
+                "{order:?}: {} {}",
+                level(&l),
+                level(&r)
+            );
+            let (l, r) = render(order, 0.0, Orientation::IDENTITY);
+            let (a, b) = (level(&l), level(&r));
+            assert!((a - b).abs() < 0.2 * a.max(b), "{order:?} ahead: {a} {b}");
+        }
+        // Head turned 50° right (yaw −50) = the source 50° further left.
+        let (l1, r1) = render(
+            AmbiOrder::Third,
+            10.0,
+            Orientation::from_ypr(-50.0, 0.0, 0.0),
+        );
+        let (l2, r2) = render(AmbiOrder::Third, 60.0, Orientation::IDENTITY);
+        // (Skip the first block and its filters' tail: the turn glides in
+        // over it.)
+        let taps = Head::default().at(48_000).unwrap().taps;
+        for i in 2 * 64 + taps..n {
+            assert!(
+                (l1[i] - l2[i]).abs() < 2e-4 && (r1[i] - r2[i]).abs() < 2e-4,
+                "{i}: {} {} / {} {}",
+                l1[i],
+                l2[i],
+                r1[i],
+                r2[i]
+            );
+        }
+    }
+
+    /// The head glides: smoothed, it gets to where it is turned over the
+    /// time constant, and the output never jumps on the way.
+    #[test]
+    fn the_head_glides_to_where_it_is_turned() {
+        use faderframe_core::ambisonics::Orientation;
+        let layout = ChannelLayout::Surround(SurroundFormat::S51);
+        let mut r = ku100(layout, Room::Near);
+        let n = 48_000;
+        // About 3 kHz: the head shadows it well.
+        let tone: Vec<f32> = (0..n).map(|i| (i as f32 * 0.4).sin() * 0.5).collect();
+        let silent = vec![0.0f32; n];
+        let input: Vec<&[f32]> = (0..6)
+            .map(|c| if c == 2 { &tone[..] } else { &silent[..] })
+            .collect();
+        let target = Orientation::from_ypr(90.0, 0.0, 0.0);
+        let (mut l, mut rr) = (vec![0.0; n], vec![0.0; n]);
+        // A tenth of a second straight, then turned with 50 ms smoothing.
+        let first = 4800;
+        let part: Vec<&[f32]> = input.iter().map(|c| &c[..first]).collect();
+        r.process(&part, &mut l[..first], &mut rr[..first], first);
+        r.turn(target, 0.05);
+        let after_10ms: Vec<&[f32]> = input.iter().map(|c| &c[first..first + 480]).collect();
+        r.process(
+            &after_10ms,
+            &mut l[first..first + 480],
+            &mut rr[first..first + 480],
+            480,
+        );
+        let moved = r.head().angle_to(&Orientation::IDENTITY);
+        assert!(moved > 5.0 && moved < 60.0, "after 10 ms: {moved}°");
+        let rest: Vec<&[f32]> = input.iter().map(|c| &c[first + 480..]).collect();
+        let m = n - first - 480;
+        r.process(&rest, &mut l[first + 480..], &mut rr[first + 480..], m);
+        assert!(r.head().angle_to(&target) < 0.01);
+        // The centre speaker ends on the right (the head turned left).
+        let tail = n - 9600;
+        assert!(level(&rr[tail..]) > 1.5 * level(&l[tail..]));
+        // No step bigger than the tone's own slope allows (a jump would be
+        // a click).
+        let steepest = |x: &[f32]| {
+            x.windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let steady = steepest(&l[1000..first]).max(steepest(&rr[1000..first]));
+        let turning = steepest(&l[first..first + 9600]).max(steepest(&rr[first..first + 9600]));
+        assert!(turning < 2.0 * steady.max(1e-3), "{turning} vs {steady}");
     }
 
     /// A head that is not there is refused (monitoring then stays on the

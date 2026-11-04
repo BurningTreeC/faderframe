@@ -18,7 +18,7 @@ mod output;
 mod surface;
 
 pub use faderframe_midi_ump::UmpClient;
-pub use output::{Captured, CapturedUmp, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY};
+pub use output::{Captured, CapturedUmp, MidiOutputPort, MidiOutputs, OUTPUT_CAPACITY, Schedule};
 pub use surface::{SurfacePorts, VirtualSurface};
 
 mod ump_ports;
@@ -351,20 +351,14 @@ impl MidiHub {
         let Some(lister) = &self.lister else {
             return self.refresh_ump();
         };
-        // MIDI 2.0 clients are read as such, not again as MIDI 1.0.
-        let ump_clients: HashSet<u8> = self
-            .ump
-            .as_ref()
-            .map(|c| c.ump_clients().into_iter().collect())
-            .unwrap_or_default();
+        // MIDI 2.0 devices are read as such, not again as MIDI 1.0.
+        let claimed = self.ump.as_ref().map(|c| c.claimed()).unwrap_or_default();
         let mut listed: Vec<(String, midir::MidiInputPort)> = Vec::new();
         for p in lister.ports() {
             let Ok(full) = lister.port_name(&p) else {
                 continue;
             };
-            if full.starts_with(CLIENT_NAME)
-                || ump_ports::sequencer_client(&full).is_some_and(|c| ump_clients.contains(&c))
-            {
+            if full.starts_with(CLIENT_NAME) || claimed.contains(&full) {
                 continue;
             }
             listed.push((full, p));

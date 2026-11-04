@@ -1,10 +1,11 @@
 //! The Lead Sheet view: the engraved pages of the lead sheet made last
 //! (a clip's or a track's melody with its chords and words, or a score of
-//! several tracks, their staves one below the other; guitar tab), on
-//! paper, scrolled and zoomed (Ctrl + wheel); a strip above to write it as
-//! notes, notes with tab or tab alone (with a tuning and capo), its
-//! rhythms with sixteenths or triplets, and to export it as PDF, MusicXML
-//! or plain-text tab.
+//! several tracks, their staves one below the other; a part as played;
+//! guitar tab), on paper, scrolled and zoomed (Ctrl + wheel); a strip above
+//! to write it as the melody, every note as played (a piano's part on a
+//! grand staff), notes with tab or tab alone (with a tuning and capo), its
+//! rhythms on the grid that fits, straight or in triplets, and to export
+//! it as PDF, MusicXML or plain-text tab.
 
 #![forbid(unsafe_code)]
 
@@ -36,8 +37,9 @@ pub enum Button {
     Text,
 }
 
-const NOTATIONS: [(Notation, &str); 3] = [
-    (Notation::Standard, "Notes"),
+const NOTATIONS: [(Notation, &str); 4] = [
+    (Notation::Standard, "Melody"),
+    (Notation::AsPlayed, "As Played"),
     (Notation::WithTab, "Notes + Tab"),
     (Notation::Tab, "Tab"),
 ];
@@ -116,7 +118,7 @@ impl LeadSheetView {
         }
         x -= 14.0;
         for (g, _) in GRIDS.iter().rev() {
-            add(Button::Grid(*g), 66.0, &mut x);
+            add(Button::Grid(*g), 60.0, &mut x);
         }
         x -= 14.0;
         if tab {
@@ -125,7 +127,7 @@ impl LeadSheetView {
         for (n, label) in NOTATIONS.iter().rev() {
             add(
                 Button::Notation(*n),
-                18.0 + label.len() as f32 * 6.5,
+                14.0 + label.len() as f32 * 6.3,
                 &mut x,
             );
         }
@@ -253,8 +255,8 @@ impl CanvasView<Session, Action> for LeadSheetView {
                     &["Listening to the melody…"]
                 } else {
                     &[
-                        "No lead sheet yet: right-click a clip in the arranger and choose Lead Sheet (an audio clip's melody is heard, a MIDI clip's notes are read; chords from the chord track, words from the lyrics)",
-                        "Several clips of a track selected make one line; several tracks (or clips on several tracks) a score, a staff each",
+                        "No lead sheet yet: right-click a clip in the arranger and choose Lead Sheet (every note of an audio clip is heard, a MIDI clip's read, and the melody picked out; chords from the chord track, else from what plays under and around the melody; words from the lyrics)",
+                        "Several clips of a track selected make one line; several tracks (or clips on several tracks) a score, a staff each; As Played above writes every note (a piano's part on a grand staff)",
                         "Guitar tab: choose Guitar Tab in the clip or track menu, or Notes + Tab / Tab above (a guitar's chords are kept and fingered; the words go to the notes, a syllable a note)",
                     ]
                 };
@@ -522,6 +524,9 @@ mod tests {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         })
         .collect();
         let clip = faderframe_core::ClipId(8000);
@@ -622,6 +627,9 @@ mod tests {
                             channel: 0,
                             muted: false,
                             release: None,
+                            time_locked: false,
+                            articulation: None,
+                            fine: None,
                         })
                         .collect(),
                     ..MidiClip::default()
@@ -754,5 +762,40 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "Bass · 4 Strings"));
         assert!(items.iter().any(|i| i.label == "Capo"));
         view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+        // As Played: every note, no tab (the tuning button goes).
+        let (a, _) = press(&mut view, &s, Button::Notation(Notation::AsPlayed));
+        assert_eq!(
+            a,
+            [Action::SetSheetStyle(SheetStyle {
+                notation: Notation::AsPlayed,
+                ..s.sheet_style()
+            })]
+        );
+        for a in a {
+            s.dispatch(a).unwrap();
+        }
+        assert!(!s.sheet_style().tab());
+        assert!(
+            !LeadSheetView::buttons(size, s.sheet_style().tab())
+                .iter()
+                .any(|(b, _)| *b == Button::Tuning)
+        );
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        assert!(p.texts().contains(&"As Played") && p.texts().contains(&"Melody"));
+    }
+
+    /// The strip's buttons stay clear of its title at the narrowest the
+    /// view is shown with its notation and grid choices.
+    #[test]
+    fn the_strip_fits_beside_its_title() {
+        for tab in [false, true] {
+            let size = Size::new(if tab { 1150.0 } else { 900.0 }, 400.0);
+            let left = LeadSheetView::buttons(size, tab)
+                .iter()
+                .map(|(_, r)| r.x)
+                .fold(f32::MAX, f32::min);
+            assert!(left >= 112.0, "{left} at {}", size.w);
+        }
     }
 }

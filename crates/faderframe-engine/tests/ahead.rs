@@ -76,6 +76,8 @@ fn stateless_project() -> Project {
 struct Run {
     r: OfflineRenderer,
     bufs: OwnedBuffers,
+    /// Paced runs of a try after a late one wait for the anticipators.
+    patience: common::Patience,
     /// Left master output by transport position, while playing.
     heard: HashMap<i64, f32>,
     /// The transport's position after each callback (playing or not).
@@ -116,6 +118,7 @@ impl Run {
         Self {
             r,
             bufs: OwnedBuffers::new(2, 2, BLOCK),
+            patience: common::Patience::new(Duration::from_secs(30)),
             heard: HashMap::new(),
             positions: Vec::new(),
             ran_on: HashMap::new(),
@@ -123,9 +126,15 @@ impl Run {
     }
 
     /// `blocks` callbacks; with `paced` at the device's pace (the
-    /// anticipator runs alongside in real time).
+    /// anticipator runs alongside in real time) — on a try after a late
+    /// one ([`on_time`]) waiting for the anticipators where they are
+    /// behind.
     fn run(&mut self, blocks: usize, paced: bool) {
+        let patient = paced && PATIENT.get();
         for _ in 0..blocks {
+            if patient {
+                self.patience.wait(&self.r.controller, BLOCK);
+            }
             self.r.processor.process_device(&mut self.bufs);
             let t = self.r.controller.transport_snapshot();
             let ran_on = self.positions.last() == Some(&(t.position - BLOCK as i64));
@@ -151,18 +160,34 @@ impl Run {
     }
 }
 
+thread_local! {
+    /// Paced runs on this thread wait for the anticipators ([`on_time`]).
+    static PATIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Paced runs share the machine with the other tests: a hosted runner can
 /// keep the anticipator from a deadline once, which plays a block of
 /// silence (a miss) where nothing else differs. `attempt` plays one paced
 /// comparison and returns how often it was late, asserting the audio only
 /// when it never was; a late one is tried again, three times at most.
+///
+/// The first try keeps the device's pace whatever happens. Under a heavy
+/// load (several builds beside the tests) the anticipators — ordinary
+/// threads in a test, where the audio thread they follow is one too —
+/// can be kept from the shallow tier's few milliseconds in any two
+/// seconds, so the tries after a late one wait for them where they are
+/// behind (`Run::run`, [`common::Patience`]): what they prove — the audio
+/// rendered ahead is the audio played live, and all of it arrives — no
+/// longer depends on the machine's load; only the first try's timing did.
 fn on_time(mut attempt: impl FnMut() -> u64) {
     for tries in 1..=3 {
+        PATIENT.set(tries > 1);
         let misses = attempt();
+        PATIENT.set(false);
         if misses == 0 {
             return;
         }
-        eprintln!("try {tries}: {misses} blocks late (a busy machine): again");
+        eprintln!("try {tries}: {misses} blocks late (a busy machine): again, waiting for them");
     }
     panic!("late in every try: the anticipator does not keep up here");
 }

@@ -64,6 +64,19 @@ GLYPHS = {
     "rest16th": 0xE4E7,
     "tuplet3": 0xE883,
     "metNoteQuarterUp": 0xECA5,
+    # The score editor's marks: articulations (above and below the note)
+    # and dynamics.
+    "articAccentAbove": 0xE4A0,
+    "articAccentBelow": 0xE4A1,
+    "articStaccatoAbove": 0xE4A2,
+    "articStaccatoBelow": 0xE4A3,
+    "articTenutoAbove": 0xE4A4,
+    "articTenutoBelow": 0xE4A5,
+    "articMarcatoAbove": 0xE4AC,
+    "articMarcatoBelow": 0xE4AD,
+    "dynamicPiano": 0xE520,
+    "dynamicMezzo": 0xE521,
+    "dynamicForte": 0xE522,
 }
 
 DEFAULTS = [

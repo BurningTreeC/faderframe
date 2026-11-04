@@ -61,6 +61,7 @@ fn session() -> (Session, TrackId, ClipId) {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     })
@@ -121,6 +122,9 @@ fn midi_clip(s: &mut Session, starts: &[f64]) -> ClipId {
                         channel: 0,
                         muted: false,
                         release: None,
+                        time_locked: false,
+                        articulation: None,
+                        fine: None,
                     })
                     .collect(),
                 ..MidiClip::default()

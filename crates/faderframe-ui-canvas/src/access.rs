@@ -9,8 +9,14 @@
 //! screen; ids are stable (a track's fader keeps its id while the mixer
 //! shows the track) so the focus and a screen reader's place survive
 //! repaints.
+//!
+//! What only the view can do for a control — open its menu, a text entry
+//! or a chooser, change its own presentation (a filter, a selection) — the
+//! keyboard asks of the view ([`AccessPress`],
+//! [`crate::CanvasView::access_press`]); [`key_on`] says what a key does on
+//! a node, for the host and for tests ([`press_key`]).
 
-use crate::Rect;
+use crate::{CanvasView, EventCx, HostRequest, Key, Modifiers, Rect, Size};
 
 /// What a node is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,6 +75,31 @@ pub struct AccessValue {
     pub text: String,
 }
 
+/// What the keyboard asks of the view itself for a node
+/// ([`crate::CanvasView::access_press`]): what its press would do that
+/// only the view can — a menu, a text entry, a chooser, its own state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccessPress {
+    /// Enter on a node that asks the view ([`AccessNode::press`]).
+    Activate,
+    /// The node's menu ([`AccessNode::menu`]): Shift+F10 or the Menu key,
+    /// and Enter when nothing else answers it (a menu button).
+    Menu,
+    /// Up/Right and Down/Left on a node whose steps are the view's
+    /// ([`AccessNode::view_steps`]).
+    Increment,
+    Decrement,
+}
+
+/// What a key does on the control the keyboard is on ([`key_on`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AccessKey<A> {
+    /// An action for the session.
+    Act(A),
+    /// The view answers ([`crate::CanvasView::access_press`]).
+    Press(AccessPress),
+}
+
 /// One control or part of a view.
 #[derive(Clone, Debug)]
 pub struct AccessNode<A> {
@@ -88,6 +119,24 @@ pub struct AccessNode<A> {
     /// Up / Right, Down / Left: one step.
     pub increment: Option<A>,
     pub decrement: Option<A>,
+    /// Enter asks the view ([`AccessPress::Activate`]) when there is no
+    /// `activate`.
+    pub press: bool,
+    /// It has a menu ([`AccessPress::Menu`]; told as a popup).
+    pub menu: bool,
+    /// The arrows ask the view ([`AccessPress::Increment`],
+    /// [`AccessPress::Decrement`]) when there are no step actions.
+    pub view_steps: bool,
+    /// Does nothing now (told as unavailable; the keys pass it by).
+    pub disabled: bool,
+    /// A Tab stop with nothing to do: a reading the keyboard visits (a
+    /// meter, a summary) to hear it.
+    pub stop: bool,
+    /// Stays put when the view scrolls sideways (`fixed_x`) or up and down
+    /// (`fixed_y`) — a toolbar's buttons, a header column: the keyboard
+    /// never scrolls the view to bring it in.
+    pub fixed_x: bool,
+    pub fixed_y: bool,
     pub children: Vec<AccessNode<A>>,
 }
 
@@ -105,6 +154,13 @@ impl<A> AccessNode<A> {
             activate: None,
             increment: None,
             decrement: None,
+            press: false,
+            menu: false,
+            view_steps: false,
+            disabled: false,
+            stop: false,
+            fixed_x: false,
+            fixed_y: false,
             children: Vec::new(),
         }
     }
@@ -150,6 +206,56 @@ impl<A> AccessNode<A> {
         self
     }
 
+    /// Enter asks the view ([`AccessPress::Activate`]).
+    pub fn on_press(mut self) -> Self {
+        self.press = true;
+        self
+    }
+
+    /// It has a menu the view opens ([`AccessPress::Menu`]).
+    pub fn with_menu(mut self) -> Self {
+        self.menu = true;
+        self
+    }
+
+    /// The arrows ask the view ([`AccessPress::Increment`] and
+    /// [`AccessPress::Decrement`]).
+    pub fn view_steps(mut self) -> Self {
+        self.view_steps = true;
+        self
+    }
+
+    pub fn disabled(mut self, off: bool) -> Self {
+        self.disabled = off;
+        self
+    }
+
+    /// The keyboard visits it though it does nothing (a reading).
+    pub fn tab_stop(mut self) -> Self {
+        self.stop = true;
+        self
+    }
+
+    /// Stays put however the view scrolls (a toolbar's).
+    pub fn fixed(mut self) -> Self {
+        self.fixed_x = true;
+        self.fixed_y = true;
+        self
+    }
+
+    /// Stays put when the view scrolls sideways (a column of row headers).
+    pub fn fixed_x(mut self) -> Self {
+        self.fixed_x = true;
+        self
+    }
+
+    /// Stays put when the view scrolls up and down (a row of column
+    /// headers).
+    pub fn fixed_y(mut self) -> Self {
+        self.fixed_y = true;
+        self
+    }
+
     pub fn child(mut self, node: AccessNode<A>) -> Self {
         self.children.push(node);
         self
@@ -166,6 +272,10 @@ impl<A> AccessNode<A> {
             || self.activate.is_some()
             || self.increment.is_some()
             || self.decrement.is_some()
+            || self.press
+            || self.menu
+            || self.view_steps
+            || self.stop
     }
 
     /// The nodes depth-first: the order Tab moves in.
@@ -196,6 +306,68 @@ impl<A> AccessNode<A> {
         }
         s
     }
+}
+
+/// What `key` does on `node`: Enter its action, else the view's press, else
+/// its menu; the arrows (and Page Up/Down, once each) a step; Shift+F10 and
+/// the Menu key its menu. `None`: nothing there (a disabled node: nothing at
+/// all) — the key goes to the view.
+pub fn key_on<A: Clone>(
+    node: &AccessNode<A>,
+    key: Key,
+    modifiers: Modifiers,
+) -> Option<AccessKey<A>> {
+    if node.disabled {
+        return None;
+    }
+    let menu = node.menu.then_some(AccessKey::Press(AccessPress::Menu));
+    let step = |action: &Option<A>, press: AccessPress| {
+        action
+            .clone()
+            .map(AccessKey::Act)
+            .or_else(|| node.view_steps.then_some(AccessKey::Press(press)))
+    };
+    match key {
+        Key::Enter => node
+            .activate
+            .clone()
+            .map(AccessKey::Act)
+            .or_else(|| {
+                node.press
+                    .then_some(AccessKey::Press(AccessPress::Activate))
+            })
+            .or(menu),
+        Key::Up | Key::Right | Key::PageUp => step(&node.increment, AccessPress::Increment),
+        Key::Down | Key::Left | Key::PageDown => step(&node.decrement, AccessPress::Decrement),
+        Key::F(10) if modifiers.shift => menu,
+        Key::Menu => menu,
+        _ => None,
+    }
+}
+
+/// The keyboard presses `key` on control `id` of `nodes` (as the host does,
+/// for tests): the actions for the session and the view's requests to the
+/// host. `None`: the key does nothing there.
+pub fn press_key<M, A: Clone, V: CanvasView<M, A> + ?Sized>(
+    view: &mut V,
+    nodes: &[AccessNode<A>],
+    id: u64,
+    key: Key,
+    modifiers: Modifiers,
+    size: Size,
+    model: &M,
+) -> Option<(Vec<A>, Vec<HostRequest<A>>)> {
+    let node = find_node(nodes, id)?;
+    let mut actions = Vec::new();
+    let mut requests = Vec::new();
+    match key_on(node, key, modifiers)? {
+        AccessKey::Act(a) => actions.push(a),
+        AccessKey::Press(p) => {
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            view.access_press(id, p, size, model, &mut cx);
+        }
+    }
+    Some((actions, requests))
 }
 
 /// The focus order of a view's tree.
@@ -268,5 +440,58 @@ mod tests {
         assert_eq!(find_node(&tree, 2).unwrap().spoken(), "Volume, −6.0 dB");
         assert_ne!(access_id(&[1, 2]), access_id(&[2, 1]));
         assert_ne!(access_id_str("a", &[1]), access_id_str("b", &[1]));
+    }
+
+    /// Enter: the action, else the view's press, else the menu; the arrows
+    /// steps, the view's when it has none; Shift+F10 and the Menu key the
+    /// menu; nothing on a disabled node.
+    #[test]
+    fn keys_reach_actions_presses_and_menus() {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        };
+        let button = AccessNode::<u8>::new(1, AccessRole::Button, "Grid ▾").with_menu();
+        assert!(button.focusable());
+        assert_eq!(
+            key_on(&button, Key::Enter, Modifiers::NONE),
+            Some(AccessKey::Press(AccessPress::Menu))
+        );
+        assert_eq!(
+            key_on(&button, Key::F(10), shift),
+            Some(AccessKey::Press(AccessPress::Menu))
+        );
+        assert_eq!(key_on(&button, Key::F(10), Modifiers::NONE), None);
+        let row = AccessNode::<u8>::new(2, AccessRole::ListItem, "Song")
+            .on_press()
+            .with_menu()
+            .view_steps();
+        assert_eq!(
+            key_on(&row, Key::Enter, Modifiers::NONE),
+            Some(AccessKey::Press(AccessPress::Activate))
+        );
+        assert_eq!(
+            key_on(&row, Key::Menu, Modifiers::NONE),
+            Some(AccessKey::Press(AccessPress::Menu))
+        );
+        assert_eq!(
+            key_on(&row, Key::PageDown, Modifiers::NONE),
+            Some(AccessKey::Press(AccessPress::Decrement))
+        );
+        let slider = AccessNode::new(3, AccessRole::Slider, "Trim")
+            .on_step(4u8, 5)
+            .on_activate(6);
+        assert_eq!(
+            key_on(&slider, Key::Right, Modifiers::NONE),
+            Some(AccessKey::Act(4))
+        );
+        assert_eq!(
+            key_on(&slider, Key::Enter, Modifiers::NONE),
+            Some(AccessKey::Act(6))
+        );
+        assert_eq!(key_on(&slider, Key::Menu, Modifiers::NONE), None);
+        let off = slider.disabled(true);
+        assert!(off.focusable(), "still found, told as unavailable");
+        assert_eq!(key_on(&off, Key::Enter, Modifiers::NONE), None);
     }
 }

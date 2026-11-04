@@ -33,6 +33,9 @@ fn setup() -> (Session, ClipId) {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         })
         .collect();
     s.dispatch(Action::AddNotes { clip, notes }).unwrap();
@@ -154,6 +157,7 @@ fn controller_lanes_and_clip_length() {
         .map(|i| ControllerPoint {
             time: q(i as f64),
             value: 30 * i,
+            fine: None,
         })
         .collect();
     s.dispatch(Action::SetControllerPoints {

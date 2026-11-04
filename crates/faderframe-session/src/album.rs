@@ -114,6 +114,9 @@ pub enum AlbumAction {
     },
     /// To a point of the album (seconds).
     Seek(f64),
+    /// Show the last export's report again (its files measured, the QC
+    /// checks, Save QC Report…): the delivery the QC report is of.
+    ShowReport,
 }
 
 /// Album playback as the view shows it.
@@ -1247,6 +1250,18 @@ impl Session {
                 self.album_seek(t);
                 return Ok(());
             }
+            AlbumAction::ShowReport => {
+                let Some(done) = self.album_state.last_export.clone() else {
+                    return Err(SessionError::Other("the album was not exported yet".into()));
+                };
+                self.note_album_export_quietly(&done);
+                self.ui_requests.push(crate::UiRequest::RenderReport {
+                    what: format!("Album “{}”", self.project.name),
+                    files: done.report,
+                });
+                self.revision += 1;
+                return Ok(());
+            }
         }
         if album == self.project.album {
             return Ok(());
@@ -1654,6 +1669,7 @@ impl Session {
                 ),
             );
         }
+        self.note_album_export(&done);
         if !done.report.is_empty() {
             self.ui_requests.push(crate::UiRequest::RenderReport {
                 what: format!("Album “{}”", self.project.name),

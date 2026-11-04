@@ -1,6 +1,7 @@
 //! CLAP plugin hosting.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod ara;
 pub mod host;
 mod instance;
 mod processor;
@@ -88,5 +89,17 @@ impl PluginFactory for ClapFactory {
             .get(&p.bundle)
             .ok_or_else(|| PluginError::NotFound(id.to_string()))?;
         Ok(Box::new(ClapInstance::new(entry, p)?))
+    }
+
+    fn ara_plugins(&self) -> Vec<String> {
+        catalog()
+            .into_iter()
+            .filter(|p| {
+                p.features
+                    .iter()
+                    .any(|f| f == ara::FEATURE || f == ara::FEATURE_REQUIRED)
+            })
+            .map(|p| p.id)
+            .collect()
     }
 }

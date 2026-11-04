@@ -141,6 +141,9 @@ fn song() -> Session {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         };
         p.clips.insert(
             id,

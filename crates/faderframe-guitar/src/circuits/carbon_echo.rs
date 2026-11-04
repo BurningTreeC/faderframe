@@ -133,19 +133,50 @@
 //!   a bass note: the box's forward, "vocal" repeats.
 //! - **Distortion** of the wet path, harmonics 2 to 5: about 0.5 % for a
 //!   guitar's 220 Hz at its level, 1.5 % at 1 kHz; at the manual's own test
-//!   point (1 kHz, -5 dBV) 4.5 % at 12 o'clock, where the M169A says "under
-//!   1 %". The four BBDs add under half a per cent of it; the rest is the
-//!   Sallen-Key followers' (`the_filters_followers_are_where_a_hot_echo_frays`).
+//!   point (1 kHz, -5 dBV) 4.7 % at 12 o'clock, where the M169A says "under
+//!   1 %". Where it comes from is below.
 //! - **At rest** under -115 dBV at full MIX: the expander shuts the BBDs'
 //!   hiss and clock away.
 //!
-//! ## Open questions
+//! ## Where the model and the manual disagree
 //!
-//! - The manual's top modulation speed, 2.2 Hz, against TR1's 3.65 Hz here:
-//!   with the traced R19, C11 / C12 and R8 / R16 the triangle's slope and its
-//!   thresholds put the top there. A misread part, a smaller trimmer stop, or
-//!   a manual quoting a narrower range than the trimmer has would each do it.
-//! - Its distortion at the manual's test point, above.
+//! Both are the traced circuit's, measured stage by stage
+//! (`tests::distortion_by_stage`, `tests::triangle_by_arithmetic`); neither
+//! is the solver's or a figure set here.
+//!
+//! - **Distortion at the test point**, 4.7 % against "under 1 %", comes from
+//!   three places (`the_filters_followers_are_where_a_hot_echo_frays`):
+//!   the compressor's rectifier ripple (C5's 2.2 ms against a 2 kHz
+//!   ripple: a third harmonic of 1.1 % at U7A's output, at any level); Q7,
+//!   whose own base-emitter law puts only 0.06 % of second harmonic on
+//!   its output, but in a Sallen-Key whose C25 is 248 times C20 an error at
+//!   the follower's output comes back some 36 times larger at 2 kHz: 2 % at
+//!   the BBDs' input, the same with the board stepped at 48, 96 or 192 kHz;
+//!   and Q9, which sits on TR8's 10 k at DC but about 6 k at audio (TR8 into
+//!   the expander's 6.7 k): biased at 0.28 mA from the BBDs' output level it
+//!   can pull its emitter about 1.7 V down, and a hot echo reaches that, so
+//!   it all but cuts off once a cycle (second harmonic 7 % at its emitter,
+//!   fourth 1 %). The level at Q9 is pinned by TR8's calibration within the
+//!   write-up's 2 to 3 o'clock; its bias is `BBD_OUT_LEVEL`, an estimate: a
+//!   volt more there halves the figure (2.5 %), and nothing within the
+//!   trace's reach takes it under 1 %, since the compander's ripple and Q7's
+//!   loop alone make about 1.5 % at 1 kHz even at -20 dBV. The write-up,
+//!   for its part, measured the response with white noise because sine
+//!   sweeps came out disturbed. The manual's figure may be of the earlier
+//!   (MN3205) board, or of a measurement made otherwise; this board, traced
+//!   as it is, does not make it.
+//! - **The top modulation speed**, 3.65 Hz against the manual's 2.2 Hz
+//!   (`the_triangle_runs_at_the_manuals_rates`). The triangle's speed is the
+//!   traced network's arithmetic, `R16 / (4 R8 R19 C)` at TR1's top with
+//!   the square's asymmetry, and the simulated ends are that arithmetic's
+//!   to a few per cent. The bottom, 0.24 Hz, is the manual's 0.2. No single
+//!   traced part puts both ends on the manual's figures: R19, C11 / C12 and
+//!   R8 / R16 scale both together (the top brought to 2.2 Hz takes the
+//!   bottom to 0.14), R11 moves the bottom alone. About 100 k between U5A's
+//!   output and TR1's top would give 0.19 to 2.2 Hz; the trace has the
+//!   trimmer straight on the output. A part the trace missed, or a manual
+//!   written for another board, would each explain it; the model keeps the
+//!   trace.
 //! - Whether REGEN's full turn runs away at long delays on a real unit: here
 //!   it depends on TR8's setting twice over (the compander squares the wet
 //!   gain), and a dB on TR8 is two on the loop.
@@ -265,7 +296,9 @@ const BBD_BIAS_SOURCE: f64 = 12_400.0;
 /// output stage a source follower about a volt under its input's bias,
 /// scaled to 9 V: ESTIMATED), and what TR12 and the two follower outputs look
 /// like from R69 -- 10 k's two halves in parallel and the followers' own.
-/// ESTIMATED.
+/// ESTIMATED. The level is Q14's and Q9's bias: how close a hot echo takes
+/// Q9 to cutting off (see the module's "Where the model and the manual
+/// disagree": 4.7 % at the test point at 4 V, 2.5 % at 5 V).
 const BBD_OUT_LEVEL: f64 = 4.0;
 const BBD_OUT_SOURCE: f64 = 3_500.0;
 
@@ -309,6 +342,17 @@ const R12: f64 = 10_000.0;
 /// Schmitt's lower threshold, so the LFO starts at once and from the same
 /// phase every time (`Netlist::charged`).
 const TRIANGLE_START: f64 = -0.45;
+/// The LFO's timing parts (traced): R8 from the triangle and R16 from the
+/// square into U5A's non-inverting input (the thresholds are R8 / R16 of
+/// the square's swing either side of the bias line), TR1 SPEED across the
+/// square and R11, its wiper through R19 into the integrator's C12 and C11
+/// (4.7 µF back to back).
+const R8: f64 = 62_000.0;
+const R16: f64 = 470_000.0;
+const R11: f64 = 39_000.0;
+const R19: f64 = 220_000.0;
+const TR1: f64 = 500_000.0;
+const INTEGRATING: f64 = 2.35e-6;
 
 // --- the bucket brigades ---------------------------------------------------------
 
@@ -331,8 +375,9 @@ const TRIANGLE_START: f64 = -0.45;
 ///   sheet's (0.2 % a chip at -10 dBm, 9 V): the four chips add under half a
 ///   per cent at the M169A's own test point (1 kHz, -5 dBV in), whose whole
 ///   wet path is rated "under 1 %". The BL3208A is not Panasonic's part.
-///   ESTIMATED. (The traced filters' followers take more than that on their
-///   own there: `the_filters_followers_are_where_a_hot_echo_frays`.)
+///   ESTIMATED. (The compressor and the traced filters' followers take more
+///   than that on their own there:
+///   `the_filters_followers_are_where_a_hot_echo_frays`.)
 /// - **Noise**: white plus a part that grows with the holding time, from the
 ///   sheet's V_no-f_cp curve, A-weighted at a chip's output: -63 dBm at a
 ///   10 kHz clock, -72 at 100 kHz. Four chips' powers summed, that is 1.1 mV
@@ -672,8 +717,8 @@ pub fn build_clock(rate: f64) -> Result<Circuit, Fault> {
         .capacitor("lb", "gnd", 47e-6) // C1
         // U5A: the triangle in through R8 and its own square back through
         // R16, both into its non-inverting input; the inverting on the bias.
-        .resistor("sq", "sp", 470_000.0) // R16
-        .resistor("tri", "sp", 62_000.0); // R8
+        .resistor("sq", "sp", R16) // R16
+        .resistor("tri", "sp", R8); // R8
     tl062(
         &mut net,
         "u5a",
@@ -685,10 +730,10 @@ pub fn build_clock(rate: f64) -> Result<Circuit, Fault> {
     // SPEED across the square and R11, its wiper through R19 into the
     // integrator: C12 and C11, 4.7 µF back to back, 2.35 µF.
     net.rest(SPEED_TRIM, TR1_REST)
-        .pot("sq", "tr1", "r11", 500_000.0, Taper::Linear, SPEED_TRIM) // TR1
-        .resistor("r11", "lb", 39_000.0) // R11
-        .resistor("tr1", "im", 220_000.0) // R19
-        .capacitor("tri", "im", 2.35e-6) // C12 + C11
+        .pot("sq", "tr1", "r11", TR1, Taper::Linear, SPEED_TRIM) // TR1
+        .resistor("r11", "lb", R11) // R11
+        .resistor("tr1", "im", R19) // R19
+        .capacitor("tri", "im", INTEGRATING) // C12 + C11
         .charged("tri", "im", TRIANGLE_START)
         // MOD off puts R12 across the integrator (SW1B): a gain of a twentieth,
         // and the triangle stops where it is.

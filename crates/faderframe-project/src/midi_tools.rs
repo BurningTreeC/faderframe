@@ -506,6 +506,9 @@ fn new_note(
         channel: like.channel,
         muted: like.muted,
         release: None,
+        time_locked: like.time_locked,
+        articulation: None,
+        fine: None,
     })
 }
 
@@ -705,9 +708,18 @@ pub fn transform(
                 }
                 Recombine::ShuffleVelocities => {
                     let mut v: Vec<u8> = sorted.iter().map(|n| n.velocity).collect();
+                    // Each velocity goes with its 16 bits (where notes have
+                    // MIDI 2.0's resolution).
+                    let mut full: Vec<(u8, u16)> = sorted
+                        .iter()
+                        .map(|n| (n.velocity, n.velocity16()))
+                        .collect();
                     shuffle(&mut v);
                     for (n, x) in sorted.iter_mut().zip(v) {
-                        n.velocity = x;
+                        match full.iter().position(|f| f.0 == x) {
+                            Some(i) => n.set_velocity16(full.swap_remove(i).1),
+                            None => n.velocity = x,
+                        }
                     }
                 }
                 Recombine::ShuffleLengths => {
@@ -864,6 +876,9 @@ pub fn generate(
         channel: 0,
         muted: false,
         release: None,
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     let velocity = i32::from(s.velocity);
     let mut out = Vec::new();
@@ -1206,6 +1221,9 @@ mod tests {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         }
     }
 

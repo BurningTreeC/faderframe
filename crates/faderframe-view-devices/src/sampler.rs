@@ -2,6 +2,12 @@
 //! a button to load another), the waveform with the start and end points
 //! and the loop (drag their markers) and where the newest voice plays, a keyboard with
 //! the zones over it, and the controls.
+//!
+//! Sliced, the waveform shows the slices numbered (drag a cut to move
+//! it); in slice mode the keyboard shows the key each plays. A right-click
+//! in the waveform slices (at the transients, into equal parts), adds or
+//! removes a cut there, turns slice mode on or off, and sends the slices
+//! to a MIDI clip or a new Drum Sampler.
 
 use crate::kit::{
     self, Ctl, Ctx, Edit, Face, KNOB, Meter, MeterKind, Panel, SMALL, SWITCH_H, Scale,
@@ -10,7 +16,11 @@ use crate::values::{is_black, note_name};
 use faderframe_core::ParameterId;
 use faderframe_plugin_host::devices::sampler::{self as smp, id, value};
 use faderframe_plugin_host::devices::samples::Contents;
-use faderframe_ui_canvas::{Accent, Color, Paint, Painter, Rect, Size, TextStyle, ViewEvent};
+use faderframe_session::Action;
+use faderframe_ui_canvas::{
+    Accent, Color, HostRequest, MenuItem, Paint, Painter, PointerButton, Rect, Size, TextStyle,
+    ViewEvent,
+};
 
 fn pid(i: u32) -> ParameterId {
     ParameterId(i)
@@ -23,6 +33,8 @@ enum Marker {
     End,
     LoopStart,
     LoopEnd,
+    /// A slice's cut (its index among the cuts).
+    Cut(usize),
 }
 
 impl Marker {
@@ -32,8 +44,23 @@ impl Marker {
             Marker::End => id::END,
             Marker::LoopStart => id::LOOP_START,
             Marker::LoopEnd => id::LOOP_END,
+            Marker::Cut(_) => u32::MAX,
         }
     }
+}
+
+/// How near (pixels) a click takes a cut.
+const CUT_REACH: f32 = 6.0;
+
+/// The cuts of the single sample (frames) and its length, when it is one
+/// (not an SFZ).
+fn cuts(contents: Option<&std::sync::Arc<Contents>>) -> Option<(Vec<u64>, usize)> {
+    let c = contents?;
+    if !c.set.zones.is_empty() {
+        return None;
+    }
+    let frames = c.set.slot(0)?.frames;
+    Some((c.doc.slices.clone(), frames))
 }
 
 pub(crate) struct SamplerFace {
@@ -50,7 +77,7 @@ impl SamplerFace {
     }
 
     /// Header (name, button), waveform, keyboard.
-    fn split(r: Rect) -> (Rect, Rect, Rect, Rect) {
+    pub(crate) fn split(r: Rect) -> (Rect, Rect, Rect, Rect) {
         let head = Rect::new(r.x + 8.0, r.y + 6.0, r.w - 16.0, 26.0);
         let button = Rect::new(head.right() - 120.0, head.y, 120.0, 24.0);
         let keys = Rect::new(r.x + 8.0, r.bottom() - 46.0, r.w - 16.0, 38.0);
@@ -65,6 +92,74 @@ impl SamplerFace {
 
     fn contents(cx: &Ctx<'_>) -> Option<std::sync::Arc<Contents>> {
         cx.tap.assets::<Contents>()
+    }
+
+    /// The waveform's menu at `x`: slicing (the session's entries), a cut
+    /// added there or the one there removed, slice mode on or off.
+    fn slice_menu(
+        &self,
+        cx: &Ctx<'_>,
+        x: f32,
+        wave: Rect,
+        near: Option<usize>,
+    ) -> Vec<MenuItem<Action>> {
+        let plugin = cx.plugin;
+        let mut items = Vec::new();
+        let contents = Self::contents(cx);
+        if let Some((cuts, frames)) = cuts(contents.as_ref()) {
+            let at =
+                (((x - wave.x) / wave.w).clamp(0.0, 1.0) as f64 * frames as f64).round() as u64;
+            match near {
+                Some(i) => {
+                    let mut fewer = cuts.clone();
+                    fewer.remove(i);
+                    items.push(MenuItem::new(
+                        format!("Remove the Cut Before Slice {}", i + 2),
+                        Action::SetSampleSlices {
+                            plugin,
+                            slices: fewer,
+                        },
+                    ));
+                }
+                None if at > 0 && (at as usize) < frames => {
+                    let mut more = cuts.clone();
+                    more.push(at);
+                    items.push(MenuItem::new(
+                        "Cut a Slice Here",
+                        Action::SetSampleSlices {
+                            plugin,
+                            slices: more,
+                        },
+                    ));
+                }
+                None => {}
+            }
+        }
+        let on = cx.on(pid(id::SLICES));
+        if let Some((track, _)) = cx.model.plugin_owner(plugin) {
+            items.push(
+                MenuItem::new(
+                    "Play Slices (a Key Each)",
+                    Action::Edit(faderframe_project::Command::SetPluginParameter {
+                        track,
+                        plugin,
+                        parameter: pid(id::SLICES),
+                        value: Some(if on { 0.0 } else { 1.0 }),
+                    }),
+                )
+                .checked(on),
+            );
+        }
+        let choices = cx.model.sample_slice_choices(plugin, 0);
+        for (i, (label, action, separated)) in choices.into_iter().enumerate() {
+            let item = MenuItem::new(label, action);
+            items.push(if separated || i == 0 {
+                item.separated()
+            } else {
+                item
+            });
+        }
+        items
     }
 }
 
@@ -110,6 +205,11 @@ impl Face for SamplerFace {
             pid(id::PITCH_MODE),
             "Keep Length",
             Rect::new(b[0].x, b[0].y - SWITCH_H - 6.0, b[0].w, SWITCH_H),
+        ));
+        c.push(Ctl::toggle(
+            pid(id::SLICES),
+            "Slices",
+            Rect::new(b[1].x, b[1].y - SWITCH_H - 6.0, b[1].w, SWITCH_H),
         ));
         let r = kit::inside(&s[1]);
         c.push(Ctl::segments(
@@ -267,9 +367,27 @@ impl Face for SamplerFace {
                     .map(|x| x.as_ref())
             }
         });
+        let slicing = cx.on(pid(id::SLICES));
         if let Some(sample) = shown {
             kit::waveform(p, wave, sample, self.accent);
-            if zones == 0 {
+            // The slices: their cuts, numbered.
+            if let Some((cuts, frames)) = cuts(contents.as_ref()).filter(|c| !c.0.is_empty()) {
+                let x = |f: u64| wave.x + wave.w * (f as f32 / frames.max(1) as f32).min(1.0);
+                let starts = std::iter::once(0).chain(cuts.iter().copied());
+                for (k, a) in starts.enumerate() {
+                    let xx = x(a);
+                    if k > 0 {
+                        p.vline(xx, wave.y, wave.bottom(), self.accent);
+                        p.fill(Rect::new(xx - 3.0, wave.y, 6.0, 6.0), self.accent);
+                    }
+                    p.text(
+                        &(k + 1).to_string(),
+                        Rect::new(xx + 3.0, wave.y + 6.0, 24.0, 12.0),
+                        &TextStyle::new(th.fonts.tiny, self.accent).bold(),
+                    );
+                }
+            }
+            if zones == 0 && !slicing {
                 let frac = |i: u32| cx.value(pid(i)) as f32;
                 let x = |f: f32| wave.x + wave.w * f.clamp(0.0, 1.0);
                 if cx.value(pid(id::LOOP)) >= 0.5 {
@@ -369,6 +487,21 @@ impl Face for SamplerFace {
                     );
                 }
             }
+            Some(s) if slicing && !s.slices.is_empty() => {
+                // A key a slice, from the first slice key.
+                let first = cx.value(pid(id::SLICE_KEY)).round() as i32;
+                for k in 0..s.slices.len() as i32 {
+                    let key = first + k;
+                    if !(lo..=hi).contains(&key) {
+                        continue;
+                    }
+                    let shade = if k % 2 == 0 { 0.75 } else { 0.45 };
+                    p.fill(
+                        Rect::new(key_x(key), strip.y, (w - 1.0).max(1.0), strip.h),
+                        self.accent.with_alpha(shade),
+                    );
+                }
+            }
             Some(s) if s.slot(0).is_some() => {
                 p.fill(strip, self.accent.with_alpha(0.4));
                 let root = cx.value(pid(id::ROOT)).round() as i32;
@@ -389,11 +522,47 @@ impl Face for SamplerFace {
         edit: &mut Edit<'_, '_>,
     ) -> bool {
         let (_, button, wave, _) = Self::split(r);
-        let single =
-            Self::contents(cx).is_some_and(|c| c.set.zones.is_empty() && c.set.slot(0).is_some());
+        let contents = Self::contents(cx);
+        let single = contents
+            .as_ref()
+            .is_some_and(|c| c.set.zones.is_empty() && c.set.slot(0).is_some());
+        let sliced = cuts(contents.as_ref());
+        let slicing = cx.on(pid(id::SLICES));
+        // The cut near `x`, if any.
+        let cut_at = |x: f32| {
+            let (cuts, frames) = sliced.as_ref()?;
+            cuts.iter()
+                .enumerate()
+                .map(|(i, &f)| {
+                    (
+                        i,
+                        (wave.x + wave.w * f as f32 / (*frames).max(1) as f32 - x).abs(),
+                    )
+                })
+                .filter(|(_, d)| *d <= CUT_REACH)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
         match *ev {
             ViewEvent::PointerDown { pos, .. } if button.contains(pos) => {
                 edit.choose_samples(0, "Load a Sample or SFZ Instrument", true);
+                true
+            }
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Secondary,
+                ..
+            } if single && wave.contains(pos) => {
+                let items = self.slice_menu(cx, pos.x, wave, cut_at(pos.x));
+                edit.cx.request(HostRequest::ContextMenu { at: pos, items });
+                true
+            }
+            ViewEvent::PointerDown { pos, .. }
+                if single && slicing && wave.contains(pos) && cut_at(pos.x).is_some() =>
+            {
+                let Some(i) = cut_at(pos.x) else { return false };
+                self.drag = Some(Marker::Cut(i));
+                edit.begin("Slice Points");
                 true
             }
             ViewEvent::PointerDown { pos, .. } if single && wave.contains(pos) => {
@@ -429,7 +598,28 @@ impl Face for SamplerFace {
             } => {
                 let Some(m) = self.drag else { return false };
                 let f = f64::from((pos.x - wave.x) / wave.w).clamp(0.0, 1.0);
-                edit.set(pid(m.parameter()), f);
+                match m {
+                    Marker::Cut(i) => {
+                        // Between its neighbours.
+                        let Some((mut cuts, frames)) = sliced else {
+                            return true;
+                        };
+                        if i >= cuts.len() {
+                            return true;
+                        }
+                        let lo = if i == 0 { 1 } else { cuts[i - 1] + 1 };
+                        let hi = cuts.get(i + 1).map_or(frames as u64 - 1, |c| c - 1);
+                        let at = ((f * frames as f64).round() as u64).clamp(lo, hi.max(lo));
+                        if cuts[i] != at {
+                            cuts[i] = at;
+                            edit.cx.emit(Action::SetSampleSlices {
+                                plugin: cx.plugin,
+                                slices: cuts,
+                            });
+                        }
+                    }
+                    _ => edit.set(pid(m.parameter()), f),
+                }
                 true
             }
             ViewEvent::PointerUp { .. } => {
@@ -464,6 +654,10 @@ impl Face for SamplerFace {
             id::LOOP => "Loop for ever, or while the key is held (drag the markers)",
             id::CROSSFADE => "Blend across the loop's seam",
             id::FILTER_ENV => "The amp envelope opens (or closes) the filter",
+            id::SLICES => {
+                "A key each: every key from the first slice key plays one slice of the sample as recorded (right-click the waveform to slice)"
+            }
+            id::SLICE_KEY => "The key that plays the first slice",
             _ => return None,
         })
     }

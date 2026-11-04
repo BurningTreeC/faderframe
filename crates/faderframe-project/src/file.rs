@@ -13,11 +13,17 @@
 //! rejected rather than misread. Saving writes to a temporary file in the
 //! same directory and renames it over the target, so a crash never leaves a
 //! truncated project behind.
+//!
+//! Beside the project a file may carry [`FileExtras`]: where the state comes
+//! from ([`crate::lineage`]) and content hashes of the media it names, which
+//! a merge with a copy edited elsewhere goes by. Older readers ignore them.
 
 use crate::Project;
+use crate::lineage::Lineage;
 use faderframe_workspace::WorkspaceSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const FORMAT_ID: &str = "faderframe-project";
@@ -46,6 +52,19 @@ pub struct LoadedProject {
     pub project: Project,
     pub workspace: Option<WorkspaceSet>,
     pub notes: Vec<String>,
+    pub extras: FileExtras,
+}
+
+/// What a file carries beside the project.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileExtras {
+    /// Where this saved state comes from (none in files from before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+    /// Content hashes of the media files it names, by the path as stored
+    /// (`<length>:<hash>`; see `faderframe_session::version_merge`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub media: BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +72,10 @@ struct FileOut<'a> {
     format: &'static str,
     version: u32,
     generator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lineage: Option<&'a Lineage>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    media: &'a BTreeMap<String, String>,
     project: &'a Project,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<&'a WorkspaceSet>,
@@ -63,6 +86,19 @@ struct FileIn {
     project: Project,
     #[serde(default)]
     workspace: Option<WorkspaceSet>,
+    #[serde(default)]
+    lineage: Option<Lineage>,
+    #[serde(default)]
+    media: BTreeMap<String, String>,
+}
+
+/// Only the stamp of a file (the rest is skipped, not built).
+#[derive(Deserialize)]
+struct StampIn {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    lineage: Option<Lineage>,
 }
 
 type Migration = fn(Value) -> Result<Value, FileError>;
@@ -113,6 +149,15 @@ fn migrate_v1_to_v2(mut doc: Value) -> Result<Value, FileError> {
 /// place (a scratch pad shown is put aside and named as the one to show
 /// when the file is opened, see [`crate::scratch`]).
 pub fn to_string(project: &Project, workspace: Option<&WorkspaceSet>) -> Result<String, FileError> {
+    to_string_with(project, workspace, &FileExtras::default())
+}
+
+/// [`to_string`] with the extras a save stamps.
+pub fn to_string_with(
+    project: &Project,
+    workspace: Option<&WorkspaceSet>,
+    extras: &FileExtras,
+) -> Result<String, FileError> {
     let shown = project.shown_pad();
     let mut song = project.song();
     if shown.is_some() {
@@ -122,6 +167,8 @@ pub fn to_string(project: &Project, workspace: Option<&WorkspaceSet>) -> Result<
         format: FORMAT_ID,
         version: CURRENT_VERSION,
         generator: concat!("FaderFrame ", env!("CARGO_PKG_VERSION")).to_string(),
+        lineage: extras.lineage.as_ref(),
+        media: &extras.media,
         project: &song,
         workspace,
     };
@@ -158,6 +205,8 @@ pub fn from_str(text: &str) -> Result<LoadedProject, FileError> {
     let FileIn {
         mut project,
         mut workspace,
+        lineage,
+        media,
     } = serde_json::from_value(doc)?;
     notes.extend(project.repair());
     // The scratch pad that was shown when it was saved.
@@ -173,7 +222,19 @@ pub fn from_str(text: &str) -> Result<LoadedProject, FileError> {
         project,
         workspace,
         notes,
+        extras: FileExtras { lineage, media },
     })
+}
+
+/// The stamp of the project file at `path` (`None`: none, or not a
+/// project file), without building the project.
+pub fn read_lineage(path: &Path) -> Option<Lineage> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let stamp: StampIn = serde_json::from_str(&text).ok()?;
+    if stamp.format.as_deref() != Some(FORMAT_ID) {
+        return None;
+    }
+    stamp.lineage
 }
 
 /// Atomically write a project file.
@@ -182,7 +243,17 @@ pub fn save(
     project: &Project,
     workspace: Option<&WorkspaceSet>,
 ) -> Result<(), FileError> {
-    let text = to_string(project, workspace)?;
+    save_with(path, project, workspace, &FileExtras::default())
+}
+
+/// [`save`] with the extras a save stamps.
+pub fn save_with(
+    path: &Path,
+    project: &Project,
+    workspace: Option<&WorkspaceSet>,
+    extras: &FileExtras,
+) -> Result<(), FileError> {
+    let text = to_string_with(project, workspace, extras)?;
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

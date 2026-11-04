@@ -135,6 +135,19 @@ impl PluginFactory for SandboxedFactory {
         }
         self.inner.instantiate(id)
     }
+
+    fn ara_plugins(&self) -> Vec<String> {
+        self.inner.ara_plugins()
+    }
+
+    /// ARA plug-ins run in FaderFrame's process whatever the switch says:
+    /// they read its audio and model through pointers.
+    fn instantiate_in_process(
+        &self,
+        id: &str,
+    ) -> Result<Box<dyn faderframe_plugin_host::PluginInstance>, PluginError> {
+        self.inner.instantiate_in_process(id)
+    }
 }
 
 /// Instantiate `id` of `format` in a helper started by `launcher`,

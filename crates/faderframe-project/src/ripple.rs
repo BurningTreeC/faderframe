@@ -149,6 +149,43 @@ impl RippleShift {
             .iter()
             .try_fold((start, end), |(s, e), sh| sh.map_range(s, e))
     }
+
+    /// [`Self::map_range_all`] for a range placed in time (a locked
+    /// section): the shifts take out or open the time their spans last
+    /// under `tl`, in samples, as [`Self::map_in_time`]. An edge that
+    /// moves lands on a whole sample; one that stays is given back as it
+    /// is.
+    pub fn map_range_all_in_time(
+        shifts: &[RippleShift],
+        start: MusicalTime,
+        end: MusicalTime,
+        tl: &Timeline,
+        rate: f64,
+    ) -> Option<(MusicalTime, MusicalTime)> {
+        let s = |m: MusicalTime| MusicalTime(tl.to_samples(m, rate));
+        let timed: Vec<RippleShift> = Self::ordered(shifts)
+            .iter()
+            .map(|sh| {
+                let cut = s(sh.cut);
+                RippleShift {
+                    cut,
+                    delta: s(sh.cut + sh.delta) - cut,
+                }
+            })
+            .collect();
+        let (a, b) = (s(start), s(end));
+        let (a2, b2) = timed
+            .iter()
+            .try_fold((a, b), |(x, y), sh| sh.map_range(x, y))?;
+        let back = |to: MusicalTime, from: MusicalTime, was: MusicalTime| {
+            if to == from {
+                was
+            } else {
+                tl.at_sample(to.ticks(), rate)
+            }
+        };
+        Some((back(a2, a, start), back(b2, b, end)))
+    }
 }
 
 /// How a track's clips take a ripple (see the module docs).
@@ -374,9 +411,18 @@ pub fn global_commands(p: &Project, shifts: &[RippleShift], what: RippleGlobals)
     if shifts.is_empty() {
         return cmds;
     }
+    // Markers and sections placed in time move by the time a shift takes
+    // out or opens (see `crate::time_lock`), with the timeline as it is.
+    let rate = f64::from(p.sample_rate.max(1));
     if what.markers {
         for m in &p.markers {
-            let position = RippleShift::map_all(&shifts, m.position);
+            let position = if m.is_time_locked() {
+                shifts
+                    .iter()
+                    .fold(m.position, |t, s| s.map_in_time(t, &p.timeline, rate))
+            } else {
+                RippleShift::map_all(&shifts, m.position)
+            };
             if position != m.position {
                 cmds.push(Command::UpdateMarker {
                     marker: crate::Marker {
@@ -387,7 +433,12 @@ pub fn global_commands(p: &Project, shifts: &[RippleShift], what: RippleGlobals)
             }
         }
         for s in &p.sections {
-            match RippleShift::map_range_all(&shifts, s.start, s.end) {
+            let range = if s.is_time_locked() {
+                RippleShift::map_range_all_in_time(&shifts, s.start, s.end, &p.timeline, rate)
+            } else {
+                RippleShift::map_range_all(&shifts, s.start, s.end)
+            };
+            match range {
                 Some((start, end)) if (start, end) != (s.start, s.end) => {
                     cmds.push(Command::UpdateSection {
                         section: crate::Section {
@@ -699,6 +750,7 @@ mod tests {
                         pitch: None,
                         effects: None,
                         spectral: None,
+                        envelope: None,
                     }),
                 },
             );
@@ -824,6 +876,7 @@ mod tests {
             id: m,
             position: q(9.0),
             name: "M".into(),
+            time_base: Default::default(),
         });
         let (s1, s2): (SectionId, SectionId) = (p.ids.allocate(), p.ids.allocate());
         p.sections = vec![
@@ -833,6 +886,7 @@ mod tests {
                 start: q(0.0),
                 end: q(8.0),
                 color: GREY,
+                time_base: Default::default(),
             },
             Section {
                 id: s2,
@@ -840,6 +894,7 @@ mod tests {
                 start: q(8.0),
                 end: q(10.0),
                 color: GREY,
+                time_base: Default::default(),
             },
         ];
         p.loop_range = Some(MusicalRange {

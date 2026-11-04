@@ -3,7 +3,8 @@
 //! through a cable (one buffer plus `CABLE` frames): the ping measures
 //! exactly that round trip, and with it set the return lines up with the
 //! dry signal — an impulse mixed half and half comes out as one impulse;
-//! without it, as two a round trip apart.
+//! without it, as two a round trip apart. Mono → Stereo sends a mono
+//! track to two outputs alike and takes a pair back.
 
 mod common;
 
@@ -22,10 +23,12 @@ const BLOCK: usize = 64;
 const CABLE: usize = 37;
 const CHANNELS: usize = 4;
 
-/// The device: four channels, output `n` cabled to input `n`.
+/// The device: four channels, output `n` cabled to input `n` (through
+/// gear with a gain per channel).
 struct Device {
     bufs: OwnedBuffers,
     cable: Vec<VecDeque<f32>>,
+    gear: [f32; CHANNELS],
 }
 
 impl Device {
@@ -35,6 +38,7 @@ impl Device {
             cable: (0..CHANNELS)
                 .map(|_| std::iter::repeat_n(0.0, BLOCK + CABLE).collect())
                 .collect(),
+            gear: [1.0; CHANNELS],
         }
     }
 
@@ -49,7 +53,8 @@ impl Device {
         p.process_device(&mut self.bufs);
         c.collect_garbage();
         for ch in 0..CHANNELS {
-            let out = self.bufs.output(ch).to_vec();
+            let gain = self.gear[ch];
+            let out: Vec<f32> = self.bufs.output(ch).iter().map(|v| v * gain).collect();
             self.cable[ch].extend(out);
         }
         self.bufs.output(0).to_vec()
@@ -167,4 +172,77 @@ fn the_return_lines_up_with_the_dry_signal() {
     // Later by the round trip (the whole mix waits for the return).
     assert_eq!(h2[0], h[0] + trip as usize);
     let _ = MusicalTime::ZERO;
+}
+
+/// Every output of the device while the impulse plays through the
+/// insert (wet only, the round trip measured) with Channels as given, the
+/// gear halving the fourth channel on its way back.
+fn played_wide(channels: f64) -> (TestProject, Vec<Vec<f32>>) {
+    let trip = (BLOCK + CABLE) as u32;
+    let mut tp = project(Some(trip));
+    let vox = tp
+        .project
+        .tracks
+        .iter()
+        .find(|t| t.name == "Vox")
+        .unwrap()
+        .id;
+    let slot = &mut tp.project.track_mut(vox).unwrap().inserts[0];
+    slot.parameters.retain(|p| p.id != ParameterId(id::MIX));
+    slot.parameters.push(SavedParameter {
+        id: ParameterId(id::MIX),
+        value: 1.0,
+    });
+    slot.parameters.push(SavedParameter {
+        id: ParameterId(id::CHANNELS),
+        value: channels,
+    });
+    let (mut c, mut p) = engine(&tp);
+    let mut dev = Device::new();
+    dev.gear[3] = 0.5;
+    c.transport(TransportCommand::Locate(0)).unwrap();
+    c.transport(TransportCommand::Play).unwrap();
+    let mut outs = vec![Vec::new(); CHANNELS];
+    for _ in 0..(10_000 / BLOCK) {
+        dev.run(&mut p, &mut c);
+        for (ch, out) in outs.iter_mut().enumerate() {
+            out.extend_from_slice(dev.bufs.output(ch));
+        }
+    }
+    (tp, outs)
+}
+
+#[test]
+fn mono_to_stereo_sends_both_outputs_and_returns_a_pair() {
+    // As the track (mono): one output, one input; the track stays mono.
+    let (tp, outs) = played_wide(0.0);
+    let vox = tp.project.tracks.iter().find(|t| t.name == "Vox").unwrap();
+    assert_eq!(vox.chain_layout(), ChannelLayout::Mono);
+    assert_eq!(hits(&outs[2], 0.1).len(), 1);
+    assert!(
+        hits(&outs[3], 1e-6).is_empty(),
+        "the fourth output stays silent"
+    );
+    let (l, r) = (hits(&outs[0], 0.05), hits(&outs[1], 0.05));
+    assert_eq!(l, r);
+    assert!(
+        (outs[0][l[0]] - outs[1][r[0]]).abs() < 1e-6,
+        "mono in the middle"
+    );
+
+    // Mono → Stereo: both outputs alike, a pair back, stereo after it.
+    let (tp, outs) = played_wide(1.0);
+    let vox = tp.project.tracks.iter().find(|t| t.name == "Vox").unwrap();
+    assert_eq!(vox.chain_layout(), ChannelLayout::Stereo);
+    let (s3, s4) = (hits(&outs[2], 0.1), hits(&outs[3], 0.1));
+    assert_eq!(s3.len(), 1, "{s3:?}");
+    assert_eq!(s3, s4, "the same send on both outputs");
+    assert_eq!(outs[2][s3[0]], outs[3][s4[0]]);
+    // The master: its left from the third input, its right from the
+    // fourth, which the gear halved — the pair came back as a pair.
+    let (l, r) = (hits(&outs[0], 0.05), hits(&outs[1], 0.05));
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert_eq!(l, r, "on time on both sides");
+    let ratio = outs[1][r[0]] / outs[0][l[0]];
+    assert!((ratio - 0.5).abs() < 1e-3, "right / left = {ratio}");
 }

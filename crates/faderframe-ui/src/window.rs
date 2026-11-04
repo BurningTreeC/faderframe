@@ -45,6 +45,9 @@ pub struct Chrome {
     /// (playing, recording, counting in).
     pub said_notice: RefCell<String>,
     pub said_transport: Cell<Option<(bool, bool, bool)>>,
+    /// Stem separations (and their model's download) under way.
+    pub stems_box: gtk::Box,
+    pub stems_bar: gtk::ProgressBar,
 }
 
 /// A message that slides in at the top of the window.
@@ -251,7 +254,13 @@ impl Chrome {
             None => self.notice.set_text(""),
         }
         let imports = s.imports();
-        self.import_box.set_visible(!imports.is_empty());
+        let dawproject = s.dawproject_progress();
+        self.import_box
+            .set_visible(!imports.is_empty() || dawproject.is_some());
+        if let (true, Some((text, fraction))) = (imports.is_empty(), &dawproject) {
+            self.import_bar.set_fraction(*fraction);
+            self.import_bar.set_text(Some(text));
+        }
         if let Some(job) = imports.first() {
             self.import_bar.set_fraction(job.fraction());
             let more = imports.len() - 1;
@@ -261,6 +270,35 @@ impl Chrome {
                 format!("Importing {}", job.current_name())
             };
             self.import_bar.set_text(Some(&text));
+        }
+        let separations = s.separations();
+        let download = s.separation_download();
+        self.stems_box
+            .set_visible(!separations.is_empty() || download.is_some());
+        if let Some(job) = separations.first() {
+            self.stems_bar.set_fraction(f64::from(job.fraction));
+            let more = separations.len() - 1;
+            let text = format!(
+                "Stems of ‘{}’: {} {:.0} %{}",
+                job.name,
+                job.stage.label(),
+                job.fraction * 100.0,
+                if more > 0 {
+                    format!(" (+{more})")
+                } else {
+                    String::new()
+                }
+            );
+            self.stems_bar.set_text(Some(&text));
+        } else if let Some((model, done, total)) = download {
+            self.stems_bar
+                .set_fraction(done as f64 / total.max(1) as f64);
+            self.stems_bar.set_text(Some(&format!(
+                "Downloading {} ({} of {} MB)",
+                model.name,
+                done / 1_000_000,
+                total / 1_000_000
+            )));
         }
         let active = s.midi_active();
         if active != self.midi_led.has_css_class("active") {
@@ -365,8 +403,11 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
         &section(&[
             ("Save Version…", "app.save-version"),
             ("Versions…", "app.show-versions"),
+            ("Merge Project File…", "app.merge-project-file"),
+            ("Last Merge…", "app.merge-conflicts"),
         ]),
     );
+    file.append_section(None, &section(&[("Collaborate…", "app.collaborate")]));
     file.append_section(
         None,
         &section(&[
@@ -377,9 +418,22 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
                 "app.conform-lists",
             ),
             ("Import ADM BWF Master (Bed and Objects)…", "app.import-adm"),
+            ("Import Ambisonic Audio (AmbiX)…", "app.import-ambisonic"),
+            ("Import First-Order B-Format (FuMa)…", "app.import-fuma"),
             ("Import MIDI File…", "app.import-midi"),
             ("Export MIDI File…", "app.export-midi"),
             ("Export MIDI 2.0 Clip…", "app.export-midi2"),
+            ("Import MusicXML Score…", "app.import-musicxml"),
+        ]),
+    );
+    file.append_section(
+        None,
+        &section(&[
+            (
+                "Import DAWproject (Opens as a New Project)…",
+                "app.import-dawproject",
+            ),
+            ("Export DAWproject…", "app.export-dawproject"),
         ]),
     );
     file.append_section(
@@ -394,6 +448,28 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("DDP Player (Check and Play a CD Master)", "app.show-ddp"),
         ]),
     );
+    // AAF interchange (`crate::aaf`): string actions, the target says
+    // which dialog.
+    let aaf = gio::Menu::new();
+    for (label, arg) in [
+        ("Import AAF (Pro Tools, Media Composer, Resolve)…", ""),
+        ("Export AAF with the Audio Inside…", "@embed"),
+        ("Export AAF with Linked WAVE Files…", "@link"),
+    ] {
+        let item = gio::MenuItem::new(Some(label), None);
+        let action = if arg.is_empty() {
+            "app.import-aaf"
+        } else {
+            "app.export-aaf"
+        };
+        item.set_action_and_target_value(Some(action), Some(&arg.to_variant()));
+        aaf.append_item(&item);
+    }
+    file.append_section(None, &aaf);
+    file.append_section(
+        None,
+        &section(&[("Batch Processing…", "app.batch-processing")]),
+    );
     file.append_section(None, &section(&[("Preferences…", "app.preferences")]));
     file.append_section(None, &section(&[("Quit", "app.quit")]));
     // No mnemonics on the menu bar: Alt is the edit modes' and tools'
@@ -407,6 +483,10 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("Undo", "app.undo"),
             ("Redo", "app.redo"),
             ("Undo History", "app.show-history"),
+            (
+                "Audio Bisect (Find the Edit That Made It Worse)…",
+                "app.audio-bisect",
+            ),
         ]),
     );
     // The selection's (or the focused text field's): `edit_keys`.
@@ -554,6 +634,16 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("Follow Playhead", "app.toggle-follow"),
         ]),
     );
+    // Clip envelopes on audio clips (`app.show-clip-envelope`) and Strip
+    // Silence (`crate::clip_tools_actions`).
+    let envelopes = gio::Menu::new();
+    for (label, id) in [("Hide", "hide"), ("Volume", "volume"), ("Pan", "pan")] {
+        envelopes.append_item(&target(label, "app.show-clip-envelope", id));
+    }
+    let clip_tools = gio::Menu::new();
+    clip_tools.append_submenu(Some("Clip Envelopes"), &envelopes);
+    clip_tools.append_item(&target("Strip Silence…", "app.strip-silence", ""));
+    edit.append_section(None, &clip_tools);
     menu.append_submenu(Some("Edit"), &edit);
 
     let track = gio::Menu::new();
@@ -630,6 +720,8 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("Metronome On (K)", "app.toggle-metronome"),
             ("Input Quantize (Q)", "app.input-quantize"),
             ("Capture MIDI", "app.capture-midi"),
+            ("Capture Audio", "app.capture-audio"),
+            ("Keep Input for Capture Audio", "app.toggle-audio-capture"),
             ("Varispeed…", "app.varispeed"),
         ]),
     );
@@ -655,6 +747,13 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
         &crate::recording::menu_for(&crate::prefs::Preferences::load().record_settings()),
     );
     transport.append_section(None, &section(&[("Panic (All Notes Off)", "app.panic")]));
+    transport.append_section(
+        None,
+        &section(&[
+            ("Web Remote On", "app.toggle-web-remote"),
+            ("Phone and Web Remote…", "app.web-remote-settings"),
+        ]),
+    );
     menu.append_submenu(Some("Transport"), &transport);
 
     let view = gio::Menu::new();
@@ -662,8 +761,10 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
         None,
         &section(&[
             ("Inspector", "app.view-inspector"),
+            ("Browser (Sounds, Loops, MIDI Files)", "app.view-browser"),
             ("Mixer", "app.view-mixer"),
             ("Channel Overview", "app.view-channel-overview"),
+            ("Mix Scenes (Snapshots, Crossfades)", "app.view-mix-scenes"),
             ("Piano Roll", "app.view-piano-roll"),
             ("MIDI Event List", "app.view-events"),
             ("Automation", "app.view-automation"),
@@ -684,7 +785,10 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
             ("Video Full Screen", "app.video-full-screen"),
             ("ADR Cue List", "app.view-adr"),
             ("Lead Sheet", "app.view-lead-sheet"),
+            ("Score (Notation Editor)", "app.view-score"),
             ("Setlist", "app.view-setlist"),
+            ("Interactive Music", "app.view-interactive-music"),
+            ("Map Editor (Articulation and Drum Maps)", "app.view-maps"),
             ("Show Mode (Setlist on Stage)", "app.show-mode"),
             ("Bottom Dock", "app.dock-bottom"),
             ("Master Strip at the Side", "app.master-panel"),
@@ -754,18 +858,23 @@ pub fn menu_model(recent: &gio::Menu, custom_themes: &gio::Menu) -> gio::Menu {
     audio.append_submenu(Some("Listen"), &crate::listen::menu());
     audio.append_submenu(Some("Console"), &crate::console::menu());
     audio.append_submenu(Some("Cue Mixes"), &crate::cues::menu());
+    audio.append_submenu(Some("Tuning"), &crate::tuning::menu());
     audio.append_section(
         None,
         &section(&[("Speaker Layouts…", "app.speaker-layouts")]),
     );
     audio.append_section(
         None,
-        &section(&[(
-            "Download Speech Model (Whisper)…",
-            "app.download-speech-model",
-        )]),
+        &section(&[
+            (
+                "Download Speech Model (Whisper)…",
+                "app.download-speech-model",
+            ),
+            ("Stem Separation Model…", "app.stems-settings"),
+        ]),
     );
     menu.append_submenu(Some("Audio"), &audio);
+    menu.append_submenu(Some("Scripts"), &crate::scripts::menu());
 
     let help = gio::Menu::new();
     help.append(Some("About FaderFrame"), Some("app.about"));
@@ -1040,9 +1149,22 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
     import_box.append(&import_bar);
     import_box.append(&cancel);
     import_box.set_visible(false);
+    let stems_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let stems_bar = gtk::ProgressBar::new();
+    stems_bar.set_show_text(true);
+    stems_bar.set_valign(gtk::Align::Center);
+    stems_bar.set_width_request(300);
+    let stop = gtk::Button::from_icon_name("process-stop-symbolic");
+    stop.set_action_name(Some("app.cancel-separation"));
+    stop.set_tooltip_text(Some("Stop separating stems"));
+    stop.add_css_class("flat");
+    stems_box.append(&stems_bar);
+    stems_box.append(&stop);
+    stems_box.set_visible(false);
     let platform = gtk::Label::new(Some(&platform_label(&window)));
     status.append(&notice);
     status.append(&import_box);
+    status.append(&stems_box);
     // MIDI activity (and MIDI learn) indicator → Preferences, MIDI.
     let midi_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let midi_led = gtk::Label::new(Some("●"));
@@ -1095,6 +1217,8 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         workspace_guard: guard,
         said_notice: RefCell::default(),
         said_transport: Cell::new(None),
+        stems_box,
+        stems_bar,
     });
     *app.window.borrow_mut() = Some(window.clone());
     window

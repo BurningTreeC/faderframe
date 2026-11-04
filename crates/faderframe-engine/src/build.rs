@@ -23,8 +23,11 @@
 
 use crate::EngineError;
 use crate::ahead::{AheadReader, AheadRing, AheadWriter};
+use crate::cache::Plays;
 use crate::context::EngineContext;
-use crate::midi::{MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT};
+use crate::midi::{
+    KeyFilter, MidiFilter, MidiInputNode, MidiOutputSink, MidiShared, NO_PORT, NoteMap,
+};
 use crate::nodes::{
     AudioClipPlayer, ChannelStrip, Crosstalk, DeviceInputTap, DeviceOutputSink, FoldDown,
     HardwareReturn, HardwareSendGain, ListenOut, MidiClipPlayer, MonitorGate, ObjectRenderer,
@@ -173,6 +176,14 @@ fn plays_from_timeline(project: &Project, t: &Track, live: &HashSet<TrackId>) ->
         && t.slots()
             .iter()
             .all(|s| s.plugin.id != faderframe_core::builtin::HARDWARE_INSERT)
+}
+
+/// Do the devices of a track of this kind that take notes get them? An
+/// instrument track's take its own MIDI; on an audio track they take the
+/// notes of the MIDI tracks playing it (a pitch corrector's target notes,
+/// a vocoder's keys).
+fn devices_take_notes(kind: TrackKind) -> bool {
+    matches!(kind, TrackKind::Instrument | TrackKind::Audio)
 }
 
 fn is_bus(kind: TrackKind) -> bool {
@@ -411,6 +422,10 @@ enum Role {
     Capture = 28,
     /// An analysis render's probe after a device.
     Probe = 29,
+    /// A self-frozen track's cache player ([`crate::cache`]).
+    Cached = 30,
+    /// Its crossfade between the chain and the cache.
+    Handover = 31,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -441,14 +456,21 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
             .warp
             .as_ref()
             .filter(|w| !w.is_identity(a.source_offset, a.length));
-        if c.muted || a.reversed || track.freeze.is_some() || (warped.is_none() && !pitched) {
+        let transposed = a.stretch.semitones() != 0.0;
+        if c.muted
+            || a.reversed
+            || track.freeze.is_some()
+            || (warped.is_none() && !pitched && !transposed)
+        {
             continue;
         }
-        // Pitch edits play through PSOLA voices, warped or not.
+        // Pitch edits play through PSOLA voices, warped or not; a clip
+        // only transposed through a polyphonic stretcher.
         let i = match warped.map(|w| w.algorithm) {
             _ if pitched => 2,
             Some(WarpAlgorithm::Polyphonic) => 0,
             Some(WarpAlgorithm::Rhythmic) => 1,
+            None if transposed => 0,
             _ => continue,
         };
         if in_slot {
@@ -504,6 +526,8 @@ fn node_key(track: TrackId, role: Role, sub: u64, layouts: &[ChannelLayout]) -> 
                     .iter()
                     .position(|x| x == f)
                     .unwrap_or(0) as u64),
+            // A field is not a bed or discrete channels of its width.
+            ChannelLayout::Ambisonic(o) => eat(0x3_0000 + o.order() as u64),
             other => eat(other.channel_count() as u64),
         }
     }
@@ -746,6 +770,19 @@ impl PluginCx<'_> {
         } else {
             0
         };
+        // How the track's tuning reaches it (instruments and effects that
+        // take notes; MIDI effects pass keys on, the instrument after
+        // them is retuned).
+        let retune = if takes_events && self.takes_notes(slot) && !self.note_effect(slot) {
+            let expressions = self
+                .plugins
+                .instance(host_slot)
+                .ok()
+                .and_then(|i| i.note_expressions());
+            crate::tuning::method_for(track, slot.plugin.format, expressions.as_deref())
+        } else {
+            crate::tuning::Method::None
+        };
         match self.plugins.activate(host_slot, &process) {
             Ok(p) => {
                 // Latency and bypass change the node's behaviour, and a
@@ -761,7 +798,8 @@ impl PluginCx<'_> {
                     ^ ((p.latency as u64) << 40)
                     ^ ((bypass as u64) << 63)
                     ^ p.activation.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                    ^ upstream.rotate_left(23);
+                    ^ upstream.rotate_left(23)
+                    ^ (retune.key() << 56);
                 let channels = spec.audio_outputs.first().map_or(0, |l| l.channel_count());
                 let latency = if bypass { 0 } else { p.latency };
                 let node = PluginNode::new(
@@ -776,7 +814,13 @@ impl PluginCx<'_> {
                     p.notes,
                     takes_events,
                     upstream,
-                );
+                )
+                .with_retune(crate::tuning::Retuner::new(retune, p.tuned));
+                let node = if self.plugins.is_ara_renderer(host_slot.id) {
+                    node.rendering_the_timeline()
+                } else {
+                    node
+                };
                 (
                     b.add_node(
                         spec.key(node_key(key_track, role, sub, &layouts)),
@@ -831,6 +875,9 @@ fn add_hardware_insert(
     };
     let (send_ch, ret_ch, _, trip) =
         faderframe_plugin_host::devices::hardware_insert::routing(&params);
+    // Mono → Stereo: a mono track goes out on two outputs alike (the
+    // graph duplicates it into the send) and comes back as a pair.
+    let layout = slot.output_layout(layout);
     let label = format!("{} · {}", t.name, t.name_of(slot));
     let id = slot.id.raw();
     let level = b.add_node(
@@ -978,6 +1025,7 @@ pub fn build_graph(
     monitoring: &Monitoring,
     talkback: &crate::slots::Talkback,
     capture: Option<&crate::capture::Capture>,
+    cache: &crate::cache::CacheOverlay,
 ) -> Result<BuiltGraph, EngineError> {
     let early = &monitoring.tracks;
     let midi_ports = &routing.inputs;
@@ -1088,9 +1136,17 @@ pub fn build_graph(
         }
         let mut tn = TrackNodes::default();
         let frozen = t.freeze.is_some();
+        // Self-frozen: the cache plays the chain's output, alone or (a
+        // handover) beside the chain.
+        let cached = cached_plays(cache, t);
+        let cache_only = matches!(cached, Some(Plays::Cache(_)));
         // Frozen: the rendered audio is the chain's (stereo, if a device
         // widened a mono track).
-        let layout = if frozen { t.chain_layout() } else { t.layout };
+        let layout = if frozen || cache_only {
+            t.chain_layout()
+        } else {
+            t.layout
+        };
         // What the chain ends in: the strip's input.
         let end_layout = t.chain_layout();
         // Rendered ahead: the chain into the deep tier's graph and a
@@ -1105,9 +1161,9 @@ pub fn build_graph(
             let realtime = pcx.realtime;
             pcx.realtime = false;
             let (input, end, chain_latency) = if bus {
-                build_ahead_chain(&mut bb, &mut pcx, slots, project, t, config)?
+                build_ahead_chain(&mut bb, &mut pcx, slots, project, t, config, cache)?
             } else {
-                build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config)?
+                build_ahead_chain(&mut ab, &mut pcx, slots, project, t, config, cache)?
             };
             pcx.realtime = realtime;
             // What reaches a bus is aligned at its input to the slowest of
@@ -1269,7 +1325,7 @@ pub fn build_graph(
             nodes.insert(t.id, tn);
             continue;
         }
-        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !frozen {
+        if matches!(t.kind, TrackKind::Instrument | TrackKind::Midi) && !frozen && !cache_only {
             // A MIDI track mutes here (it has no strip).
             let mute = if t.kind == TrackKind::Midi {
                 Some(slots.midi_mute(t.id)?)
@@ -1303,6 +1359,15 @@ pub fn build_graph(
                 (f.port.map_or(0x1_0000, u64::from) << 8) | f.channel.map_or(0xFF, u64::from)
             });
             let live = slots.midi_live(t.id)?;
+            // A drum map plays what is played where its sounds say.
+            let drums = project.track_drum_map(t.id);
+            let notes = drums
+                .filter(|m| m.sounds.iter().any(|s| !s.plays_as_written()))
+                .map(NoteMap::from_drum_map);
+            let sub = sub
+                ^ notes
+                    .as_ref()
+                    .map_or(0, |n| n.fingerprint().rotate_left(29));
             let node = b.add_node(
                 NodeSpec::new(format!("{} · MIDI In", t.name))
                     .key(node_key(t.id, Role::MidiInput, sub, &[]))
@@ -1315,6 +1380,7 @@ pub fn build_graph(
                         live,
                         std::sync::Arc::clone(&routing.shared),
                     );
+                    let node = node.with_note_map(notes);
                     match mute {
                         Some(m) => node.with_mute(m),
                         None => node,
@@ -1334,21 +1400,55 @@ pub fn build_graph(
             // An external MIDI device.
             if let Some(out) = &t.midi_output {
                 let port = routing.outputs.get(&out.port).copied().unwrap_or(NO_PORT);
-                let sink = b.add_node(
-                    NodeSpec::new(format!("{} · MIDI Out", t.name))
-                        .role(NodeRole::EventOutput { port })
-                        .group(gi)
-                        .events_in(1)
-                        .events_out(1),
-                    Box::new(MidiOutputSink::new(out.channel)),
+                // Drum sounds with an output of their own go there (by the
+                // note and channel they play on), the rest to the track's.
+                let mut elsewhere: Vec<(&str, Vec<(u8, u8)>)> = Vec::new();
+                for s in drums.map(|m| m.sounds.as_slice()).unwrap_or_default() {
+                    let Some(p) = s.port.as_deref().filter(|p| *p != out.port) else {
+                        continue;
+                    };
+                    let keys: Vec<(u8, u8)> = (0..16u8).map(|ch| s.output(ch)).collect();
+                    match elsewhere.iter_mut().find(|(q, _)| *q == p) {
+                        Some((_, k)) => k.extend(keys),
+                        None => elsewhere.push((p, keys)),
+                    }
+                }
+                let mut main = MidiOutputSink::new(out.channel).with_retune(
+                    t.id,
+                    crate::tuning::Retuner::new(
+                        crate::tuning::output_method(t),
+                        Default::default(),
+                    ),
                 );
-                own(&mut owners, sink, t.id, None, NodeWork::MidiOutput);
-                if let Some(fx) = tn.midi_fx {
-                    b.connect_events(fx, 0, sink, 0)?;
-                } else {
-                    b.connect_events(midi, 0, sink, 0)?;
-                    if let Some(live) = tn.midi_in {
-                        b.connect_events(live, 0, sink, 0)?;
+                if !elsewhere.is_empty() {
+                    main = main.with_keys(KeyFilter::new(
+                        elsewhere.iter().flat_map(|(_, k)| k.iter().copied()),
+                        false,
+                    ));
+                }
+                let mut sinks = vec![(port, main, String::new())];
+                for (p, keys) in elsewhere {
+                    let port = routing.outputs.get(p).copied().unwrap_or(NO_PORT);
+                    let sink = MidiOutputSink::new(None).with_keys(KeyFilter::new(keys, true));
+                    sinks.push((port, sink, format!(" ({p})")));
+                }
+                for (port, processor, label) in sinks {
+                    let sink = b.add_node(
+                        NodeSpec::new(format!("{} · MIDI Out{label}", t.name))
+                            .role(NodeRole::EventOutput { port })
+                            .group(gi)
+                            .events_in(1)
+                            .events_out(1),
+                        Box::new(processor),
+                    );
+                    own(&mut owners, sink, t.id, None, NodeWork::MidiOutput);
+                    if let Some(fx) = tn.midi_fx {
+                        b.connect_events(fx, 0, sink, 0)?;
+                    } else {
+                        b.connect_events(midi, 0, sink, 0)?;
+                        if let Some(live) = tn.midi_in {
+                            b.connect_events(live, 0, sink, 0)?;
+                        }
                     }
                 }
             }
@@ -1373,7 +1473,11 @@ pub fn build_graph(
         // The modulators, between the input and the devices (a follower of
         // the input hears the track before its devices).
         let mut chain_start = input;
-        if let Some((_, keys)) = mod_shape.iter().find(|(id, _)| *id == t.id) {
+        if let Some((_, keys)) = mod_shape
+            .iter()
+            .find(|(id, _)| *id == t.id)
+            .filter(|_| !cache_only)
+        {
             let sub = keys
                 .iter()
                 .fold(keys.len() as u64, |h, k| h.rotate_left(13) ^ k.raw());
@@ -1403,7 +1507,7 @@ pub fn build_graph(
             chain_start = node;
         }
 
-        let chain = if frozen {
+        let chain = if frozen || cache_only {
             Vec::new()
         } else {
             pcx.audio_chain(t)
@@ -1430,6 +1534,14 @@ pub fn build_graph(
         };
 
         match t.kind {
+            // Self-frozen: the cache, straight to the strip.
+            TrackKind::Audio | TrackKind::Instrument if cache_only => {
+                if let Some(Plays::Cache(c)) = &cached {
+                    let player = add_cached_player(&mut b, t, c, None, layout, config, Some(gi));
+                    own(&mut owners, player, t.id, None, NodeWork::Clips);
+                    b.connect_audio(player, 0, input, 0)?;
+                }
+            }
             // Frozen: the rendered audio, straight to the strip.
             TrackKind::Audio | TrackKind::Instrument if frozen => {
                 let latency = t.freeze.as_ref().map_or(0, |f| {
@@ -1574,7 +1686,7 @@ pub fn build_graph(
                 let before = (prev, layout);
                 let mut links = ChainLinks {
                     project,
-                    notes: t.kind == TrackKind::Instrument,
+                    notes: devices_take_notes(t.kind),
                     events: &events,
                     raw,
                     takes_notes: &mut takes_notes,
@@ -1608,15 +1720,16 @@ pub fn build_graph(
                 add_hardware_insert(&mut b, &mut pcx, &mut owners, t, slot, prev, layout, gi)?
             {
                 prev = node;
+                layout = slot.output_layout(layout);
                 continue;
             }
             // Inserts that take notes (a synth placed as an insert, MIDI-
             // controlled effects) get the track's MIDI too.
-            let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
+            let notes = devices_take_notes(t.kind) && pcx.takes_notes(slot);
             // A device that widens a mono track takes it as stereo (the
             // graph duplicates it) and everything after it is stereo.
             let before = (prev, layout);
-            layout = slot.plugin.output_layout(layout);
+            layout = slot.output_layout(layout);
             let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
                 .group(gi)
                 .audio_in(layout)
@@ -1660,6 +1773,14 @@ pub fn build_graph(
                 }
             }
             prev = node;
+        }
+        // A handover: the chain and the cache, crossfaded.
+        if let Some(Plays::Both(c, shared)) = &cached {
+            let (player, fade) =
+                add_handover(&mut b, t, c, shared, prev, layout, config, Some(gi))?;
+            own(&mut owners, player, t.id, None, NodeWork::Clips);
+            own(&mut owners, fade, t.id, None, NodeWork::Clips);
+            prev = fade;
         }
 
         let strip = add_strip(
@@ -1895,11 +2016,10 @@ pub fn build_graph(
             };
             let level = slots.send(send.id)?;
             // Taken before the panner, a mono or stereo track's send
-            // follows the panner into a bed.
-            let surround = |l: ChannelLayout| matches!(l, ChannelLayout::Surround(_));
+            // follows the panner into a bed (or an ambisonic field).
             let follow = (matches!(send.tap, SendTap::PreFx | SendTap::PreFader)
-                && !surround(t.layout)
-                && surround(target.layout))
+                && !t.layout.is_spatial()
+                && target.layout.is_spatial())
             .then(|| slots.strip_of(t.id))
             .flatten();
             let diffuse = follow.is_some() && is_diffuse(project, t);
@@ -2112,10 +2232,9 @@ pub fn build_graph(
                 let (from, port, from_layout) = match send {
                     Some((src, send)) => {
                         let level = slots.send(send.id)?;
-                        let surround = |l: ChannelLayout| matches!(l, ChannelLayout::Surround(_));
                         let follow = (matches!(send.tap, SendTap::PreFx | SendTap::PreFader)
-                            && !surround(src.layout)
-                            && surround(t.layout))
+                            && !src.layout.is_spatial()
+                            && t.layout.is_spatial())
                         .then(|| slots.strip_of(src.id))
                         .flatten();
                         let diffuse = follow.is_some() && is_diffuse(project, src);
@@ -3237,9 +3356,11 @@ fn cue_chain_nodes(
             continue;
         }
         if slot.plugin.id == faderframe_core::builtin::HARDWARE_INSERT {
+            // Passed by, as wide as the main path is after it.
+            layout = slot.output_layout(layout);
             continue;
         }
-        layout = slot.plugin.output_layout(layout);
+        layout = slot.output_layout(layout);
         let mut spec = NodeSpec::new(format!("{} · {} · Cue", t.name, t.name_of(slot)))
             .audio_in(layout)
             .audio_out(layout);
@@ -3394,10 +3515,13 @@ fn build_ahead_chain(
     project: &Project,
     t: &Track,
     config: &PrepareConfig,
+    cache: &crate::cache::CacheOverlay,
 ) -> Result<(NodeId, NodeId, u32), EngineError> {
+    let cached = cached_plays(cache, t);
+    let cache_only = matches!(cached, Some(Plays::Cache(_)));
     // Frozen: the rendered audio is the chain's (stereo, if a device
     // widened a mono track).
-    let layout = if t.freeze.is_some() {
+    let layout = if t.freeze.is_some() || cache_only {
         t.chain_layout()
     } else {
         t.layout
@@ -3412,13 +3536,21 @@ fn build_ahead_chain(
     );
     let mut midi = None;
     let frozen = t.freeze.as_ref();
-    let chain = if frozen.is_some() {
+    let chain = if frozen.is_some() || cache_only {
         Vec::new()
     } else {
         pcx.audio_chain(t)
     };
     let mut fx = Vec::new();
     match t.kind {
+        // Self-frozen: the cache.
+        TrackKind::Audio | TrackKind::Instrument if cache_only => {
+            if let Some(Plays::Cache(c)) = &cached {
+                let player = add_cached_player(ab, t, c, None, layout, config, None);
+                latency += c.latency;
+                ab.connect_audio(player, 0, input, 0)?;
+            }
+        }
         // Frozen: the rendered audio.
         TrackKind::Audio | TrackKind::Instrument if frozen.is_some() => {
             let frozen_latency = frozen.map_or(0, |f| {
@@ -3484,7 +3616,7 @@ fn build_ahead_chain(
     let mut prev = input;
     // The modulators (rendered ahead: they follow the song position, the
     // track's own input and its notes only).
-    if !t.modulators.is_empty() && crate::modulation::modulated_kind(t.kind) {
+    if !t.modulators.is_empty() && crate::modulation::modulated_kind(t.kind) && !cache_only {
         let node = ab.add_node(
             NodeSpec::new(format!("{} · Modulators", t.name))
                 .key(node_key(t.id, Role::Modulators, 0, &[layout]))
@@ -3512,7 +3644,7 @@ fn build_ahead_chain(
             let events: Vec<NodeId> = midi.into_iter().collect();
             let mut links = ChainLinks {
                 project,
-                notes: t.kind == TrackKind::Instrument,
+                notes: devices_take_notes(t.kind),
                 events: &events,
                 raw: false,
                 takes_notes: &mut takes_notes,
@@ -3534,10 +3666,10 @@ fn build_ahead_chain(
             prev = out;
             continue;
         }
-        let notes = t.kind == TrackKind::Instrument && pcx.takes_notes(slot);
+        let notes = devices_take_notes(t.kind) && pcx.takes_notes(slot);
         // A device that widens a mono track takes it as stereo (the graph
         // duplicates it) and everything after it is stereo.
-        layout = slot.plugin.output_layout(layout);
+        layout = slot.output_layout(layout);
         let mut spec = NodeSpec::new(format!("{} · {}", t.name, t.name_of(slot)))
             .audio_in(layout)
             .audio_out(layout);
@@ -3552,7 +3684,87 @@ fn build_ahead_chain(
         }
         prev = node;
     }
+    // A handover: the chain and the cache, crossfaded (aligned to the
+    // later of the two).
+    if let Some(Plays::Both(c, shared)) = &cached {
+        let (_, fade) = add_handover(ab, t, c, shared, prev, layout, config, None)?;
+        latency = latency.max(c.latency);
+        prev = fade;
+    }
     Ok((input, prev, latency))
+}
+
+/// How a self-frozen track plays (only audio and instrument tracks are
+/// cached, and never a frozen one).
+fn cached_plays<'a>(cache: &'a crate::cache::CacheOverlay, t: &Track) -> Option<Plays<'a>> {
+    if t.freeze.is_some() || !matches!(t.kind, TrackKind::Audio | TrackKind::Instrument) {
+        return None;
+    }
+    cache.plays(t.id)
+}
+
+/// A track's cache player in `g` (`handover`: beside its chain).
+fn add_cached_player(
+    g: &mut GraphBuilder<EngineContext>,
+    t: &Track,
+    c: &crate::cache::CachedChain,
+    handover: Option<&Arc<crate::cache::HandoverShared>>,
+    layout: ChannelLayout,
+    config: &PrepareConfig,
+    group: Option<u32>,
+) -> NodeId {
+    let sub = c.key ^ (u64::from(c.latency) << 32) ^ u64::from(c.file_latency);
+    let mut spec = NodeSpec::new(format!("{} · Cached", t.name))
+        .key(node_key(t.id, Role::Cached, sub, &[layout]))
+        .audio_out(layout);
+    if let Some(gi) = group {
+        spec = spec.group(gi);
+    }
+    g.add_node(
+        spec,
+        Box::new(crate::nodes::CachedPlayer::new(
+            t.id,
+            c.latency,
+            c.file_latency,
+            config.sample_rate,
+            handover.cloned(),
+        )),
+    )
+}
+
+/// A handover after the chain's end `end` in `g`: the cache player and the
+/// crossfade (returned: the player, the crossfade).
+#[allow(clippy::too_many_arguments)]
+fn add_handover(
+    g: &mut GraphBuilder<EngineContext>,
+    t: &Track,
+    c: &crate::cache::CachedChain,
+    shared: &Arc<crate::cache::HandoverShared>,
+    end: NodeId,
+    layout: ChannelLayout,
+    config: &PrepareConfig,
+    group: Option<u32>,
+) -> Result<(NodeId, NodeId), EngineError> {
+    let player = add_cached_player(g, t, c, Some(shared), layout, config, group);
+    let mut spec = NodeSpec::new(format!("{} · Handover", t.name))
+        .key(node_key(t.id, Role::Handover, 0, &[layout]))
+        .audio_in(layout)
+        .audio_in(layout)
+        .audio_out(layout);
+    if let Some(gi) = group {
+        spec = spec.group(gi);
+    }
+    let fade = g.add_node(
+        spec,
+        Box::new(crate::nodes::Handover::new(
+            t.id,
+            Arc::clone(shared),
+            config.sample_rate,
+        )),
+    );
+    g.connect_audio(end, 0, fade, 0)?;
+    g.connect_audio(player, 0, fade, 1)?;
+    Ok((player, fade))
 }
 
 #[cfg(test)]

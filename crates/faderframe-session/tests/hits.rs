@@ -29,6 +29,7 @@ fn hits_land_on_beats_and_audio_stays_where_it_sounds() {
                 id: MarkerId(500 + i as u64),
                 position,
                 name: format!("Cut {}", i + 1),
+                time_base: Default::default(),
             },
         }))
         .unwrap();
@@ -39,6 +40,7 @@ fn hits_land_on_beats_and_audio_stays_where_it_sounds() {
             id: MarkerId(600),
             position: note_at,
             name: "Door slam".into(),
+            time_base: Default::default(),
         },
     }))
     .unwrap();
@@ -81,6 +83,7 @@ fn hits_land_on_beats_and_audio_stays_where_it_sounds() {
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         }),
     }))
@@ -107,6 +110,9 @@ fn hits_land_on_beats_and_audio_stays_where_it_sounds() {
                     channel: 0,
                     muted: false,
                     release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
                 }],
                 ..MidiClip::default()
             }),

@@ -109,6 +109,7 @@ fn song(name: &str) -> Song {
             start: at,
             end: at + bar(2.0),
             color: TrackColor::palette(i),
+            time_base: Default::default(),
         });
         sections.push(id);
         let clip: ClipId = p.ids.allocate();
@@ -121,6 +122,9 @@ fn song(name: &str) -> Song {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         };
         p.clips.insert(
             clip,
@@ -161,6 +165,7 @@ fn song(name: &str) -> Song {
                     pitch: None,
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             },
         );

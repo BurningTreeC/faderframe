@@ -1,0 +1,24 @@
+[package]
+name = "faderframe-script"
+description = "Sandboxed Lua 5.4 for FaderFrame's scripts and macros (mlua, the vendored Lua under MIT)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+# Lua 5.4 compiled from the vendored sources (lua-src, MIT) with `cc`.
+# `send`: the Lua state may live in a `Send` session.
+[target.'cfg(not(faderframe_check_only))'.dependencies]
+mlua = { version = "0.12", features = ["lua54", "vendored", "send"] }
+
+# SDK-less cross-checks compile no C: `module` builds nothing and links
+# nothing (`cargo check` never links).
+[target.'cfg(faderframe_check_only)'.dependencies]
+mlua = { version = "0.12", features = ["lua54", "module"] }

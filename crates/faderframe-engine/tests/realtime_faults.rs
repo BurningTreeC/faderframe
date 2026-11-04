@@ -148,3 +148,46 @@ fn recording_takes_no_page_faults() {
     eprintln!("page faults while recording: {faults}");
     assert_eq!(faults, 0, "faults while recording");
 }
+
+/// Capture Audio: its rings (seconds of the kept inputs, made when the
+/// capture starts) are mapped before the audio thread fills them, playing
+/// or stopped.
+#[test]
+fn keeping_inputs_for_capture_audio_takes_no_page_faults() {
+    use faderframe_transport::TransportCommand;
+    const SR: u32 = 48_000;
+    const BLOCK: usize = 256;
+    let tp = common::TestProject::new(SR);
+    let config = EngineConfig {
+        sample_rate: SR,
+        ..EngineConfig::default()
+    };
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config, BLOCK, 2).unwrap();
+    faderframe_realtime::memory::prefault_code();
+    let mut bufs = OwnedBuffers::new(2, 2, BLOCK);
+    for _ in 0..8 {
+        r.processor.process_device(&mut bufs);
+    }
+    // Two seconds of rings, the keeper's side keeping up (as its thread
+    // would): stopped, then playing — every ring slot written for the
+    // first time.
+    let mut cap = r.controller.capture_inputs(vec![0, 1], 2.0).unwrap();
+    let drain = |cap: &mut faderframe_engine::input_capture::CaptureStreams| {
+        while cap.headers.pop().is_ok() {}
+        let n = cap.data.slots();
+        if let Ok(chunk) = cap.data.read_chunk(n) {
+            chunk.commit_all();
+        }
+    };
+    let faults = faults_in(|| {
+        for k in 0..(3 * SR as usize / BLOCK) {
+            if k == SR as usize / BLOCK {
+                r.controller.transport(TransportCommand::Play).unwrap();
+            }
+            r.processor.process_device(&mut bufs);
+            drain(&mut cap);
+        }
+    });
+    eprintln!("page faults keeping the inputs: {faults}");
+    assert_eq!(faults, 0, "faults while keeping the inputs");
+}

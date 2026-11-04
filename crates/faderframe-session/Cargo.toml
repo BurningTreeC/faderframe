@@ -12,10 +12,12 @@ workspace = true
 
 [dependencies]
 faderframe-analysis.workspace = true
+faderframe-codec.workspace = true
 faderframe-mix-intelligence.workspace = true
 faderframe-polypitch.workspace = true
 faderframe-transcribe.workspace = true
 faderframe-speech.workspace = true
+faderframe-separate.workspace = true
 faderframe-spectral.workspace = true
 faderframe-leadsheet.workspace = true
 serde_json.workspace = true
@@ -42,17 +44,32 @@ faderframe-plugin-host.workspace = true
 faderframe-automation.workspace = true
 faderframe-transport.workspace = true
 faderframe-realtime.workspace = true
+faderframe-stretch.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+faderframe-qc.workspace = true
+faderframe-interchange.workspace = true
+faderframe-aaf.workspace = true
+roxmltree = "0.21"
+faderframe-script.workspace = true
+faderframe-remote.workspace = true
+faderframe-collab.workspace = true
+rmp-serde.workspace = true
+rmpv.workspace = true
 
 [dev-dependencies]
 faderframe-guitar.workspace = true
+faderframe-plugin-host = { workspace = true, features = ["ara-mock"] }
 gst.workspace = true
 gst-app.workspace = true
 faderframe-audio-graph.workspace = true
 midly.workspace = true
 faderframe-plugin-clap.workspace = true
 faderframe-plugin-vst3.workspace = true
+clack-host = { workspace = true, features = ["clack-plugin"] }
+clack-plugin.workspace = true
+clack-extensions = { workspace = true, features = ["clack-plugin"] }
+faderframe-audio-aes67.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 faderframe-plugin-lv2.workspace = true

@@ -990,7 +990,7 @@ impl Session {
                     }
                 }
                 for l in &mut m.controllers {
-                    let carried = l.value_at(shift);
+                    let carried = l.point_at(shift).copied();
                     l.points.retain(|pt| pt.time >= shift);
                     for pt in &mut l.points {
                         pt.time -= shift;
@@ -1004,7 +1004,7 @@ impl Session {
                             0,
                             faderframe_project::ControllerPoint {
                                 time: MusicalTime::ZERO,
-                                value: v,
+                                ..v
                             },
                         );
                     }

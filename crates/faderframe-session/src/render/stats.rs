@@ -12,9 +12,15 @@
 //! The same [`FileStats`] serves every render the window starts — one
 //! track, the master, stems (a row per file), ADM and IAMF masters; the
 //! album and other workers can hand theirs the same way.
+//!
+//! The same reading measures what the delivery QC report checks beyond
+//! the levels ([`FileStats::qc`]: silence, gaps, clipped runs, phase and
+//! the mono fold-down; `faderframe_analysis::qc`), so a report for any
+//! spec needs no second reading.
 
 use super::Rendered;
 use faderframe_analysis::levels::{FileLevels, FileMeter, full_scale};
+use faderframe_analysis::qc::{QcLevels, QcMeter, silence_floor};
 use faderframe_audio_files::WavFormat;
 use faderframe_audio_files::wavstream::{WavFile, read_chunk};
 use faderframe_core::SurroundFormat;
@@ -63,8 +69,14 @@ pub struct FileStats {
     /// The figures above come from the file's header (false: the
     /// encoder's, the file was not read back).
     pub from_file: bool,
+    /// Bits per sample of a PCM or float file (`None`: a coded file) and
+    /// whether it is floating point.
+    pub bits: Option<u16>,
+    pub float: bool,
     /// Measured from the file's audio (`None`: see `notes`).
     pub levels: Option<FileLevels>,
+    /// What the QC report checks besides (`None` with `levels`).
+    pub qc: Option<QcLevels>,
     /// Wall time of rendering and writing this file (seconds).
     pub render_seconds: f64,
     /// What was not measured, and why.
@@ -84,6 +96,30 @@ impl FileStats {
     /// Seconds of audio per second of rendering.
     pub fn realtime_factor(&self) -> Option<f64> {
         (self.render_seconds > 0.0).then(|| self.seconds() / self.render_seconds)
+    }
+
+    /// Its header facts as the QC report lists them.
+    pub fn facts(&self) -> faderframe_qc::Facts {
+        faderframe_qc::Facts {
+            container: self.container.clone(),
+            encoding: self.encoding.clone(),
+            sample_rate: self.sample_rate,
+            bits: self.bits,
+            float: self.float,
+            channels: self.channels,
+            layout: self.layout.clone(),
+            frames: self.frames,
+            seconds: self.seconds(),
+            bytes: self.bytes,
+            from_file: self.from_file,
+        }
+    }
+
+    /// Its levels as the QC report lists them (`None`: not measured).
+    pub fn qc_levels(&self) -> Option<faderframe_qc::Levels> {
+        self.levels
+            .as_ref()
+            .map(|l| faderframe_qc::Levels::of(l, self.qc.as_ref(), self.sample_rate))
     }
 
     /// What its levels warn of: clipping, overs, samples past full scale,
@@ -251,7 +287,10 @@ pub(crate) fn measure(
             channel_mask: None,
             frames: *frames,
             from_file: false,
+            bits: None,
+            float: false,
             levels: None,
+            qc: None,
             render_seconds,
             notes: vec![
                 "Levels not measured: the coded IAMF file is not decoded here. Rate, channels \
@@ -319,11 +358,13 @@ pub(crate) fn measure(
             (format!("{channels} channels"), None)
         }
     };
-    let mut meter = FileMeter::new(
+    let fs = full_scale(format.bits(), !format.is_integer());
+    let mut meter = FileMeter::new(wav.sample_rate(), channels, weights.as_deref(), fs);
+    let mut qc = QcMeter::new(
         wav.sample_rate(),
         channels,
-        weights.as_deref(),
-        full_scale(format.bits(), !format.is_integer()),
+        fs,
+        silence_floor(format.bits(), !format.is_integer()),
     );
     let mut buffers = vec![vec![0.0f32; CHUNK]; channels];
     let mut scratch = Vec::new();
@@ -337,6 +378,7 @@ pub(crate) fn measure(
         wav.read(at, &mut out, &mut scratch).map_err(fail)?;
         let read: Vec<&[f32]> = buffers.iter().map(|b| &b[..n]).collect();
         meter.add(&read);
+        qc.add(&read);
         at += n as u64;
     }
     let mut container = container_of(file).map_err(fail)?;
@@ -358,7 +400,10 @@ pub(crate) fn measure(
         channel_mask: mask,
         frames: wav.frames(),
         from_file: true,
+        bits: Some(format.bits()),
+        float: !format.is_integer(),
         levels: Some(meter.finish()),
+        qc: Some(qc.finish()),
         render_seconds,
         notes,
     })

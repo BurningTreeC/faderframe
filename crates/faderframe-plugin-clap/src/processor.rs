@@ -335,23 +335,20 @@ impl PluginProcessor for ClapProcessor {
                         }
                         let id = note_match(st.note_ids.start(channel, key));
                         let pckn = Pckn::new(0u16, channel as u16, key as u16, id);
-                        st.events_in
-                            .push(&NoteOnEvent::new(t, pckn, velocity as f64 / 127.0));
+                        // At full resolution (a MIDI 2.0 velocity's 16
+                        // bits), never 0 for a note-on.
+                        let velocity = ev
+                            .unit()
+                            .unwrap_or(f64::from(velocity) / 127.0)
+                            .max(1.0 / 65535.0);
+                        st.events_in.push(&NoteOnEvent::new(t, pckn, velocity));
                     }
-                    MidiEvent::NoteOn {
-                        channel,
-                        key,
-                        velocity,
-                    }
-                    | MidiEvent::NoteOff {
-                        channel,
-                        key,
-                        velocity,
-                    } => {
+                    MidiEvent::NoteOn { channel, key, .. }
+                    | MidiEvent::NoteOff { channel, key, .. } => {
                         let id = note_match(st.note_ids.end(channel, key));
                         let pckn = Pckn::new(0u16, channel as u16, key as u16, id);
-                        st.events_in
-                            .push(&NoteOffEvent::new(t, pckn, velocity as f64 / 127.0));
+                        let velocity = ev.unit().unwrap_or(0.0);
+                        st.events_in.push(&NoteOffEvent::new(t, pckn, velocity));
                     }
                     MidiEvent::NoteExpression {
                         channel,

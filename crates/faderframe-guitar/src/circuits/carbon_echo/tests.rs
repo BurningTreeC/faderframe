@@ -266,9 +266,13 @@ impl Rig {
         self.stage.circuit().unwrap().echo().unwrap()
     }
 
-    fn volts(&self, node: &str) -> f64 {
-        let sim = self.stage.circuit().unwrap().simulation();
-        sim.voltage_at(unknown(node))
+    /// A node's voltage by its unknown (`unknown`, looked up once).
+    fn volts_at(&self, unknown: usize) -> f64 {
+        self.stage
+            .circuit()
+            .unwrap()
+            .simulation()
+            .voltage_at(unknown)
     }
 }
 
@@ -538,8 +542,30 @@ fn triangle_at(rate: f64, speed: f64, seconds: f64) -> (f64, f64) {
     (1.0 / period, swing)
 }
 
+/// The triangle's speed by arithmetic on the traced network: TR1's wiper
+/// (at `speed`, 1 the square's end) through `r19` into the integrator,
+/// from a square `TL062_HEADROOM` inside either rail around the bias line,
+/// between thresholds of R8 / R16 of it either side; `series` ohms between
+/// U5A's output and TR1's top (none on the trace).
+fn triangle_by_arithmetic(speed: f64, series: f64, r19: f64) -> f64 {
+    let high = BATTERY - TL062_HEADROOM - LFO_BIAS;
+    let low = LFO_BIAS - TL062_HEADROOM;
+    let top = TR1 * (1.0 - speed) + series;
+    let bottom = TR1 * speed + R11;
+    let share = bottom / (top + bottom);
+    let source = top * bottom / (top + bottom) + r19;
+    let window = (high + low) * R8 / R16;
+    1.0 / (window * INTEGRATING * source / share * (1.0 / high + 1.0 / low))
+}
+
 /// MOD: the triangle at TR1's factory setting runs inside the manual's
-/// 0.2 to 2.2 Hz, and SPEED's ends reach about its ends.
+/// 0.2 to 2.2 Hz, and SPEED's bottom is the manual's — but its top is
+/// 3.6 Hz, and that is the traced parts', not the model's: the simulated
+/// ends are the network's arithmetic. No single traced part puts both
+/// ends on the manual's figures: R19, C11 / C12 and R8 / R16 scale both
+/// (the top brought to 2.2 Hz takes the bottom to 0.14), R11 moves the
+/// bottom alone. About 100 k between U5A's output and TR1's top would:
+/// 0.19 to 2.2 Hz. The trace has the trimmer straight on the output.
 #[test]
 fn the_triangle_runs_at_the_manuals_rates() {
     let (factory, swing) = triangle(TR1_REST, 6.0);
@@ -549,14 +575,35 @@ fn the_triangle_runs_at_the_manuals_rates() {
     );
     assert!((0.1..0.25).contains(&swing), "node A swings {swing:.3} V");
     let (slowest, _) = triangle(0.0, 24.0);
+    let (fastest, _) = triangle(1.0, 3.0);
+    for (simulated, speed) in [(slowest, 0.0), (fastest, 1.0)] {
+        let arithmetic = triangle_by_arithmetic(speed, 0.0, R19);
+        assert!(
+            (simulated / arithmetic - 1.0).abs() < 0.1,
+            "SPEED {speed}: {simulated:.3} Hz simulated, {arithmetic:.3} Hz by arithmetic"
+        );
+    }
     assert!(
         (0.15..0.3).contains(&slowest),
         "{slowest:.2} Hz with SPEED down"
     );
-    let (fastest, _) = triangle(1.0, 3.0);
     assert!(
-        (2.0..4.0).contains(&fastest),
+        (3.3..4.0).contains(&fastest),
         "{fastest:.2} Hz with SPEED up"
+    );
+    // R19 (or the capacitors, or R8 / R16) made to give the manual's top
+    // leaves the bottom well under the manual's.
+    let r19 = R19 * triangle_by_arithmetic(1.0, 0.0, R19) / 2.2;
+    let bottom = triangle_by_arithmetic(0.0, 0.0, r19);
+    assert!(bottom < 0.16, "{bottom:.3} Hz at the bottom");
+    // A resistance at TR1's top puts both ends there.
+    let (top, bottom) = (
+        triangle_by_arithmetic(1.0, 100e3, R19),
+        triangle_by_arithmetic(0.0, 100e3, R19),
+    );
+    assert!(
+        (2.0..2.4).contains(&top) && (0.18..0.22).contains(&bottom),
+        "{bottom:.3} to {top:.3} Hz"
     );
 }
 
@@ -629,39 +676,91 @@ fn thd(x: &[f64], hz: f64) -> f64 {
     h[1..].iter().map(|v| v * v).sum::<f64>().sqrt() / h[0]
 }
 
-/// At the manual's test point, 1 kHz at -5 dBV, the four BBDs add under
-/// half a per cent between their input and their output. The wet path as a
-/// whole is rated under 1 % there and this model is not: the Sallen-Key
-/// followers either side (Q7, Q14, Q9: emitter followers on 10 k, in loops
-/// whose capacitors stand 250 and 120 to 1) cannot quite keep up with a
-/// kilohertz at a volt and more, and their second harmonic falls on the
-/// filters' peak. At a guitar's level and pitch the echo is clean.
+/// The amplitudes of the first five harmonics of `hz` in `x`, its mean
+/// taken out (on one scale, `power_at`'s).
+fn harmonics(x: &[f64], hz: f64, rate: f64) -> [f64; 5] {
+    let mean = x.iter().sum::<f64>() / x.len() as f64;
+    let y: Vec<f64> = x.iter().map(|v| v - mean).collect();
+    std::array::from_fn(|k| power_at(&y, hz * (k + 1) as f64, rate).sqrt())
+}
+
+/// Where the wet path's distortion comes from at the M169A's test point,
+/// 1 kHz at -5 dBV (rated "under 1 %"; 4.7 % here), stage by stage:
+///
+/// - the compressor (U7A): its rectifier's 2 kHz ripple through C5's
+///   2.2 ms, a third harmonic of about 1 % at its output at any level;
+/// - Q7, the anti-aliasing filter's follower. Its own base-emitter law
+///   leaves a twentieth of a per cent of second harmonic in its output,
+///   but an error at the follower's output goes back through C25 to a node
+///   C20, 248 times smaller, hardly holds: near the filter's peak the loop
+///   returns it some 36 times larger (at 2 kHz, from the trace's values),
+///   2 % at the BBDs' input — at every rate the board is stepped at
+///   (`distortion_by_stage`: 48 to 192 kHz), so the circuit's, not the
+///   solver's;
+/// - the BBDs, which add little;
+/// - Q9, the reconstruction filter's last follower: 10 k of TR8 at DC but
+///   about 6 k at audio (TR8 into the expander's 6.7 k), biased at 0.28 mA
+///   from the BBDs' output level, it can pull its emitter about 1.7 V down,
+///   and the echo reaches that there: it all but cuts off once a cycle.
+///
+/// At a guitar's level and pitch the echo is clean.
 #[test]
 fn the_filters_followers_are_where_a_hot_echo_frays() {
     let amp = digital(10f64.powf(-5.0 / 20.0) * 2f64.sqrt());
-    let n = (SR * 1.5) as usize;
+    let n = SR as usize;
     let mut rig = Rig::new(&knobs(0.5, 1.0, 0.0, false));
-    let (mut sent, mut back) = (Vec::new(), Vec::new());
+    let [c_out, q7b, q7e, bbd_in, tp10, q9b, q9e] =
+        ["c_out", "q7b", "q7e", BBD_IN, "tp10", "q9b", "q9e"].map(unknown);
+    let vbe = |rig: &Rig, b, e| rig.volts_at(b) - rig.volts_at(e);
+    let rest = [vbe(&rig, q7b, q7e), vbe(&rig, q9b, q9e)];
+    let mut low = rest;
+    let watched = [c_out, q7e, bbd_in, tp10];
+    // Their voltages, and Q7's base-emitter voltage last.
+    let mut traces = vec![Vec::new(); watched.len() + 1];
     for k in 0..n {
         rig.stage
             .process(amp * (TAU * 1000.0 * k as f64 / SR).sin());
-        if k >= n / 2 {
-            sent.push(rig.volts(BBD_IN));
-            back.push(rig.volts("tp10"));
+        if k < n / 2 {
+            continue;
         }
+        for (t, &u) in traces.iter_mut().zip(&watched) {
+            t.push(rig.volts_at(u));
+        }
+        traces[watched.len()].push(vbe(&rig, q7b, q7e));
+        low[0] = low[0].min(vbe(&rig, q7b, q7e));
+        low[1] = low[1].min(vbe(&rig, q9b, q9e));
     }
-    let centre = |x: &mut Vec<f64>| {
-        let mean = x.iter().sum::<f64>() / x.len() as f64;
-        x.iter_mut().for_each(|v| *v -= mean);
-    };
-    centre(&mut sent);
-    centre(&mut back);
-    let (into, out_of) = (thd(&sent, 1000.0), thd(&back, 1000.0));
+    let h: Vec<[f64; 5]> = traces.iter().map(|t| harmonics(t, 1000.0, SR)).collect();
+    let rel = |i: usize, k: usize| h[i][k] / h[i][0];
+    let thd_of = |i: usize| (1..5).map(|k| rel(i, k).powi(2)).sum::<f64>().sqrt();
+    let compressor = rel(0, 2);
     assert!(
-        out_of - into < 0.005,
+        (0.005..0.02).contains(&compressor) && rel(0, 1) < 0.004,
+        "the compressor's third {:.2} %, second {:.2} %",
+        compressor * 100.0,
+        rel(0, 1) * 100.0
+    );
+    let own = h[4][1] / h[1][0];
+    let at_bbds = rel(2, 1);
+    assert!(
+        own < 1e-3 && at_bbds > 0.01 && at_bbds > 15.0 * own,
+        "Q7's own second harmonic {:.3} %, at the BBDs' input {:.2} %",
+        own * 100.0,
+        at_bbds * 100.0
+    );
+    assert!(
+        thd_of(3) - thd_of(2) < 0.005,
         "the BBDs take {:.2} % to {:.2} %",
-        into * 100.0,
-        out_of * 100.0
+        thd_of(2) * 100.0,
+        thd_of(3) * 100.0
+    );
+    // The emitter current at the trough against at rest: Q7 never far
+    // from it, Q9 down to under a fifth (40 mV of base-emitter voltage).
+    assert!(
+        rest[0] - low[0] < 0.02 && rest[1] - low[1] > 0.04,
+        "base-emitter voltage down by {:.0} mV (Q7) and {:.0} mV (Q9)",
+        (rest[0] - low[0]) * 1e3,
+        (rest[1] - low[1]) * 1e3
     );
     let nominal = digital(GUITAR_VOLTS * 2f64.sqrt());
     let echo = wet(0.5, n, &|k| nominal * (TAU * 220.0 * k as f64 / SR).sin());
@@ -845,5 +944,58 @@ fn measurements() {
         })
         .collect();
         println!("DELAY {delay}: wet re 100 Hz: {}", row.join(", "));
+    }
+}
+
+/// Harmonics stage by stage at the M169A's distortion test point (1 kHz,
+/// -5 dBV in), the board stepped at 48, 96 and 192 kHz, and the wet THD
+/// against level and the BBDs' output level. What
+/// `the_filters_followers_are_where_a_hot_echo_frays` holds and the
+/// module's documentation quotes. Run in release with --ignored
+/// --nocapture.
+#[test]
+#[ignore]
+fn distortion_by_stage() {
+    let names = [
+        "c_out", "f1", "f2", "q7e", BBD_IN, "tp10", "r2", "q14e", "r3", "q9e", "e_out",
+    ];
+    let amp = digital(10f64.powf(-5.0 / 20.0) * 2f64.sqrt());
+    for rate in [48_000.0, 96_000.0, 192_000.0] {
+        let n = rate as usize;
+        let mut rig = Rig::at(&knobs(0.5, 1.0, 0.0, false), rate);
+        let at = names.map(unknown);
+        let mut traces = vec![Vec::new(); names.len()];
+        for k in 0..n {
+            rig.stage
+                .process(amp * (TAU * 1000.0 * k as f64 / rate).sin());
+            if k >= n / 2 {
+                for (t, &u) in traces.iter_mut().zip(&at) {
+                    t.push(rig.volts_at(u));
+                }
+            }
+        }
+        for (name, t) in names.iter().zip(&traces) {
+            let h = harmonics(t, 1000.0, rate);
+            println!(
+                "{rate} Hz {name:>6}: H2 {:6.1} dB, H3 {:6.1} dB, H4 {:6.1} dB",
+                db(h[1] / h[0]),
+                db(h[2] / h[0]),
+                db(h[3] / h[0])
+            );
+        }
+    }
+    let n = (SR * 1.5) as usize;
+    for (dbv, hz) in [
+        (-5.0, 1000.0),
+        (-10.0, 1000.0),
+        (-20.0, 1000.0),
+        (-5.0, 220.0),
+    ] {
+        let amp = digital(10f64.powf(dbv / 20.0) * 2f64.sqrt());
+        let w = wet(0.5, n, &|k| amp * (TAU * hz * k as f64 / SR).sin());
+        println!(
+            "{dbv} dBV, {hz} Hz: wet THD {:.2} % (BBD output at {BBD_OUT_LEVEL} V)",
+            thd(&w[n / 2..], hz) * 100.0
+        );
     }
 }

@@ -54,6 +54,7 @@ pub(crate) fn is_editor(kind: ViewKind) -> bool {
             | ViewKind::Events
             | ViewKind::Spectral
             | ViewKind::Setlist
+            | ViewKind::Score
     )
 }
 
@@ -169,6 +170,7 @@ pub(crate) fn forwards(key: Key, focus: Focus, workspace: bool) -> bool {
             | Key::PageUp
             | Key::PageDown
             | Key::Other
+            | Key::Menu
     );
     workspace && !navigation && matches!(focus, Focus::OtherView | Focus::Other)
 }
@@ -406,6 +408,7 @@ mod tests {
             Key::PageUp,
             Key::PageDown,
             Key::Other,
+            Key::Menu,
         ] {
             assert!(!forwards(k, Focus::Other, true), "{k:?} moves the focus");
         }

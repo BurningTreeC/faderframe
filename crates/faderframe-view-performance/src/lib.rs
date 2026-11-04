@@ -10,6 +10,7 @@
 
 use faderframe_core::{PluginInstanceId, TrackId};
 use faderframe_project::{Command, PluginFormat, TrackColor, TrackKind};
+use faderframe_session::self_freeze::{SelfFreezeMode, SelfFreezeSummary, TrackCache};
 use faderframe_session::{
     Action, Load, PerformanceReport, PluginPerformance, SelectMode, Session, TrackPerformance,
 };
@@ -63,6 +64,8 @@ enum Hit {
 }
 
 const PAD: f32 = 12.0;
+/// The summary's line about self-freezing.
+const SELF_FREEZE_H: f32 = 16.0;
 const TOOLBAR_H: f32 = 34.0;
 const HEADER_H: f32 = 24.0;
 const BREAKDOWN_H: f32 = 30.0;
@@ -160,7 +163,8 @@ impl PerformanceView {
     fn layout(&self, size: Size) -> Layout {
         let mut r = Rect::from_size(size);
         let toolbar = r.take_top(TOOLBAR_H);
-        let summary = r.take_top(self.theme.perf.summary_height.min(size.h * 0.45));
+        let summary =
+            r.take_top((self.theme.perf.summary_height + SELF_FREEZE_H).min(size.h * 0.45));
         let breakdown = r.take_top(BREAKDOWN_H);
         let header = r.take_top(HEADER_H);
         Layout {
@@ -469,11 +473,18 @@ impl PerformanceView {
         );
     }
 
-    fn paint_summary(&self, p: &mut dyn Painter, r: Rect, report: &PerformanceReport) {
+    fn paint_summary(
+        &self,
+        p: &mut dyn Painter,
+        r: Rect,
+        report: &PerformanceReport,
+        model: &Session,
+    ) {
         let t = &self.theme;
         let pt = &t.perf;
         p.fill(r, pt.panel);
-        let inner = r.inset(PAD);
+        // The self-freeze line runs under both columns: it is long.
+        let (inner, l5) = r.inset(PAD).split_bottom(SELF_FREEZE_H);
         let (mut left, graph) = inner.split_left(250.0f32.min(inner.w * 0.42));
         // Big total figure.
         let label = left.take_top(14.0);
@@ -552,6 +563,15 @@ impl PerformanceView {
                 )
             },
             t.ui.text_faint,
+        );
+        // Tracks played from their caches: what their devices would cost.
+        let sf = model.self_freeze_summary();
+        let (text, color) = self_freeze_line(&sf, model);
+        line(
+            p,
+            l5,
+            &text,
+            if color { t.ui.accent } else { t.ui.text_faint },
         );
         self.paint_history(p, graph, report);
     }
@@ -824,15 +844,24 @@ impl PerformanceView {
                         1 => "1 plugin".to_string(),
                         n => format!("{n} plugins"),
                     };
+                    // Played from its cache: what that saves.
+                    let cache = model.self_freeze_track(tr.track);
                     // Its path's latency, or the compensation it waits for.
-                    let plugins = if tr.latency > 0 {
+                    let plugins = if let Some(c) = cache_note(cache) {
+                        c
+                    } else if tr.latency > 0 {
                         format!("{plugins} · {} smp", tr.latency)
                     } else if tr.waits > 0 {
                         format!("{plugins} · waits {}", tr.waits)
                     } else {
                         plugins
                     };
-                    self.paint_numbers(p, &cols, tr.load, scale, &plugins, t.ui.text_faint, false);
+                    let note = if cache.is_cached() {
+                        t.ui.accent
+                    } else {
+                        t.ui.text_faint
+                    };
+                    self.paint_numbers(p, &cols, tr.load, scale, &plugins, note, false);
                 }
                 Row::Plugin(ti, pi) => {
                     let tr = &report.tracks[ti];
@@ -876,8 +905,15 @@ impl PerformanceView {
                             },
                         ),
                     );
+                    let resting =
+                        matches!(model.self_freeze_track(tr.track), TrackCache::Cached { .. });
                     let (info, color) = if pl.failed {
                         ("failed".to_string(), pt.load_critical)
+                    } else if resting {
+                        (
+                            "resting: its track plays from a cache".to_string(),
+                            t.ui.accent,
+                        )
                     } else if pl.bypassed {
                         ("bypassed".to_string(), t.ui.text_faint)
                     } else if pl.monitoring {
@@ -957,7 +993,7 @@ impl CanvasView<Session, Action> for PerformanceView {
         let l = self.layout(size);
         p.fill(Rect::from_size(size), theme.perf.background);
         self.paint_toolbar(p, l.toolbar, report);
-        self.paint_summary(p, l.summary, report);
+        self.paint_summary(p, l.summary, report, model);
         self.paint_breakdown(p, l.breakdown, report);
         self.paint_header(p, l.header, self.scale(report));
         self.paint_table(p, l.table, model, report);
@@ -1176,5 +1212,57 @@ fn low_latency_note(report: &PerformanceReport) -> String {
         0 => String::new(),
         1 => " · low-latency monitoring: 1 track".to_string(),
         n => format!(" · low-latency monitoring: {n} tracks"),
+    }
+}
+
+/// The summary's line about self-freezing, and whether it is news (shown
+/// in the accent colour).
+fn self_freeze_line(s: &SelfFreezeSummary, model: &Session) -> (String, bool) {
+    if !s.on {
+        return ("self-freeze off".into(), false);
+    }
+    let name = |t: TrackId| {
+        model
+            .project()
+            .track(t)
+            .map_or_else(String::new, |t| t.name.clone())
+    };
+    let mode = match (s.mode, s.needed) {
+        (SelfFreezeMode::Always, _) => "self-freeze",
+        (SelfFreezeMode::WhenNeeded, true) => "self-freeze when needed (needed now)",
+        (SelfFreezeMode::WhenNeeded, false) => "self-freeze when needed",
+    };
+    let mut text = match s.cached.len() {
+        0 if s.mode == SelfFreezeMode::WhenNeeded && !s.needed => {
+            format!("{mode}: the machine copes, every track plays live")
+        }
+        0 => format!("{mode}: no track cached"),
+        n => format!(
+            "{mode}: {n} track{} cached · {} saved",
+            if n == 1 { "" } else { "s" },
+            format_load(f64::from(s.saved))
+        ),
+    };
+    if let Some((t, done)) = s.rendering {
+        text.push_str(&format!(" · rendering {} {:.0} %", name(t), done * 100.0));
+    }
+    text.push_str(&format!(
+        " · {:.1} of {:.1} GB",
+        s.bytes as f64 / 1e9,
+        s.limit as f64 / 1e9
+    ));
+    (text, !s.cached.is_empty() || s.rendering.is_some())
+}
+
+/// A track's row note while self-freezing has it.
+fn cache_note(c: TrackCache) -> Option<String> {
+    match c {
+        TrackCache::Cached { cost } => {
+            Some(format!("cached · saves {}", format_load(f64::from(cost))))
+        }
+        TrackCache::ToCache => Some("fading to its cache".into()),
+        TrackCache::ToLive => Some("fading back to live".into()),
+        TrackCache::Rendering(done) => Some(format!("caching {:.0} %", done * 100.0)),
+        TrackCache::Live(_) | TrackCache::Waiting => None,
     }
 }

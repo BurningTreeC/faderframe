@@ -18,7 +18,8 @@
 //!   polarity, confidence, the sum against the energies, onsets) and those
 //!   left out;
 //! * `mix-dynamics:x` — log every subject's dynamics indicators and width
-//!   by region.
+//!   by region;
+//! * `mix-scene:<op>` — mix scenes (see [`scene`]).
 
 use crate::state::AppState;
 use faderframe_core::TrackRole;
@@ -325,6 +326,92 @@ pub(crate) fn dynamics(a: &Rc<AppState>, _: &str) {
             w.broad_width_db,
             w.broad_mono_db
         );
+    }
+}
+
+/// `mix-scene:<op>` — mix scenes from a script (`n` is a scene's place in
+/// the list from 1, or its name):
+///
+/// * `store=<name>` / `store-plugins=<name>` — store the console (with
+///   the devices' values);
+/// * `recall=<n>` — recall it as it says; `crossfade=<n>@<ms>` — with a
+///   crossfade of that length (the project's switch point);
+/// * `morph=<a>/<b>@<pos>` — make them A and B and morph to `pos` (0…1),
+///   one undo step;
+/// * `compare=<a|mix>/<b>` — compare them (B heard); `compare=flip`,
+///   `compare=keep`, `compare=back`;
+/// * `next`, `previous`, `stop` (a crossfade where it is), `delete=<n>`.
+pub(crate) fn scene(a: &Rc<AppState>, arg: &str) {
+    use faderframe_project::scenes::{FadeLength, SceneFade};
+    use faderframe_session::scenes::SceneOp;
+    let find = |name: &str| {
+        let s = a.session.borrow();
+        let scenes = &s.mix_scenes().scenes;
+        name.parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| scenes.get(i))
+            .or_else(|| scenes.iter().find(|x| x.name == name))
+            .map(|x| x.id)
+    };
+    let scene_op = |op: SceneOp| a.dispatch(Action::MixScene(op));
+    let (what, rest) = arg.split_once('=').unwrap_or((arg, ""));
+    match what {
+        "store" | "store-plugins" => scene_op(SceneOp::Store {
+            name: (!rest.is_empty()).then(|| rest.to_string()),
+            plugins: what == "store-plugins",
+        }),
+        "recall" => {
+            if let Some(scene) = find(rest) {
+                scene_op(SceneOp::Recall { scene, fade: None });
+            }
+        }
+        "crossfade" => {
+            let (n, ms) = rest.split_once('@').unwrap_or((rest, "1000"));
+            let switch = a.session.borrow().mix_scenes().fade.switch;
+            if let (Some(scene), Ok(ms)) = (find(n), ms.parse::<f64>()) {
+                scene_op(SceneOp::Recall {
+                    scene,
+                    fade: Some(SceneFade {
+                        length: FadeLength::Millis { ms },
+                        switch,
+                    }),
+                });
+            }
+        }
+        "morph" => {
+            let (pair, pos) = rest.split_once('@').unwrap_or((rest, "0.5"));
+            let (x, y) = pair.split_once('/').unwrap_or((pair, ""));
+            if let (Some(sa), Some(sb), Ok(position)) = (find(x), find(y), pos.parse::<f64>()) {
+                scene_op(SceneOp::SetAB {
+                    a: Some(sa),
+                    b: Some(sb),
+                });
+                scene_op(SceneOp::Morph { position });
+                scene_op(SceneOp::EndMorph);
+            }
+        }
+        "compare" => match rest {
+            "flip" => scene_op(SceneOp::CompareFlip),
+            "keep" => scene_op(SceneOp::CompareEnd { keep: true }),
+            "back" => scene_op(SceneOp::CompareEnd { keep: false }),
+            pair => {
+                let (x, y) = pair.split_once('/').unwrap_or(("mix", pair));
+                let first = if x == "mix" { None } else { find(x) };
+                if let Some(b) = find(y) {
+                    scene_op(SceneOp::CompareStart { a: first, b });
+                }
+            }
+        },
+        "next" => scene_op(SceneOp::Next),
+        "previous" => scene_op(SceneOp::Previous),
+        "stop" => scene_op(SceneOp::StopFade),
+        "delete" => {
+            if let Some(scene) = find(rest) {
+                scene_op(SceneOp::Delete(scene));
+            }
+        }
+        _ => tracing::warn!("mix-scene: unknown {arg}"),
     }
 }
 

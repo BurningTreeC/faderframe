@@ -2,8 +2,10 @@
 //! designs, a zero-delay-feedback state variable filter, one poles, a DC
 //! blocker), oversampling, interpolated delay lines, envelope followers,
 //! LFOs (tempo synced too), parameter smoothing, true peak detection,
-//! K-weighted loudness and noise. Everything here is allocation free once made.
+//! K-weighted loudness, noise and convolution without latency (long
+//! responses, partitioned). Everything here is allocation free once made.
 
+pub mod convolve;
 pub mod delay;
 pub mod env;
 pub mod filter;

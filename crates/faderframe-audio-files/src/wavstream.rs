@@ -148,6 +148,50 @@ impl WavWriter {
         Ok(())
     }
 
+    /// Append `frames` frames of a fixed-point file's codes as they are
+    /// (no scaling, no dither: what a reader gets back exactly, divided
+    /// by 2^(bits − 1)); clamped to the format's range. Missing channels
+    /// are written as silence. A floating-point file takes samples
+    /// ([`WavWriter::write_planar`]), not codes: an error.
+    pub fn write_codes(&mut self, channels: &[&[i32]], frames: usize) -> io::Result<()> {
+        if !self.format.is_integer() {
+            return Err(io::Error::other(
+                "a floating-point file takes samples, not codes",
+            ));
+        }
+        let bps = (self.format.bits() / 8) as usize;
+        let limit = (u32::MAX as u64 - 64) / (self.channels as u64 * bps as u64);
+        if self.frames + frames as u64 > limit {
+            return Err(io::Error::other("WAV size limit (4 GiB) reached"));
+        }
+        let half = 1i64 << (self.format.bits().clamp(2, 32) - 1);
+        self.scratch.clear();
+        self.scratch.reserve(frames * self.channels as usize * bps);
+        for i in 0..frames {
+            for c in 0..self.channels as usize {
+                let v = channels
+                    .get(c)
+                    .and_then(|ch| ch.get(i))
+                    .copied()
+                    .unwrap_or(0);
+                match self.format {
+                    WavFormat::Float32 => {}
+                    WavFormat::Pcm16 => {
+                        let v = i64::from(v).clamp(-half, half - 1) as i16;
+                        self.scratch.extend_from_slice(&v.to_le_bytes());
+                    }
+                    WavFormat::Pcm24 => {
+                        let v = i64::from(v).clamp(-half, half - 1) as i32;
+                        self.scratch.extend_from_slice(&v.to_le_bytes()[..3]);
+                    }
+                }
+            }
+        }
+        self.out.write_all(&self.scratch)?;
+        self.frames += frames as u64;
+        Ok(())
+    }
+
     /// Flush, patch the header sizes and close.
     pub fn finish(mut self) -> io::Result<PathBuf> {
         let bytes = self.frames * u64::from(self.channels) * u64::from(self.format.bits() / 8);
@@ -445,6 +489,25 @@ mod tests {
         assert_eq!(l[9], ramp[9_999]);
         assert!(l[10..].iter().all(|v| *v == 0.0));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn codes_are_written_as_they_are() {
+        for format in [WavFormat::Pcm16, WavFormat::Pcm24] {
+            let path = tmp(&format!("codes-{}.wav", format.bits()));
+            let half = 1i32 << (format.bits() - 1);
+            let codes = [0, 1, -1, half - 1, -half, half + 5, 12_345];
+            let mut w = WavWriter::create(&path, 1, 48_000, format, true).unwrap();
+            w.write_codes(&[&codes], codes.len()).unwrap();
+            w.finish().unwrap();
+            let f = WavFile::open(&path).unwrap();
+            let mut out = vec![0.0f32; codes.len()];
+            f.read(0, &mut [&mut out], &mut Vec::new()).unwrap();
+            let back: Vec<i32> = out.iter().map(|v| (*v * half as f32) as i32).collect();
+            // Clamped to the range; never dithered.
+            assert_eq!(back, [0, 1, -1, half - 1, -half, half - 1, 12_345]);
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]

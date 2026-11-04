@@ -645,6 +645,7 @@ pub(crate) fn place_takes(
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     };
     // Existing material in the way.
@@ -775,6 +776,95 @@ pub(crate) fn place_takes(
         }
     };
     (commands, Some(id))
+}
+
+/// Commands placing the passes `new` of one take on `track` as the loop
+/// recording mode says (recording and Capture Audio): one pass as it is,
+/// all as takes of a folder, the last complete one, or each earlier pass
+/// on a new muted track under it (`pass_tracks`: those made for other
+/// tracks in the same step). Returns the commands and the clips placed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn place_passes(
+    p: &mut Project,
+    track: TrackId,
+    track_name: &str,
+    mut new: Vec<NewTake>,
+    mode: RecordMode,
+    loop_mode: LoopRecordMode,
+    pass_tracks: &mut Vec<(usize, usize)>,
+) -> (Vec<Command>, Vec<ClipId>) {
+    let folder_name = format!("{track_name} Takes");
+    let mut commands = Vec::new();
+    let mut placed = Vec::new();
+    match loop_mode {
+        _ if new.len() == 1 => {
+            let (cmds, clip) = place_takes(p, track, &new, mode, &folder_name);
+            commands.extend(cmds);
+            placed.extend(clip);
+        }
+        LoopRecordMode::Takes => {
+            let (cmds, clip) = place_takes(p, track, &new, mode, &folder_name);
+            commands.extend(cmds);
+            placed.extend(clip);
+        }
+        LoopRecordMode::LastPass => {
+            // The last complete pass: one cut short by Stop (just
+            // after a wrap, say) does not throw away the whole
+            // pass before it; with none complete, the last.
+            let longest = new.iter().map(|t| t.abs_end - t.abs_start).max();
+            let keep = longest
+                .and_then(|l| {
+                    let enough = l - (l / 100).max(64);
+                    new.iter().rposition(|t| t.abs_end - t.abs_start >= enough)
+                })
+                .unwrap_or(new.len() - 1);
+            let last = vec![new.swap_remove(keep)];
+            let (cmds, clip) = place_takes(p, track, &last, mode, &folder_name);
+            commands.extend(cmds);
+            placed.extend(clip);
+        }
+        LoopRecordMode::NewTracks => {
+            // The last pass goes to the armed track (in the record
+            // mode); earlier passes each get a new, muted track below.
+            let last = new.split_off(new.len() - 1);
+            let (cmds, clip) = place_takes(p, track, &last, mode, &folder_name);
+            commands.extend(cmds);
+            placed.extend(clip);
+            let template = p.track(track).cloned();
+            // Right under the armed track as the batch has it then:
+            // pass tracks put in above it for other armed tracks
+            // moved it down.
+            let own = p.track_index(track).unwrap_or(0);
+            let above: usize = pass_tracks
+                .iter()
+                .filter(|(i, _)| *i < own)
+                .map(|(_, n)| *n)
+                .sum();
+            pass_tracks.push((own, new.len()));
+            let first = own + above + 1;
+            for (index, (k, pass)) in (first..).zip(new.into_iter().enumerate()) {
+                let Some(mut t) = template.clone() else { break };
+                t.id = p.ids.allocate();
+                t.name = format!("{track_name} Pass {}", k + 1);
+                t.clips.clear();
+                t.sends.clear();
+                t.inserts.clear();
+                t.instrument = None;
+                t.preamp = None;
+                t.record_arm = false;
+                t.mute = true;
+                let new_track = t.id;
+                commands.push(Command::AddTrack {
+                    track: Box::new(t),
+                    index,
+                });
+                let (cmds, _) =
+                    place_takes(p, new_track, &[pass], RecordMode::Replace, &folder_name);
+                commands.extend(cmds);
+            }
+        }
+    }
+    (commands, placed)
 }
 
 impl Session {
@@ -929,6 +1019,8 @@ impl Session {
             // Played, not taken: Capture MIDI still has it.
             note(self.engine.end_midi_recording().map_err(Into::into));
         }
+        // And Capture Audio its audio.
+        self.audio_capture_recording_discarded();
         let slot = r.slot.take();
         let from = r.from;
         self.discarding.push(r);
@@ -1237,6 +1329,20 @@ impl Session {
             .collect()
     }
 
+    /// Frames an audio take is read later than it was captured, so that
+    /// what was played lines up with what was heard: the device's input
+    /// and output latency, the graph's output latency (plugin delay
+    /// compensation: what the player heard was processed that much
+    /// earlier), varispeed's resampler in and out, and the user's offset.
+    /// Recording and Capture Audio both place takes by it.
+    pub(crate) fn audio_take_latency(&self, info: &faderframe_audio::StreamInfo) -> i64 {
+        info.input_latency as i64
+            + info.output_latency as i64
+            + i64::from(self.engine.graph_latency())
+            + self.record.latency_offset
+            + 2 * i64::from(self.engine.varispeed_delay())
+    }
+
     /// Enter record mode with the window starting at `from` (or the punch
     /// range).
     pub(crate) fn start_recording(&mut self, from: i64) -> Result<()> {
@@ -1328,11 +1434,8 @@ impl Session {
                 from,
                 to,
                 tracks: midi_tracks,
-                latency: info.input_latency as i64
-                    + info.output_latency as i64
-                    + graph
-                    + 2 * i64::from(self.engine.varispeed_delay())
-                    + self.record.latency_offset,
+                latency: self.audio_take_latency(&info),
+                later: Vec::new(),
                 seen: false,
                 slot: None,
             });
@@ -1362,12 +1465,21 @@ impl Session {
             paths.push(path);
         }
         let tracks = targets.iter().map(|t| t.track).chain(midi_tracks).collect();
-        let latency = info.input_latency as i64
-                + info.output_latency as i64
-                + graph
-                + self.record.latency_offset
-                // Varispeed's resampler, in and out.
-                + 2 * i64::from(self.engine.varispeed_delay());
+        // Inputs of a device following another's clock come later (its
+        // ring and resampler): those takes move back by that much more.
+        let devices = self.stream_devices();
+        let later: Vec<(TrackId, i64)> = targets
+            .iter()
+            .filter_map(|t| {
+                let most = (t.first_channel..t.first_channel + t.channels.max(1))
+                    .map(|c| faderframe_audio::channel_input_latency(&devices, &info, c))
+                    .max()?;
+                let more = i64::from(most) - i64::from(info.input_latency);
+                (more != 0).then_some((t.track, more))
+            })
+            .collect();
+        let latency = self.audio_take_latency(&info);
+        self.audio_capture_recording_starts();
         let streams = self
             .engine
             .begin_recording(targets, from, to, self.record.buffer_seconds)?;
@@ -1384,6 +1496,7 @@ impl Session {
             to,
             tracks,
             latency,
+            later,
             seen: false,
             slot: None,
         });
@@ -1493,7 +1606,8 @@ impl Session {
             self.notify(NoticeLevel::Error, format!("recording: {e}"));
         }
         if let Some(slot) = r.slot {
-            return self.finish_slot_recording(slot, outcome, r.midi.as_ref(), r.latency);
+            let latency = ActiveRecording::latency_for(r.latency, &r.later, slot.track);
+            return self.finish_slot_recording(slot, outcome, r.midi.as_ref(), latency);
         }
         let (overruns, _) = self.engine.record_counters();
         let mut commands = Vec::new();
@@ -1545,7 +1659,8 @@ impl Session {
             let passes = take.segments.len();
             let mut new = Vec::new();
             for (k, seg) in take.segments.iter().enumerate() {
-                let offset = seg.file_offset as i64 + r.latency;
+                let offset = seg.file_offset as i64
+                    + ActiveRecording::latency_for(r.latency, &r.later, take.track);
                 // A pass reads `latency` frames past its own: the next
                 // pass's first frames are what was played at its end only
                 // when the next one followed at once (the loop wrapped
@@ -1588,76 +1703,17 @@ impl Session {
             commands.push(Command::AddSource {
                 source: Box::new(source.clone()),
             });
-            let mode = self.record.mode;
-            let folder_name = format!("{track_name} Takes");
-            match self.record.loop_mode {
-                _ if new.len() == 1 => {
-                    let (cmds, clip) = place_takes(p, take.track, &new, mode, &folder_name);
-                    commands.extend(cmds);
-                    placed.extend(clip);
-                }
-                LoopRecordMode::Takes => {
-                    let (cmds, clip) = place_takes(p, take.track, &new, mode, &folder_name);
-                    commands.extend(cmds);
-                    placed.extend(clip);
-                }
-                LoopRecordMode::LastPass => {
-                    // The last complete pass: one cut short by Stop (just
-                    // after a wrap, say) does not throw away the whole
-                    // pass before it; with none complete, the last.
-                    let longest = new.iter().map(|t| t.abs_end - t.abs_start).max();
-                    let keep = longest
-                        .and_then(|l| {
-                            let enough = l - (l / 100).max(64);
-                            new.iter().rposition(|t| t.abs_end - t.abs_start >= enough)
-                        })
-                        .unwrap_or(new.len() - 1);
-                    let last = vec![new.swap_remove(keep)];
-                    let (cmds, clip) = place_takes(p, take.track, &last, mode, &folder_name);
-                    commands.extend(cmds);
-                    placed.extend(clip);
-                }
-                LoopRecordMode::NewTracks => {
-                    // The last pass goes to the armed track (in the record
-                    // mode); earlier passes each get a new, muted track below.
-                    let last = new.split_off(new.len() - 1);
-                    let (cmds, clip) = place_takes(p, take.track, &last, mode, &folder_name);
-                    commands.extend(cmds);
-                    placed.extend(clip);
-                    let template = p.track(take.track).cloned();
-                    // Right under the armed track as the batch has it then:
-                    // pass tracks put in above it for other armed tracks
-                    // moved it down.
-                    let own = p.track_index(take.track).unwrap_or(0);
-                    let above: usize = pass_tracks
-                        .iter()
-                        .filter(|(i, _)| *i < own)
-                        .map(|(_, n)| *n)
-                        .sum();
-                    pass_tracks.push((own, new.len()));
-                    let first = own + above + 1;
-                    for (index, (k, pass)) in (first..).zip(new.into_iter().enumerate()) {
-                        let Some(mut t) = template.clone() else { break };
-                        t.id = p.ids.allocate();
-                        t.name = format!("{track_name} Pass {}", k + 1);
-                        t.clips.clear();
-                        t.sends.clear();
-                        t.inserts.clear();
-                        t.instrument = None;
-                        t.preamp = None;
-                        t.record_arm = false;
-                        t.mute = true;
-                        let new_track = t.id;
-                        commands.push(Command::AddTrack {
-                            track: Box::new(t),
-                            index,
-                        });
-                        let (cmds, _) =
-                            place_takes(p, new_track, &[pass], RecordMode::Replace, &folder_name);
-                        commands.extend(cmds);
-                    }
-                }
-            }
+            let (cmds, clips) = place_passes(
+                p,
+                take.track,
+                &track_name,
+                new,
+                self.record.mode,
+                self.record.loop_mode,
+                &mut pass_tracks,
+            );
+            commands.extend(cmds);
+            placed.extend(clips);
             opened.push((source.id, take.path.clone(), take.peaks));
         }
         for (id, path, peaks) in opened {
@@ -1793,6 +1849,7 @@ impl Session {
                         pitch: None,
                         effects: None,
                         spectral: None,
+                        envelope: None,
                     }),
                 }),
             });

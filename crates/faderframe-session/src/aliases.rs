@@ -14,6 +14,7 @@ use faderframe_timeline::MusicalTime;
 fn content_edits(cmd: &Command, out: &mut Vec<ClipId>) {
     match cmd {
         Command::SetClipContent { clip, .. }
+        | Command::SetClipEnvelope { clip, .. }
         | Command::AddNote { clip, .. }
         | Command::RemoveNote { clip, .. }
         | Command::UpdateNote { clip, .. } => out.push(*clip),

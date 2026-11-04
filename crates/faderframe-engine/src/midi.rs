@@ -18,7 +18,7 @@
 use crate::EngineContext;
 use faderframe_audio_graph::{NodeIo, ProcessContext, Processor};
 use faderframe_core::TrackId;
-use faderframe_midi::{MidiBuffer, MidiEvent, MidiInputQueue, NoteTracker, TimedMidiEvent};
+use faderframe_midi::{Fine, MidiBuffer, MidiEvent, MidiInputQueue, NoteTracker, TimedMidiEvent};
 use faderframe_realtime::ParamSlot;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
@@ -350,16 +350,14 @@ impl MidiInputState {
         let now = q.clock.now_ns();
         let block_ns = frames as f64 * 1e9 / rate.max(1.0);
         while let Ok(raw) = q.consumer.pop() {
-            let Some(event) = raw.event() else { continue };
+            // With its MIDI 2.0 resolution.
+            let Some(event) = raw.timed(0) else { continue };
             let age = now.saturating_sub(raw.time_ns) as f64;
             let at = ((block_ns - age).max(0.0) / block_ns * frames as f64) as usize;
             let offset = at.min(frames - 1) as u32;
             // Older than a block: played now, recorded where it was.
             let early = ((age - block_ns).max(0.0) / block_ns * frames as f64) as u32;
-            if !self
-                .events
-                .push_early(raw.port, TimedMidiEvent::new(offset, event), early)
-            {
+            if !self.events.push_early(raw.port, event.at(offset), early) {
                 dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -391,8 +389,8 @@ impl MidiInputState {
                             out.push_sysex(port, at, bytes);
                         }
                     }
-                    e => {
-                        out.push_early(port, TimedMidiEvent::new(at, e), early);
+                    _ => {
+                        out.push_early(port, ev.at(at), early);
                     }
                 }
             }
@@ -416,6 +414,138 @@ impl MidiFilter {
     }
 }
 
+/// Where a drum map plays each written note: per input channel and key,
+/// the output channel and key (live input and auditioning; clips are
+/// mapped in the timeline snapshot).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteMap {
+    to: Box<[(u8, u8)]>,
+}
+
+impl NoteMap {
+    /// The map's sounds' outputs (keys it has no sound on play as
+    /// written).
+    pub fn from_drum_map(map: &faderframe_project::drum_map::DrumMap) -> Self {
+        let mut to: Vec<(u8, u8)> = (0..16u8)
+            .flat_map(|ch| (0..128u8).map(move |k| (ch, k)))
+            .collect();
+        for s in &map.sounds {
+            for ch in 0..16u8 {
+                to[usize::from(ch) * 128 + usize::from(s.pitch & 127)] = s.output(ch);
+            }
+        }
+        Self {
+            to: to.into_boxed_slice(),
+        }
+    }
+
+    /// A key for the graph node (a map that plays elsewhere is another
+    /// node).
+    pub fn fingerprint(&self) -> u64 {
+        self.to.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, (c, k)| {
+            (h ^ (u64::from(*c) << 8 | u64::from(*k))).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// `ev` as it plays (realtime-safe).
+    #[inline]
+    pub fn apply(&self, ev: MidiEvent) -> MidiEvent {
+        let to = |channel: u8, key: u8| {
+            self.to[usize::from(channel & 15) * 128 + usize::from(key & 127)]
+        };
+        match ev {
+            MidiEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            } => {
+                let (channel, key) = to(channel, key);
+                MidiEvent::NoteOn {
+                    channel,
+                    key,
+                    velocity,
+                }
+            }
+            MidiEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
+                let (channel, key) = to(channel, key);
+                MidiEvent::NoteOff {
+                    channel,
+                    key,
+                    velocity,
+                }
+            }
+            MidiEvent::PolyPressure {
+                channel,
+                key,
+                pressure,
+            } => {
+                let (channel, key) = to(channel, key);
+                MidiEvent::PolyPressure {
+                    channel,
+                    key,
+                    pressure,
+                }
+            }
+            MidiEvent::NoteExpression {
+                channel,
+                key,
+                kind,
+                value,
+            } => {
+                let (channel, key) = to(channel, key);
+                MidiEvent::NoteExpression {
+                    channel,
+                    key,
+                    kind,
+                    value,
+                }
+            }
+            e => e,
+        }
+    }
+}
+
+/// The notes an output sink takes by (channel, key): a drum map's sounds
+/// with an output of their own go to theirs, the rest to the track's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyFilter {
+    keys: [u128; 16],
+    /// Take only those notes (and nothing else); else everything but them.
+    only: bool,
+}
+
+impl KeyFilter {
+    pub fn new(keys: impl IntoIterator<Item = (u8, u8)>, only: bool) -> Self {
+        let mut set = [0u128; 16];
+        for (ch, k) in keys {
+            set[usize::from(ch & 15)] |= 1u128 << (k & 127);
+        }
+        Self { keys: set, only }
+    }
+
+    #[inline]
+    fn takes(&self, ev: MidiEvent) -> bool {
+        let key = match ev {
+            MidiEvent::NoteOn { key, .. }
+            | MidiEvent::NoteOff { key, .. }
+            | MidiEvent::PolyPressure { key, .. }
+            | MidiEvent::NoteExpression { key, .. } => Some(key),
+            _ => None,
+        };
+        match key {
+            Some(k) => {
+                let listed = self.keys[usize::from(ev.channel() & 15)] & (1u128 << (k & 127)) != 0;
+                listed == self.only
+            }
+            None => !self.only,
+        }
+    }
+}
+
 /// A track's live MIDI input and editor auditioning (events out: port 0).
 pub struct MidiInputNode {
     track: u64,
@@ -426,6 +556,8 @@ pub struct MidiInputNode {
     mute: Option<ParamSlot>,
     held: NoteTracker,
     shared: Arc<MidiShared>,
+    /// A drum map's outputs for what is played.
+    notes: Option<NoteMap>,
 }
 
 impl MidiInputNode {
@@ -442,6 +574,7 @@ impl MidiInputNode {
             mute: None,
             held: NoteTracker::default(),
             shared,
+            notes: None,
         }
     }
 }
@@ -451,6 +584,23 @@ impl MidiInputNode {
     pub fn with_mute(mut self, mute: ParamSlot) -> Self {
         self.mute = Some(mute);
         self
+    }
+
+    /// Play what comes in where a drum map says.
+    pub fn with_note_map(mut self, notes: Option<NoteMap>) -> Self {
+        self.notes = notes;
+        self
+    }
+
+    #[inline]
+    fn mapped(&self, ev: TimedMidiEvent) -> TimedMidiEvent {
+        match &self.notes {
+            Some(m) => TimedMidiEvent {
+                event: m.apply(ev.event),
+                ..ev
+            },
+            None => ev,
+        }
     }
 }
 
@@ -481,7 +631,7 @@ impl Processor<EngineContext> for MidiInputNode {
             }
             if port == AUDITION_PORT {
                 if audition {
-                    let _ = out.push(ev);
+                    let _ = out.push(self.mapped(ev));
                 }
                 continue;
             }
@@ -489,6 +639,7 @@ impl Processor<EngineContext> for MidiInputNode {
                 && self.filter.is_some_and(|f| f.accepts(port, ev.event))
                 && !self.shared.consumed.contains(port, ev.event)
             {
+                let ev = self.mapped(ev);
                 self.held.observe(ev.event);
                 let _ = out.push(ev);
             }
@@ -505,11 +656,41 @@ impl Processor<EngineContext> for MidiInputNode {
 /// of this node (`NodeRole::EventOutput`).
 pub struct MidiOutputSink {
     channel: Option<u8>,
+    /// The notes it takes (all when `None`).
+    keys: Option<KeyFilter>,
+    /// The track whose tuning its notes carry (MPE bends or per-note
+    /// pitch; see [`crate::tuning::output_method`]).
+    track: Option<TrackId>,
+    retune: crate::tuning::Retuner,
+    /// A block's events retuned.
+    retuned: MidiBuffer,
 }
 
 impl MidiOutputSink {
     pub fn new(channel: Option<u8>) -> Self {
-        Self { channel }
+        Self {
+            channel,
+            keys: None,
+            track: None,
+            retune: crate::tuning::Retuner::none(),
+            retuned: MidiBuffer::with_capacities(1, 0),
+        }
+    }
+
+    /// Only the notes `keys` takes.
+    pub fn with_keys(mut self, keys: KeyFilter) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Retune the notes as `track`'s tuning says.
+    pub fn with_retune(mut self, track: TrackId, retune: crate::tuning::Retuner) -> Self {
+        if retune.method() != crate::tuning::Method::None {
+            self.track = Some(track);
+            self.retune = retune;
+            self.retuned = MidiBuffer::with_capacity(MidiBuffer::DEFAULT_CAPACITY);
+        }
+        self
     }
 }
 
@@ -559,9 +740,24 @@ fn on_channel(ev: MidiEvent, ch: u8) -> MidiEvent {
 }
 
 impl Processor<EngineContext> for MidiOutputSink {
-    fn process(&mut self, _cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
+    fn process(&mut self, cx: &ProcessContext<'_, EngineContext>, io: &mut NodeIo<'_>) {
         let (Some(input), Some(out)) = (io.events_in.first(), io.events_out.first_mut()) else {
             return;
+        };
+        let input = match self.track {
+            Some(track) => {
+                let tuning = cx.data.timeline.tuning(track);
+                let standard = cx.data.timeline.standard_tuning();
+                if self.retune.wants(tuning, standard) {
+                    self.retuned.clear();
+                    self.retuned.merge_from(input, 0);
+                    self.retune.apply(tuning, standard, &mut self.retuned);
+                    &self.retuned
+                } else {
+                    input
+                }
+            }
+            None => input,
         };
         for ev in input.iter() {
             if matches!(ev.event, MidiEvent::SysEx(_)) {
@@ -569,12 +765,19 @@ impl Processor<EngineContext> for MidiOutputSink {
                 // Note expressions go on: MIDI 2.0 ports send them.
                 continue;
             }
+            if self.keys.as_ref().is_some_and(|k| !k.takes(ev.event)) {
+                continue;
+            }
             let e = match self.channel {
                 Some(ch) => on_channel(ev.event, ch),
                 None => ev.event,
             };
-            let _ = out.push(TimedMidiEvent::new(ev.sample_offset, e));
+            let _ = out.push(TimedMidiEvent { event: e, ..*ev });
         }
+    }
+
+    fn reset(&mut self) {
+        self.retune.reset();
     }
 }
 
@@ -595,6 +798,8 @@ pub struct RecordedMidi {
     /// Contiguous passes (a loop wrap or locate starts a new one).
     pub pass: u32,
     pub event: MidiEvent,
+    /// Its MIDI 2.0 resolution (16-bit velocities, 32-bit controllers).
+    pub fine: Fine,
 }
 
 /// Captures armed tracks' MIDI input on the audio thread.
@@ -658,6 +863,7 @@ impl MidiRecorder {
                         position: at,
                         pass: self.pass,
                         event: ev.event,
+                        fine: ev.fine,
                     };
                     if self.tx.push(rec).is_err() {
                         overruns.fetch_add(1, Ordering::Relaxed);

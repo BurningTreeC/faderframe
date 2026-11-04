@@ -19,8 +19,16 @@ const MIDI_EFFECTS: [&str; 4] = [
     builtin::NOTE_ECHO,
 ];
 
+/// The instruments (their presets are played with notes).
+const INSTRUMENTS: [&str; 4] = [
+    builtin::SYNTH,
+    builtin::WAVETABLE,
+    builtin::FM,
+    builtin::GRANULAR,
+];
+
 /// Every built-in with factory presets.
-const WITH_PRESETS: [&str; 21] = [
+const WITH_PRESETS: [&str; 33] = [
     builtin::COMPRESSOR_76,
     builtin::CHANNEL_STRIP,
     builtin::ARPEGGIATOR,
@@ -42,6 +50,18 @@ const WITH_PRESETS: [&str; 21] = [
     builtin::GUITAR_STATION,
     builtin::TAPE_MACHINE,
     builtin::LEVELER_2A,
+    builtin::DENOISE,
+    builtin::DECLICK,
+    builtin::DEHUM,
+    builtin::DECLIP,
+    builtin::DEREVERB,
+    builtin::CONVOLUTION_REVERB,
+    builtin::MULTIBAND_DYNAMICS,
+    builtin::VOCODER,
+    builtin::WAVETABLE,
+    builtin::FM,
+    builtin::GRANULAR,
+    builtin::PITCH_CORRECT,
 ];
 
 #[test]
@@ -157,6 +177,16 @@ fn factory_programs_replace_all_settings_and_round_trip() {
             assert_eq!(inst.current_program(), Some(index));
             let expected = preset.values(&infos);
             for &(pid, value) in &expected {
+                if kept(id, pid) {
+                    // A learned profile stays as it was.
+                    assert_eq!(
+                        inst.parameter(pid),
+                        Some(f64::from(
+                            infos.iter().find(|p| p.id == pid).unwrap().max as f32
+                        ))
+                    );
+                    continue;
+                }
                 assert_eq!(
                     inst.parameter(pid),
                     Some(f64::from(value as f32)),
@@ -286,6 +316,7 @@ pub(crate) fn render(
                 builtin::COMPRESSOR => pid == crate::devices::compressor::id::EXTERNAL,
                 builtin::GATE => pid == crate::devices::gate::id::EXTERNAL,
                 builtin::CHANNEL_STRIP => pid == crate::devices::channel_strip::id::EXTERNAL,
+                builtin::MULTIBAND_DYNAMICS => pid == crate::devices::multiband::id::EXTERNAL,
                 builtin::EQ => (0..crate::eq::BANDS)
                     .any(|b| pid == crate::eq::band_id(b, crate::eq::Field::Key).0),
                 _ => false,
@@ -431,7 +462,7 @@ fn every_preset_sounds_and_stays_in_bounds() {
                 continue;
             }
             let name = preset.name;
-            let instrument = id == builtin::SYNTH;
+            let instrument = INSTRUMENTS.contains(&id);
             let r = if instrument {
                 render(id, i, &input, &key, &CHORD, 7.0)
             } else {
@@ -510,7 +541,7 @@ fn audition() {
     {
         println!("== {id}");
         for (i, preset) in factory_presets(id).iter().enumerate() {
-            let instrument = id == builtin::SYNTH;
+            let instrument = INSTRUMENTS.contains(&id);
             let r = if instrument {
                 render(id, i, &input, &key, &CHORD, 8.0)
             } else {
@@ -657,6 +688,68 @@ fn the_synth_presets_are_balanced() {
         );
         if (level - TARGET).abs() > 1.5 || peak > -1.0 {
             wrong.push(preset.name);
+        }
+    }
+    assert!(wrong.is_empty(), "unbalanced: {wrong:?}");
+}
+
+/// The notes a preset of the Wavetable, FM or Granular is judged by, as
+/// the Synth's: one note for a mono patch (a bass C2, else C4), a
+/// four-note chord for a poly one, held until its attacks are over and a
+/// second more.
+fn poly_notes(id: &str, preset: &FactoryPreset) -> (Vec<(u8, f64, f64)>, f64) {
+    use crate::devices::poly::id;
+    let values = preset.values(&parameters(id));
+    let get = |pid: u32| {
+        values
+            .iter()
+            .find(|(p, _)| p.0 == pid)
+            .map_or(0.0, |(_, v)| *v)
+    };
+    let mut attack = get(id::ATTACK);
+    if id == builtin::FM {
+        use crate::devices::fm::id::{OP_ATTACK, op};
+        for k in 0..6 {
+            attack = attack.max(get(op(k, OP_ATTACK)));
+        }
+    }
+    let hold = 1.0 + attack * 0.001;
+    let notes = if get(id::VOICE_MODE) >= 0.5 {
+        let key = if preset.name.contains("Bass") { 36 } else { 60 };
+        vec![(key, 0.0, hold)]
+    } else {
+        [48, 52, 55, 60].iter().map(|&k| (k, 0.0, hold)).collect()
+    };
+    (notes, hold + 0.5)
+}
+
+/// The Wavetable's, the FM's and the Granular's patches sit at the
+/// Synth's loudness (−18 LUFS momentary at most, played as meant) and
+/// keep a decibel of headroom.
+#[test]
+fn the_new_instruments_presets_are_balanced() {
+    const TARGET: f64 = -18.0;
+    let (input, key) = material(0.1);
+    let mut wrong = Vec::new();
+    for id in [builtin::WAVETABLE, builtin::FM, builtin::GRANULAR] {
+        for (i, preset) in factory_presets(id).iter().enumerate() {
+            let (notes, seconds) = poly_notes(id, preset);
+            let r = render(id, i, &input, &key, &notes, seconds);
+            let level = momentary_max(&r.out);
+            let peak = peak_db(&r.out[0]).max(peak_db(&r.out[1]));
+            let volume = preset
+                .values(&parameters(id))
+                .iter()
+                .find(|(p, _)| p.0 == crate::devices::poly::id::VOLUME)
+                .map_or(0.0, |(_, v)| *v);
+            println!(
+                "{id:24} {:20} {level:6.1} LUFS  peak {peak:6.1}  volume {volume:+5.1} → {:+5.1}",
+                preset.name,
+                volume + TARGET - level
+            );
+            if (level - TARGET).abs() > 1.5 || peak > -1.0 {
+                wrong.push(format!("{id} {}", preset.name));
+            }
         }
     }
     assert!(wrong.is_empty(), "unbalanced: {wrong:?}");

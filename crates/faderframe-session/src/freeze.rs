@@ -253,6 +253,7 @@ impl Session {
                         pitch: None,
                         effects: None,
                         spectral: None,
+                        envelope: None,
                     }),
                 }),
             });
@@ -302,6 +303,7 @@ impl Session {
             | Command::MoveClip { .. }
             | Command::RemoveClip { .. }
             | Command::SetClipContent { .. }
+            | Command::SetClipEnvelope { .. }
             | Command::SetClipMuted { .. }
             | Command::SplitClip { .. }
             | Command::AddNote { .. }
@@ -318,6 +320,7 @@ impl Session {
             }
             Command::RemoveClip { clip }
             | Command::SetClipContent { clip, .. }
+            | Command::SetClipEnvelope { clip, .. }
             | Command::SetClipMuted { clip, .. }
             | Command::SplitClip { clip, .. }
             | Command::AddNote { clip, .. }
@@ -328,6 +331,12 @@ impl Session {
             | Command::SetPreamp { track, .. }
             | Command::SetInstrument { track, .. }
             | Command::SetPluginState { track, .. } => frozen(Some(*track)),
+            // Its own tuning is in its frozen audio (the project's moves
+            // only what plays live).
+            Command::SetTuning {
+                track: Some(track), ..
+            }
+            | Command::SetTrackRetune { track, .. } => frozen(Some(*track)),
             // A rearrangement of the song (section moves, conform, material
             // brought back from a pad) that would move a frozen track's
             // clips or automation: its frozen audio would stay where it

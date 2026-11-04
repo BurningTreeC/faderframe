@@ -1216,8 +1216,71 @@ fn a_strip_feeding_a_bed_pans_in_the_room() {
     let (actions, _) = run(&mut view, down(c, 2), size, &s);
     assert!(matches!(actions[..], [Action::ShowSurroundPanner(id)] if id == pluck));
     let formats = s.format_choices(pluck);
-    assert_eq!(formats.len(), 2 + SurroundFormat::ALL.len());
+    assert_eq!(
+        formats.len(),
+        2 + SurroundFormat::ALL.len() + faderframe_core::AmbiOrder::ALL.len()
+    );
     assert!(formats.iter().any(|f| f.label.starts_with("7.1.4")));
+}
+
+/// A strip feeding an ambisonic field shows its direction on the circle
+/// (no pan knob): a drag across turns it, the field's own strip reads its
+/// order.
+#[test]
+fn a_strip_into_a_field_shows_its_direction() {
+    use faderframe_core::{AmbiOrder, ChannelLayout};
+    let mut s = session();
+    let master = s.project().master_id().unwrap();
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: master,
+        layout: ChannelLayout::Ambisonic(AmbiOrder::Third),
+    }))
+    .unwrap();
+    let pluck = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Pluck")
+        .unwrap()
+        .id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1400.0, 760.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"FIELD"), "{:?}", p.texts());
+    let i = MixerView::channel_tracks(&s)
+        .iter()
+        .position(|t| t.id == pluck)
+        .unwrap();
+    let t = s.project().track(pluck).unwrap();
+    let l = view.layout_for(view.strip_rect(i, size), t, s.project());
+    let c = l.pan_knob.center();
+    let tip = view.tooltip(c, size, &s).unwrap_or_default();
+    assert!(tip.contains("AmbiX 3"), "{tip}");
+    let (actions, _) = run(&mut view, down(c, 1), size, &s);
+    assert!(
+        matches!(actions[..], [Action::BeginGesture(_)]),
+        "{actions:?}"
+    );
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(c.x - l.pan_knob.w * 0.25, c.y),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    match &actions[..] {
+        [Action::Edit(Command::SetTrackSurround { track, pan })] => {
+            assert_eq!(*track, pluck);
+            // A quarter of the width to the left: a quarter turn left.
+            assert!((pan.azimuth - 90.0).abs() < 1e-3, "{pan:?}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// The master's record slot is its mono check; its menu chooses how it is
@@ -2534,4 +2597,327 @@ fn the_strip_menu_chooses_the_time_base() {
     assert!(s.is_time_locked(t.id));
     let t = s.project().track(t.id).unwrap().clone();
     assert_eq!(menu(&s, &t)[1].checked, Some(true));
+}
+
+/// The strip menu's Mix Scenes: store, recall each, the track safe from
+/// each scene, the view.
+#[test]
+fn the_strip_menu_stores_and_recalls_mix_scenes() {
+    use faderframe_session::scenes::SceneOp;
+    let mut s = session();
+    let t = MixerView::channel_tracks(&s)[0].clone();
+    let menu = |s: &Session, t: &Track| {
+        let HostRequest::ContextMenu { items, .. } =
+            MixerView::track_menu(s, t, Point::new(0.0, 0.0))
+        else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Mix Scenes")
+            .unwrap()
+            .children
+    };
+    let items = menu(&s, &t);
+    assert_eq!(items[0].label, "Store Mix Scene");
+    s.dispatch(items[0].action.clone().unwrap()).unwrap();
+    let scene = s.mix_scenes().scenes[0].clone();
+    let items = menu(&s, &t);
+    let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+    let recall = format!("Recall ‘{}’", scene.name);
+    let safe = format!("‘{}’ Safe from ‘{}’", t.name, scene.name);
+    assert!(labels.contains(&recall.as_str()), "{labels:?}");
+    assert!(labels.contains(&"Show Mix Scenes"));
+    let entry = items.iter().find(|i| i.label == safe).unwrap();
+    assert_eq!(entry.checked, Some(false));
+    assert_eq!(
+        entry.action,
+        Some(Action::MixScene(SceneOp::SetSafe {
+            scene: scene.id,
+            track: t.id,
+            safe: true
+        }))
+    );
+    s.dispatch(entry.action.clone().unwrap()).unwrap();
+    assert!(s.mix_scenes().scenes[0].safe.contains(&t.id));
+}
+
+/// A saved session (its cache folder in the temp folder) with one short
+/// loop through a utility, self-freezing on for every chain.
+fn small_session(name: &str) -> (Session, TrackId, std::path::PathBuf) {
+    use faderframe_project::{
+        AudioClip, AudioSource, Clip, ClipContent, ClipFades, PluginRef, PluginSlot, Project,
+        SourceSpec, StretchSettings, TrackColor,
+    };
+    let dir =
+        std::env::temp_dir().join(format!("ff-view-self-freeze-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut p = Project::new("Small", 48_000);
+    let source = p.ids.allocate();
+    p.sources.insert(
+        source,
+        AudioSource {
+            id: source,
+            name: "Tone".into(),
+            spec: SourceSpec::Generated {
+                generator: faderframe_audio_files::GeneratorSpec::Sine {
+                    frequency: 220.0,
+                    seconds: 1.0,
+                    amplitude: 0.5,
+                },
+            },
+        },
+    );
+    let id: TrackId = p.ids.allocate();
+    let clip = p.ids.allocate();
+    let mut t = Track::new(id, TrackKind::Audio, "Loop", TrackColor::palette(0));
+    t.inserts.push(PluginSlot {
+        id: p.ids.allocate(),
+        plugin: PluginRef::builtin(faderframe_core::builtin::GAIN, "Utility"),
+        bypass: false,
+        parameters: Vec::new(),
+        state: None,
+        sidechain: None,
+    });
+    t.clips.push(clip);
+    let at = p.tracks.len() - 1;
+    p.tracks.insert(at, t);
+    p.clips.insert(
+        clip,
+        Clip {
+            id: clip,
+            track: id,
+            name: "Tone".into(),
+            color: None,
+            start: faderframe_timeline::MusicalTime::ZERO,
+            muted: false,
+            content: ClipContent::Audio(AudioClip {
+                source,
+                source_offset: 0,
+                length: 48_000,
+                gain_db: 0.0,
+                fades: ClipFades::default(),
+                stretch: StretchSettings::Off,
+                reversed: false,
+                warp: None,
+                pitch: None,
+                effects: None,
+                spectral: None,
+                envelope: None,
+            }),
+        },
+    );
+    let mut s = Session::new(p, None, faderframe_engine::EngineConfig::default()).unwrap();
+    s.save_as(&dir.join("small.ffproj")).unwrap();
+    s.set_self_freeze(faderframe_session::self_freeze::SelfFreezeSettings {
+        min_cost_percent: 0.0,
+        mode: faderframe_session::self_freeze::SelfFreezeMode::Always,
+        ..Default::default()
+    });
+    s.self_freeze_now();
+    (s, id, dir)
+}
+
+/// Self-freezing on a strip: the menu keeps a track live, a cached track's
+/// inserts say so, an insert's menu keeps its plugin's tracks live.
+#[test]
+fn a_strip_shows_and_chooses_self_freezing() {
+    let (mut s, t, dir) = small_session("mixer");
+    let track = s.project().track(t).unwrap().clone();
+    let HostRequest::ContextMenu { items, .. } =
+        MixerView::track_menu(&s, &track, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let auto = items
+        .into_iter()
+        .find(|i| i.label == "Self-Freeze")
+        .unwrap()
+        .children;
+    let labels: Vec<_> = auto.iter().map(|i| (i.label.as_str(), i.checked)).collect();
+    assert_eq!(
+        labels,
+        vec![("Automatic", Some(true)), ("Keep Live", Some(false))]
+    );
+    assert_eq!(
+        auto[1].action,
+        Some(Action::Edit(Command::SetTrackSelfFreeze {
+            track: t,
+            off: true
+        }))
+    );
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1000.0, 760.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"INSERTS"));
+    assert!(s.wait_for_self_freeze(std::time::Duration::from_secs(120)));
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"INSERTS · CACHED"), "{:?}", p.texts());
+    // The insert's menu: keep the utility's tracks live.
+    let l = view.layout_of(&s, t, size).unwrap();
+    let slot = l.inserts.unwrap()[0];
+    let (_, req) = run(&mut view, right(slot.center()), size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req
+        .into_iter()
+        .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+    else {
+        panic!("the insert menu")
+    };
+    let keep = items
+        .into_iter()
+        .find(|i| i.label == "Keep Tracks Using This Plugin Live")
+        .unwrap();
+    assert_eq!(keep.checked, Some(false));
+    s.dispatch(keep.action.unwrap()).unwrap();
+    assert!(s.plugin_kept_live(faderframe_core::builtin::GAIN));
+    s.tick(0.01);
+    s.tick(0.01);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    assert!(p.texts().contains(&"INSERTS"), "live again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_audio_strips_menu_separates_its_stems() {
+    use faderframe_session::separate::{Stem, StemTarget};
+    let s = Session::demo(EngineConfig::default()).unwrap();
+    let menu = |t: &Track| {
+        let HostRequest::ContextMenu { items, .. } =
+            MixerView::track_menu(&s, t, Point::new(0.0, 0.0))
+        else {
+            panic!("a menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Separate Stems")
+            .map(|i| i.children)
+    };
+    let pad = s.project().tracks.iter().find(|t| t.name == "Pad").unwrap();
+    let items = menu(pad).unwrap();
+    let remove = items
+        .iter()
+        .find(|i| i.label == "Remove Vocals (Instrumental)")
+        .unwrap();
+    assert_eq!(
+        remove.action,
+        Some(Action::SeparateStems {
+            target: StemTarget::Track(pad.id),
+            model: None,
+            stems: vec![Stem::Instrumental],
+        })
+    );
+    // Buses have no clips to separate.
+    let bus = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Bus)
+        .unwrap();
+    assert!(menu(bus).is_none());
+}
+
+/// An insert bound to ARA says so in its menu, and the entry lets it go
+/// (an insert that is no ARA plug-in shows none).
+#[test]
+fn an_inserts_menu_shows_its_ara_binding() {
+    let mut s = session();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Gain"),
+    })
+    .unwrap();
+    let slot = s.project().track(t).unwrap().inserts[0].id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1600.0, 760.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let menu = |view: &mut MixerView, s: &Session| {
+        let l = view.layout_of(s, t, size).unwrap();
+        let at = l.inserts.unwrap()[0];
+        let (_, req) = run(view, right(at.center()), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("the insert menu")
+        };
+        items
+    };
+    let ara = |items: Vec<MenuItem<Action>>| items.into_iter().find(|i| i.label.contains("ARA"));
+    assert!(ara(menu(&mut view, &s)).is_none(), "no ARA plug-in");
+    s.edit(Command::SetAraSlot { slot, on: true }).unwrap();
+    let entry = ara(menu(&mut view, &s)).unwrap();
+    assert_eq!(entry.label, "Render the Track's Clips (ARA)");
+    assert_eq!(entry.checked, Some(true));
+    assert_eq!(
+        entry.action,
+        Some(Action::Edit(Command::SetAraSlot { slot, on: false }))
+    );
+    // Not an ARA plug-in: it plays as an ordinary insert.
+    assert!(s.ara_rendered_tracks().is_empty());
+}
+
+/// An instrument strip's menu chooses the tuning it plays and how its
+/// plugins are retuned; an audio strip has no tuning.
+#[test]
+fn an_instrument_strip_chooses_its_tuning_and_retuning() {
+    use faderframe_project::tuning::Tuning;
+    let s = session();
+    let of = |kind: TrackKind| {
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.kind == kind)
+            .unwrap()
+            .clone()
+    };
+    let keys = of(TrackKind::Instrument);
+    let HostRequest::ContextMenu { items, .. } =
+        MixerView::track_menu(&s, &keys, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let tuning = items
+        .into_iter()
+        .find(|i| i.label == "Tuning")
+        .unwrap()
+        .children;
+    assert!(tuning[0].label.starts_with("Project Tuning"));
+    assert_eq!(tuning[0].checked, Some(true));
+    let edo = tuning.iter().find(|i| i.label == "19-EDO").unwrap();
+    assert_eq!(
+        edo.action,
+        Some(Action::Edit(Command::SetTuning {
+            track: Some(keys.id),
+            tuning: Some(Tuning::equal(19)),
+        }))
+    );
+    let retune = tuning.iter().find(|i| i.label == "Retune Plugins").unwrap();
+    assert!(
+        retune
+            .children
+            .iter()
+            .any(|i| i.label == "Automatic" && i.checked == Some(true))
+    );
+    let audio = of(TrackKind::Audio);
+    let HostRequest::ContextMenu { items, .. } =
+        MixerView::track_menu(&s, &audio, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    assert!(items.iter().all(|i| i.label != "Tuning"));
 }

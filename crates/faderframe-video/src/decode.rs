@@ -9,16 +9,17 @@ use gst_video::prelude::*;
 use std::path::Path;
 use std::time::Duration;
 
-/// A frame in video memory ([`crate::zero_copy`], Linux).
-#[cfg(target_os = "linux")]
+/// A frame in video memory ([`crate::zero_copy`]: a dmabuf on Linux, a
+/// D3D12 texture on Windows).
+#[cfg(any(target_os = "linux", windows))]
 pub type Gpu = crate::zero_copy::GpuFrame;
 /// No frames in video memory here.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Gpu {}
 
 /// A decoded frame: rows of RGBA (opaque), `width * 4` bytes each — or,
-/// from a zero-copy decoder, a dmabuf (`gpu`, `rgba` empty).
+/// from a zero-copy decoder, in video memory (`gpu`, `rgba` empty).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
@@ -142,6 +143,29 @@ impl Decoder {
             .build();
         let mut d = Self::open_with(path, width, height, convert, caps, false)?;
         d.map = map;
+        Ok(d)
+    }
+
+    /// Open `path`'s picture converted into D3D12 textures of RGBA at
+    /// `width`×`height` (GStreamer's `d3d12convert` scales and converts on
+    /// the GPU, whatever decoded it; see [`crate::zero_copy`]).
+    #[cfg(windows)]
+    pub fn open_d3d12(path: &Path, width: u32, height: u32) -> Result<Self> {
+        let convert = make("d3d12convert")?;
+        let caps = crate::zero_copy::caps_for(width, height);
+        let d = Self::open_with(path, width, height, convert, caps, true)?;
+        let caps = d
+            .sink
+            .static_pad("sink")
+            .and_then(|p| p.current_caps())
+            .ok_or_else(|| VideoError::Unavailable("nothing negotiated".into()))?;
+        if !caps
+            .features(0)
+            .is_some_and(|f| f.contains(crate::zero_copy::D3D12_MEMORY))
+        {
+            return Err(VideoError::Unavailable(format!("negotiated {caps}")));
+        }
+        tracing::debug!("{}: frames in D3D12 textures: {caps}", path.display());
         Ok(d)
     }
 
@@ -293,6 +317,25 @@ impl Decoder {
                 .ok_or_else(|| VideoError::Gst("a sample without a frame".into()))?;
             let gpu = crate::zero_copy::GpuFrame::of(&owned, &info)
                 .ok_or_else(|| VideoError::Gst("a frame that is not in dmabufs".into()))?;
+            return Ok(Frame {
+                width: info.width(),
+                height: info.height(),
+                time,
+                rgba: Vec::new(),
+                gpu: Some(gpu),
+            });
+        }
+        #[cfg(windows)]
+        if caps
+            .features(0)
+            .is_some_and(|f| f.contains(crate::zero_copy::D3D12_MEMORY))
+        {
+            let info = gst_video::VideoInfo::from_caps(caps)?;
+            let owned = sample
+                .buffer_owned()
+                .ok_or_else(|| VideoError::Gst("a sample without a frame".into()))?;
+            let gpu = crate::zero_copy::GpuFrame::of(&owned, &info)
+                .ok_or_else(|| VideoError::Gst("a frame that is not in a texture".into()))?;
             return Ok(Frame {
                 width: info.width(),
                 height: info.height(),

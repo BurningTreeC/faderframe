@@ -36,6 +36,75 @@ impl LoopRange {
     }
 }
 
+/// A planned jump: when playback reaches timeline sample `at` it goes on
+/// from `to`, the loop as `then_loop` says from then on (an interactive
+/// score's transition: sample-accurate, and predicted by the render-ahead
+/// tiers like a loop wrap). `to == at` jumps nowhere and only changes the
+/// loop on that frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cue {
+    pub at: i64,
+    pub to: i64,
+    /// The loop range and switch from then on (`None`: as they are).
+    pub then_loop: Option<(Option<LoopRange>, bool)>,
+}
+
+/// Jumps planned at most at once.
+pub const MAX_CUES: usize = 2;
+
+/// Planned jumps in the order they come ([`TransportCommand::SetCues`]):
+/// only the first is armed; the next one is armed once it has been taken.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cues {
+    list: [Option<Cue>; MAX_CUES],
+}
+
+impl Cues {
+    pub const NONE: Cues = Cues {
+        list: [None; MAX_CUES],
+    };
+
+    /// The first [`MAX_CUES`] of `cues`, in order.
+    pub fn new(cues: &[Cue]) -> Self {
+        let mut list = [None; MAX_CUES];
+        for (slot, c) in list.iter_mut().zip(cues) {
+            *slot = Some(*c);
+        }
+        Self { list }
+    }
+
+    /// The armed cue.
+    pub fn first(&self) -> Option<Cue> {
+        self.list[0]
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.iter().filter(|c| c.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.list[0].is_none()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Cue> + '_ {
+        self.list.iter().map_while(|c| *c)
+    }
+
+    fn pop(&mut self) {
+        self.list.rotate_left(1);
+        self.list[MAX_CUES - 1] = None;
+    }
+}
+
+/// The loop and the planned jumps: what a loop change hands the
+/// render-ahead tiers to take on at a frame (see [`TransportState::plan`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopPlan {
+    pub range: Option<LoopRange>,
+    pub enabled: bool,
+    pub cues: Cues,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportCommand {
     Play,
@@ -61,6 +130,9 @@ pub enum TransportCommand {
     /// ends a block there). Play while counting changes nothing, Stop (and
     /// TogglePlay) cancels it. 0 frames: Play.
     PlayAfterCountIn(u64),
+    /// Plan jumps (replacing those planned): see [`Cue`]. A locate, a stop
+    /// or a scrub forgets them.
+    SetCues(Cues),
 }
 
 /// A scrub snippet in progress.
@@ -100,6 +172,10 @@ pub struct TransportState {
     /// Frames of a count-in left before playback starts (0: none; see
     /// [`TransportCommand::PlayAfterCountIn`]).
     count_in: u64,
+    /// Jumps planned ([`TransportCommand::SetCues`]).
+    cues: Cues,
+    /// Cues taken so far (wrapping).
+    cues_taken: u32,
 }
 
 impl TransportState {
@@ -147,6 +223,32 @@ impl TransportState {
         self.loop_enabled = enabled;
     }
 
+    /// The jumps planned.
+    pub fn cues(&self) -> Cues {
+        self.cues
+    }
+
+    /// How many planned jumps have been taken (wrapping).
+    pub fn cues_taken(&self) -> u32 {
+        self.cues_taken
+    }
+
+    /// The loop and the jumps planned (what a loop change amends).
+    pub fn plan(&self) -> LoopPlan {
+        LoopPlan {
+            range: self.loop_range,
+            enabled: self.loop_enabled,
+            cues: self.cues,
+        }
+    }
+
+    /// Take on a loop and planned jumps at once (as [`Self::set_loop`] and
+    /// [`TransportCommand::SetCues`]): never a discontinuity.
+    pub fn set_plan(&mut self, plan: LoopPlan) {
+        self.set_loop(plan.range, plan.enabled);
+        self.cues = plan.cues;
+    }
+
     /// How often playback has jumped (stop, locate, scrub): loop wraps are
     /// not jumps. Wraps around.
     pub fn jumps(&self) -> u32 {
@@ -162,6 +264,8 @@ impl TransportState {
         self.discontinuity = true;
         self.jumps = self.jumps.wrapping_add(1);
         self.jumped_to = self.position;
+        // What was planned from where it was is void.
+        self.cues = Cues::NONE;
     }
 
     /// Playing a scrub snippet (not normal playback).
@@ -270,7 +374,17 @@ impl TransportState {
             }
             TransportCommand::SetLoopEnabled(on) => self.loop_enabled = on,
             TransportCommand::SetRecording(on) => self.recording = on,
+            TransportCommand::SetCues(cues) => self.cues = cues,
         }
+    }
+
+    /// The armed cue while playback runs normally (not counting in, not
+    /// scrubbing) and it lies ahead.
+    fn cue_ahead(&self) -> Option<Cue> {
+        if !self.playing || self.count_in > 0 || self.scrub.is_some() {
+            return None;
+        }
+        self.cues.first().filter(|c| c.at > self.position)
     }
 
     /// How many of the next `max` frames can be processed before the loop
@@ -283,20 +397,26 @@ impl TransportState {
         if let Some(s) = self.scrub {
             return (s.left as usize).clamp(1, max.max(1));
         }
+        let mut n = max;
         if self.playing
             && self.loop_enabled
             && let Some(lr) = self.loop_range
             && self.position < lr.end
         {
-            return ((lr.end - self.position) as usize).clamp(1, max.max(1));
+            n = ((lr.end - self.position) as usize).clamp(1, max.max(1));
         }
-        max
+        if let Some(c) = self.cue_ahead() {
+            n = n.min(((c.at - self.position) as usize).clamp(1, max.max(1)));
+        }
+        n
     }
 
     /// Advance after processing `frames` frames. Returns `true` if the
-    /// playhead wrapped to the loop start. Counting in, the frames count
-    /// the count-in down (the position stands); at its end playback starts
-    /// (not a jump, as Play from stop is not).
+    /// playhead wrapped to the loop start or took a planned jump (a cue
+    /// wins over a loop end on the same frame; neither counts as a jump).
+    /// Counting in, the frames count the count-in down (the position
+    /// stands); at its end playback starts (not a jump, as Play from stop
+    /// is not).
     pub fn advance(&mut self, frames: usize) -> bool {
         if self.count_in > 0 {
             self.count_in = self.count_in.saturating_sub(frames as u64);
@@ -327,6 +447,22 @@ impl TransportState {
                     }
                 }
                 self.jumped();
+            }
+            return false;
+        }
+        if let Some(c) = self.cues.first()
+            && before < c.at
+            && self.position >= c.at
+        {
+            self.position = c.to + (self.position - c.at);
+            if let Some((range, enabled)) = c.then_loop {
+                self.set_loop(range, enabled);
+            }
+            self.cues.pop();
+            self.cues_taken = self.cues_taken.wrapping_add(1);
+            if c.to != c.at {
+                self.discontinuity = true;
+                return true;
             }
             return false;
         }
@@ -426,6 +562,8 @@ pub struct TransportShared {
     counting_in: AtomicU64,
     jumps: AtomicU32,
     jumped_to: AtomicI64,
+    cues_taken: AtomicU32,
+    cues_waiting: AtomicU32,
 }
 
 /// What the UI reads.
@@ -450,6 +588,10 @@ pub struct TransportSnapshot {
     /// Where the newest of them went ([`TransportState::jumped_to`]): a
     /// stop's is where it stopped, a locate's its target.
     pub jumped_to: i64,
+    /// Planned jumps taken so far ([`TransportState::cues_taken`]).
+    pub cues_taken: u32,
+    /// Planned jumps still waiting.
+    pub cues_waiting: u32,
 }
 
 impl TransportSnapshot {
@@ -472,6 +614,9 @@ impl TransportShared {
         self.scrubbing.store(scrubbing, Ordering::Relaxed);
         self.counting_in.store(state.count_in, Ordering::Relaxed);
         self.jumped_to.store(state.jumped_to, Ordering::Relaxed);
+        self.cues_taken.store(state.cues_taken, Ordering::Relaxed);
+        self.cues_waiting
+            .store(state.cues.len() as u32, Ordering::Relaxed);
         self.jumps.store(state.jumps, Ordering::Release);
     }
 
@@ -486,6 +631,8 @@ impl TransportShared {
             counting_in: self.counting_in.load(Ordering::Relaxed),
             jumps: self.jumps.load(Ordering::Acquire),
             jumped_to: self.jumped_to.load(Ordering::Relaxed),
+            cues_taken: self.cues_taken.load(Ordering::Relaxed),
+            cues_waiting: self.cues_waiting.load(Ordering::Relaxed),
         }
     }
 }
@@ -656,6 +803,79 @@ mod tests {
         assert_eq!(t.position(), 100);
         assert!(t.take_discontinuity());
         assert_eq!(t.frames_until_wrap(64), 64);
+    }
+
+    #[test]
+    fn planned_jumps_land_on_their_frames_and_change_the_loop() {
+        let mut t = TransportState::default();
+        t.apply(TransportCommand::SetLoopRange(LoopRange::new(1000, 2000)));
+        t.apply(TransportCommand::SetLoopEnabled(true));
+        t.apply(TransportCommand::Locate(1900));
+        t.apply(TransportCommand::Play);
+        t.take_discontinuity();
+        // A jump on the loop's end (it wins over the wrap) to 5000, which
+        // loops 5000–6000 from then on; then a jump at 5500 back to 1200.
+        t.apply(TransportCommand::SetCues(Cues::new(&[
+            Cue {
+                at: 2000,
+                to: 5000,
+                then_loop: Some((LoopRange::new(5000, 6000), true)),
+            },
+            Cue {
+                at: 5500,
+                to: 1200,
+                then_loop: None,
+            },
+        ])));
+        assert_eq!(t.cues().len(), 2);
+        assert_eq!(t.frames_until_wrap(512), 100);
+        assert!(t.advance(100));
+        assert_eq!(t.position(), 5000);
+        assert!(t.take_discontinuity());
+        assert_eq!(t.loop_range(), LoopRange::new(5000, 6000));
+        assert_eq!((t.cues_taken(), t.cues().len()), (1, 1));
+        assert_eq!(t.jumps(), 1, "only the locate: cues are not jumps");
+        assert_eq!(t.frames_until_wrap(1024), 500);
+        assert!(t.advance(500));
+        assert_eq!(t.position(), 1200);
+        assert_eq!(t.loop_range(), LoopRange::new(5000, 6000), "kept");
+        assert!(t.cues().is_empty());
+        // A cue behind the position waits for the next time round.
+        t.apply(TransportCommand::Locate(5100));
+        t.apply(TransportCommand::SetCues(Cues::new(&[Cue {
+            at: 5050,
+            to: 100,
+            then_loop: Some((None, false)),
+        }])));
+        assert_eq!(t.frames_until_wrap(4096), 900, "the loop's end first");
+        t.advance(900);
+        assert_eq!(t.position(), 5000);
+        assert_eq!(t.frames_until_wrap(4096), 50);
+        t.advance(60);
+        assert_eq!(t.position(), 110);
+        assert!(!t.looping());
+        // A cue that jumps nowhere only changes the loop, no discontinuity.
+        t.take_discontinuity();
+        t.apply(TransportCommand::SetCues(Cues::new(&[Cue {
+            at: 200,
+            to: 200,
+            then_loop: Some((LoopRange::new(0, 400), true)),
+        }])));
+        assert!(!t.advance(100));
+        assert!(!t.take_discontinuity());
+        assert_eq!(t.position(), 210);
+        assert!(t.looping());
+        // A locate or a stop forgets what was planned.
+        t.apply(TransportCommand::SetCues(Cues::new(&[Cue {
+            at: 300,
+            to: 0,
+            then_loop: None,
+        }])));
+        t.apply(TransportCommand::Locate(250));
+        assert!(t.cues().is_empty());
+        let shared = TransportShared::default();
+        shared.publish(&t);
+        assert_eq!(shared.snapshot().cues_taken, 4);
     }
 
     #[test]

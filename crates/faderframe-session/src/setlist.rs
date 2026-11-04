@@ -6,13 +6,15 @@
 //! unless it plays on; then the show stands on the next song, and plays it
 //! after the gap when the song says so. Next and Previous move along the
 //! list (while playing: the next song at once). Show mode is not saved.
+//! Standing on a song recalls its mix scene and changes its external gear
+//! (see [`crate::show_gear`]).
 //!
 //! [`EngineController::stop_at`]: faderframe_engine::EngineController::stop_at
 
 use crate::{NoticeLevel, Result, Session, SessionError, TransportAction};
 use faderframe_core::SectionId;
 use faderframe_project::Command;
-use faderframe_project::setlist::{AfterSong, SetSong, Setlist};
+use faderframe_project::setlist::{AfterSong, GearTiming, SetSong, Setlist, SongGear};
 use faderframe_timeline::MusicalTime;
 use std::time::{Duration, Instant};
 
@@ -37,7 +39,34 @@ pub enum SetlistOp {
     Rename(usize, String),
     Then(usize, AfterSong),
     Notes(usize, String),
+    /// The mix scene recalled when the show stands on the song (`None`:
+    /// none).
+    Scene(usize, Option<faderframe_core::MixSceneId>),
     Clear,
+    /// A song's gear changes, replaced.
+    Gear(usize, SongGear),
+    /// A song's gear changes from text (`SongGear::to_text`'s form;
+    /// outputs not named go to the song's default one).
+    GearText(usize, String),
+    /// When a song's gear changes go out.
+    GearTiming(usize, GearTiming),
+    /// A song's program change (0-based) with a bank, on the default
+    /// output's channel 1 (replacing the one there).
+    GearProgram {
+        song: usize,
+        program: u8,
+        bank: Option<u16>,
+    },
+    /// Add the SysEx messages of a `.syx` file (patch dumps).
+    GearSysexFile(usize, std::path::PathBuf),
+    /// Add a snapshot of the controllers a track's clips set by the
+    /// song's start.
+    GearSnapshot {
+        song: usize,
+        track: faderframe_core::TrackId,
+    },
+    /// Ask the shell for a `.syx` file for a song's gear.
+    ChooseGearSysex(usize),
 }
 
 /// Show mode's controls.
@@ -53,6 +82,8 @@ pub enum ShowOp {
     Previous,
     /// Play the song stood on, or stop.
     PlayStop,
+    /// Send a song's gear changes now (whatever their timing).
+    SendGear(usize),
 }
 
 /// Show mode as it runs (not saved).
@@ -69,6 +100,8 @@ pub struct ShowState {
     stop_armed: Option<i64>,
     /// The song's end was seen while playing (a stop on it is the song's).
     playing_song: Option<usize>,
+    /// Gear changes timed for songs' first frames.
+    pub(crate) gear: crate::show_gear::GearPlayback,
 }
 
 impl Session {
@@ -103,6 +136,12 @@ impl Session {
 
     /// Edit the setlist (one undo step).
     pub(crate) fn edit_setlist(&mut self, op: SetlistOp) -> Result<()> {
+        if let SetlistOp::ChooseGearSysex(song) = op {
+            self.ui_requests
+                .push(crate::UiRequest::ImportGearSysex { song });
+            self.revision += 1;
+            return Ok(());
+        }
         let mut list = self.project.setlist.clone();
         let label = match op {
             SetlistOp::FromSections => {
@@ -121,6 +160,8 @@ impl Session {
                         end: s.end,
                         then: AfterSong::Stop,
                         notes: String::new(),
+                        scene: None,
+                        gear: Default::default(),
                     })
                     .collect();
                 "Setlist from Sections"
@@ -137,6 +178,8 @@ impl Session {
                     end,
                     then: AfterSong::Stop,
                     notes: String::new(),
+                    scene: None,
+                    gear: Default::default(),
                 });
                 "Add Song"
             }
@@ -150,6 +193,8 @@ impl Session {
                     end: s.end,
                     then: AfterSong::Stop,
                     notes: String::new(),
+                    scene: None,
+                    gear: Default::default(),
                 });
                 "Add Song"
             }
@@ -174,9 +219,44 @@ impl Session {
                 list.songs[i].notes = notes;
                 "Song Notes"
             }
+            SetlistOp::Scene(i, scene) if i < list.songs.len() => {
+                list.songs[i].scene = scene;
+                "Song Mix Scene"
+            }
             SetlistOp::Clear => {
                 list.songs.clear();
                 "Clear Setlist"
+            }
+            SetlistOp::Gear(i, mut gear) if i < list.songs.len() => {
+                gear.tidy();
+                list.songs[i].gear = gear;
+                "Song Gear"
+            }
+            SetlistOp::GearText(i, text) if i < list.songs.len() => {
+                let mut gear = self.gear_from_text(i, &text)?;
+                gear.tidy();
+                list.songs[i].gear = gear;
+                "Song Gear"
+            }
+            SetlistOp::GearTiming(i, timing) if i < list.songs.len() => {
+                list.songs[i].gear.timing = timing;
+                "Song Gear"
+            }
+            SetlistOp::GearProgram {
+                song,
+                program,
+                bank,
+            } if song < list.songs.len() => {
+                list.songs[song].gear = self.gear_with_program(song, program, bank)?;
+                "Song Gear"
+            }
+            SetlistOp::GearSysexFile(i, path) if i < list.songs.len() => {
+                list.songs[i].gear = self.gear_with_sysex_file(i, &path)?;
+                "Song Gear"
+            }
+            SetlistOp::GearSnapshot { song, track } if song < list.songs.len() => {
+                list.songs[song].gear = self.gear_with_snapshot(song, track)?;
+                "Song Gear"
             }
             _ => return Ok(()),
         };
@@ -190,6 +270,8 @@ impl Session {
         if self.show.current >= n {
             self.show.current = n.saturating_sub(1);
         }
+        // Gear edited (or songs moved): the next stand sends again.
+        self.show.gear.cued = None;
         Ok(())
     }
 
@@ -206,6 +288,7 @@ impl Session {
                 self.show.on = true;
                 self.show.since = Some(Instant::now());
                 self.show.pending = None;
+                self.show.gear.cued = None;
                 let current = self.show.current.min(n - 1);
                 self.cue_song(current)?;
                 self.workspace_action(crate::WorkspaceAction::ShowView(
@@ -222,6 +305,7 @@ impl Session {
                 self.disarm_stop()?;
             }
             ShowOp::Cue(i) if i < n => self.cue_song(i)?,
+            ShowOp::SendGear(i) if i < n => self.send_gear_now(i)?,
             ShowOp::Go(i) if i < n => {
                 self.cue_song(i)?;
                 // The song from its start (not the Play Start Marker).
@@ -274,6 +358,9 @@ impl Session {
         self.show.pending = None;
         self.disarm_stop()?;
         self.transport_action(TransportAction::Locate(song.start))?;
+        // The song's mix scene and its gear.
+        self.song_scene(i);
+        self.song_gear(i);
         Ok(())
     }
 
@@ -336,6 +423,7 @@ impl Session {
                     return self.show_op(ShowOp::Go(i + 1));
                 }
                 self.show.current = i + 1;
+                self.song_scene(i + 1);
                 self.revision += 1;
             }
             // The stop that ends this run of songs: this song's end, or —

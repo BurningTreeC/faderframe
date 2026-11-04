@@ -43,4 +43,7 @@ pub struct EngineContext {
     pub history: crate::history::PlayHistory,
     /// The audio recording under way (see [`crate::record`]).
     pub recording: crate::record::RecordingNow,
+    /// Post-fader audio of the track shared with others (a live session's
+    /// host streams its master: Listen Along).
+    pub share: Arc<faderframe_realtime::ScopeRing>,
 }

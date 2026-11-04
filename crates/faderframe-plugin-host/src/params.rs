@@ -68,11 +68,20 @@ impl ParamValues {
     /// The value with its modulation now.
     #[inline]
     pub fn live(&self, index: usize) -> f32 {
+        self.shifted(index, 0.0)
+    }
+
+    /// The value with its modulation and `extra` (a share of the range,
+    /// in the parameter's own scale) on top: what one voice of an
+    /// instrument reads with its own per-note modulation.
+    #[inline]
+    pub fn shifted(&self, index: usize, extra: f32) -> f32 {
         let base = self.base(index);
         let m = self
             .mods
             .get(index)
-            .map_or(0.0, |v| v.load(Ordering::Relaxed));
+            .map_or(0.0, |v| v.load(Ordering::Relaxed))
+            + extra;
         if m == 0.0 {
             return base;
         }

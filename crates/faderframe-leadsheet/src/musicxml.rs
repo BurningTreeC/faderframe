@@ -1,9 +1,12 @@
-//! A lead sheet as MusicXML 4.0 (`score-partwise`, a part a staff; a
-//! score's parts bracketed in one group): what notation programs
-//! (MuseScore, Dorico, Sibelius, Finale) open. Elements go in the order
-//! the schema asks for. Chords are notes with `<chord/>`; tablature is a
-//! part with a TAB clef, its strings' tuning in `staff-details` and each
-//! note's string and fret.
+//! A lead sheet as MusicXML 4.0 (`score-partwise`, a part a staff — a
+//! grand staff one part of two staves, the lower one's notes after a
+//! `<backup>`; a score's parts bracketed in one group): what notation
+//! programs (MuseScore, Dorico, Sibelius, Finale) open. Elements go in the
+//! order the schema asks for. Chords are notes with `<chord/>`; tablature
+//! is a part with a TAB clef, its strings' tuning in `staff-details` and
+//! each note's string and fret. A bar's second voice follows its first
+//! after a `<backup>` (voice 2; 6 on a grand staff's lower staff), its
+//! articulations in `<notations>` and its dynamics as directions.
 
 use crate::score::{Clef, DIVISIONS, Event, LeadSheet, Measure, Part, Pitch, TabStaff, Tuplet};
 use std::fmt::Write;
@@ -64,7 +67,8 @@ fn write_into(x: &mut String, s: &LeadSheet, date: &str) -> std::fmt::Result {
     )?;
     x.push_str("  </identification>\n");
     x.push_str("  <part-list>\n");
-    let score = s.parts.len() > 1;
+    let instruments = s.instruments();
+    let score = instruments.len() > 1;
     if score {
         writeln!(
             x,
@@ -72,7 +76,8 @@ fn write_into(x: &mut String, s: &LeadSheet, date: &str) -> std::fmt::Result {
             if s.bar_lines_joined() { "yes" } else { "no" }
         )?;
     }
-    for (n, part) in s.parts.iter().enumerate() {
+    for (id, &(n, _)) in instruments.iter().enumerate() {
+        let part = &s.parts[n];
         // Tablature under a part's notes is named after it.
         let name = if part.name.is_empty() && part.tab.is_some() {
             let above = n.checked_sub(1).map_or("", |m| s.parts[m].name.as_str());
@@ -87,7 +92,7 @@ fn write_into(x: &mut String, s: &LeadSheet, date: &str) -> std::fmt::Result {
         write!(
             x,
             "    <score-part id=\"P{}\"><part-name>{}</part-name>",
-            n + 1,
+            id + 1,
             esc(&name)
         )?;
         if score {
@@ -103,15 +108,23 @@ fn write_into(x: &mut String, s: &LeadSheet, date: &str) -> std::fmt::Result {
         x.push_str("    <part-group type=\"stop\" number=\"1\"/>\n");
     }
     x.push_str("  </part-list>\n");
-    for (n, part) in s.parts.iter().enumerate() {
-        write_part(x, s, part, n)?;
+    for (id, &(n, k)) in instruments.iter().enumerate() {
+        let lower = (k == 2).then(|| &s.parts[n + 1]);
+        write_part(x, s, &s.parts[n], lower, id)?;
     }
     x.push_str("</score-partwise>\n");
     Ok(())
 }
 
-/// Part `n`'s bars (the tempo marked in the first part's).
-fn write_part(x: &mut String, s: &LeadSheet, part: &Part, n: usize) -> std::fmt::Result {
+/// The `n`th part's bars (the tempo marked in the first part's), with
+/// `lower` its grand staff's lower staff.
+fn write_part(
+    x: &mut String,
+    s: &LeadSheet,
+    part: &Part,
+    lower: Option<&Part>,
+    n: usize,
+) -> std::fmt::Result {
     writeln!(x, "  <part id=\"P{}\">", n + 1)?;
     let last = part.measures.len().saturating_sub(1);
     for (i, m) in part.measures.iter().enumerate() {
@@ -135,14 +148,14 @@ fn write_part(x: &mut String, s: &LeadSheet, part: &Part, n: usize) -> std::fmt:
                 )?;
             }
             if i == 0 {
-                match &part.tab {
-                    Some(t) => tab_attributes(x, t)?,
-                    None => x.push_str(match part.clef {
-                        Clef::Treble => "        <clef><sign>G</sign><line>2</line></clef>\n",
-                        Clef::Treble8vb => "        <clef><sign>G</sign><line>2</line><clef-octave-change>-1</clef-octave-change></clef>\n",
-                        Clef::Bass => "        <clef><sign>F</sign><line>4</line></clef>\n",
-                        Clef::Bass8vb => "        <clef><sign>F</sign><line>4</line><clef-octave-change>-1</clef-octave-change></clef>\n",
-                    }),
+                match (&part.tab, lower) {
+                    (Some(t), _) => tab_attributes(x, t)?,
+                    (None, Some(l)) => {
+                        x.push_str("        <staves>2</staves>\n");
+                        clef(x, part.clef, Some(1))?;
+                        clef(x, l.clef, Some(2))?;
+                    }
+                    (None, None) => clef(x, part.clef, None)?,
                 }
             }
             x.push_str("      </attributes>\n");
@@ -158,7 +171,18 @@ fn write_part(x: &mut String, s: &LeadSheet, part: &Part, n: usize) -> std::fmt:
                 (t * 100.0).round() / 100.0
             )?;
         }
-        measure(x, m, part.tab.is_some())?;
+        match lower.and_then(|l| l.measures.get(i)) {
+            Some(below) => {
+                measure(x, m, false, Some(1))?;
+                writeln!(
+                    x,
+                    "      <backup><duration>{}</duration></backup>",
+                    m.length()
+                )?;
+                measure(x, below, false, Some(2))?;
+            }
+            None => measure(x, m, part.tab.is_some(), None)?,
+        }
         if i == last {
             x.push_str(
                 "      <barline location=\"right\"><bar-style>light-heavy</bar-style></barline>\n",
@@ -167,6 +191,24 @@ fn write_part(x: &mut String, s: &LeadSheet, part: &Part, n: usize) -> std::fmt:
         x.push_str("    </measure>\n");
     }
     x.push_str("  </part>\n");
+    Ok(())
+}
+
+/// A clef (`staff`: which of a grand staff's).
+fn clef(x: &mut String, clef: Clef, staff: Option<u8>) -> std::fmt::Result {
+    match staff {
+        Some(n) => write!(x, "        <clef number=\"{n}\">")?,
+        None => x.push_str("        <clef>"),
+    }
+    x.push_str(match clef {
+        Clef::Treble => "<sign>G</sign><line>2</line>",
+        Clef::Treble8vb => {
+            "<sign>G</sign><line>2</line><clef-octave-change>-1</clef-octave-change>"
+        }
+        Clef::Bass => "<sign>F</sign><line>4</line>",
+        Clef::Bass8vb => "<sign>F</sign><line>4</line><clef-octave-change>-1</clef-octave-change>",
+    });
+    x.push_str("</clef>\n");
     Ok(())
 }
 
@@ -199,7 +241,9 @@ fn tab_attributes(x: &mut String, t: &TabStaff) -> std::fmt::Result {
     Ok(())
 }
 
-fn measure(x: &mut String, m: &Measure, tab: bool) -> std::fmt::Result {
+/// A bar's notes (`staff`: which of a grand staff's they go on; the lower
+/// staff's in a voice of its own).
+fn measure(x: &mut String, m: &Measure, tab: bool, staff: Option<u8>) -> std::fmt::Result {
     let mut chords = m.chords.iter().peekable();
     for e in &m.events {
         // Chords starting while this note sounds go before it (with an
@@ -244,16 +288,58 @@ fn measure(x: &mut String, m: &Measure, tab: bool) -> std::fmt::Result {
             chords.next();
         }
         // The chord's notes: the first with the beams and the words.
+        dynamic(x, e, staff)?;
         let n = 1 + e.chord.len();
         for k in 0..n {
-            note(x, e, m.length(), k, tab)?;
+            note(x, e, m.length(), k, tab, staff, false)?;
+        }
+    }
+    if !m.under.is_empty() {
+        writeln!(
+            x,
+            "      <backup><duration>{}</duration></backup>",
+            m.length()
+        )?;
+        for e in &m.under {
+            dynamic(x, e, staff)?;
+            for k in 0..1 + e.chord.len() {
+                note(x, e, m.length(), k, tab, staff, true)?;
+            }
         }
     }
     Ok(())
 }
 
-/// The `k`th note of event `e` (0: its pitch, then its chord's).
-fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::Result {
+/// A dynamic marked on `e`, as a direction under the staff before it.
+fn dynamic(x: &mut String, e: &Event, staff: Option<u8>) -> std::fmt::Result {
+    let Some(d) = e.dynamic.filter(|_| !e.tied_from) else {
+        return Ok(());
+    };
+    write!(
+        x,
+        "      <direction placement=\"below\"><direction-type><dynamics><{}/></dynamics></direction-type>",
+        d.name()
+    )?;
+    if let Some(n) = staff {
+        write!(x, "<staff>{n}</staff>")?;
+    }
+    // MusicXML's dynamics are percent of a forte's velocity (90).
+    let percent = (f64::from(d.velocity()) / 0.9).round();
+    writeln!(x, "<sound dynamics=\"{percent}\"/></direction>")?;
+    Ok(())
+}
+
+/// The `k`th note of event `e` (0: its pitch, then its chord's; `second`:
+/// of the bar's second voice).
+fn note(
+    x: &mut String,
+    e: &Event,
+    bar: u32,
+    k: usize,
+    tab: bool,
+    staff: Option<u8>,
+    second: bool,
+) -> std::fmt::Result {
     x.push_str("      <note>");
     if k > 0 {
         x.push_str("<chord/>");
@@ -290,7 +376,8 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
     if e.tie {
         x.push_str("<tie type=\"start\"/>");
     }
-    x.push_str("<voice>1</voice>");
+    let voice = if staff == Some(2) { 5 } else { 1 } + u8::from(second);
+    write!(x, "<voice>{voice}</voice>")?;
     if !e.bar_rest {
         write!(x, "<type>{}</type>", e.duration.value.name())?;
         for _ in 0..e.duration.dots {
@@ -302,6 +389,9 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
     }
     if e.duration.triplet {
         x.push_str("<time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>");
+    }
+    if let Some(n) = staff {
+        write!(x, "<staff>{n}</staff>")?;
     }
     if k == 0 {
         for (level, b) in e.beams.iter().enumerate() {
@@ -316,7 +406,8 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
         _ => None,
     };
     let fret = e.frets.get(k).filter(|_| tab);
-    if e.tie || e.tied_from || tuplet.is_some() || fret.is_some() {
+    let marks = !e.marks.is_empty() && k == 0 && !e.tied_from;
+    if e.tie || e.tied_from || tuplet.is_some() || fret.is_some() || marks {
         x.push_str("<notations>");
         if e.tied_from {
             x.push_str("<tied type=\"stop\"/>");
@@ -334,6 +425,13 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
                 f.string, f.fret
             )?;
         }
+        if marks {
+            x.push_str("<articulations>");
+            for (_, name) in e.marks.glyphs() {
+                write!(x, "<{name}/>")?;
+            }
+            x.push_str("</articulations>");
+        }
         x.push_str("</notations>");
     }
     if let Some(l) = e.lyric.as_ref().filter(|_| k == 0) {
@@ -346,6 +444,9 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
         if l.extend {
             x.push_str("<extend/>");
         }
+        if l.end_line {
+            x.push_str("<end-line/>");
+        }
         x.push_str("</lyric>");
     }
     x.push_str("</note>\n");
@@ -356,6 +457,7 @@ fn note(x: &mut String, e: &Event, bar: u32, k: usize, tab: bool) -> std::fmt::R
 pub(crate) mod tests {
     use super::*;
     use crate::build::{Bar, ChordAt, Input, Line, Note, Staff, build};
+    use crate::score::Clef;
     use faderframe_midi::theory::{Chord, Key, Quality, Scale};
 
     pub(crate) fn sample() -> LeadSheet {
@@ -403,7 +505,7 @@ pub(crate) mod tests {
                         text: "of the night".into(),
                     },
                 ],
-                tab: None,
+                ..Staff::default()
             }],
             chords: vec![
                 ChordAt {
@@ -534,24 +636,151 @@ pub(crate) mod tests {
                     name: "Lead Vocal".into(),
                     notes: voice,
                     lines,
-                    tab: None,
+                    ..Staff::default()
                 },
                 Staff {
                     name: "Guitar".into(),
                     notes: guitar,
-                    lines: vec![],
-                    tab: None,
+                    ..Staff::default()
                 },
                 Staff {
                     name: "Bass".into(),
                     notes: bass,
-                    lines: vec![],
-                    tab: None,
+                    ..Staff::default()
                 },
             ],
             chords,
             ..Input::default()
         })
+    }
+
+    /// A piano's part on a grand staff (block chords in the left hand, a
+    /// tune in the right), after a sung line when `voice`.
+    pub(crate) fn piano_sample(voice: bool) -> LeadSheet {
+        let mut notes = Vec::new();
+        for (b, chord) in [[48u8, 52, 55], [45, 48, 52], [41, 45, 48], [43, 47, 50]]
+            .iter()
+            .enumerate()
+        {
+            for half in [0.0, 2.0] {
+                for k in chord {
+                    let at = 4.0 * b as f64 + half;
+                    notes.push(Note {
+                        start: at,
+                        end: at + 2.0,
+                        key: *k,
+                    });
+                }
+            }
+        }
+        for i in 0..16 {
+            notes.push(Note {
+                start: i as f64,
+                end: i as f64 + 1.0,
+                key: [76u8, 79, 77, 74][i % 4],
+            });
+        }
+        let (right, left) = crate::build::hands(&notes);
+        let mut staves = Vec::new();
+        if voice {
+            staves.push(Staff {
+                name: "Voice".into(),
+                notes: (0..8)
+                    .map(|i| Note {
+                        start: 2.0 * i as f64,
+                        end: 2.0 * i as f64 + 2.0,
+                        key: 67 + (i % 3) as u8,
+                    })
+                    .collect(),
+                lines: vec![Line {
+                    start: 0.0,
+                    end: 16.0,
+                    text: "La la la la la la la la".into(),
+                }],
+                ..Staff::default()
+            });
+        }
+        staves.push(Staff {
+            name: "Piano".into(),
+            notes: right,
+            chords: true,
+            clef: Some(Clef::Treble),
+            brace: true,
+            ..Staff::default()
+        });
+        staves.push(Staff {
+            notes: left,
+            chords: true,
+            clef: Some(Clef::Bass),
+            ..Staff::default()
+        });
+        build(&Input {
+            title: "Grand".into(),
+            key: Some(Key::new(0, Scale::Major)),
+            bars: (0..4)
+                .map(|i| Bar {
+                    start: i as f64 * 4.0,
+                    time: (4, 4),
+                })
+                .collect(),
+            tempo: Some(100.0),
+            staves,
+            chords: vec![ChordAt {
+                start: 0.0,
+                chord: Chord::new(0, Quality::Major),
+            }],
+            ..Input::default()
+        })
+    }
+
+    /// A grand staff is one part of two staves: its clefs numbered, each
+    /// bar's right hand, a backup, the left hand on staff 2 in a voice of
+    /// its own; a score lists it once.
+    #[test]
+    fn a_grand_staff_is_one_part_of_two_staves() {
+        let x = write(&piano_sample(false), "2026-10-29");
+        assert!(!x.contains("part-group"), "one instrument");
+        assert_eq!(x.matches("<score-part ").count(), 1);
+        assert!(x.contains("<staves>2</staves>"));
+        assert!(x.contains("<clef number=\"1\"><sign>G</sign><line>2</line></clef>"));
+        assert!(x.contains("<clef number=\"2\"><sign>F</sign><line>4</line></clef>"));
+        assert_eq!(
+            x.matches("<backup><duration>48</duration></backup>")
+                .count(),
+            4
+        );
+        assert!(x.contains("<voice>5</voice>") && x.contains("<staff>2</staff>"));
+        // Each staff of each bar adds up to the bar.
+        for m in x.split("<measure ").skip(1) {
+            let (upper, lower) = m.split_once("<backup>").unwrap();
+            let lower = lower.split_once("</backup>").unwrap().1;
+            for staff in [upper, lower] {
+                let d: u32 = staff
+                    .split("<note>")
+                    .skip(1)
+                    .filter(|n| !n.contains("<chord/>"))
+                    .filter_map(|n| {
+                        n.split("<duration>")
+                            .nth(1)?
+                            .split('<')
+                            .next()?
+                            .parse::<u32>()
+                            .ok()
+                    })
+                    .sum();
+                assert_eq!(d, 48, "{m}");
+            }
+        }
+        well_formed(&x);
+        let score = write(&piano_sample(true), "2026-10-29");
+        assert!(score.contains("<group-symbol>bracket</group-symbol>"));
+        assert_eq!(score.matches("<score-part ").count(), 2);
+        assert!(score.contains("<score-part id=\"P2\"><part-name>Piano</part-name>"));
+        assert_eq!(score.matches("<part id=").count(), 2);
+        well_formed(&score);
+        if let Ok(dir) = std::env::var("FADERFRAME_LEADSHEET_OUT") {
+            let _ = std::fs::write(std::path::Path::new(&dir).join("grand.musicxml"), &score);
+        }
     }
 
     #[test]

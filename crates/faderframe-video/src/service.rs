@@ -38,6 +38,9 @@ pub struct Media {
     pub par: (u32, u32),
     /// Its proxy and the proxy's size, once made (same frame times).
     pub proxy: Option<(PathBuf, (u32, u32))>,
+    /// Frames are wanted in memory, never in video memory (a 360° picture
+    /// is looked into on the CPU).
+    pub memory: bool,
 }
 
 impl Media {
@@ -220,8 +223,9 @@ struct Shared {
     cache: Mutex<Cache>,
     thumbs: Mutex<Cache>,
     asked: Mutex<Asked>,
-    /// Files whose picture does not decode into dmabufs.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Files whose picture does not decode into video memory (dmabufs,
+    /// D3D12 textures).
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     no_dmabuf: Mutex<std::collections::HashSet<PathBuf>>,
     wake: Condvar,
     stop: AtomicBool,
@@ -489,7 +493,7 @@ fn decoder_for<'a>(
     } else {
         crate::colour::Colour::default()
     };
-    let gpu = play && !colour.needs_mapping() && zero_copy_for(file, s);
+    let gpu = play && !m.memory && !colour.needs_mapping() && zero_copy_for(file, s);
     let same = open
         .as_ref()
         .is_some_and(|o| o.key == key && &o.file == file && o.size == size && o.gpu == gpu);
@@ -524,24 +528,29 @@ fn decoder_for<'a>(
     open.as_mut().map(|o| &mut o.decoder)
 }
 
-/// Whether `file` plays into dmabufs (zero-copy on, and it has not failed
-/// for this file).
+/// Whether `file` plays into video memory (zero-copy on, and it has not
+/// failed for this file): dmabufs on Linux, D3D12 textures on Windows.
 fn zero_copy_for(file: &PathBuf, s: &Shared) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     {
         crate::zero_copy::enabled() && !lock(&s.no_dmabuf).contains(file)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (file, s);
         false
     }
 }
 
-/// A dmabuf decoder of `file`, or `None` (then never again for it).
+/// A decoder of `file` into video memory (dmabufs, D3D12 textures), or
+/// `None` (then never again for it).
 fn open_dmabuf(file: &PathBuf, size: (u32, u32), s: &Shared) -> Option<Decoder> {
     #[cfg(target_os = "linux")]
-    match Decoder::open_dmabuf(file, size.0, size.1) {
+    let opened = Decoder::open_dmabuf(file, size.0, size.1);
+    #[cfg(windows)]
+    let opened = Decoder::open_d3d12(file, size.0, size.1);
+    #[cfg(any(target_os = "linux", windows))]
+    match opened {
         Ok(d) => return Some(d),
         Err(e) => {
             tracing::info!("{}: frames through memory ({e})", file.display());

@@ -1,12 +1,14 @@
-//! Factory presets of the stock effects, the MIDI effects and the Synth:
-//! starting points that
+//! Factory presets of the stock effects, the MIDI effects and the
+//! instruments (the Synth, Wavetable, FM and Granular): starting points
+//! that
 //! show what each device does best, named for what they are for.
 //!
 //! A preset lists only the values it moves; everything else is the
 //! parameter's default, so [`FactoryPreset::values`] always gives the
 //! device's complete settings and loading one leaves nothing of what was
-//! there before. The samplers (their sound is the samples) and the tuner
-//! have none.
+//! there before — but what a device measured of the recording (De-noise's
+//! learned profile, [`kept`]). The samplers (their sound is the samples)
+//! and the tuner have none.
 //!
 //! Effects that are usually fed from sends (reverb, delay) are voiced for
 //! inserts, with a musical mix; [`send_return_mix`] names their mix so a
@@ -16,11 +18,18 @@ mod dynamics;
 mod effects;
 mod equalisers;
 mod guitar;
+mod instruments;
 mod midi;
+mod restoration;
 mod synth;
 mod tape;
 #[cfg(test)]
 mod tests;
+// Convolution reverb, multiband dynamics, the vocoder.
+mod convolution;
+mod multiband;
+mod vocoder;
+mod voice;
 
 use crate::ParameterInfo;
 /// The EQ's preset groups.
@@ -103,7 +112,29 @@ pub fn factory_presets(plugin_id: &str) -> Vec<FactoryPreset> {
         builtin::GUITAR_STATION => guitar::guitar(),
         builtin::TAPE_MACHINE => tape::tape_machine(),
         builtin::LEVELER_2A => dynamics::leveler_2a(),
+        builtin::DENOISE => restoration::denoise(),
+        builtin::DECLICK => restoration::declick(),
+        builtin::DEHUM => restoration::dehum(),
+        builtin::DECLIP => restoration::declip(),
+        builtin::DEREVERB => restoration::dereverb(),
+        builtin::CONVOLUTION_REVERB => convolution::convolution_reverb(),
+        builtin::MULTIBAND_DYNAMICS => multiband::multiband_dynamics(),
+        builtin::VOCODER => vocoder::vocoder(),
+        builtin::WAVETABLE => instruments::wavetable(),
+        builtin::FM => instruments::fm(),
+        builtin::GRANULAR => instruments::granular(),
+        builtin::PITCH_CORRECT => voice::pitch_correct(),
         _ => Vec::new(),
+    }
+}
+
+/// Parameters a factory preset leaves as they are: what a device measured
+/// of the recording (De-noise's learned profile and whether it is used),
+/// not a setting.
+pub fn kept(plugin_id: &str, id: ParameterId) -> bool {
+    match plugin_id {
+        builtin::DENOISE => crate::devices::denoise::kept(id),
+        _ => false,
     }
 }
 
@@ -132,15 +163,29 @@ pub fn parameters(plugin_id: &str) -> Vec<ParameterInfo> {
         builtin::GUITAR_STATION => guitar::parameters(),
         builtin::TAPE_MACHINE => crate::devices::tape::parameters(),
         builtin::LEVELER_2A => leveler::parameters(),
+        builtin::DENOISE => denoise::parameters(),
+        builtin::DECLICK => declick::parameters(),
+        builtin::DEHUM => dehum::parameters(),
+        builtin::DECLIP => declip::parameters(),
+        builtin::DEREVERB => dereverb::parameters(),
+        builtin::CONVOLUTION_REVERB => crate::devices::convolution::parameters(),
+        builtin::MULTIBAND_DYNAMICS => crate::devices::multiband::parameters(),
+        builtin::VOCODER => crate::devices::vocoder::parameters(),
+        builtin::WAVETABLE => wavetable::parameters(),
+        builtin::FM => fm::parameters(),
+        builtin::GRANULAR => granular::parameters(),
+        builtin::PITCH_CORRECT => pitch_correct::parameters(),
         _ => Vec::new(),
     }
 }
 
 /// Preset `index` of a built-in plugin, complete (see
-/// [`FactoryPreset::values`]).
+/// [`FactoryPreset::values`]) but for the parameters it [`kept`].
 pub fn factory_preset_values(plugin_id: &str, index: usize) -> Option<Vec<(ParameterId, f64)>> {
     let preset = factory_presets(plugin_id).into_iter().nth(index)?;
-    Some(preset.values(&parameters(plugin_id)))
+    let mut values = preset.values(&parameters(plugin_id));
+    values.retain(|(id, _)| !kept(plugin_id, *id));
+    Some(values)
 }
 
 /// The mix of a device usually fed from a send: on an effect return its
@@ -149,6 +194,7 @@ pub fn send_return_mix(plugin_id: &str) -> Option<ParameterId> {
     match plugin_id {
         builtin::REVERB => Some(ParameterId(crate::devices::reverb::id::MIX)),
         builtin::ECHO => Some(ParameterId(crate::devices::delay::id::MIX)),
+        builtin::CONVOLUTION_REVERB => Some(ParameterId(crate::devices::convolution::id::MIX)),
         _ => None,
     }
 }

@@ -28,6 +28,9 @@ pub enum BackendChoice {
     /// Steinberg ASIO drivers (Windows builds with the `asio` feature).
     Asio,
     Dummy,
+    /// AES67 network audio, its callback on the PTP media clock (the
+    /// streams set up in Preferences → Network Audio).
+    Aes67,
 }
 
 impl BackendChoice {
@@ -40,6 +43,7 @@ impl BackendChoice {
                 BackendChoice::Jack,
                 BackendChoice::System,
                 BackendChoice::Dummy,
+                BackendChoice::Aes67,
             ]
         } else if faderframe_audio_cpal::ASIO {
             vec![
@@ -47,12 +51,14 @@ impl BackendChoice {
                 BackendChoice::Asio,
                 BackendChoice::System,
                 BackendChoice::Dummy,
+                BackendChoice::Aes67,
             ]
         } else {
             vec![
                 BackendChoice::Auto,
                 BackendChoice::System,
                 BackendChoice::Dummy,
+                BackendChoice::Aes67,
             ]
         }
     }
@@ -66,6 +72,7 @@ impl BackendChoice {
             BackendChoice::System => Some("system"),
             BackendChoice::Asio => Some("asio"),
             BackendChoice::Dummy => Some("dummy"),
+            BackendChoice::Aes67 => Some("aes67"),
         }
     }
 
@@ -92,10 +99,21 @@ impl BackendChoice {
             BackendChoice::System => "ALSA (direct)",
             BackendChoice::Asio => "ASIO",
             BackendChoice::Dummy => "No audio device (silent)",
+            BackendChoice::Aes67 => "AES67 network audio (PTP clock)",
         }
     }
 
+    /// The backends of this choice, with the AES67 streams joined to their
+    /// devices where Preferences → Network Audio asks for that.
     pub fn backends(self) -> Vec<Box<dyn AudioBackend>> {
+        let aes67 = faderframe_audio_aes67::settings();
+        if self == BackendChoice::Aes67 {
+            return vec![Box::new(faderframe_audio_aes67::Aes67Backend::new(aes67))];
+        }
+        faderframe_audio_aes67::Alongside::wrap_all(self.plain_backends(), &aes67)
+    }
+
+    fn plain_backends(self) -> Vec<Box<dyn AudioBackend>> {
         let system =
             || Box::new(faderframe_audio_cpal::CpalBackend::default()) as Box<dyn AudioBackend>;
         // ASIO devices first where the build has them (none otherwise).
@@ -120,15 +138,22 @@ impl BackendChoice {
         let loopback = std::env::var("FADERFRAME_DUMMY_LOOPBACK")
             .ok()
             .and_then(|v| v.parse::<u32>().ok());
-        // FADERFRAME_DUMMY_DEVICES=<name>=<inputs>x<outputs>[;…]: the dummy
-        // offers these pretend interfaces instead of its one silent device
-        // (the Audio preferences without hardware, scripted screenshots).
+        // FADERFRAME_DUMMY_DEVICES=<name>=<inputs>x<outputs>[@<ppm>][;…]: the
+        // dummy offers these pretend interfaces instead of its one silent
+        // device (the Audio preferences without hardware, scripted
+        // screenshots); `@<ppm>`: its clock runs that far off (as a
+        // follower of another device, `audio-devices:`).
         let devices = std::env::var("FADERFRAME_DUMMY_DEVICES").ok().map(|v| {
-            faderframe_audio::dummy::DummyDevices::new(
+            let mut clocks = Vec::new();
+            let devices = faderframe_audio::dummy::DummyDevices::new(
                 v.split(';')
                     .filter_map(|d| {
                         let (name, io) = d.split_once('=')?;
+                        let (io, ppm) = io.split_once('@').unwrap_or((io, ""));
                         let (inputs, outputs) = io.split_once('x')?;
+                        if let Ok(ppm) = ppm.trim().parse::<f64>() {
+                            clocks.push((name.trim().to_string(), ppm));
+                        }
                         Some(faderframe_audio::dummy::mock_device(
                             name.trim(),
                             inputs.trim().parse().ok()?,
@@ -138,7 +163,18 @@ impl BackendChoice {
                         ))
                     })
                     .collect(),
-            )
+            );
+            for (name, ppm) in clocks {
+                devices.set_clock(
+                    &name,
+                    faderframe_audio::dummy::PretendClock {
+                        ppm,
+                        jitter: 0.0002,
+                        block: None,
+                    },
+                );
+            }
+            devices
         });
         let dummy = move || {
             Box::new(match (tone, loopback, &devices) {
@@ -160,12 +196,12 @@ impl BackendChoice {
                 BackendChoice::PipeWire => vec![pipewire()],
                 BackendChoice::Jack => vec![jack()],
                 BackendChoice::System | BackendChoice::Asio => vec![system()],
-                BackendChoice::Dummy => vec![dummy()],
+                BackendChoice::Dummy | BackendChoice::Aes67 => vec![dummy()],
             }
         }
         #[cfg(not(target_os = "linux"))]
         match self {
-            BackendChoice::Dummy => vec![dummy()],
+            BackendChoice::Dummy | BackendChoice::Aes67 => vec![dummy()],
             BackendChoice::Asio if faderframe_audio_cpal::ASIO => asio(),
             BackendChoice::System
             | BackendChoice::Asio
@@ -402,8 +438,14 @@ impl AppState {
         crate::recording::follow(self);
         crate::monitoring::follow(self);
         crate::console::follow(self);
+        crate::tuning::follow(self);
         crate::cues::follow(self);
         crate::favorites::follow(self);
+        crate::self_freeze_prefs::follow(self);
+        crate::head_tracking::follow(self);
+        crate::capture_audio::follow(self);
+        crate::scripts::follow(self);
+        crate::web_remote::follow(self);
     }
 
     /// Show an error: always in the status bar, optionally as a dialog.
@@ -427,10 +469,11 @@ impl AppState {
     pub fn start_audio(self: &Rc<Self>) {
         let (choice, prefs) = {
             let o = self.options.borrow();
-            (
-                o.backend,
-                crate::prefs::Preferences::load().audio_preferences(&o),
-            )
+            let stored = crate::prefs::Preferences::load();
+            // The AES67 streams the backends open (as the audio system or
+            // beside it).
+            faderframe_audio_aes67::configure(stored.aes67.clone());
+            (o.backend, stored.audio_preferences(&o))
         };
         let result = self
             .session
@@ -493,6 +536,9 @@ impl AppState {
                 faderframe_session::UiRequest::ImportSysex { clip, at } => {
                     crate::dialogs::import_sysex(self, clip, at);
                 }
+                faderframe_session::UiRequest::ImportGearSysex { song } => {
+                    crate::dialogs::import_gear_sysex(self, song);
+                }
                 faderframe_session::UiRequest::AlbumDetails(song) => {
                     crate::dialogs::album_details(self, song);
                 }
@@ -541,6 +587,26 @@ impl AppState {
                     crate::render_report::show(self, win.as_ref(), &what, &files);
                 }
                 faderframe_session::UiRequest::AutoAlign => crate::auto_align::open(self),
+                faderframe_session::UiRequest::ChooseTuning { track, file } => {
+                    crate::tuning::choose(self, track, file);
+                }
+                faderframe_session::UiRequest::RenameMixScene(scene) => {
+                    crate::dialogs::rename_mix_scene(self, scene);
+                }
+                faderframe_session::UiRequest::MergeProjectFile => {
+                    crate::version_merge::choose_file(self);
+                }
+                faderframe_session::UiRequest::MergeConflicts => {
+                    crate::version_merge::window(self);
+                }
+                faderframe_session::UiRequest::StripSilence => crate::strip_silence::open(self),
+                faderframe_session::UiRequest::ScriptPrompt(p) => crate::scripts::prompt(self, p),
+                faderframe_session::UiRequest::RelinkAaf { file, missing } => {
+                    crate::aaf::relink(self, &file, &missing);
+                }
+                faderframe_session::UiRequest::NewBrowserTag(files) => {
+                    crate::browser::new_tag(self, files);
+                }
             }
         }
         let report = self

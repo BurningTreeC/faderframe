@@ -9,7 +9,7 @@
 //! silent. Nothing here allocates, locks or frees.
 
 use faderframe_audio_graph::NodeIo;
-use faderframe_midi::{MidiEvent, NoteExpressionKind, NoteIds, TimedMidiEvent};
+use faderframe_midi::{Fine, MidiEvent, NoteExpressionKind, NoteIds, TimedMidiEvent};
 use faderframe_plugin_host::emulated::{EmulatedMods, ModBases, delta_of};
 use faderframe_plugin_host::{ParamMod, PluginProcessContext, PluginProcessor, ProcessStatus};
 use faderframe_realtime::TryCell;
@@ -666,12 +666,18 @@ impl Active {
                             }));
                     }
                     let id = self.note_ids.start(channel, key);
+                    // At full resolution (a MIDI 2.0 velocity's 16 bits),
+                    // never 0 for a note-on.
+                    let velocity = ev
+                        .unit()
+                        .unwrap_or(f64::from(velocity) / 127.0)
+                        .max(1.0 / 65535.0) as f32;
                     self.in_events.push(note_event(t, kNoteOnEvent as u16, |e| {
                         e.__field0.noteOn = NoteOnEvent {
                             channel: channel as i16,
                             pitch: key as i16,
                             tuning: 0.0,
-                            velocity: velocity as f32 / 127.0,
+                            velocity,
                             length: 0,
                             noteId: id,
                         }
@@ -680,8 +686,8 @@ impl Active {
                 MidiEvent::NoteOn { channel, key, .. }
                 | MidiEvent::NoteOff { channel, key, .. } => {
                     let velocity = match ev.event {
-                        MidiEvent::NoteOff { velocity, .. } => velocity,
-                        _ => 64,
+                        MidiEvent::NoteOff { .. } => ev.unit().unwrap_or(0.0) as f32,
+                        _ => 0.5,
                     };
                     let id = self.note_ids.end(channel, key);
                     self.in_events
@@ -689,23 +695,20 @@ impl Active {
                             e.__field0.noteOff = NoteOffEvent {
                                 channel: channel as i16,
                                 pitch: key as i16,
-                                velocity: velocity as f32 / 127.0,
+                                velocity,
                                 noteId: id,
                                 tuning: 0.0,
                             }
                         }));
                 }
-                MidiEvent::PolyPressure {
-                    channel,
-                    key,
-                    pressure,
-                } => {
+                MidiEvent::PolyPressure { channel, key, .. } => {
+                    let pressure = ev.unit().unwrap_or(0.0) as f32;
                     self.in_events
                         .push(note_event(t, kPolyPressureEvent as u16, |e| {
                             e.__field0.polyPressure = PolyPressureEvent {
                                 channel: channel as i16,
                                 pitch: key as i16,
-                                pressure: pressure as f32 / 127.0,
+                                pressure,
                                 noteId: self.note_ids.get(channel, key),
                             }
                         }));
@@ -745,23 +748,25 @@ impl Active {
                     };
                     self.in_events.push(event);
                 }
+                // Controllers, pressure and bend at full resolution (32
+                // bits from MIDI 2.0).
                 MidiEvent::ControlChange {
                     channel,
                     controller,
-                    value,
+                    ..
                 } => {
                     if let Some(id) = mapped(channel, controller as usize & 127) {
-                        self.set_param(mods, id, t, value as f64 / 127.0);
+                        self.set_param(mods, id, t, ev.unit().unwrap_or(0.0));
                     }
                 }
-                MidiEvent::ChannelPressure { channel, pressure } => {
+                MidiEvent::ChannelPressure { channel, .. } => {
                     if let Some(id) = mapped(channel, AFTERTOUCH) {
-                        self.set_param(mods, id, t, pressure as f64 / 127.0);
+                        self.set_param(mods, id, t, ev.unit().unwrap_or(0.0));
                     }
                 }
-                MidiEvent::PitchBend { channel, value } => {
+                MidiEvent::PitchBend { channel, .. } => {
                     if let Some(id) = mapped(channel, PITCH_BEND) {
-                        self.set_param(mods, id, t, value.min(16383) as f64 / 16383.0);
+                        self.set_param(mods, id, t, ev.unit().unwrap_or(0.5));
                     }
                 }
                 // SysEx: a data event pointing at the bytes in the graph's
@@ -915,31 +920,36 @@ impl Active {
             for e in self.out_events.iter() {
                 let at = e.sampleOffset.clamp(0, last) as u32;
                 // SAFETY: the union member matches the event type.
-                let event = unsafe {
+                // Velocities at full resolution (16 bits beside the MIDI
+                // 1.0 value).
+                let (event, fine) = unsafe {
                     match e.r#type as u32 {
                         t if t == kNoteOnEvent as u32 => {
                             let n = e.__field0.noteOn;
-                            MidiEvent::NoteOn {
+                            let (velocity, fine) =
+                                Fine::of_unit_velocity(f64::from(n.velocity), true);
+                            let event = MidiEvent::NoteOn {
                                 channel: (n.channel & 15) as u8,
                                 key: n.pitch.clamp(0, 127) as u8,
-                                velocity: (n.velocity * 127.0).round().clamp(1.0, 127.0) as u8,
-                            }
+                                velocity,
+                            };
+                            (event, fine)
                         }
                         t if t == kNoteOffEvent as u32 => {
                             let n = e.__field0.noteOff;
-                            MidiEvent::NoteOff {
+                            let (velocity, fine) =
+                                Fine::of_unit_velocity(f64::from(n.velocity), false);
+                            let event = MidiEvent::NoteOff {
                                 channel: (n.channel & 15) as u8,
                                 key: n.pitch.clamp(0, 127) as u8,
-                                velocity: (n.velocity * 127.0).round().clamp(0.0, 127.0) as u8,
-                            }
+                                velocity,
+                            };
+                            (event, fine)
                         }
                         _ => continue,
                     }
                 };
-                let _ = out.push(TimedMidiEvent {
-                    sample_offset: at,
-                    event,
-                });
+                let _ = out.push(TimedMidiEvent::with_fine(at, event, fine));
             }
         }
 

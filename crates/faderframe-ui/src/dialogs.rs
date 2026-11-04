@@ -273,6 +273,36 @@ pub fn import_audio(app: &Rc<AppState>) {
     });
 }
 
+/// File → Import Ambisonic Audio (AmbiX / FuMa)…: each file onto a new
+/// track of its order at the playhead.
+pub fn import_ambisonic(app: &Rc<AppState>, kind: faderframe_session::ambix::AmbiFile) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let title = match kind {
+        faderframe_session::ambix::AmbiFile::AmbiX => "Import Ambisonic Audio (AmbiX)",
+        faderframe_session::ambix::AmbiFile::FuMa => "Import First-Order B-Format (FuMa)",
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title(title)
+        .accept_label("Import")
+        .modal(true)
+        .filters(&audio_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open_multiple(Some(&win), gio::Cancellable::NONE, move |res| {
+        let (Ok(list), Some(app)) = (res, weak.upgrade()) else {
+            return;
+        };
+        let files: Vec<std::path::PathBuf> = (0..list.n_items())
+            .filter_map(|i| list.item(i).and_downcast::<gio::File>())
+            .filter_map(|f| f.path())
+            .collect();
+        let at = app.session.borrow().playhead();
+        app.dispatch(faderframe_session::Action::ImportAmbisonic { files, at, kind });
+    });
+}
+
 /// File → Import ADM BWF…: an object-based master's bed and objects as
 /// tracks (the master takes a format that holds them).
 pub fn import_adm(app: &Rc<AppState>) {
@@ -483,12 +513,21 @@ pub struct Closing {
 pub fn closing(app: &Rc<AppState>) -> Closing {
     let keep = crate::prefs::Preferences::load().unused_media == "keep";
     let s = app.session.borrow();
+    let mut unused = (!keep).then(|| s.unused_media()).flatten();
+    // Self-freeze caches no track would play any more go with them.
+    if !keep && s.path().is_some() {
+        let stale = s.self_freeze_stale_files();
+        if !stale.is_empty() {
+            let u = unused.get_or_insert_with(Default::default);
+            for (f, bytes) in stale {
+                u.files.push(f);
+                u.bytes += bytes;
+            }
+        }
+    }
     Closing {
         path: s.path().map(std::path::Path::to_path_buf),
-        unused: (!keep)
-            .then(|| s.unused_media())
-            .flatten()
-            .filter(|u| !u.is_empty()),
+        unused: unused.filter(|u| !u.is_empty()),
     }
 }
 
@@ -521,21 +560,35 @@ pub fn ask_unused(
         then(app);
         return;
     };
+    let cached = |f: &std::path::Path| {
+        f.parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|d| d == faderframe_session::self_freeze::CACHE_FOLDER)
+    };
     let audio = unused
         .files
         .iter()
-        .filter(|f| f.extension().is_none_or(|e| e != "ffpk"))
+        .filter(|f| f.extension().is_none_or(|e| e != "ffpk") && !cached(f))
         .count();
+    let caches = unused.files.iter().filter(|f| cached(f)).count();
     let dialog = gtk::AlertDialog::builder()
         .message("Move unused media to the trash?")
         .detail(format!(
             "{audio} audio file{} ({}) in the project's Audio folder {} used by neither the \
              saved project nor any of its versions — deleted recordings and imports, replaced \
-             renders. With the project closed, Undo cannot bring them back either.\n\n\
+             renders. With the project closed, Undo cannot bring them back either.{}\n\n\
              Preferences → General chooses what happens without asking.",
             if audio == 1 { "" } else { "s" },
             size_text(unused.bytes),
             if audio == 1 { "is" } else { "are" },
+            match caches {
+                0 => String::new(),
+                n => format!(
+                    " With them go {n} self-freeze cache{} no track plays any more (made \
+                     again when needed).",
+                    if n == 1 { "" } else { "s" }
+                ),
+            },
         ))
         .buttons(["Keep Them", "Move to Trash"])
         .cancel_button(0)
@@ -771,6 +824,31 @@ pub fn rename_group(app: &Rc<AppState>, group: faderframe_core::GroupId) {
     );
 }
 
+/// Ask for a mix scene's new name.
+pub fn rename_mix_scene(app: &Rc<AppState>, scene: faderframe_core::MixSceneId) {
+    let Some(name) = app
+        .session
+        .borrow()
+        .mix_scenes()
+        .get(scene)
+        .map(|s| s.name.clone())
+    else {
+        return;
+    };
+    name_prompt(
+        app,
+        "Rename Mix Scene",
+        "Scene name:",
+        &name,
+        "Rename",
+        move |name| {
+            faderframe_session::Action::MixScene(faderframe_session::scenes::SceneOp::Rename(
+                scene, name,
+            ))
+        },
+    );
+}
+
 /// Ask for a scratch pad's new name.
 pub fn rename_scratch_pad(app: &Rc<AppState>, pad: faderframe_core::ScratchPadId) {
     let Some(name) = app
@@ -831,7 +909,9 @@ pub(crate) fn ago(t: Option<std::time::SystemTime>) -> String {
 }
 
 /// The project's versions: save another, compare one with the project as
-/// it is now, go back to one (the present is kept as a version first).
+/// it is now, go back to one (the present is kept as a version first),
+/// merge one into it (from the version both come from: found by where they
+/// come from, or the one chosen in "Merge from").
 pub fn versions(app: &Rc<AppState>) {
     let Some(main) = app.window.borrow().clone() else {
         return;
@@ -850,7 +930,7 @@ pub fn versions(app: &Rc<AppState>) {
     body.set_margin_end(14);
     let top = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let intro = gtk::Label::new(Some(
-        "Snapshots of this project, kept in its Versions folder. Restoring one keeps the project as it is as a version first.",
+        "Snapshots of this project, kept in its Versions folder. Restoring one keeps the project as it is as a version first; merging one brings its changes into the project as one undo step.",
     ));
     intro.set_wrap(true);
     intro.set_xalign(0.0);
@@ -862,6 +942,34 @@ pub fn versions(app: &Rc<AppState>) {
     top.append(&intro);
     top.append(&save);
     body.append(&top);
+    // The base merges start from: found, or a version chosen.
+    let base_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let base_label = gtk::Label::new(Some("Merge from:"));
+    base_label.add_css_class("dim-label");
+    let bases = gtk::StringList::new(&["The version both come from"]);
+    let base = gtk::DropDown::new(Some(bases.clone()), gtk::Expression::NONE);
+    base.set_tooltip_text(Some(
+        "The common version a merge starts from: changes since it on both sides are joined",
+    ));
+    let merge_file = gtk::Button::with_label("Merge Project File…");
+    merge_file.set_tooltip_text(Some(
+        "Merge a copy of this project someone else worked on (its media are found here by content)",
+    ));
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    base_row.append(&base_label);
+    base_row.append(&base);
+    base_row.append(&spacer);
+    base_row.append(&merge_file);
+    body.append(&base_row);
+    let weak = Rc::downgrade(app);
+    merge_file.connect_clicked(move |_| {
+        if let Some(app) = weak.upgrade() {
+            app.dispatch(faderframe_session::Action::PromptMergeProjectFile);
+        }
+    });
+    // The versions the base list offers (by place after the first entry).
+    let base_paths: Rc<std::cell::RefCell<Vec<std::path::PathBuf>>> = Rc::default();
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::None);
     list.add_css_class("boxed-list");
@@ -897,10 +1005,24 @@ pub fn versions(app: &Rc<AppState>) {
             details.clone(),
             Rc::clone(&shown),
         );
+        let (bases, base, base_paths) = (bases.clone(), base.clone(), Rc::clone(&base_paths));
         Rc::new(move || {
             let Some(app) = weak.upgrade() else { return };
             let versions = app.session.borrow().versions();
             shown.set(versions.len());
+            let chosen = base.selected() as usize;
+            let was = chosen
+                .checked_sub(1)
+                .and_then(|i| base_paths.borrow().get(i).cloned());
+            bases.splice(1, bases.n_items().saturating_sub(1), &[]);
+            *base_paths.borrow_mut() = versions.iter().rev().map(|v| v.path.clone()).collect();
+            for v in versions.iter().rev() {
+                bases.append(&format!("{} ‘{}’", v.number, v.name));
+            }
+            let again = was
+                .and_then(|w| base_paths.borrow().iter().position(|p| *p == w))
+                .map_or(0, |i| i + 1);
+            base.set_selected(again as u32);
             while let Some(row) = list.first_child() {
                 list.remove(&row);
             }
@@ -931,15 +1053,36 @@ pub fn versions(app: &Rc<AppState>) {
                 when.add_css_class("dim-label");
                 let compare = gtk::Button::with_label("Compare");
                 let restore = gtk::Button::with_label("Restore");
+                let merge = gtk::Button::with_label("Merge");
+                merge.set_tooltip_text(Some(
+                    "Bring this version's changes into the project as it is (one undo step)",
+                ));
                 for w in [
                     &number.clone().upcast::<gtk::Widget>(),
                     &name.upcast(),
                     &when.upcast(),
                     &compare.clone().upcast(),
+                    &merge.clone().upcast(),
                     &restore.clone().upcast(),
                 ] {
                     row.append(w);
                 }
+                let (weak, path, base, base_paths) = (
+                    Rc::downgrade(&app),
+                    v.path.clone(),
+                    base.clone(),
+                    Rc::clone(&base_paths),
+                );
+                merge.connect_clicked(move |_| {
+                    let Some(app) = weak.upgrade() else { return };
+                    let from = (base.selected() as usize)
+                        .checked_sub(1)
+                        .and_then(|i| base_paths.borrow().get(i).cloned());
+                    app.dispatch(faderframe_session::Action::MergeVersion {
+                        theirs: path.clone(),
+                        base: from,
+                    });
+                });
                 let (weak, details, path) = (Rc::downgrade(&app), details.clone(), v.path.clone());
                 let (num, vname) = (v.number, v.name.clone());
                 compare.connect_clicked(move |_| {
@@ -1702,6 +1845,19 @@ pub fn about(app: &Rc<AppState>) {
         .authors(["BurningTreeC and the FaderFrame contributors"])
         .modal(true)
         .build();
+    // Models fetched when asked for (not in the program): their makers
+    // and licences, as the licences ask.
+    let mut models: Vec<String> = faderframe_session::separate::models::MODELS
+        .iter()
+        .map(|m| format!("Stem separation: {}", m.attribution))
+        .collect();
+    models.push(
+        "Speech and lyrics: OpenAI's Whisper (whisper-base), Apache-2.0, \
+         https://huggingface.co/openai/whisper-base"
+            .into(),
+    );
+    let models: Vec<&str> = models.iter().map(String::as_str).collect();
+    dialog.add_credit_section("Models downloaded on request", &models);
     if let Some(win) = app.window.borrow().as_ref() {
         dialog.set_transient_for(Some(win));
     }
@@ -1844,6 +2000,30 @@ pub fn import_sysex(
                     .borrow_mut()
                     .notify(faderframe_session::NoticeLevel::Warning, e),
             }
+        }
+    });
+}
+
+/// Pick a `.syx` file whose messages setlist song `song` sends to its gear
+/// (patch dumps).
+pub fn import_gear_sysex(app: &Rc<AppState>, song: usize) {
+    let Some(win) = app.window.borrow().clone() else {
+        return;
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title("Patch Dump for the Song")
+        .accept_label("Add")
+        .modal(true)
+        .filters(&sysex_filters())
+        .build();
+    let weak = Rc::downgrade(app);
+    dialog.open(Some(&win), gio::Cancellable::NONE, move |res| {
+        if let (Ok(file), Some(app)) = (res, weak.upgrade())
+            && let Some(path) = file.path()
+        {
+            app.dispatch(faderframe_session::Action::Setlist(
+                faderframe_session::setlist::SetlistOp::GearSysexFile(song, path),
+            ));
         }
     });
 }

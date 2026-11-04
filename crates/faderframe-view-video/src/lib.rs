@@ -2,17 +2,35 @@
 //! drawn reaches the screen ([`Session::video_picture`]), letterboxed on
 //! black, with a timecode overlay (project timecode, frame, the file). Its
 //! menu imports video, moves the picture against the sound (by frames or
-//! milliseconds), makes the flash-and-beep sync test, spots a clip to its
-//! timecode, writes the movie and goes full screen (a double-click too).
+//! milliseconds), makes the flash-and-beep sync test, calibrates the
+//! picture offset with a camera, follows an object for a track's pan,
+//! spots a clip to its timecode, writes the movie and goes full screen (a
+//! double-click too).
+//!
+//! While A/V calibration runs the window is the test's screen: white for
+//! each flash, dark between ([`Session::av_calibration_screen`], timed as
+//! the picture is). Following an object: a box drawn on the picture
+//! (Shift+drag, or a drag with the box tool on) is a key
+//! ([`FollowOp::Key`]); the box followed is drawn over the picture.
+//! Screen readers and the keyboard: see [`access`].
 
 #![forbid(unsafe_code)]
 
+mod access;
+mod sphere;
+
+use faderframe_session::av_calibration::{
+    CalibrationSettings, CalibrationStatus, CameraChoice, DEFAULT_FLASHES,
+};
+use faderframe_session::object_tracking::{DEFAULT_DEPTH, FollowOp, FollowTarget, Seen};
 use faderframe_session::video::{VideoCompare, VideoOp, VideoShown};
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
-    Align, CanvasView, Color, EventCx, External, FontFamily, FontWeight, HostRequest, MenuItem,
-    Painter, Pixels, Point, PointerButton, Rect, Size, TextStyle, Theme, ViewEvent,
+    AccessNode, AccessPress, Align, CanvasView, Color, EventCx, External, FontFamily, FontWeight,
+    HostRequest, MenuItem, Painter, Pixels, Point, PointerButton, Rect, Size, TextStyle, Theme,
+    ViewEvent,
 };
+use faderframe_video::track::Area;
 use faderframe_workspace::ViewId;
 
 /// Files offered for import.
@@ -35,6 +53,21 @@ pub struct VideoView {
     /// it is being dragged.
     wipe: f32,
     wiping: bool,
+    /// The picture last drawn (single view): where, of which clip and
+    /// frame — what a box is drawn on.
+    shown: Option<(Rect, faderframe_core::VideoClipId, usize)>,
+    /// A box being drawn (from, to).
+    boxing: Option<(Point, Point)>,
+    /// What the picture last drawn shows, as read (timecode, file, frame).
+    caption: Option<String>,
+    /// What screen readers were last told (jobs, calibration).
+    told: Option<access::Told>,
+    /// Views into 360° frames (A, B), kept until the frame or view changes.
+    sphere_cache: [sphere::SphereCache; 2],
+    /// Where a 360° picture was last drawn in the single view.
+    sphere_shown: Option<Rect>,
+    /// Looking round or panning on it.
+    sphere_drag: Option<sphere::SphereDrag>,
 }
 
 impl VideoView {
@@ -47,6 +80,214 @@ impl VideoView {
             waiting: false,
             wipe: 0.5,
             wiping: false,
+            shown: None,
+            boxing: None,
+            caption: None,
+            told: None,
+            sphere_cache: Default::default(),
+            sphere_shown: None,
+            sphere_drag: None,
+        }
+    }
+
+    /// `area` (shares of the picture) on the picture drawn at `r`.
+    pub fn on_picture(area: Area, r: Rect) -> Rect {
+        Rect::new(
+            r.x + area.x * r.w,
+            r.y + area.y * r.h,
+            area.w * r.w,
+            area.h * r.h,
+        )
+    }
+
+    /// The box from `a` to `b` as shares of the picture at `r` (`None`:
+    /// too small, or off the picture).
+    pub fn area_of(a: Point, b: Point, r: Rect) -> Option<Area> {
+        if r.w <= 0.0 || r.h <= 0.0 {
+            return None;
+        }
+        let x0 = ((a.x.min(b.x) - r.x) / r.w).clamp(0.0, 1.0);
+        let x1 = ((a.x.max(b.x) - r.x) / r.w).clamp(0.0, 1.0);
+        let y0 = ((a.y.min(b.y) - r.y) / r.h).clamp(0.0, 1.0);
+        let y1 = ((a.y.max(b.y) - r.y) / r.h).clamp(0.0, 1.0);
+        ((x1 - x0) * r.w >= 6.0 && (y1 - y0) * r.h >= 6.0)
+            .then(|| Area::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// The A/V calibration submenu.
+    fn calibration_menu(model: &Session) -> MenuItem<Action> {
+        let start = |camera: CameraChoice| {
+            Action::Video(VideoOp::Calibrate(CalibrationSettings {
+                camera,
+                input: 0,
+                flashes: DEFAULT_FLASHES,
+            }))
+        };
+        let mut items = Vec::new();
+        if model.av_calibrating() {
+            items.push(MenuItem::new(
+                "Stop Calibrating",
+                Action::Video(VideoOp::CancelCalibration),
+            ));
+        } else {
+            let (cameras, searched) = model.av_cameras();
+            for c in cameras {
+                items.push(MenuItem::new(
+                    format!("With {}", c.label()),
+                    start(CameraChoice::Named(c.label())),
+                ));
+            }
+            if cameras.is_empty() {
+                items.push(MenuItem::new(
+                    "With the First Camera",
+                    start(CameraChoice::Default),
+                ));
+            }
+            items.push(
+                MenuItem::new(
+                    if searched {
+                        "Look for Cameras Again"
+                    } else {
+                        "Look for Cameras"
+                    },
+                    Action::Video(VideoOp::FindCameras),
+                )
+                .separated(),
+            );
+            items.push(MenuItem::new(
+                "Test Without a Camera",
+                start(CameraChoice::Virtual {
+                    display_ms: 0.0,
+                    readout: 0.0,
+                }),
+            ));
+        }
+        match model.av_calibration() {
+            Some(CalibrationStatus::Done(r)) => items.push(
+                MenuItem::disabled(format!(
+                    "Last: {:+.1} ms (±{:.1} ms, {} of {} flashes)",
+                    r.offset_ms, r.spread_ms, r.used, r.shown
+                ))
+                .separated(),
+            ),
+            Some(CalibrationStatus::Failed(e)) => {
+                items.push(MenuItem::disabled(format!("Last: {e}")).separated());
+            }
+            _ => {}
+        }
+        MenuItem::submenu("Calibrate with a Camera", items)
+    }
+
+    /// The menu of following an object (about the frame shown).
+    fn follow_menu(model: &Session, shown: &Option<VideoShown>) -> Vec<MenuItem<Action>> {
+        let drawing = model.follow_drawing();
+        let mut items = vec![
+            MenuItem::new(
+                "Follow an Object (Draw a Box Around It)",
+                Action::Video(VideoOp::Follow(FollowOp::Draw(!drawing))),
+            )
+            .checked(drawing)
+            .separated(),
+        ];
+        let Some(status) = model.follow_status() else {
+            return items;
+        };
+        if let Some(v) = shown
+            && v.clip == status.clip
+            && status.keys.contains(&v.frame)
+            && status.keys.len() > 1
+        {
+            items.push(MenuItem::new(
+                "Take Back the Box on This Frame",
+                Action::Video(VideoOp::Follow(FollowOp::RemoveKey { frame: v.frame })),
+            ));
+        }
+        let mut apply = Vec::new();
+        for (track, name, target) in model.follow_tracks() {
+            let with = |depth| Action::Video(VideoOp::Follow(FollowOp::Apply { track, depth }));
+            apply.push(MenuItem::new(
+                format!("{name} — {}", target.label()),
+                with(None),
+            ));
+            if target == FollowTarget::Room {
+                apply.push(MenuItem::new(
+                    format!("{name} — {} and Depth", target.label()),
+                    with(Some(DEFAULT_DEPTH)),
+                ));
+            }
+        }
+        if apply.is_empty() {
+            items.push(MenuItem::disabled("Pan a Track with It (no audio tracks)"));
+        } else {
+            items.push(MenuItem::submenu("Pan a Track with It", apply));
+        }
+        items.push(MenuItem::new(
+            "Forget the Object",
+            Action::Video(VideoOp::Follow(FollowOp::Forget)),
+        ));
+        items
+    }
+
+    /// The calibration's screen: white for a flash, dark between, and
+    /// what is going on along the bottom.
+    fn paint_calibration(p: &mut dyn Painter, size: Size, lit: bool, model: &Session) {
+        let area = Rect::from_size(size);
+        // The test's light itself: pure white and near black, whatever the
+        // skin (what the camera measures).
+        p.fill(
+            area,
+            if lit {
+                Color::rgb(1.0, 1.0, 1.0)
+            } else {
+                Color::rgb(0.02, 0.02, 0.02)
+            },
+        );
+        let text = match model.av_calibration() {
+            Some(CalibrationStatus::Opening) => "A/V calibration — opening the camera…".to_string(),
+            Some(CalibrationStatus::Measuring { flash, of }) => {
+                format!("A/V calibration — flash {flash} of {of} · keep the camera on this window")
+            }
+            _ => "A/V calibration".to_string(),
+        };
+        let colour = if lit {
+            Color::rgb(0.75, 0.75, 0.75)
+        } else {
+            Color::rgb(0.35, 0.35, 0.35)
+        };
+        p.text(
+            &text,
+            Rect::new(0.0, size.h - 26.0, size.w, 18.0),
+            &TextStyle::new(11.0, colour).align(Align::Center),
+        );
+    }
+
+    /// The object's box on the picture at `r`, and the one being drawn.
+    fn paint_follow(&self, p: &mut dyn Painter, model: &Session, v: &VideoShown, r: Rect) {
+        let theme = &self.theme;
+        if let Some((area, seen)) = model.followed_box(v.clip, v.frame) {
+            let b = Self::on_picture(area, r);
+            let (colour, width) = match seen {
+                Seen::Key => (theme.ui.accent, 2.5),
+                Seen::Followed => (theme.ui.selection, 2.0),
+                Seen::Lost => (theme.console.meter.red, 2.0),
+            };
+            p.stroke_rounded(b, 3.0, width, colour);
+            let (cx, cy) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+            p.fill(Rect::new(cx - 4.0, cy - 0.75, 8.0, 1.5), colour);
+            p.fill(Rect::new(cx - 0.75, cy - 4.0, 1.5, 8.0), colour);
+        }
+        if let Some(status) = model.follow_status().filter(|s| s.clip == v.clip) {
+            let text = if status.busy {
+                "Following the object…".to_string()
+            } else if status.lost > 0 {
+                format!(
+                    "Object followed · {} frames lost: draw the box again there",
+                    status.lost
+                )
+            } else {
+                format!("Object followed · {} frames", status.followed)
+            };
+            Self::tag(p, &text, Point::new(8.0, 40.0));
         }
     }
 
@@ -82,7 +323,12 @@ impl VideoView {
             )
             .separated(),
             MenuItem::new("Flash-and-Beep Sync Test", Action::Video(VideoOp::SyncTest)),
+            Self::calibration_menu(model),
         ];
+        items.extend(Self::sphere_menu(model, &shown));
+        if sphere::spherical_of(model, &shown).is_none() {
+            items.extend(Self::follow_menu(model, &shown));
+        }
         let two = model.project().video.shown_tracks().count() >= 2;
         let now = model.video_compare();
         let compare = |label: &str, c: VideoCompare| {
@@ -125,14 +371,17 @@ impl VideoView {
         items
     }
 
-    /// Draw `shown` letterboxed in `area` (or what stands for it); whether
-    /// the exact frame is still to come.
+    /// Draw `shown` letterboxed in `area` (or what stands for it; a 360°
+    /// picture looked into, filling it); whether the exact frame is still
+    /// to come.
     fn draw_picture(
         p: &mut dyn Painter,
         model: &Session,
         shown: &Option<VideoShown>,
         area: Rect,
         theme: &Theme,
+        scale: f32,
+        cache: &mut sphere::SphereCache,
     ) -> bool {
         let small = TextStyle::new(11.0, theme.ui.text_dim).align(Align::Center);
         let middle = Rect::new(area.x, area.y + area.h / 2.0 - 10.0, area.w, 20.0);
@@ -153,6 +402,12 @@ impl VideoView {
                 false
             }
             Some(v) => match &v.picture {
+                Some(_) if model.video_spherical(v.source).is_some() => {
+                    let Some(s) = model.video_spherical(v.source) else {
+                        return true;
+                    };
+                    Self::draw_sphere(p, model, v, &s, area, scale, cache)
+                }
                 Some(pic) => {
                     let f = &pic.frame;
                     let fit = Self::fit(f.width as f32, f.height as f32, Size::new(area.w, area.h));
@@ -188,16 +443,20 @@ impl VideoView {
                     !pic.exact
                 }
                 None => {
-                    let state = model.video_source_state(v.source);
-                    let text = match &state.error {
-                        Some(e) => e.clone(),
-                        None if !state.indexed => "Reading the video…".into(),
-                        None => "…".into(),
-                    };
-                    p.text(&text, middle, &small);
+                    p.text(&Self::missing_text(model, v), middle, &small);
                     true
                 }
             },
+        }
+    }
+
+    /// Why a picture is not there yet: its file's error, or being read.
+    fn missing_text(model: &Session, v: &VideoShown) -> String {
+        let state = model.video_source_state(v.source);
+        match &state.error {
+            Some(e) => e.clone(),
+            None if !state.indexed => "Reading the video…".into(),
+            None => "…".into(),
         }
     }
 
@@ -299,6 +558,29 @@ impl VideoView {
 }
 
 impl CanvasView<Session, Action> for VideoView {
+    fn accessible(&self, size: Size, model: &Session) -> Vec<AccessNode<Action>> {
+        self.access_nodes(size, model)
+    }
+
+    fn accessible_name(&self) -> Option<String> {
+        Some("Video".into())
+    }
+
+    fn access_press(
+        &mut self,
+        id: u64,
+        press: AccessPress,
+        size: Size,
+        model: &Session,
+        cx: &mut EventCx<'_, Action>,
+    ) -> bool {
+        self.press(id, press, size, model, cx)
+    }
+
+    fn access_news(&mut self, model: &Session) -> Vec<String> {
+        self.news(model)
+    }
+
     fn frame_timing(&mut self, lead_ns: i64, scale: f32) {
         self.lead = lead_ns;
         self.scale = scale.clamp(0.5, 4.0);
@@ -313,6 +595,13 @@ impl CanvasView<Session, Action> for VideoView {
     }
 
     fn paint(&mut self, p: &mut dyn Painter, size: Size, model: &Session, theme: &Theme) {
+        if let Some(lit) = model.av_calibration_screen(self.lead) {
+            self.waiting = true;
+            self.shown = None;
+            self.caption = None;
+            Self::paint_calibration(p, size, lit, model);
+            return;
+        }
         let area = Rect::new(0.0, 0.0, size.w, size.h);
         // Picture is framed in black, whatever the skin.
         p.fill(area, Color::rgb(0.0, 0.0, 0.0));
@@ -337,17 +626,57 @@ impl CanvasView<Session, Action> for VideoView {
         let shown = match compare {
             VideoCompare::Single => {
                 let shown = model.video_picture(self.lead, max);
-                self.waiting = Self::draw_picture(p, model, &shown, area, theme);
+                let scale = self.scale;
+                self.waiting = Self::draw_picture(
+                    p,
+                    model,
+                    &shown,
+                    area,
+                    theme,
+                    scale,
+                    &mut self.sphere_cache[0],
+                );
+                // A 360° picture fills the window and is looked round in;
+                // a flat one: where it is (a box drawn on it), and the
+                // object followed over it.
+                self.sphere_shown = sphere::spherical_of(model, &shown).map(|_| area);
+                self.shown = shown
+                    .as_ref()
+                    .filter(|_| self.sphere_shown.is_none())
+                    .and_then(|v| {
+                        let f = &v.picture.as_ref()?.frame;
+                        let r = Self::fit(f.width as f32, f.height as f32, size);
+                        Some((r, v.clip, v.frame))
+                    });
+                if let (Some(v), Some((r, _, _))) = (&shown, self.shown) {
+                    self.paint_follow(p, model, v, r);
+                }
+                if self.sphere_shown.is_some() {
+                    self.paint_sphere_overlay(p, model, area);
+                }
+                if let Some((a, b)) = self.boxing {
+                    let r = Rect::new(
+                        a.x.min(b.x),
+                        a.y.min(b.y),
+                        (a.x - b.x).abs(),
+                        (a.y - b.y).abs(),
+                    );
+                    p.stroke_rounded(r, 2.0, 1.5, self.theme.ui.accent);
+                }
                 shown
             }
             VideoCompare::SideBySide => {
+                self.shown = None;
+                self.sphere_shown = None;
                 let half = (max.0 / 2, max.1);
                 let a = model.video_picture_on(Some(pair[0].0), self.lead, half);
                 let b = model.video_picture_on(Some(pair[1].0), self.lead, half);
                 let left = Rect::new(0.0, 0.0, size.w / 2.0 - 1.0, size.h);
                 let right = Rect::new(size.w / 2.0 + 1.0, 0.0, size.w / 2.0 - 1.0, size.h);
-                let wa = Self::draw_picture(p, model, &a, left, theme);
-                let wb = Self::draw_picture(p, model, &b, right, theme);
+                let scale = self.scale;
+                let [ca, cb] = &mut self.sphere_cache;
+                let wa = Self::draw_picture(p, model, &a, left, theme, scale, ca);
+                let wb = Self::draw_picture(p, model, &b, right, theme, scale, cb);
                 self.waiting = wa || wb;
                 Self::tag(p, &format!("A · {}", pair[0].1), Point::new(8.0, 40.0));
                 Self::tag(
@@ -358,13 +687,17 @@ impl CanvasView<Session, Action> for VideoView {
                 a
             }
             VideoCompare::Wipe => {
+                self.shown = None;
+                self.sphere_shown = None;
                 let a = model.video_picture_on(Some(pair[0].0), self.lead, max);
                 let b = model.video_picture_on(Some(pair[1].0), self.lead, max);
-                let wb = Self::draw_picture(p, model, &b, area, theme);
+                let scale = self.scale;
+                let [ca, cb] = &mut self.sphere_cache;
+                let wb = Self::draw_picture(p, model, &b, area, theme, scale, cb);
                 let x = (self.wipe * size.w).round();
                 p.push_clip(Rect::new(0.0, 0.0, x, size.h));
                 p.fill(area, Color::rgb(0.0, 0.0, 0.0));
-                let wa = Self::draw_picture(p, model, &a, area, theme);
+                let wa = Self::draw_picture(p, model, &a, area, theme, scale, ca);
                 p.pop_clip();
                 p.fill(
                     Rect::new(x - 1.0, 0.0, 2.0, size.h),
@@ -378,6 +711,13 @@ impl CanvasView<Session, Action> for VideoView {
                 a
             }
         };
+        self.caption = shown.as_ref().map(|v| {
+            let (tc, what) = Self::overlay_text(model, v);
+            match &v.picture {
+                Some(_) => format!("{tc}, {what}"),
+                None => format!("{tc}, {what}, {}", Self::missing_text(model, v)),
+            }
+        });
         if self.overlay
             && let Some(v) = &shown
         {
@@ -414,6 +754,7 @@ impl CanvasView<Session, Action> for VideoView {
             // Over the picture (not the letterbox).
             let area = shown
                 .as_ref()
+                .filter(|_| self.sphere_shown.is_none())
                 .and_then(|v| v.picture.as_ref())
                 .map_or(Rect::from_size(size), |pic| {
                     Self::fit(pic.frame.width as f32, pic.frame.height as f32, size)
@@ -467,6 +808,70 @@ impl CanvasView<Session, Action> for VideoView {
             } => {
                 let items = self.menu(model);
                 cx.request(HostRequest::ContextMenu { at: *pos, items });
+                true
+            }
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Primary,
+                modifiers,
+                clicks: 1,
+            } if (modifiers.shift || model.follow_drawing())
+                && self.shown.is_some_and(|(r, _, _)| r.contains(*pos)) =>
+            {
+                self.boxing = Some((*pos, *pos));
+                cx.redraw();
+                true
+            }
+            ViewEvent::PointerMove {
+                pos,
+                dragging: true,
+                ..
+            } if self.boxing.is_some() => {
+                if let Some((a, _)) = self.boxing {
+                    self.boxing = Some((a, *pos));
+                }
+                cx.redraw();
+                true
+            }
+            ViewEvent::PointerUp { pos, .. } if self.boxing.is_some() => {
+                if let (Some((a, _)), Some((r, clip, frame))) = (self.boxing.take(), self.shown)
+                    && let Some(area) = Self::area_of(a, *pos, r)
+                {
+                    cx.emit(Action::Video(VideoOp::Follow(FollowOp::Key {
+                        clip,
+                        frame,
+                        area,
+                    })));
+                }
+                cx.redraw();
+                true
+            }
+            // A 360° picture: dragged round, or clicked to pan a track.
+            ViewEvent::PointerDown {
+                pos,
+                button: PointerButton::Primary,
+                modifiers,
+                clicks: 1,
+            } if self.sphere_area().is_some_and(|r| r.contains(*pos)) => {
+                self.sphere_press(*pos, modifiers.alt, model, cx);
+                true
+            }
+            ViewEvent::PointerMove {
+                pos,
+                dragging: true,
+                ..
+            } if self.sphere_drag.is_some() => {
+                self.sphere_move(*pos, model, cx);
+                true
+            }
+            ViewEvent::PointerUp { .. } if self.sphere_drag.is_some() => {
+                self.sphere_release(cx);
+                true
+            }
+            ViewEvent::Scroll { pos, dy, .. }
+                if self.sphere_area().is_some_and(|r| r.contains(*pos)) =>
+            {
+                self.sphere_zoom(*dy, model, cx);
                 true
             }
             ViewEvent::PointerDown {
@@ -526,5 +931,237 @@ impl CanvasView<Session, Action> for VideoView {
                 sound: true,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faderframe_engine::EngineConfig;
+    use faderframe_project::Project;
+    use faderframe_ui_canvas::{DrawOp, Modifiers, RecordingPainter};
+
+    fn session() -> Session {
+        Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap()
+    }
+
+    fn send(view: &mut VideoView, ev: ViewEvent, s: &Session) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        let mut cx = EventCx::new(&mut actions, &mut requests);
+        view.event(&ev, Size::new(640.0, 360.0), s, &mut cx);
+        actions
+    }
+
+    fn flat(items: &[MenuItem<Action>]) -> Vec<(String, Option<Action>)> {
+        let mut out = Vec::new();
+        for i in items {
+            out.push((i.label.clone(), i.action.clone()));
+            out.extend(flat(&i.children));
+        }
+        out
+    }
+
+    #[test]
+    fn a_box_maps_onto_the_picture_and_back() {
+        let r = Rect::new(80.0, 0.0, 480.0, 270.0);
+        let a = VideoView::area_of(Point::new(320.0, 135.0), Point::new(200.0, 27.0), r).unwrap();
+        assert!((a.x - 0.25).abs() < 1e-6 && (a.y - 0.1).abs() < 1e-6);
+        assert!((a.w - 0.25).abs() < 1e-6 && (a.h - 0.4).abs() < 1e-6);
+        let back = VideoView::on_picture(a, r);
+        assert_eq!(back, Rect::new(200.0, 27.0, 120.0, 108.0));
+        // A click is no box.
+        assert!(
+            VideoView::area_of(Point::new(100.0, 100.0), Point::new(102.0, 101.0), r).is_none()
+        );
+    }
+
+    #[test]
+    fn a_shift_drag_on_the_picture_boxes_an_object_to_follow() {
+        let s = session();
+        let mut view = VideoView::new(Theme::default());
+        let clip = faderframe_core::VideoClipId(7);
+        let picture = Rect::new(80.0, 0.0, 480.0, 360.0);
+        view.shown = Some((picture, clip, 12));
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::NONE
+        };
+        // Without Shift (and the tool off): no box.
+        let none = send(
+            &mut view,
+            ViewEvent::PointerDown {
+                pos: Point::new(200.0, 100.0),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+                clicks: 1,
+            },
+            &s,
+        );
+        assert!(none.is_empty());
+        assert!(view.boxing.is_none());
+        send(
+            &mut view,
+            ViewEvent::PointerDown {
+                pos: Point::new(200.0, 90.0),
+                button: PointerButton::Primary,
+                modifiers: shift,
+                clicks: 1,
+            },
+            &s,
+        );
+        send(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(260.0, 150.0),
+                modifiers: shift,
+                dragging: true,
+            },
+            &s,
+        );
+        // Being drawn while dragging.
+        assert_eq!(
+            view.boxing,
+            Some((Point::new(200.0, 90.0), Point::new(260.0, 150.0)))
+        );
+        let actions = send(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: Point::new(260.0, 150.0),
+                button: PointerButton::Primary,
+                modifiers: shift,
+            },
+            &s,
+        );
+        let [
+            Action::Video(VideoOp::Follow(FollowOp::Key {
+                clip: c,
+                frame,
+                area,
+            })),
+        ] = actions.as_slice()
+        else {
+            panic!("{actions:?}");
+        };
+        assert_eq!((*c, *frame), (clip, 12));
+        assert!((area.x - 0.25).abs() < 1e-6 && (area.y - 0.25).abs() < 1e-6);
+        assert!((area.w - 0.125).abs() < 1e-6 && (area.h - 1.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_menu_calibrates_with_a_camera_and_follows_an_object() {
+        let s = session();
+        let view = VideoView::new(Theme::default());
+        let items = flat(&view.menu(&s));
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Calibrate with a Camera"), "{labels:?}");
+        let test = items
+            .iter()
+            .find(|(l, _)| l == "Test Without a Camera")
+            .and_then(|(_, a)| a.clone());
+        assert!(matches!(
+            test,
+            Some(Action::Video(VideoOp::Calibrate(CalibrationSettings {
+                camera: CameraChoice::Virtual { .. },
+                ..
+            })))
+        ));
+        assert!(labels.contains(&"Look for Cameras"));
+        assert!(labels.contains(&"With the First Camera"));
+        let draw = items
+            .iter()
+            .find(|(l, _)| l == "Follow an Object (Draw a Box Around It)")
+            .and_then(|(_, a)| a.clone());
+        assert_eq!(
+            draw,
+            Some(Action::Video(VideoOp::Follow(FollowOp::Draw(true))))
+        );
+        // Nothing followed: nothing to apply yet.
+        assert!(!labels.contains(&"Pan a Track with It"));
+    }
+
+    #[test]
+    fn the_calibration_screen_is_the_whole_window() {
+        let s = session();
+        let size = Size::new(640.0, 360.0);
+        let mut p = RecordingPainter::new();
+        VideoView::paint_calibration(&mut p, size, true, &s);
+        assert_eq!(p.ops.first(), Some(&DrawOp::Rect(Rect::from_size(size))));
+        assert!(p.texts().iter().any(|t| t.starts_with("A/V calibration")));
+        // Not calibrating: the picture as ever.
+        let mut view = VideoView::new(Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        assert!(p.texts().iter().any(|t| t.starts_with("No video")));
+    }
+
+    /// The picture is one control: read as what it shows, its menu (the
+    /// window's) opened with Enter or the Menu key; a wiped comparison's
+    /// divider is a slider the arrows move.
+    #[test]
+    fn the_picture_reads_as_what_it_shows_and_opens_its_menu() {
+        use faderframe_ui_canvas::access::{focus_order, press_key};
+        use faderframe_ui_canvas::{AccessRole, Key};
+        let size = Size::new(640.0, 360.0);
+        let s = session();
+        let mut view = VideoView::new(Theme::default());
+        assert_eq!(view.accessible_name().as_deref(), Some("Video"));
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let nodes = view.accessible(size, &s);
+        let order = focus_order(&nodes);
+        assert_eq!(order.len(), 1);
+        let picture = order[0].clone();
+        assert_eq!(
+            (picture.role, picture.label.as_str()),
+            (AccessRole::Region, "No video")
+        );
+        assert!(picture.menu);
+        for k in [Key::Enter, Key::Menu] {
+            let (_, requests) =
+                press_key(&mut view, &nodes, picture.id, k, Modifiers::NONE, size, &s).unwrap();
+            let Some(HostRequest::ContextMenu { items, .. }) = requests.first() else {
+                panic!("the video menu")
+            };
+            assert!(flat(items).iter().any(|(l, _)| l == "Import Video…"));
+        }
+        // What is shown, as read.
+        view.caption = Some("01:00:00:00, film.mov · frame 0".into());
+        let nodes = view.accessible(size, &s);
+        assert_eq!(nodes[0].label, "Picture 01:00:00:00, film.mov · frame 0");
+        // The divider: only while two tracks are wiped; the view's own.
+        assert!(nodes[0].children.is_empty());
+        let mut wiped =
+            Session::new(Project::new("Film", 48_000), None, EngineConfig::default()).unwrap();
+        wiped.dispatch(Action::Video(VideoOp::AddTrack)).unwrap();
+        wiped.dispatch(Action::Video(VideoOp::AddTrack)).unwrap();
+        wiped
+            .dispatch(Action::Video(VideoOp::SetCompare(VideoCompare::Wipe)))
+            .unwrap();
+        let nodes = view.accessible(size, &wiped);
+        let wipe = nodes[0].children.first().cloned().unwrap();
+        assert_eq!(wipe.role, AccessRole::Slider);
+        press_key(
+            &mut view,
+            &nodes,
+            wipe.id,
+            Key::Right,
+            Modifiers::NONE,
+            size,
+            &wiped,
+        )
+        .unwrap();
+        assert!((view.wipe - 0.55).abs() < 1e-6);
+    }
+
+    /// Jobs finishing are said; nothing on the first look.
+    #[test]
+    fn finished_jobs_are_said() {
+        let s = session();
+        let mut view = VideoView::new(Theme::default());
+        assert!(view.access_news(&s).is_empty());
+        view.told = Some(access::Told::with_jobs(vec!["Reading film.mov".into()]));
+        assert_eq!(view.access_news(&s), ["Reading film.mov: done"]);
+        assert!(view.access_news(&s).is_empty());
     }
 }

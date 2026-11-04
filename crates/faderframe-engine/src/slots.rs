@@ -108,6 +108,20 @@ pub struct ChainSlots {
     /// Balance, −1..1.
     pub pan: ParamSlot,
 }
+/// Writes into a parameter table that leave some slots alone.
+struct Writes<'a> {
+    table: &'a ParamTable,
+    skip: &'a HashSet<ParamSlot>,
+}
+
+impl Writes<'_> {
+    fn set(&self, slot: ParamSlot, value: f32) {
+        if !self.skip.contains(&slot) {
+            self.table.set(slot, value);
+        }
+    }
+}
+
 /// Meter channels reserved per track at least (stereo).
 const METER_CHANNELS: u16 = 2;
 
@@ -146,6 +160,9 @@ pub struct SlotRegistry {
     bass: Option<[ParamSlot; 4]>,
     /// Tracks' own delays (milliseconds), once they have one.
     delays: HashMap<TrackId, ParamSlot>,
+    /// Gains beside the faders (an interactive score's layers heard in its
+    /// preview), folded into the strips' VCA gain; never in the project.
+    trims: HashMap<TrackId, f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -172,7 +189,18 @@ impl SlotRegistry {
             mix: None,
             bass: None,
             delays: HashMap::new(),
+            trims: HashMap::new(),
         }
+    }
+
+    /// Gains beside the faders from now on (linear; tracks left out: unity).
+    /// Written with the other values by [`Self::write_params`].
+    pub fn set_trims(&mut self, trims: HashMap<TrackId, f32>) {
+        self.trims = trims;
+    }
+
+    pub fn trims(&self) -> &HashMap<TrackId, f32> {
+        &self.trims
     }
 
     /// A track's own delay in milliseconds (`Track::delay_ms`).
@@ -546,6 +574,37 @@ impl SlotRegistry {
         });
     }
 
+    /// The slots holding continuous mixer values a glide may move, with
+    /// how each moves (see [`crate::glide`]): strips' faders, pans, dual
+    /// pans, surround positions (not the panner's modes) and VCA gains,
+    /// sends' levels and pans, cue sends' levels and pans, container
+    /// chains' levels and pans, the console's drive.
+    pub(crate) fn glidable(&self) -> Vec<(ParamSlot, crate::glide::GlideLaw)> {
+        use crate::glide::GlideLaw::{Gain, Linear};
+        let positions = faderframe_core::SurroundParam::ALL.len();
+        let mut out = Vec::new();
+        for s in self.strips.values() {
+            out.extend([
+                (s.volume, Gain),
+                (s.pan, Linear),
+                (s.pan_left, Linear),
+                (s.pan_right, Linear),
+                (s.vca, Gain),
+            ]);
+            out.extend(s.surround[..positions].iter().map(|p| (*p, Linear)));
+        }
+        out.extend(self.sends.values().map(|s| (*s, Gain)));
+        out.extend(self.send_pans.values().map(|s| (*s, Linear)));
+        for c in self.cue_sends.values() {
+            out.extend([(c.gain, Gain), (c.pan, Linear)]);
+        }
+        for c in self.chains.values() {
+            out.extend([(c.gain, Gain), (c.pan, Linear)]);
+        }
+        out.extend(self.console_drive.map(|s| (s, Linear)));
+        out
+    }
+
     /// Write the current fader/pan/mute/send values of `project` (control
     /// thread). Solo is resolved here into per-track mute flags.
     pub fn write_params(
@@ -554,7 +613,13 @@ impl SlotRegistry {
         table: &ParamTable,
         midi_live: &HashSet<TrackId>,
         suspended: &HashSet<AutomationLaneId>,
+        gliding: &HashSet<ParamSlot>,
     ) -> Result<(), SlotsExhausted> {
+        // Slots a glide moves are the audio thread's until it lets go.
+        let table = Writes {
+            table,
+            skip: gliding,
+        };
         let solo = project.solo_audible();
         if let Some(c) = &project.console {
             let slot = self.console_drive()?;
@@ -604,6 +669,9 @@ impl SlotRegistry {
                     vca_gain *= faderframe_core::db_to_gain(v.volume_db);
                 }
                 vca_muted |= v.mute && !lane(AutomationTarget::TrackMute);
+            }
+            if let Some(trim) = self.trims.get(&t.id) {
+                vca_gain *= trim.max(0.0);
             }
             table.set(s.vca, vca_gain);
             let solo_muted = vca_muted || folder_muted || solo_out;

@@ -283,6 +283,10 @@ impl Session {
                 let f = len as f64 / a.length.max(1) as f64;
                 a.fades.fade_in = (a.fades.fade_in as f64 * f) as i64;
                 a.fades.fade_out = (a.fades.fade_out as f64 * f) as i64;
+                // The envelope stretches with the audio.
+                if let Some(e) = &mut a.envelope {
+                    e.scale(f);
+                }
                 a.length = len;
                 ClipContent::Audio(a)
             }
@@ -360,6 +364,17 @@ impl Session {
 /// the source's start, nor into the devices' latency at the start of a
 /// clip-effects render (`rendered_offset`).
 pub(crate) fn trim_audio_start(a: &mut AudioClip, delta: i64) {
+    let length = a.length;
+    trim_start_of_audio(a, delta);
+    // The envelope stays with the audio: what came off the start moves
+    // it (points outside the clip are kept for a trim back).
+    let taken = length - a.length;
+    if let Some(e) = &mut a.envelope {
+        e.shift(-taken);
+    }
+}
+
+fn trim_start_of_audio(a: &mut AudioClip, delta: i64) {
     let lo = a
         .effects
         .as_ref()

@@ -87,6 +87,7 @@ fn audio_clip(t: TrackId, source: AudioSourceId, start: f64, bars: f64, id: u64)
             pitch: None,
             effects: None,
             spectral: None,
+            envelope: None,
         }),
     }
 }
@@ -111,16 +112,21 @@ fn midi_clip(t: TrackId, start: f64, id: u64) -> Clip {
         channel: 0,
         muted: false,
         release: Some(40),
+        time_locked: false,
+        articulation: None,
+        fine: None,
     };
     let mut wheel = ControllerLane::new(MidiController::Cc { number: 1 }, 0);
     wheel.points = vec![
         ControllerPoint {
             time: q(0.0),
             value: 5,
+            fine: None,
         },
         ControllerPoint {
             time: q(2.0),
             value: 100,
+            fine: None,
         },
     ];
     Clip {
@@ -145,6 +151,7 @@ fn midi_clip(t: TrackId, start: f64, id: u64) -> Clip {
                 time: q(0.5),
                 data: vec![0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7],
             }],
+            articulations: Vec::new(),
         }),
     }
 }

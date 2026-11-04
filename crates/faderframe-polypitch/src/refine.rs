@@ -1,7 +1,9 @@
 //! The pitch of each note of a chord over time: for every analysis frame,
 //! the frequency within 70 cents of the note's key whose harmonics hold the
 //! most energy (a weighted harmonic sum over the spectrum, refined by a
-//! parabola), or nothing where the note is no longer heard.
+//! parabola), or nothing where the note is no longer heard — and how
+//! strongly it is heard (that sum), which lead sheets weigh notes by and
+//! check a note's octave with.
 
 use crate::fft::Fft;
 use crate::render::{together, window_for};
@@ -22,8 +24,27 @@ const HARMONICS: u32 = 8;
 const REACH_CENTS: i32 = 70;
 const STEP_CENTS: i32 = 2;
 
+/// A note followed frame by frame: its pitch (MIDI, NaN where not heard)
+/// and how strongly its harmonics are heard there (the weighted harmonic
+/// sum at its pitch, a frame's spectrum scaled to its window; 0 where not
+/// heard), at `start + i * hop`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Followed {
+    pub pitch: Vec<f32>,
+    pub level: Vec<f32>,
+}
+
 /// Each note's pitch (MIDI, NaN where not heard) at `start + i * hop`.
 pub fn pitch_tracks(mono: &[f32], rate: f64, notes: &[Heard], hop: usize) -> Vec<Vec<f32>> {
+    follow(mono, rate, notes, hop)
+        .into_iter()
+        .map(|f| f.pitch)
+        .collect()
+}
+
+/// Each note followed ([`Followed`]): its pitch as [`pitch_tracks`] has it,
+/// and its level.
+pub fn follow(mono: &[f32], rate: f64, notes: &[Heard], hop: usize) -> Vec<Followed> {
     // Each note's window: the long one where it sounds with others.
     let spans: Vec<(i64, i64)> = notes.iter().map(|h| (h.start, h.end)).collect();
     let windows: Vec<usize> = notes
@@ -47,9 +68,15 @@ pub fn pitch_tracks(mono: &[f32], rate: f64, notes: &[Heard], hop: usize) -> Vec
             )
         });
     }
-    let mut out: Vec<Vec<f32>> = notes
+    let mut out: Vec<Followed> = notes
         .iter()
-        .map(|h| vec![f32::NAN; ((h.end - h.start).max(0) as usize) / hop.max(1) + 1])
+        .map(|h| {
+            let frames = ((h.end - h.start).max(0) as usize) / hop.max(1) + 1;
+            Followed {
+                pitch: vec![f32::NAN; frames],
+                level: vec![0.0; frames],
+            }
+        })
         .collect();
     let longest = windows.iter().copied().max().unwrap_or(256);
     let (mut re, mut im) = (vec![0.0; longest], vec![0.0; longest]);
@@ -189,8 +216,9 @@ pub fn pitch_tracks(mono: &[f32], rate: f64, notes: &[Heard], hop: usize) -> Vec
             }
             let f0 = if den > 0.0 { num / den } else { coarse };
             let k = ((t - h.start) / hop) as usize;
-            if let Some(slot) = out[i].get_mut(k) {
+            if let Some(slot) = out[i].pitch.get_mut(k) {
                 *slot = (69.0 + 12.0 * (f0 / 440.0).log2()) as f32;
+                out[i].level[k] = (v / (0.5 * n as f64)) as f32;
             }
         }
     }

@@ -60,9 +60,36 @@ struct Made {
     staged: Option<StagedFile>,
 }
 
+/// A span of a track being rendered as its clips play it
+/// ([`Session::render_span`]).
+pub(crate) struct SpanRender {
+    job: render::RenderJob,
+    /// The file the render writes (removed once read).
+    scratch: PathBuf,
+    /// The span's length (the render runs on past it).
+    frames: usize,
+}
+
+impl SpanRender {
+    /// Wait for the render (on a worker thread) and read it: the span's
+    /// channels exactly, and their rate.
+    pub fn join(self) -> std::result::Result<(Vec<Vec<f32>>, u32), String> {
+        let rendered = self.job.join();
+        let wav = rendered
+            .map_err(|e| e.to_string())
+            .and_then(|_| read_wav(&self.scratch).map_err(|e| e.to_string()));
+        let _ = std::fs::remove_file(&self.scratch);
+        let mut wav = wav?;
+        for c in &mut wav.channels {
+            c.truncate(self.frames);
+        }
+        Ok((wav.channels, wav.sample_rate))
+    }
+}
+
 /// The fade at an end that cuts through sound (seconds): no click, and
 /// too short to soften an attack.
-const EDGE_FADE: f64 = 0.001;
+pub(crate) const EDGE_FADE: f64 = 0.001;
 /// Rendered past the end, to make up for any latency.
 const SPARE_SECONDS: f32 = 0.25;
 
@@ -71,7 +98,7 @@ impl Session {
     /// ("Selection", "Clip", "Clips"): the edit selection when the track is
     /// in it, else the selected clips on the track, else `clip`. Audio
     /// tracks only.
-    fn sample_span(
+    pub(crate) fn sample_span(
         &self,
         track: TrackId,
         clip: Option<ClipId>,
@@ -205,8 +232,21 @@ impl Session {
         self.start_sample(track, start, end, target, Overwrite::Always)
     }
 
+    /// The media folder's samples folder (made).
+    pub(crate) fn samples_dir(&self) -> Result<PathBuf> {
+        let dir = self.media_dir.join(SAMPLES_FOLDER);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
+        Ok(dir)
+    }
+
     /// Can a sample be made of `track` from `start` to `end`?
-    fn check_sample(&self, track: TrackId, start: MusicalTime, end: MusicalTime) -> Result<()> {
+    pub(crate) fn check_sample(
+        &self,
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+    ) -> Result<()> {
         let t = self
             .project
             .track(track)
@@ -222,21 +262,22 @@ impl Session {
         Ok(())
     }
 
-    fn start_sample(
+    /// Start rendering `track` from `start` to `end` as its clips play it
+    /// (no devices, fader or pan) into a scratch file in the samples
+    /// folder named after `name` (see [`SpanRender::join`]).
+    pub(crate) fn render_span(
         &mut self,
         track: TrackId,
         start: MusicalTime,
         end: MusicalTime,
-        target: SampleTarget,
-        overwrite: Overwrite,
-    ) -> Result<()> {
+        name: &str,
+    ) -> Result<SpanRender> {
         self.check_sample(track, start, end)?;
         let t = self
             .project
             .track(track)
             .ok_or_else(|| SessionError::Other(format!("no track {track}")))?;
         let source = t.name.clone();
-        let name = format!("{source} Sample");
         let mono = t.layout == ChannelLayout::Mono;
         let project = self.absolute_copy();
         let (mut copy, _, _) = render::track_render_project(&project, track)
@@ -262,10 +303,49 @@ impl Session {
         let frames = (project.timeline.to_samples(end, f64::from(rate))
             - project.timeline.to_samples(start, f64::from(rate)))
         .max(0) as usize;
-        let dir = self.media_dir.join(SAMPLES_FOLDER);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| SessionError::Other(format!("{}: {e}", dir.display())))?;
+        let dir = self.samples_dir()?;
         let scratch = crate::media::unique_path(&dir, &format!("{name} (rendering)"));
+        let settings = RenderSettings {
+            range: RenderRange::Span { start, end },
+            channels: if mono {
+                RenderChannels::First
+            } else {
+                RenderChannels::Stereo
+            },
+            sample_rate: rate,
+            tail_seconds: SPARE_SECONDS,
+            normalize_db: None,
+            format: WavFormat::Float32,
+            dither: Dither::Off,
+            report: false,
+            // Its own file (a name the session chose): no one to ask.
+            overwrite: crate::render::Overwrite::Always,
+            ..RenderSettings::defaults_for(&copy, scratch.clone())
+        };
+        let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;
+        Ok(SpanRender {
+            job,
+            scratch,
+            frames,
+        })
+    }
+
+    fn start_sample(
+        &mut self,
+        track: TrackId,
+        start: MusicalTime,
+        end: MusicalTime,
+        target: SampleTarget,
+        overwrite: Overwrite,
+    ) -> Result<()> {
+        let source = self
+            .project
+            .track(track)
+            .map(|t| t.name.clone())
+            .ok_or_else(|| SessionError::Other(format!("no track {track}")))?;
+        let name = format!("{source} Sample");
+        self.check_sample(track, start, end)?;
+        let dir = self.samples_dir()?;
         // A file target: a temporary beside it claimed now (a folder that
         // cannot be written to fails before rendering).
         let mut staged = None;
@@ -285,43 +365,29 @@ impl Session {
                 path
             }
         };
-        let settings = RenderSettings {
-            range: RenderRange::Span { start, end },
-            channels: if mono {
-                RenderChannels::First
-            } else {
-                RenderChannels::Stereo
-            },
-            sample_rate: rate,
-            tail_seconds: SPARE_SECONDS,
-            normalize_db: None,
-            format: WavFormat::Float32,
-            dither: Dither::Off,
-            report: false,
-            // Its own file (a name the session chose): no one to ask.
-            overwrite: crate::render::Overwrite::Always,
-            ..RenderSettings::defaults_for(&copy, scratch.clone())
+        let span = match self.render_span(track, start, end, &name) {
+            Ok(span) => span,
+            Err(e) => {
+                if staged.is_none() {
+                    let _ = std::fs::remove_file(&file);
+                }
+                return Err(e);
+            }
         };
-        let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;
         let want_root = target == SampleTarget::Sampler;
         let to_file = matches!(target, SampleTarget::File(_));
         let handle = std::thread::Builder::new()
             .name("faderframe-sample".into())
             .spawn(move || {
-                let rendered = job.join();
-                let wav = rendered
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| read_wav(&scratch).map_err(|e| e.to_string()));
-                let _ = std::fs::remove_file(&scratch);
-                let wav = wav?;
-                let mut channels = wav.channels;
-                trim(&mut channels, frames, wav.sample_rate);
+                let (mut channels, rate) = span.join()?;
+                let frames = channels.first().map_or(0, Vec::len);
+                trim(&mut channels, frames, rate);
                 let root = if want_root {
                     let n = channels.first().map_or(0, Vec::len);
                     let mix: Vec<f32> = (0..n)
                         .map(|i| channels.iter().map(|c| c[i]).sum::<f32>() / channels.len() as f32)
                         .collect();
-                    faderframe_analysis::pitch::root_key(&mix, f64::from(wav.sample_rate))
+                    faderframe_analysis::pitch::root_key(&mix, f64::from(rate))
                 } else {
                     None
                 };
@@ -331,7 +397,7 @@ impl Session {
                     (WavFormat::Float32, Dither::Off)
                 };
                 let named = staged.as_ref().map_or(file.as_path(), |f| f.dest());
-                write_wav_with(&file, &channels, wav.sample_rate, format, dither)
+                write_wav_with(&file, &channels, rate, format, dither)
                     .map_err(|e| format!("{}: {e}", named.display()))?;
                 let held = if to_file {
                     None
@@ -418,6 +484,7 @@ impl Session {
                 }
                 let doc = SampleDoc {
                     files: vec![Some(file)],
+                    ..SampleDoc::default()
                 };
                 let state = faderframe_engine::encode_state(
                     &faderframe_plugin_host::devices::samples::pack(&params, &doc),
@@ -522,7 +589,7 @@ impl Session {
 }
 
 /// Keep `frames`, and fade an end that cuts through sound.
-fn trim(channels: &mut [Vec<f32>], frames: usize, rate: u32) {
+pub(crate) fn trim(channels: &mut [Vec<f32>], frames: usize, rate: u32) {
     for c in channels.iter_mut() {
         c.truncate(frames);
     }

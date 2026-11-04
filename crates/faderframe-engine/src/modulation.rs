@@ -736,7 +736,9 @@ impl NoteVoices {
         (f64::from(ms) * sr / 1000.0) as u64
     }
 
-    fn start(&mut self, channel: u8, key: u8, velocity: u8) -> usize {
+    /// A voice for a note at `velocity` 0…1 (MIDI 2.0's 16 bits where the
+    /// note came with them).
+    fn start(&mut self, channel: u8, key: u8, velocity: f32) -> usize {
         self.serial += 1;
         let i = self
             .voices
@@ -759,7 +761,7 @@ impl NoteVoices {
             live: true,
             channel,
             key,
-            velocity: f32::from(velocity) / 127.0,
+            velocity,
             serial: self.serial,
             age: 0,
             held: None,
@@ -823,7 +825,8 @@ impl NoteVoices {
                         key,
                         velocity,
                     } if velocity > 0 => {
-                        let i = self.start(channel, key, velocity);
+                        let unit = e.unit().unwrap_or(f64::from(velocity) / 127.0);
+                        let i = self.start(channel, key, unit as f32);
                         started[i] = t;
                         let v = self.voices[i];
                         Self::emit(tm, plugin, &v, 0, t, timing, out);

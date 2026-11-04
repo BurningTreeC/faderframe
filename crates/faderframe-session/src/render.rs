@@ -9,9 +9,11 @@
 //! and move into place only when all of them are done ([`files`]: an
 //! existing destination is replaced only as [`RenderSettings::overwrite`]
 //! allows, checked again right before the move), and each is read back and
-//! measured on the worker ([`stats`]).
+//! measured on the worker ([`stats`]). Stems can be null-tested against
+//! the mix and made to null ([`null`], [`StemOptions`]).
 
 pub mod files;
+pub mod null;
 pub mod stats;
 
 pub use files::{Overwrite, Staged};
@@ -79,6 +81,26 @@ pub enum RenderChannels {
     Iamf(faderframe_iamf::Codec),
 }
 
+/// What a stems render does besides writing the stems ([`null`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StemOptions {
+    /// Sum the stems that make up the mix and compare them with the mix
+    /// rendered with the same settings ([`RenderJob::null_test`]).
+    pub null_test: bool,
+    /// Stems that null: the mix's level processing worked out on the mix
+    /// and applied to every stem alike, and what still differs written as
+    /// one more stem (`"<project> - Shared Processing.wav"`). Only the
+    /// stems that make up the mix are written (no bus or return stems);
+    /// implies the null test.
+    pub shared_stem: bool,
+}
+
+impl StemOptions {
+    pub fn tests(&self) -> bool {
+        self.null_test || self.shared_stem
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderSettings {
     pub range: RenderRange,
@@ -107,6 +129,8 @@ pub struct RenderSettings {
     /// The head a binaural render listens through (`None`: the KU100;
     /// `Session::render` fills in the one listened with).
     pub head: Option<faderframe_binaural::Head>,
+    /// Stems only: the null test, stems that null.
+    pub stems: StemOptions,
     /// File for a master render, directory for stems.
     pub output: PathBuf,
 }
@@ -118,7 +142,7 @@ impl RenderSettings {
             source: RenderSource::Master,
             format: WavFormat::Pcm24,
             sample_rate: project.sample_rate,
-            channels: if master_bed(project).is_some() {
+            channels: if master_bed(project).is_some() || master_field(project).is_some() {
                 RenderChannels::Master
             } else {
                 RenderChannels::Stereo
@@ -131,6 +155,7 @@ impl RenderSettings {
             overwrite: Overwrite::Never,
             keep_latency: false,
             head: None,
+            stems: StemOptions::default(),
             output,
         }
     }
@@ -187,6 +212,10 @@ pub struct RenderProgress {
     pub latency: AtomicU32,
     /// Reading a written file back to measure it.
     pub measuring: AtomicBool,
+    /// Comparing stems with the mix ([`null`]).
+    pub null_testing: AtomicBool,
+    /// The stems' null test once it is done.
+    pub null_test: std::sync::Mutex<Option<faderframe_qc::NullTest>>,
 }
 
 impl RenderProgress {
@@ -244,6 +273,12 @@ impl RenderJob {
         self.progress.cancel.store(true, Ordering::Relaxed);
     }
 
+    /// The stems' null test, once the render made one
+    /// ([`StemOptions::null_test`]).
+    pub fn null_test(&self) -> Option<faderframe_qc::NullTest> {
+        self.progress.null_test.lock().ok().and_then(|t| t.clone())
+    }
+
     /// Wait for the result (call after `is_finished`, or to block).
     pub fn join(mut self) -> Result<Vec<Rendered>, RenderError> {
         match self.handle.take().map(JoinHandle::join) {
@@ -258,6 +293,16 @@ impl RenderJob {
 pub fn master_bed(project: &Project) -> Option<faderframe_core::SurroundFormat> {
     match project.master_id().and_then(|m| project.track(m))?.layout {
         faderframe_core::ChannelLayout::Surround(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// The master's ambisonic order, if it is an ambisonic field ("as the
+/// master is" writes its channels as AmbiX: ACN order, SN3D, no speaker
+/// mask; stereo and mono decode it).
+pub fn master_field(project: &Project) -> Option<faderframe_core::AmbiOrder> {
+    match project.master_id().and_then(|m| project.track(m))?.layout {
+        faderframe_core::ChannelLayout::Ambisonic(o) => Some(o),
         _ => None,
     }
 }
@@ -285,7 +330,9 @@ pub fn resolve_range(
     Ok((a, b))
 }
 
-pub(crate) fn sanitize(name: &str) -> String {
+/// `name` as a file name (letters, digits, spaces, `-` and `_`; the rest
+/// `_`).
+pub fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
@@ -313,13 +360,17 @@ pub fn renderable_tracks(project: &Project) -> Vec<(TrackId, String)> {
     stem_tracks(project)
 }
 
-/// "<project> - <track>.wav" in `dir`, for each stem track: names that
-/// repeat (letter case aside, as Windows and macOS compare them) get
-/// " (2)", " (3)", … so no stem overwrites another.
-fn stem_paths(project: &Project, dir: &Path) -> Vec<(TrackId, PathBuf)> {
+/// "<project> - <track>.wav" in `dir`, for each stem track (and the
+/// nulling stem, `None`, when `shared`): names that repeat (letter case
+/// aside, as Windows and macOS compare them) get " (2)", " (3)", … so no
+/// stem overwrites another.
+fn stem_paths(project: &Project, dir: &Path, shared: bool) -> Vec<(Option<TrackId>, PathBuf)> {
     let mut taken = std::collections::HashSet::new();
-    stem_tracks(project)
+    let tracks = stem_tracks(project)
         .into_iter()
+        .map(|(t, n)| (Some(t), n))
+        .chain(shared.then(|| (None, null::SHARED_NAME.to_string())));
+    tracks
         .map(|(track, name)| {
             let base = format!("{} - {}", sanitize(&project.name), sanitize(&name));
             let mut file = format!("{base}.wav");
@@ -333,17 +384,28 @@ fn stem_paths(project: &Project, dir: &Path) -> Vec<(TrackId, PathBuf)> {
         .collect()
 }
 
+/// What a planned file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// The master mix.
+    Mix,
+    /// A track's stem (or the track rendered alone).
+    Track(TrackId),
+    /// The nulling stem: the mix less the other stems.
+    Shared,
+}
+
 /// The file name a track renders to by default ("<project> - <track>").
 pub fn track_file_stem(project: &Project, track: TrackId) -> String {
     let name = project.track(track).map_or("Track", |t| t.name.as_str());
     format!("{} - {}", sanitize(&project.name), sanitize(name))
 }
 
-/// The tracks rendered (`None`: the master mix) and the file each goes to.
+/// What is rendered and the file each goes to.
 fn render_plan(
     project: &Project,
     settings: &RenderSettings,
-) -> Result<Vec<(Option<TrackId>, PathBuf)>, RenderError> {
+) -> Result<Vec<(Part, PathBuf)>, RenderError> {
     let whole_mix = matches!(
         settings.channels,
         RenderChannels::Adm(_) | RenderChannels::Iamf(_)
@@ -354,7 +416,7 @@ fn render_plan(
         ));
     }
     Ok(match settings.source {
-        RenderSource::Master => vec![(None, settings.output.clone())],
+        RenderSource::Master => vec![(Part::Mix, settings.output.clone())],
         RenderSource::Track(track) => {
             if !stem_tracks(project).iter().any(|(t, _)| *t == track) {
                 let what = project
@@ -364,14 +426,24 @@ fn render_plan(
                     "{what} makes no audio to render"
                 )));
             }
-            vec![(Some(track), settings.output.clone())]
+            vec![(Part::Track(track), settings.output.clone())]
         }
         RenderSource::Stems => {
-            let stems = stem_paths(project, &settings.output);
-            if stems.is_empty() {
+            let shared = settings.stems.shared_stem;
+            let mut stems = stem_paths(project, &settings.output, shared);
+            if stems.iter().all(|(t, _)| t.is_none()) {
                 return Err(RenderError::NoStems);
             }
-            stems.into_iter().map(|(t, p)| (Some(t), p)).collect()
+            if shared {
+                // Only the stems that make up the mix: with a bus's, the
+                // files would hold its sources twice.
+                let (summed, _) = null::stems_summed(project);
+                stems.retain(|(t, _)| t.is_none_or(|t| summed.contains(&t)));
+            }
+            stems
+                .into_iter()
+                .map(|(t, p)| (t.map_or(Part::Shared, Part::Track), p))
+                .collect()
         }
     })
 }
@@ -385,6 +457,21 @@ pub fn destinations(
     Ok(render_plan(project, settings)?
         .into_iter()
         .map(|(_, p)| p)
+        .collect())
+}
+
+/// The tracks a render makes files of and where each goes (a stems
+/// render's stems, a track rendered alone).
+pub(crate) fn planned_tracks(
+    project: &Project,
+    settings: &RenderSettings,
+) -> Result<Vec<(TrackId, PathBuf)>, RenderError> {
+    Ok(render_plan(project, settings)?
+        .into_iter()
+        .filter_map(|(part, p)| match part {
+            Part::Track(t) => Some((t, p)),
+            _ => None,
+        })
         .collect())
 }
 
@@ -832,6 +919,7 @@ pub(crate) fn process_through(
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         },
     );
@@ -889,15 +977,9 @@ pub(crate) fn process_through(
     Ok(out)
 }
 
-/// Write `audio` (`mask`: a surround bed's speakers) after finishing to
-/// `file` (the destination's temporary file; errors name `dest`); what
-/// finishing did.
-fn finish(
-    mut audio: Vec<Vec<f32>>,
-    settings: &RenderSettings,
-    file: &StagedFile,
-    mask: Option<u32>,
-) -> Result<Option<Finished>, RenderError> {
+/// `audio` with the channels the settings ask for (the first, or summed
+/// to mono).
+fn channels_for(mut audio: Vec<Vec<f32>>, settings: &RenderSettings) -> Vec<Vec<f32>> {
     if settings.channels == RenderChannels::First {
         audio.truncate(1);
     }
@@ -909,6 +991,19 @@ fn finish(
             .collect();
         audio = vec![mono];
     }
+    audio
+}
+
+/// Write `audio` (`mask`: a surround bed's speakers) after finishing to
+/// `file` (the destination's temporary file; errors name `dest`); what
+/// finishing did.
+fn finish(
+    audio: Vec<Vec<f32>>,
+    settings: &RenderSettings,
+    file: &StagedFile,
+    mask: Option<u32>,
+) -> Result<Option<Finished>, RenderError> {
+    let mut audio = channels_for(audio, settings);
     let rate = settings.sample_rate;
     // The written file is measured afterwards ([`stats`]); here only what
     // the level processing did.
@@ -934,25 +1029,52 @@ fn finish(
             report: faderframe_analysis::delivery::measure(&audio, rate),
         })
     };
+    write_finished(&audio, settings, file, mask)?;
+    Ok(finished)
+}
+
+/// [`finish`] for stems that null: the mix's gain (`gain_db`, from its
+/// level processing) applied, nothing else — the finish's limiting is the
+/// shared stem's.
+fn finish_linked(
+    audio: Vec<Vec<f32>>,
+    settings: &RenderSettings,
+    file: &StagedFile,
+    mask: Option<u32>,
+    gain_db: Option<f64>,
+) -> Result<Option<Finished>, RenderError> {
+    let mut audio = channels_for(audio, settings);
+    let finished = gain_db.map(|gain_db| {
+        faderframe_analysis::delivery::apply_gain(&mut audio, gain_db);
+        Finished {
+            gain_db,
+            limited_db: 0.0,
+            report: faderframe_analysis::delivery::measure(&audio, settings.sample_rate),
+        }
+    });
+    write_finished(&audio, settings, file, mask)?;
+    Ok(finished)
+}
+
+/// Write finished audio as the settings ask (dither for integer formats).
+fn write_finished(
+    audio: &[Vec<f32>],
+    settings: &RenderSettings,
+    file: &StagedFile,
+    mask: Option<u32>,
+) -> Result<(), RenderError> {
+    let rate = settings.sample_rate;
     let dither = if settings.format.is_integer() {
         settings.dither
     } else {
         Dither::Off
     };
     let mask = mask.filter(|_| audio.len() > 2);
-    faderframe_audio_files::write_wav_mask(
-        file.temp(),
-        &audio,
-        rate,
-        settings.format,
-        dither,
-        mask,
-    )
-    .map_err(|source| RenderError::Io {
-        path: file.dest().to_path_buf(),
-        source,
-    })?;
-    Ok(finished)
+    faderframe_audio_files::write_wav_mask(file.temp(), audio, rate, settings.format, dither, mask)
+        .map_err(|source| RenderError::Io {
+            path: file.dest().to_path_buf(),
+            source,
+        })
 }
 
 /// Read a written file back and measure it when the settings ask
@@ -1069,12 +1191,17 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
     if frames == 0 {
         return Err(RenderError::EmptyRange);
     }
+    let range_frames = (project.timeline.to_samples(b, sr) - start).max(0) as u64;
+    let stems = settings.source == RenderSource::Stems;
+    let testing = stems && settings.stems.tests();
     let progress = Arc::new(RenderProgress::default());
+    // Every file rendered; with the null test the mix and the comparison.
+    let rendered = plan.iter().filter(|(p, _)| *p != Part::Shared).count();
+    let passes = rendered + if testing { 2 } else { 0 };
     progress
         .total
-        .store(frames as u64 * plan.len() as u64, Ordering::Relaxed);
+        .store(frames as u64 * passes as u64, Ordering::Relaxed);
     let p = Arc::clone(&progress);
-    let stems = settings.source == RenderSource::Stems;
     RenderJob::spawn(progress, move || {
         // File paths are absolute here (see `Session::render`). Streams
         // are opened afresh: their page tables must not be shared with
@@ -1083,11 +1210,15 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
         for (_, path, e) in crate::media::open_file_sources(&project, None, &mut sources) {
             tracing::warn!("render: {}: {e}", path.display());
         }
-        // As the master is: a bed's every channel.
+        // As the master is: a bed's every channel (a field's too: the
+        // render's device then holds it, so it passes undecoded).
         let bed = (settings.channels == RenderChannels::Master)
             .then(|| master_bed(&project))
             .flatten();
-        let outputs = bed.map_or(2, |f| f.channels());
+        let field = (settings.channels == RenderChannels::Master)
+            .then(|| master_field(&project))
+            .flatten();
+        let outputs = bed.map_or_else(|| field.map_or(2, |o| o.channels()), |f| f.channels());
         let binaural = match settings.channels {
             RenderChannels::Binaural(room) => Some((room, settings.head.as_ref())),
             _ => None,
@@ -1102,16 +1233,44 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
         // Every file's temporary name claimed first: a folder that cannot
         // be written to fails now, not after rendering.
         let mut claimed = Vec::with_capacity(plan.len());
-        for (solo, dest) in &plan {
-            claimed.push((*solo, StagedFile::new(dest)?));
+        for (part, dest) in &plan {
+            claimed.push((*part, StagedFile::new(dest)?));
         }
         let written = stats::Written::Wav { bed };
+        // The null test's mix first (stems that null take its gain): the
+        // same range and settings, every solo off; written as the stems
+        // are, beside them, never moved into place.
+        let reference = if testing {
+            let began = std::time::Instant::now();
+            let mix = null::reference_project(&project);
+            let audio = render_one(
+                &mix,
+                settings.sample_rate,
+                &sources,
+                start,
+                frames,
+                &p,
+                outputs,
+                binaural,
+                settings.keep_latency,
+            )?;
+            let file = StagedFile::new(&settings.output.join("Null test mix.wav"))?;
+            let finished = finish(audio, &settings, &file, mask)?;
+            tracing::info!(
+                "null test: the mix rendered in {:.2} s",
+                began.elapsed().as_secs_f64()
+            );
+            Some((file, finished.map(|f| f.gain_db)))
+        } else {
+            None
+        };
         let mut staged = Vec::with_capacity(claimed.len());
-        for (solo, file) in claimed {
+        let mut shared_file = None;
+        for (part, file) in claimed {
             let began = std::time::Instant::now();
             let soloed;
-            let project = match solo {
-                Some(track) => {
+            let project = match part {
+                Part::Track(track) => {
                     let mut p = project.clone();
                     for t in &mut p.tracks {
                         t.solo = t.id == track;
@@ -1119,7 +1278,12 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                     soloed = p;
                     &soloed
                 }
-                None => &project,
+                Part::Mix => &project,
+                Part::Shared => {
+                    // Written by the comparison, once the stems are.
+                    shared_file = Some(file);
+                    continue;
+                }
             };
             let audio = render_one(
                 project,
@@ -1132,7 +1296,12 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                 binaural,
                 settings.keep_latency,
             )?;
-            let finished = finish(audio, &settings, &file, mask)?;
+            let finished = match &reference {
+                Some((_, gain)) if settings.stems.shared_stem => {
+                    finish_linked(audio, &settings, &file, mask, *gain)?
+                }
+                _ => finish(audio, &settings, &file, mask)?,
+            };
             let seconds = began.elapsed().as_secs_f64();
             let stats = measure_written(&file, &written, &settings, seconds, &p)?;
             let path = file.dest().to_path_buf();
@@ -1145,6 +1314,60 @@ pub fn start(project: Project, settings: RenderSettings) -> Result<RenderJob, Re
                 },
             ));
         }
+        if let Some((mix, _)) = &reference {
+            let began = std::time::Instant::now();
+            let (summed, left) = null::stems_summed(&project);
+            let mut parts = Vec::new();
+            let mut left_out = Vec::new();
+            for ((part, _), (file, _)) in
+                plan.iter().filter(|(p, _)| *p != Part::Shared).zip(&staged)
+            {
+                let Part::Track(t) = part else { continue };
+                let name = file
+                    .dest()
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                if summed.contains(t) {
+                    parts.push((name, file.temp().to_path_buf()));
+                } else if let Some((_, why)) = left.iter().find(|(x, _)| x == t) {
+                    left_out.push(faderframe_qc::null::LeftOut {
+                        name,
+                        why: why.clone(),
+                    });
+                }
+            }
+            let test = null::compare(
+                &project,
+                &settings,
+                null::Compared {
+                    mix: mix.temp(),
+                    stems: parts,
+                    left_out,
+                    shared: shared_file.as_ref(),
+                    range_frames,
+                    bed,
+                    reference: null::reference_text(&project, &settings),
+                },
+                &p,
+            )?;
+            if let Some(file) = shared_file.take() {
+                let seconds = began.elapsed().as_secs_f64();
+                let stats = measure_written(&file, &written, &settings, seconds, &p)?;
+                let path = file.dest().to_path_buf();
+                staged.push((
+                    file,
+                    Rendered {
+                        path,
+                        finished: None,
+                        stats,
+                    },
+                ));
+            }
+            if let Ok(mut slot) = p.null_test.lock() {
+                *slot = Some(test);
+            }
+        }
+        drop(reference);
         if p.cancel.load(Ordering::Relaxed) {
             return Err(RenderError::Cancelled);
         }

@@ -58,6 +58,7 @@ fn audio(source: AudioSourceId, offset_bars: f64, length_bars: f64) -> AudioClip
         pitch: None,
         effects: None,
         spectral: None,
+        envelope: None,
     }
 }
 
@@ -148,6 +149,9 @@ fn selected_clips_slip_together_audio_and_midi() {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         },
         MidiNote {
             id: NoteId(2),
@@ -158,6 +162,9 @@ fn selected_clips_slip_together_audio_and_midi() {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         },
     ];
     let m = add(

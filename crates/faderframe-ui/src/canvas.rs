@@ -11,6 +11,7 @@
 use crate::painter::{KeptCache, PathCache, SnapshotPainter, TextCache};
 use crate::state::AppState;
 use faderframe_session::{Action, Session};
+use faderframe_ui_canvas::access::{AccessKey, AccessPress};
 use faderframe_ui_canvas::{
     CanvasView, Cursor, EventCx, FileChoice, HostRequest, Key, MenuItem, Modifiers, Point,
     PointerButton, ScrollAxis, Size, ViewEvent,
@@ -288,6 +289,7 @@ pub(crate) fn map_key(key: gdk::Key) -> Key {
         gdk::Key::End => Key::End,
         gdk::Key::Page_Up => Key::PageUp,
         gdk::Key::Page_Down => Key::PageDown,
+        gdk::Key::Menu => Key::Menu,
         k => k.to_unicode().map_or(Key::Other, Key::Char),
     }
 }
@@ -361,23 +363,72 @@ impl CanvasWidget {
         r
     }
 
-    /// Ask the view for its controls and update the accessible tree.
+    /// Ask the view for its controls and update the accessible tree; what
+    /// changed by itself since the last time (the view's news) is said.
     pub fn refresh_access(&self) {
+        for text in self.update_access() {
+            self.say(&text);
+        }
+    }
+
+    /// Ask the view for its controls and update the accessible tree; the
+    /// view's news, unsaid.
+    fn update_access(&self) -> Vec<String> {
         let imp = self.imp();
         imp.access_at.set(Some(std::time::Instant::now()));
-        let Some(app) = self.app() else { return };
-        let nodes = {
+        let Some(app) = self.app() else {
+            return Vec::new();
+        };
+        let (nodes, news) = {
             let Ok(session) = app.session.try_borrow() else {
-                return;
+                return Vec::new();
+            };
+            let news = match imp.view.borrow_mut().as_mut() {
+                Some(v) => v.access_news(&session),
+                None => return Vec::new(),
             };
             match imp.view.borrow().as_ref() {
-                Some(v) => v.accessible(self.size(), &session),
-                None => return,
+                Some(v) => (v.accessible(self.size(), &session), news),
+                None => return Vec::new(),
             }
         };
         let host: gtk::Accessible = self.clone().upcast();
         let after: Option<gtk::Accessible> = self.first_child().map(|c| c.upcast());
         self.with_access(|t| t.update(nodes, &host, after.as_ref()));
+        news
+    }
+
+    /// Say something to the screen reader (logged for scripted checks).
+    fn say(&self, text: &str) {
+        tracing::debug!("access: said {text}");
+        self.announce(text, gtk::AccessibleAnnouncementPriority::Medium);
+    }
+
+    /// The view does for control `id` what the keyboard asked of it (a
+    /// menu, a text entry, its own state); its requests and actions go out
+    /// as for an event.
+    fn press_control(&self, id: u64, press: AccessPress) -> bool {
+        let Some(app) = self.app() else { return false };
+        let mut actions = Vec::new();
+        let mut requests = Vec::new();
+        let done = {
+            let Ok(session) = app.session.try_borrow() else {
+                return false;
+            };
+            let mut cx = EventCx::new(&mut actions, &mut requests);
+            match self.imp().view.borrow_mut().as_mut() {
+                Some(v) => v.access_press(id, press, self.size(), &session, &mut cx),
+                None => false,
+            }
+        };
+        for req in requests {
+            self.handle_request(&app, req);
+        }
+        for a in actions {
+            app.dispatch(a);
+        }
+        self.queue_draw();
+        done
     }
 
     /// Tab (forward or back) into or along the view's controls: `Some(true)`
@@ -417,9 +468,10 @@ impl CanvasWidget {
     }
 
     /// A key while the keyboard is on the view's controls: Tab moves (GTK's
-    /// focus handling, [`Self::tab`]), Enter activates, the arrows step,
-    /// Escape leaves them. Ctrl+Tab starts on the controls of a view that
-    /// takes Tab itself. `None`: the view's key.
+    /// focus handling, [`Self::tab`]), Enter activates (or asks the view:
+    /// a menu, a text entry), the arrows step, Shift+F10 and the Menu key
+    /// open the control's menu, Escape leaves them. Ctrl+Tab starts on the
+    /// controls of a view that takes Tab itself. `None`: the view's key.
     pub(crate) fn access_key(&self, key: Key, m: Modifiers) -> Option<glib::Propagation> {
         let imp = self.imp();
         let uses_tab = imp.view.borrow().as_ref().is_some_and(|v| v.uses_tab());
@@ -438,44 +490,55 @@ impl CanvasWidget {
             return None;
         }
         let node = imp.access.borrow().focused().cloned()?;
-        let action = match key {
-            Key::Enter => node.activate.clone(),
-            Key::Up | Key::Right | Key::PageUp => node.increment.clone(),
-            Key::Down | Key::Left | Key::PageDown => node.decrement.clone(),
-            Key::Escape => {
-                let host: gtk::Accessible = self.clone().upcast();
-                self.with_access(|a| {
-                    a.keyboard = false;
-                    let f = a.focus;
-                    a.set_focus(f, &host);
-                });
-                self.queue_draw();
-                return None;
-            }
-            _ => None,
-        }?;
+        if key == Key::Escape {
+            let host: gtk::Accessible = self.clone().upcast();
+            self.with_access(|a| {
+                a.keyboard = false;
+                let f = a.focus;
+                a.set_focus(f, &host);
+            });
+            self.queue_draw();
+            return None;
+        }
+        let first = faderframe_ui_canvas::access::key_on(&node, key, m)?;
         let app = self.app()?;
-        app.dispatch(action);
-        self.refresh_access();
+        let menu = first == AccessKey::Press(AccessPress::Menu);
         // Page Up/Down: ten steps, each from where the last one left it.
-        if matches!(key, Key::PageUp | Key::PageDown) {
-            for _ in 1..10 {
-                let next = imp.access.borrow().focused().and_then(|n| {
-                    if key == Key::PageUp {
-                        n.increment.clone()
-                    } else {
-                        n.decrement.clone()
-                    }
-                });
-                let Some(a) = next else { break };
-                app.dispatch(a);
-                self.refresh_access();
+        let steps = if matches!(key, Key::PageUp | Key::PageDown) {
+            10
+        } else {
+            1
+        };
+        let mut news = Vec::new();
+        let mut next = Some(first);
+        for _ in 0..steps {
+            let Some(todo) = next.take() else { break };
+            match todo {
+                AccessKey::Act(action) => app.dispatch(action),
+                AccessKey::Press(press) => {
+                    self.press_control(node.id, press);
+                }
+            }
+            news.extend(self.update_access());
+            if steps > 1 {
+                next = imp
+                    .access
+                    .borrow()
+                    .focused()
+                    .and_then(|n| faderframe_ui_canvas::access::key_on(n, key, m));
             }
         }
-        // Say what it is now (a toggle's state, a value's text).
-        let spoken = imp.access.borrow().focused().map(|n| n.spoken());
-        if let Some(text) = spoken {
-            self.announce(&text, gtk::AccessibleAnnouncementPriority::Medium);
+        // Say what it is now (a toggle's state, a value's text) unless a
+        // menu opened (it speaks for itself), then what else changed.
+        let focused = imp.access.borrow().focused().cloned();
+        let mut said = Vec::new();
+        if let Some(n) = focused.filter(|_| !menu) {
+            said.push(n.spoken());
+            news.retain(|t| *t != n.label && *t != n.spoken());
+        }
+        said.extend(news);
+        if !said.is_empty() {
+            self.say(&said.join(". "));
         }
         self.queue_draw();
         Some(glib::Propagation::Stop)
@@ -512,9 +575,16 @@ impl CanvasWidget {
         self.imp().access.borrow().focused().map(|n| n.spoken())
     }
 
-    /// Bring the focused control into view where the view scrolls.
+    /// Bring the focused control into view where the view scrolls (not
+    /// along an axis it stays put on).
     fn scroll_to_focus(&self) {
-        let Some(r) = self.imp().access.borrow().focused().map(|n| n.bounds) else {
+        let Some((r, fixed_x, fixed_y)) = self
+            .imp()
+            .access
+            .borrow()
+            .focused()
+            .map(|n| (n.bounds, n.fixed_x, n.fixed_y))
+        else {
             return;
         };
         let size = self.size();
@@ -524,7 +594,13 @@ impl CanvasWidget {
         };
         let mut view = self.imp().view.borrow_mut();
         let Some(view) = view.as_mut() else { return };
-        for axis in [ScrollAxis::Horizontal, ScrollAxis::Vertical] {
+        for (axis, fixed) in [
+            (ScrollAxis::Horizontal, fixed_x),
+            (ScrollAxis::Vertical, fixed_y),
+        ] {
+            if fixed {
+                continue;
+            }
             let Some(info) = view.scroll_info(axis, size, &session) else {
                 continue;
             };
@@ -715,13 +791,37 @@ impl CanvasWidget {
                 return;
             };
             match self.imp().view.borrow_mut().as_mut() {
-                Some(v) => v.hover_payload(payload, self.size(), &session),
+                Some(v) => {
+                    let r = v.hover_payload(payload, self.size(), &session);
+                    // The media browser's files: a view that takes files
+                    // shows where they would go as for files from outside.
+                    let files = payload
+                        .filter(|(p, _)| faderframe_session::browser::parse_payload(p).is_some())
+                        .map(|(_, at)| at);
+                    v.drag_files(files, self.size(), &session);
+                    r || files.is_some()
+                }
                 None => false,
             }
         };
-        if redraw {
+        if redraw || payload.is_none() {
             self.queue_draw();
         }
+    }
+
+    /// Another view's payload dropped here: what this view makes of it (the
+    /// media browser's files, when the view takes no such payload: as files
+    /// dropped from outside).
+    fn take_payload(&self, payload: &str, at: Point) -> Option<Action> {
+        let app = self.app()?;
+        let session = app.session.try_borrow().ok()?;
+        let mut view = self.imp().view.borrow_mut();
+        let v = view.as_mut()?;
+        v.drop_payload(payload, at, self.size(), &session)
+            .or_else(|| {
+                let files = faderframe_session::browser::parse_payload(payload)?;
+                v.drop_files(&files, at, self.size(), &session)
+            })
     }
 
     /// Is `(x, y)` (this view's coordinates) outside its window?
@@ -858,16 +958,7 @@ impl CanvasWidget {
             return false;
         };
         let Some(app) = self.app() else { return false };
-        let action = {
-            let Ok(session) = app.session.try_borrow() else {
-                return false;
-            };
-            match target.imp().view.borrow_mut().as_mut() {
-                Some(v) => v.drop_payload(&payload, at, target.size(), &session),
-                None => None,
-            }
-        };
-        let Some(action) = action else {
+        let Some(action) = target.take_payload(&payload, at) else {
             return false;
         };
         // This view's drag is undone, then the other view's action runs.
@@ -1291,7 +1382,8 @@ impl CanvasWidget {
             let Some(text) = text else {
                 return gdk::DragAction::empty();
             };
-            if text.starts_with("clips:") {
+            if text.starts_with("clips:") || text.starts_with(faderframe_session::browser::PAYLOAD)
+            {
                 w.hover_payload(pos.map(|p| (text.as_str(), p)));
                 return gdk::DragAction::COPY;
             }
@@ -1333,20 +1425,13 @@ impl CanvasWidget {
                     return false;
                 };
                 let at = Point::new(x as f32, y as f32);
-                if !text.starts_with("clips:") {
+                if !text.starts_with("clips:")
+                    && !text.starts_with(faderframe_session::browser::PAYLOAD)
+                {
                     return w.drop_files_at(&named_files(&text), at);
                 }
                 let Some(app) = w.app() else { return false };
-                let action = {
-                    let Ok(session) = app.session.try_borrow() else {
-                        return false;
-                    };
-                    w.imp()
-                        .view
-                        .borrow_mut()
-                        .as_mut()
-                        .and_then(|v| v.drop_payload(&text, at, w.size(), &session))
-                };
+                let action = w.take_payload(&text, at);
                 w.queue_draw();
                 match action {
                     Some(a) => {

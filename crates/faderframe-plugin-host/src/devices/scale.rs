@@ -188,7 +188,9 @@ impl PluginProcessor for ScaleProcessor {
                     self.tap
                         .set_value(value::OUT, mapped.map_or(-1.0, f32::from));
                     if let Some(m) = mapped {
-                        self.sounding.on(out, offset, channel, m, velocity);
+                        // At the played note's resolution.
+                        self.sounding
+                            .on_fine(out, offset, channel, m, velocity, e.fine);
                     }
                 }
                 MidiEvent::NoteOn { channel, key, .. }

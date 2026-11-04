@@ -876,3 +876,36 @@ fn a_track_s_delay_is_typed_in_and_shown() {
     select(&mut s, &["Master"]);
     assert!(!rows_of(&mut view, &s).iter().any(|x| x == "Delay"));
 }
+
+/// Notes locked to time on a musical track: the Time Base line counts
+/// them and its menu frees them all.
+#[test]
+fn the_time_base_line_counts_notes_locked_to_time() {
+    let mut s = session();
+    select(&mut s, &["Lead Synth"]);
+    let lead = id(&s, "Lead Synth");
+    let (clip, note) = s.track_note(lead, 2).unwrap();
+    s.dispatch(Action::NoteOperation {
+        clip,
+        notes: vec![note],
+        op: faderframe_session::NoteOp::SetTimeLocked(true),
+    })
+    .unwrap();
+    let mut view = InspectorView::new(Theme::default());
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "Musical · 1 note in time"), "{t:?}");
+    let pt = find(COLUMN, 3.0, |p| {
+        view.hit(p, COLUMN, &s) == Some(InspectorHit::Field(Field::TimeBase))
+    })
+    .unwrap();
+    let (_, requests) = emitted(&mut view, down(pt), COLUMN, &s);
+    let labels = menu_labels(&requests[0]);
+    assert_eq!(labels[2].0, "Unlock 1 Note from Time");
+    let HostRequest::ContextMenu { items, .. } = &requests[0] else {
+        panic!("a menu")
+    };
+    s.dispatch(items[2].action.clone().unwrap()).unwrap();
+    assert_eq!(s.time_locked_notes(lead), 0);
+    let t = rows_of(&mut view, &s);
+    assert!(t.iter().any(|x| x == "Musical"), "{t:?}");
+}

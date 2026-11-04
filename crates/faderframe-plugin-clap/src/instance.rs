@@ -542,6 +542,30 @@ impl FfInstance for ClapInstance {
             .ok_or_else(|| PluginError::Failed("not active".into()))?;
         Ok(Box::new(ClapProcessor { cell }))
     }
+
+    fn ara_factory(&mut self) -> Option<faderframe_ara::Factory> {
+        crate::ara::factory(&self.instance)
+    }
+
+    fn bind_ara(
+        &mut self,
+        controller: faderframe_ara::ControllerRef,
+        roles: faderframe_ara::Roles,
+    ) -> Result<faderframe_ara::Extension, PluginError> {
+        if self.rt.is_some() {
+            return Err(PluginError::Failed(format!(
+                "{}: ARA binding after activation",
+                self.scanned.name
+            )));
+        }
+        crate::ara::bind(&self.instance, controller, roles).ok_or_else(|| {
+            PluginError::Failed(format!("{}: ARA binding failed", self.scanned.name))
+        })
+    }
+
+    fn deactivate(&mut self) {
+        ClapInstance::deactivate(self);
+    }
 }
 
 impl Drop for ClapInstance {

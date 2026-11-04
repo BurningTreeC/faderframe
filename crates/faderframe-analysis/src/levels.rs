@@ -2,7 +2,9 @@
 //! render statistics): per channel the sample peak, true peak (4×
 //! oversampled, BS.1770 Annex 2), RMS, samples at full scale and overs;
 //! over all channels BS.1770 loudness with each channel's weight
-//! ([`WeightedLoudness`]: integrated, range, maxima).
+//! ([`WeightedLoudness`]: integrated, range, maxima). Where the peaks are
+//! (frames), the DC offset and the reconstructed overs (inter-sample
+//! peaks past 0 dBFS) come along for the delivery QC report.
 //!
 //! Nothing is estimated: a quantity the file cannot tell (loudness of
 //! object audio, which only a renderer places) is left out by the caller
@@ -43,6 +45,13 @@ struct Channel {
     above_full_scale: u64,
     run: usize,
     overs: u64,
+    sum: f64,
+    peak_at: u64,
+    true_peak_at: u64,
+    /// The reconstructed signal is past 0 dBFS now (an over in progress).
+    true_over: bool,
+    true_overs: u64,
+    first_true_over: Option<u64>,
 }
 
 /// One channel's levels.
@@ -61,6 +70,18 @@ pub struct ChannelLevels {
     pub above_full_scale: u64,
     /// Runs of [`OVER_RUN`] or more samples at full scale.
     pub overs: u64,
+    /// The mean of the samples (linear: the DC offset; 0.001 = −60 dBFS).
+    pub dc: f64,
+    /// Where the highest sample is (frame).
+    pub sample_peak_at: u64,
+    /// Where the highest interpolated peak is (frame, within a sample or
+    /// two).
+    pub true_peak_at: u64,
+    /// Reconstructed overs: runs of the 4× interpolated signal past
+    /// 0 dBFS (inter-sample peaks that clip in conversion and coding).
+    pub true_overs: u64,
+    /// Where the first of them starts (frame).
+    pub first_true_over_at: Option<u64>,
 }
 
 /// BS.1770 loudness of the file.
@@ -91,6 +112,14 @@ pub struct FileLevels {
     pub full_scale_samples: u64,
     pub above_full_scale: u64,
     pub overs: u64,
+    /// Where the highest sample of any channel is (frame).
+    pub sample_peak_at: u64,
+    /// Where the highest true peak of any channel is (frame).
+    pub true_peak_at: u64,
+    /// Reconstructed overs of all channels ([`ChannelLevels::true_overs`]).
+    pub true_overs: u64,
+    /// The earliest of them (frame).
+    pub first_true_over_at: Option<u64>,
 }
 
 /// Measures a file's channels as they are read (see the module).
@@ -124,6 +153,12 @@ impl FileMeter {
                     above_full_scale: 0,
                     run: 0,
                     overs: 0,
+                    sum: 0.0,
+                    peak_at: 0,
+                    true_peak_at: 0,
+                    true_over: false,
+                    true_overs: 0,
+                    first_true_over: None,
                 })
                 .collect(),
             loudness: weights.map(|w| WeightedLoudness::new(sample_rate, w)),
@@ -134,12 +169,38 @@ impl FileMeter {
     /// Feed planar audio (`audio[c]`, equal lengths).
     pub fn add(&mut self, audio: &[&[f32]]) {
         let frames = audio.iter().map(|c| c.len()).min().unwrap_or(0);
+        let start = self.frames;
         for (ch, samples) in self.channels.iter_mut().zip(audio) {
-            for &x in &samples[..frames] {
+            for (i, &x) in samples[..frames].iter().enumerate() {
+                let at = start + i as u64;
                 let a = x.abs();
-                ch.peak = ch.peak.max(a);
+                if a > ch.peak {
+                    ch.peak = a;
+                    ch.peak_at = at;
+                }
+                ch.sum += f64::from(x);
                 ch.sum_square += f64::from(x) * f64::from(x);
-                ch.max_true_peak = ch.max_true_peak.max(ch.true_peak.run(x));
+                let tp = ch.true_peak.run(x);
+                // The interpolator answers for a few samples back (the
+                // new sample itself where it is the peak).
+                let tp_at = if tp <= f64::from(a) {
+                    at
+                } else {
+                    at.saturating_sub(TP_LATENCY as u64)
+                };
+                if tp > ch.max_true_peak {
+                    ch.max_true_peak = tp;
+                    ch.true_peak_at = tp_at;
+                }
+                if tp > 1.0 {
+                    if !ch.true_over {
+                        ch.true_overs += 1;
+                        ch.first_true_over.get_or_insert(tp_at);
+                    }
+                    ch.true_over = true;
+                } else {
+                    ch.true_over = false;
+                }
                 if a >= self.full_scale {
                     ch.at_full_scale += 1;
                     ch.run += 1;
@@ -175,8 +236,19 @@ impl FileMeter {
             .iter_mut()
             .map(|ch| {
                 // The interpolator's latency: the last samples' peaks.
-                for _ in 0..TP_LATENCY {
-                    ch.max_true_peak = ch.max_true_peak.max(ch.true_peak.run(0.0));
+                let end = self.frames;
+                for k in 0..TP_LATENCY as u64 {
+                    let tp = ch.true_peak.run(0.0);
+                    let tp_at = (end + k).saturating_sub(TP_LATENCY as u64);
+                    if tp > ch.max_true_peak {
+                        ch.max_true_peak = tp;
+                        ch.true_peak_at = tp_at;
+                    }
+                    if tp > 1.0 && !ch.true_over {
+                        ch.true_overs += 1;
+                        ch.first_true_over.get_or_insert(tp_at);
+                    }
+                    ch.true_over = tp > 1.0;
                 }
                 all_square += ch.sum_square;
                 ChannelLevels {
@@ -186,11 +258,26 @@ impl FileMeter {
                     full_scale_samples: ch.at_full_scale,
                     above_full_scale: ch.above_full_scale,
                     overs: ch.overs,
+                    dc: ch.sum / frames,
+                    sample_peak_at: ch.peak_at,
+                    true_peak_at: ch.true_peak_at,
+                    true_overs: ch.true_overs,
+                    first_true_over_at: ch.first_true_over,
                 }
             })
             .collect();
         let n = channels.len().max(1) as f64;
+        let loudest = |key: fn(&ChannelLevels) -> f64| {
+            channels
+                .iter()
+                .max_by(|a, b| key(a).total_cmp(&key(b)))
+                .copied()
+        };
         FileLevels {
+            sample_peak_at: loudest(|c| c.sample_peak).map_or(0, |c| c.sample_peak_at),
+            true_peak_at: loudest(|c| c.true_peak).map_or(0, |c| c.true_peak_at),
+            true_overs: channels.iter().map(|c| c.true_overs).sum(),
+            first_true_over_at: channels.iter().filter_map(|c| c.first_true_over_at).min(),
             frames: self.frames,
             sample_peak: channels
                 .iter()
@@ -283,6 +370,44 @@ mod tests {
         m.add(&[&one]);
         let l = m.finish();
         assert_eq!((l.full_scale_samples, l.overs), (1, 0));
+    }
+
+    #[test]
+    fn peaks_are_placed_and_the_offset_and_reconstructed_overs_counted() {
+        let rate = 48_000;
+        // A quiet tone with a 1 % DC offset, one loud sample at 0.4 s on
+        // the right.
+        let mut l: Vec<f32> = sine(rate, 997.0, 0.1, 1.0)
+            .into_iter()
+            .map(|v| v + 0.01)
+            .collect();
+        let mut r = l.clone();
+        r[19_200] = 0.9;
+        let mut m = FileMeter::new(rate, 2, None, full_scale(24, false));
+        m.add(&[&l, &r]);
+        let lv = m.finish();
+        assert_eq!(lv.sample_peak_at, 19_200);
+        assert_eq!(lv.channels[1].sample_peak_at, 19_200);
+        assert!(
+            (lv.channels[0].dc - 0.01).abs() < 1e-4,
+            "{}",
+            lv.channels[0].dc
+        );
+        assert!(lv.true_peak_at.abs_diff(19_200) <= 1, "{}", lv.true_peak_at);
+        assert_eq!((lv.true_overs, lv.first_true_over_at), (0, None));
+        // Samples just under full scale at a quarter of the rate peak
+        // between them: reconstructed overs with every sample below 0 dBFS.
+        l.fill(0.0);
+        for (i, v) in l.iter_mut().enumerate().skip(24_000).take(4800) {
+            *v = 0.95 * [1.0, 1.0, -1.0, -1.0][i % 4];
+        }
+        let mut m = FileMeter::new(rate, 1, None, full_scale(24, false));
+        m.add(&[&l]);
+        let lv = m.finish();
+        assert!(lv.sample_peak < 0.0 && lv.true_peak > 0.0, "{lv:?}");
+        assert!(lv.true_overs >= 1);
+        let first = lv.first_true_over_at.unwrap();
+        assert!((23_990..24_010).contains(&first), "{first}");
     }
 
     #[test]

@@ -36,8 +36,15 @@ pub struct Capabilities {
     pub input_devices: usize,
     /// Devices of different clocks are kept in step by the backend
     /// (PipeWire resamples the devices that follow another's clock).
-    /// Without it, an input device other than the output device drifts.
+    /// Without it (and without [`Self::resamples_followers`]), an input
+    /// device other than the output device drifts.
     pub clocked_by_server: bool,
+    /// The stream itself keeps devices of different clocks in step: the
+    /// first output device's clock drives the engine and every other device
+    /// follows it through a drift-steered resampler (`follow`), its
+    /// channels a few milliseconds later (compensated per channel when
+    /// recording).
+    pub resamples_followers: bool,
     /// The stream reconnects devices that come and go by itself (a server
     /// graph): a missing device is not an error, the stream plays on the
     /// default meanwhile and goes back when it returns.
@@ -59,6 +66,7 @@ impl Default for Capabilities {
             output_devices: 1,
             input_devices: 1,
             clocked_by_server: false,
+            resamples_followers: false,
             follows_devices: false,
             free_channel_counts: false,
             force_format: false,
@@ -352,6 +360,33 @@ mod tests {
         );
         assert_eq!(r.request.sample_rate, None);
         assert_eq!(r.notes.len(), 1);
+    }
+
+    /// A backend joining devices (followers resampled to the first
+    /// output's clock) keeps them all; only the first output device's
+    /// rates decide the stream's rate.
+    #[test]
+    fn followers_at_other_rates_are_kept_without_a_note() {
+        let caps = Capabilities {
+            output_devices: 4,
+            input_devices: 4,
+            resamples_followers: true,
+            ..Capabilities::default()
+        };
+        let devices = [
+            device("desk", &[48_000, 96_000], None, true),
+            device("mic", &[44_100], None, false),
+            device("phones", &[44_100], None, false),
+        ];
+        let asked = Request {
+            sample_rate: Some(96_000),
+            output_devices: vec!["desk".into(), "phones".into()],
+            input_devices: vec!["mic".into(), "desk".into()],
+            ..Request::default()
+        };
+        let r = resolve(&caps, &devices, &asked);
+        assert_eq!(r.request, asked, "as asked");
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
     }
 
     #[test]

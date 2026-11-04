@@ -165,6 +165,8 @@ enum Link {
         socket: UdpSocket,
         peer: Option<SocketAddr>,
         reply: u16,
+        /// The port it listens on (a head tracker may send there too).
+        port: u16,
     },
 }
 
@@ -199,6 +201,7 @@ impl Surface {
                 socket,
                 peer: Some(peer),
                 reply,
+                ..
             } => {
                 let to = SocketAddr::new(peer.ip(), *reply);
                 for m in messages {
@@ -318,6 +321,14 @@ impl Session {
         self.control.errors.clear();
         self.control.settings = settings.clone();
         self.apply_surface_ports();
+        // A head tracker's own socket lets go of a port a surface wants
+        // (the surface then hands the tracker's messages over).
+        let ports: Vec<u16> = settings
+            .iter()
+            .filter(|s| !s.kind.is_midi())
+            .map(|s| s.listen)
+            .collect();
+        self.release_head_port_for(&ports);
         for s in settings {
             match open(&s) {
                 Ok(surface) => {
@@ -330,7 +341,22 @@ impl Session {
                 }
             }
         }
+        if self.head_tracking().enabled {
+            self.open_head_socket();
+        }
         self.revision += 1;
+    }
+
+    /// The UDP ports the open OSC surfaces listen on.
+    pub(crate) fn osc_surface_ports(&self) -> Vec<u16> {
+        self.control
+            .surfaces
+            .iter()
+            .filter_map(|s| match s.link {
+                Link::Osc { port, .. } => Some(port),
+                Link::Midi(_) => None,
+            })
+            .collect()
     }
 
     /// Controllers FaderFrame knows among the MIDI ports, set up as they
@@ -428,13 +454,31 @@ impl Session {
                         s.protocol.receive(&msg, &mut got);
                     }
                 }
-                Link::Osc { socket, peer, .. } => {
+                Link::Osc {
+                    socket, peer, port, ..
+                } => {
                     let mut buf = [0u8; 4096];
+                    let head = self.head.wants_port(*port);
                     for _ in 0..MAX_PACKETS {
                         match socket.recv_from(&mut buf) {
                             Ok((n, from)) => {
+                                // A head tracker sending here is not the
+                                // surface's peer.
+                                if head
+                                    && faderframe_control::osc::decode(&buf[..n]).iter().all(|m| {
+                                        faderframe_control::headtrack::HeadTracker::understands(
+                                            &m.addr,
+                                        )
+                                    })
+                                {
+                                    self.head.feed_packet(&buf[..n]);
+                                    continue;
+                                }
                                 *peer = Some(from);
                                 s.protocol.receive(&buf[..n], &mut got);
+                                if head {
+                                    self.head.feed_packet(&buf[..n]);
+                                }
                             }
                             Err(_) => break,
                         }
@@ -609,7 +653,7 @@ impl Session {
     }
 
     /// The launcher's slots of `tracks` by `rows` scenes from `first`.
-    fn surface_launcher(
+    pub(crate) fn surface_launcher(
         &self,
         tracks: &[Option<TrackId>],
         first: usize,
@@ -998,13 +1042,31 @@ impl Session {
                 }
             }
             C::ClearMutes => self.clear_mutes()?,
+            C::SceneNext => self.dispatch(Action::MixScene(crate::scenes::SceneOp::Next))?,
+            C::ScenePrevious => {
+                self.dispatch(Action::MixScene(crate::scenes::SceneOp::Previous))?;
+            }
+            C::RecallScene(n) => {
+                if let Some(scene) = self.project.mix_scenes.scenes.get(n).map(|s| s.id) {
+                    self.dispatch(Action::MixScene(crate::scenes::SceneOp::Recall {
+                        scene,
+                        fade: None,
+                    }))?;
+                }
+            }
+            C::SceneMorph { permille } => {
+                self.morph(f64::from(permille.min(1000)) / 1000.0, true)?
+            }
+            C::RunMacro(n) => {
+                self.dispatch(Action::Script(crate::script::ScriptOp::RunMacro(n)))?
+            }
         }
         Ok(())
     }
 
     /// Locate to the time in `times` (sorted) after the playhead, or before
     /// it (a little before counts as at it: a second press goes further).
-    fn locate_step(
+    pub(crate) fn locate_step(
         &mut self,
         at: faderframe_timeline::MusicalTime,
         times: &[faderframe_timeline::MusicalTime],
@@ -1419,7 +1481,11 @@ impl Session {
     /// A dual-panned track's pan control set to `pan` (−1…1): the side
     /// held there, or the image moved so its middle is — stopping at the
     /// sides rather than narrowing it.
-    fn set_dual_pan_from_surface(&mut self, track: TrackId, pan: f32) -> crate::Result<()> {
+    pub(crate) fn set_dual_pan_from_surface(
+        &mut self,
+        track: TrackId,
+        pan: f32,
+    ) -> crate::Result<()> {
         let Some(t) = self.project.track(track) else {
             return Ok(());
         };
@@ -1561,6 +1627,7 @@ fn open(s: &SurfaceSettings) -> Result<Surface, String> {
             socket,
             peer: None,
             reply: s.reply,
+            port: s.listen,
         }
     };
     Ok(Surface::new(protocol_for(s), link, s))

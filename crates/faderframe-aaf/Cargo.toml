@@ -1,0 +1,14 @@
+[package]
+name = "faderframe-aaf"
+description = "AAF interchange for FaderFrame: the compound file container, the AAF object model and its stored form, compositions written with embedded or linked audio and read back"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true

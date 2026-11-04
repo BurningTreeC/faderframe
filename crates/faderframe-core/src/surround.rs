@@ -554,7 +554,7 @@ pub fn speakers_of(layout: ChannelLayout) -> Option<&'static [Speaker]> {
         ChannelLayout::Mono => Some(&MONO),
         ChannelLayout::Stereo => Some(&STEREO),
         ChannelLayout::Surround(f) => Some(f.speakers()),
-        ChannelLayout::Discrete(_) => None,
+        ChannelLayout::Discrete(_) | ChannelLayout::Ambisonic(_) => None,
     }
 }
 
@@ -599,6 +599,10 @@ fn right_front() -> f32 {
 
 fn is_right_front(v: &f32) -> bool {
     *v == -30.0
+}
+
+fn is_one(v: &f32) -> bool {
+    *v == 1.0
 }
 
 /// How a source's position becomes speaker gains.
@@ -711,6 +715,11 @@ pub struct SurroundPan {
     /// ([`diffuse_gain`]) instead of as the same signal.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub diffuse: bool,
+    /// Into an ambisonic field: the distance (1 the reference: beyond it
+    /// the level falls as `1 / d`, inside it the source opens up towards
+    /// every direction; [`crate::ambisonics::distance_effect`]).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub distance: f32,
 }
 
 fn one() -> f32 {
@@ -733,6 +742,7 @@ impl Default for SurroundPan {
             left: 30.0,
             right: -30.0,
             diffuse: false,
+            distance: 1.0,
         }
     }
 }
@@ -820,9 +830,11 @@ impl SurroundPan {
 /// (`None`: it fits, or it is not a bed): the largest format that fits,
 /// else stereo, else mono.
 pub fn fold_into(layout: ChannelLayout, room: usize) -> Option<ChannelLayout> {
-    let ChannelLayout::Surround(_) = layout else {
+    // An ambisonic field that fits passes as it is (to an outboard
+    // decoder); one that does not is decoded like a bed folds.
+    if !layout.is_spatial() {
         return None;
-    };
+    }
     if layout.channel_count() <= room {
         return None;
     }
@@ -855,10 +867,12 @@ pub enum SurroundParam {
     LeftAzimuth,
     /// Dual: the right channel's azimuth.
     RightAzimuth,
+    /// Into an ambisonic field: the distance.
+    Distance,
 }
 
 impl SurroundParam {
-    pub const ALL: [SurroundParam; 10] = [
+    pub const ALL: [SurroundParam; 11] = [
         SurroundParam::X,
         SurroundParam::Y,
         SurroundParam::Z,
@@ -869,6 +883,7 @@ impl SurroundParam {
         SurroundParam::Elevation,
         SurroundParam::LeftAzimuth,
         SurroundParam::RightAzimuth,
+        SurroundParam::Distance,
     ];
 
     pub fn index(self) -> usize {
@@ -887,6 +902,7 @@ impl SurroundParam {
             SurroundParam::Elevation => "Surround Elevation",
             SurroundParam::LeftAzimuth => "Left Channel Azimuth",
             SurroundParam::RightAzimuth => "Right Channel Azimuth",
+            SurroundParam::Distance => "Surround Distance",
         }
     }
 
@@ -916,6 +932,7 @@ impl SurroundParam {
             SurroundParam::Elevation => (-90.0, 90.0, 0.0),
             SurroundParam::LeftAzimuth => (-180.0, 180.0, 30.0),
             SurroundParam::RightAzimuth => (-180.0, 180.0, -30.0),
+            SurroundParam::Distance => (0.0, MAX_DISTANCE, 1.0),
         }
     }
 
@@ -931,6 +948,7 @@ impl SurroundParam {
             SurroundParam::Elevation => pan.elevation,
             SurroundParam::LeftAzimuth => pan.left,
             SurroundParam::RightAzimuth => pan.right,
+            SurroundParam::Distance => pan.distance,
         }
     }
 
@@ -943,6 +961,15 @@ impl SurroundParam {
                 (lo, hi, 0.0)
             }
             p => p.range(),
+        }
+    }
+
+    /// `(min, max, default)` for a source panned into `dst`: a bed's
+    /// ([`Self::range_in`]), or the whole sphere for an ambisonic field.
+    pub fn range_into(self, dst: ChannelLayout) -> (f32, f32, f32) {
+        match dst {
+            ChannelLayout::Surround(f) => self.range_in(f),
+            _ => self.range(),
         }
     }
 
@@ -977,6 +1004,7 @@ impl SurroundParam {
             SurroundParam::Elevation => pan.elevation = v,
             SurroundParam::LeftAzimuth => pan.left = v,
             SurroundParam::RightAzimuth => pan.right = v,
+            SurroundParam::Distance => pan.distance = v,
         }
         pan
     }
@@ -1005,9 +1033,53 @@ impl SurroundParam {
             SurroundParam::Spread => placed,
             SurroundParam::Width => stereo && mode == StereoSource::Image,
             SurroundParam::Lfe => format.has_lfe(),
+            // Only ambisonic fields have a distance.
+            SurroundParam::Distance => false,
+        }
+    }
+
+    /// Whether it does anything for a `source` panned into `dst` (a bed:
+    /// [`Self::applies`]; an ambisonic field: the direction, the spread,
+    /// a stereo image's width or the dual pair, and the distance — never
+    /// the room's place or an LFE send).
+    pub fn applies_into(
+        self,
+        source: ChannelLayout,
+        dst: ChannelLayout,
+        pan: &SurroundPan,
+    ) -> bool {
+        match dst {
+            ChannelLayout::Surround(f) => self.applies(source, f, pan),
+            ChannelLayout::Ambisonic(_) => {
+                let stereo = source.channel_count() == 2;
+                let mode = if stereo {
+                    pan.stereo
+                } else {
+                    StereoSource::Image
+                };
+                let placed = mode != StereoSource::Balance;
+                match self {
+                    SurroundParam::Azimuth => mode == StereoSource::Image,
+                    SurroundParam::Elevation | SurroundParam::Spread | SurroundParam::Distance => {
+                        placed
+                    }
+                    SurroundParam::LeftAzimuth | SurroundParam::RightAzimuth => {
+                        mode == StereoSource::Dual
+                    }
+                    SurroundParam::Width => stereo && mode == StereoSource::Image,
+                    SurroundParam::X | SurroundParam::Y | SurroundParam::Z | SurroundParam::Lfe => {
+                        false
+                    }
+                }
+            }
+            _ => false,
         }
     }
 }
+
+/// The farthest distance a source into an ambisonic field takes (times
+/// the reference distance).
+pub const MAX_DISTANCE: f32 = 20.0;
 
 /// Power-preserving crossfade between two neighbours at `t` (0 the
 /// first, 1 the second).
@@ -1346,6 +1418,10 @@ pub struct Mixing<'a> {
     /// spread leaves the points their share only (else it spreads
     /// coherently).
     pub diffuse: bool,
+    /// An ambisonic source's decoder onto the destination's speakers,
+    /// made off the audio thread ([`crate::ambisonics::Decoder::allrad`];
+    /// `None`: a sampling decoder is made in its place).
+    pub decoder: Option<&'a crate::ambisonics::Decoder>,
 }
 
 impl Default for Mixing<'_> {
@@ -1355,6 +1431,7 @@ impl Default for Mixing<'_> {
             downmix: Downmix::STANDARD,
             balance: 0.0,
             diffuse: false,
+            decoder: None,
         }
     }
 }
@@ -1412,11 +1489,31 @@ pub fn matrix(
     out: &mut [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
 ) -> bool {
     let surround = |l: ChannelLayout| matches!(l, ChannelLayout::Surround(_));
-    if !surround(src) && !surround(dst) {
+    if !src.is_spatial() && !dst.is_spatial() {
         return false;
     }
     for row in out.iter_mut() {
         row.fill(0.0);
+    }
+    if let ChannelLayout::Ambisonic(order) = dst {
+        // Into a field: encoded (another field: the orders they share).
+        match src {
+            ChannelLayout::Ambisonic(_) => {
+                for (c, row) in out
+                    .iter_mut()
+                    .enumerate()
+                    .take(src.channel_count().min(dst.channel_count()))
+                {
+                    row[c] = 1.0;
+                }
+            }
+            _ => encode_into(src, order, &pan.clamped(), mixing.balance, out),
+        }
+        return true;
+    }
+    if let ChannelLayout::Ambisonic(order) = src {
+        decode_into(order, dst, mixing.decoder, out);
+        return true;
     }
     let Some(to) = speakers_of(dst) else {
         // Into discrete channels: one to one.
@@ -1474,6 +1571,104 @@ pub fn matrix(
         _ => place(src, to, &pan, mixing, out),
     }
     true
+}
+
+/// A source encoded into a field of `order`: a bed's speakers each at its
+/// direction (the LFE has none: left out); a mono, stereo or discrete
+/// source placed by `pan` — its direction, a stereo source as an image
+/// (`azimuth ± 30° × width`), balanced (left at 30°, right at −30°, by
+/// `balance`) or dual; spread and distance as
+/// [`crate::ambisonics::spread_gains`] and
+/// [`crate::ambisonics::distance_effect`] make them.
+fn encode_into(
+    src: ChannelLayout,
+    order: crate::ambisonics::AmbiOrder,
+    pan: &SurroundPan,
+    balance: f32,
+    out: &mut [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
+) {
+    use crate::ambisonics::{distance_effect, encode, order_of, spread_gains};
+    let channels = order.channels();
+    if let ChannelLayout::Surround(f) = src {
+        for (row, s) in out.iter_mut().zip(f.speakers()) {
+            if !s.lfe {
+                encode(order, s.azimuth, s.elevation, &mut row[..channels]);
+            }
+        }
+        return;
+    }
+    let n = src.channel_count().min(MAX_SPEAKERS);
+    let stereo = src == ChannelLayout::Stereo;
+    let mode = if stereo {
+        pan.stereo
+    } else {
+        StereoSource::Image
+    };
+    if mode == StereoSource::Balance {
+        let (gl, gr) = crate::pan::stereo_balance(balance);
+        encode(order, 30.0, 0.0, &mut out[0][..channels]);
+        encode(order, -30.0, 0.0, &mut out[1][..channels]);
+        for (row, g) in out.iter_mut().zip([gl, gr]) {
+            for v in row.iter_mut().take(channels) {
+                *v *= g;
+            }
+        }
+        return;
+    }
+    let (gain, opened) = distance_effect(pan.distance);
+    let taper = spread_gains(order, pan.spread.max(opened));
+    for (c, row) in out.iter_mut().enumerate().take(n) {
+        let side = if c == 0 { 1.0 } else { -1.0 };
+        let azimuth = match mode {
+            StereoSource::Dual if c == 0 => pan.left,
+            StereoSource::Dual => pan.right,
+            _ if stereo => pan.azimuth + side * 30.0 * pan.width,
+            _ => pan.azimuth,
+        };
+        encode(order, azimuth, pan.elevation, &mut row[..channels]);
+        for (k, v) in row.iter_mut().enumerate().take(channels) {
+            *v *= taper[order_of(k)] * gain;
+        }
+    }
+}
+
+/// A field of `order` decoded into `dst`: discrete channels one to one,
+/// mono as its omnidirectional W, stereo and beds by `decoder` (AllRAD;
+/// without one a sampling decoder is made here).
+fn decode_into(
+    order: crate::ambisonics::AmbiOrder,
+    dst: ChannelLayout,
+    decoder: Option<&crate::ambisonics::Decoder>,
+    out: &mut [[f32; MAX_SPEAKERS]; MAX_SPEAKERS],
+) {
+    let channels = order.channels();
+    let Some(to) = speakers_of(dst) else {
+        for (c, row) in out
+            .iter_mut()
+            .enumerate()
+            .take(channels.min(dst.channel_count()))
+        {
+            row[c] = 1.0;
+        }
+        return;
+    };
+    if dst == ChannelLayout::Mono {
+        out[0][0] = 1.0;
+        return;
+    }
+    let made;
+    let d = match decoder.filter(|d| d.order() == order && d.speakers() == to.len()) {
+        Some(d) => d,
+        None => {
+            made = crate::ambisonics::Decoder::sampling(order, to);
+            &made
+        }
+    };
+    for (s, gains) in d.gains().iter().enumerate().take(to.len()) {
+        for (k, g) in gains.iter().enumerate().take(channels) {
+            out[k][s] = *g;
+        }
+    }
 }
 
 /// A mono, stereo or discrete source placed into the bed `to`.
@@ -1776,6 +1971,7 @@ mod placing {
             downmix: Downmix::STANDARD,
             balance,
             diffuse: true,
+            decoder: None,
         };
         let mut m = [[0.0; MAX_SPEAKERS]; MAX_SPEAKERS];
         assert!(matrix(src, layout(f), &pan, &mixing, &mut m));
@@ -2419,5 +2615,237 @@ mod custom {
             assert!((g.iter().map(|x| x * x).sum::<f32>() - 1.0).abs() < 1e-4);
             assert_eq!(g[15], 0.0, "never the LFE");
         }
+    }
+}
+
+#[cfg(test)]
+mod ambisonic {
+    use super::*;
+    use crate::ambisonics::{AmbiOrder, Decoder, direction, harmonics};
+    use crate::vbap::Vbap;
+
+    type M = [[f32; MAX_SPEAKERS]; MAX_SPEAKERS];
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    fn mixed(src: ChannelLayout, dst: ChannelLayout, pan: &SurroundPan, mixing: &Mixing) -> M {
+        let mut m = [[0.0; MAX_SPEAKERS]; MAX_SPEAKERS];
+        assert!(matrix(src, dst, pan, mixing, &mut m));
+        m
+    }
+
+    fn vbap_pan(azimuth: f32, elevation: f32) -> SurroundPan {
+        SurroundPan {
+            azimuth,
+            elevation,
+            ..SurroundPan::default()
+        }
+    }
+
+    /// A mono source into a field is the harmonics at its direction,
+    /// whichever panner the track had for beds.
+    #[test]
+    fn a_mono_source_is_encoded_at_its_direction() {
+        for order in AmbiOrder::ALL {
+            let dst = ChannelLayout::Ambisonic(order);
+            let pan = vbap_pan(-75.0, 20.0);
+            let m = mixed(ChannelLayout::Mono, dst, &pan, &Mixing::default());
+            let want = harmonics(direction(-75.0, 20.0));
+            for k in 0..order.channels() {
+                assert!(close(m[0][k], want[k], 1e-6), "{order:?} {k}");
+            }
+            assert!(m[0][order.channels()..].iter().all(|v| *v == 0.0));
+        }
+    }
+
+    /// A stereo image sits `width` × 30° either side, balance puts its
+    /// sides at ±30° by the strip's balance, dual each at its own azimuth.
+    #[test]
+    fn stereo_sources_go_in_as_images_balanced_or_dual() {
+        let dst = ChannelLayout::Ambisonic(AmbiOrder::First);
+        let pan = SurroundPan {
+            azimuth: 90.0,
+            width: 0.5,
+            ..SurroundPan::default()
+        };
+        let m = mixed(ChannelLayout::Stereo, dst, &pan, &Mixing::default());
+        let (l, r) = (
+            harmonics(direction(105.0, 0.0)),
+            harmonics(direction(75.0, 0.0)),
+        );
+        for k in 0..4 {
+            assert!(close(m[0][k], l[k], 1e-6) && close(m[1][k], r[k], 1e-6));
+        }
+        let balanced = SurroundPan {
+            stereo: StereoSource::Balance,
+            ..pan
+        };
+        let mixing = Mixing {
+            balance: 0.5,
+            ..Mixing::default()
+        };
+        let m = mixed(ChannelLayout::Stereo, dst, &balanced, &mixing);
+        let (gl, gr) = crate::pan::stereo_balance(0.5);
+        assert!(close(m[0][1], gl * 0.5, 1e-6), "{:?}", m[0]);
+        assert!(close(m[1][1], -gr * 0.5, 1e-6), "{:?}", m[1]);
+        let dual = SurroundPan {
+            stereo: StereoSource::Dual,
+            left: 120.0,
+            right: -10.0,
+            ..pan
+        };
+        let m = mixed(ChannelLayout::Stereo, dst, &dual, &Mixing::default());
+        assert!(close(m[0][3], 120f32.to_radians().cos(), 1e-6));
+        assert!(close(m[1][1], (-10f32).to_radians().sin(), 1e-6));
+    }
+
+    /// Distance: beyond the reference the level falls as 1/d; at the
+    /// listener the source is every direction alike (W only).
+    #[test]
+    fn distance_lowers_the_level_and_opens_up_near_the_listener() {
+        let dst = ChannelLayout::Ambisonic(AmbiOrder::Third);
+        let far = SurroundPan {
+            distance: 4.0,
+            ..vbap_pan(30.0, 0.0)
+        };
+        let m = mixed(ChannelLayout::Mono, dst, &far, &Mixing::default());
+        let want = harmonics(direction(30.0, 0.0));
+        for k in 0..16 {
+            assert!(close(m[0][k], want[k] / 4.0, 1e-6));
+        }
+        let here = SurroundPan {
+            distance: 0.0,
+            ..vbap_pan(30.0, 0.0)
+        };
+        let m = mixed(ChannelLayout::Mono, dst, &here, &Mixing::default());
+        assert!(m[0][0] > 1.0);
+        assert!(m[0][1..16].iter().all(|v| v.abs() < 1e-6));
+    }
+
+    /// A bed into a field and back (AllRAD onto its own speakers): each
+    /// speaker's channel comes back loudest on itself; the LFE is left
+    /// out of the field.
+    #[test]
+    fn a_bed_survives_a_trip_through_a_third_order_field() {
+        let f = SurroundFormat::S714;
+        let bed = ChannelLayout::Surround(f);
+        let field = ChannelLayout::Ambisonic(AmbiOrder::Third);
+        let pan = SurroundPan::default();
+        let enc = mixed(bed, field, &pan, &Mixing::default());
+        let lfe = f.speakers().iter().position(|s| s.lfe).unwrap();
+        assert!(enc[lfe].iter().all(|v| *v == 0.0));
+        let vbap = Vbap::of(f);
+        let decoder = Decoder::allrad(AmbiOrder::Third, f.speakers(), &vbap);
+        let mixing = Mixing {
+            decoder: Some(&decoder),
+            vbap: Some(&vbap),
+            ..Mixing::default()
+        };
+        let dec = mixed(field, bed, &pan, &mixing);
+        for (i, s) in f.speakers().iter().enumerate() {
+            if s.lfe {
+                continue;
+            }
+            let back: Vec<f32> = (0..f.channels())
+                .map(|o| (0..16).map(|k| enc[i][k] * dec[k][o]).sum())
+                .collect();
+            let loudest = (0..back.len())
+                .max_by(|a, b| back[*a].total_cmp(&back[*b]))
+                .unwrap();
+            assert_eq!(loudest, i, "{}: {back:?}", s.label);
+            assert_eq!(back[lfe], 0.0);
+        }
+        // Without a decoder made for it, a sampling decoder stands in.
+        let fallback = mixed(field, bed, &pan, &Mixing::default());
+        assert!(fallback.iter().flatten().any(|v| *v != 0.0));
+    }
+
+    /// Between fields the shared orders pass; into mono only W; into
+    /// discrete channels one to one.
+    #[test]
+    fn fields_pass_their_shared_orders_and_mono_hears_w() {
+        let pan = SurroundPan::default();
+        let m = mixed(
+            ChannelLayout::Ambisonic(AmbiOrder::Third),
+            ChannelLayout::Ambisonic(AmbiOrder::First),
+            &pan,
+            &Mixing::default(),
+        );
+        for (r, row) in m.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                assert_eq!(*v, if r == c && r < 4 { 1.0 } else { 0.0 });
+            }
+        }
+        let m = mixed(
+            ChannelLayout::Ambisonic(AmbiOrder::Second),
+            ChannelLayout::Mono,
+            &pan,
+            &Mixing::default(),
+        );
+        assert_eq!(m[0][0], 1.0);
+        assert!(m[1..].iter().all(|r| r[0] == 0.0));
+        let m = mixed(
+            ChannelLayout::Ambisonic(AmbiOrder::First),
+            ChannelLayout::Discrete(4),
+            &pan,
+            &Mixing::default(),
+        );
+        assert!((0..4).all(|c| m[c][c] == 1.0));
+    }
+
+    /// What applies into a field: the direction, spread and distance;
+    /// never the room's place or the LFE; and distance into no bed.
+    #[test]
+    fn what_a_field_pans_by() {
+        let field = ChannelLayout::Ambisonic(AmbiOrder::Second);
+        let pan = SurroundPan::default();
+        let on: Vec<SurroundParam> = SurroundParam::ALL
+            .into_iter()
+            .filter(|p| p.applies_into(ChannelLayout::Mono, field, &pan))
+            .collect();
+        assert_eq!(
+            on,
+            [
+                SurroundParam::Spread,
+                SurroundParam::Azimuth,
+                SurroundParam::Elevation,
+                SurroundParam::Distance
+            ]
+        );
+        assert!(SurroundParam::Width.applies_into(ChannelLayout::Stereo, field, &pan));
+        let bed = ChannelLayout::Surround(SurroundFormat::S714);
+        assert!(!SurroundParam::Distance.applies_into(ChannelLayout::Mono, bed, &pan));
+        assert!(SurroundParam::X.applies_into(ChannelLayout::Mono, bed, &pan));
+        assert!(!SurroundParam::Azimuth.applies_into(
+            ChannelLayout::Mono,
+            ChannelLayout::Stereo,
+            &pan
+        ));
+    }
+
+    /// The distance is kept in files only when it is not the default, and
+    /// clamped; a field wider than the device folds (decodes) to a bed
+    /// that fits, one that fits passes.
+    #[test]
+    fn distance_in_files_and_fields_on_devices() {
+        let pan = SurroundPan::default();
+        assert!(!serde_json::to_string(&pan).unwrap().contains("distance"));
+        let far = SurroundParam::Distance.set(pan, 99.0);
+        assert_eq!(far.distance, MAX_DISTANCE);
+        let back: SurroundPan =
+            serde_json::from_str(&serde_json::to_string(&far).unwrap()).unwrap();
+        assert_eq!(back.distance, MAX_DISTANCE);
+        assert_eq!(
+            SurroundPan::from_values(&far.values()).distance,
+            MAX_DISTANCE
+        );
+        let field = ChannelLayout::Ambisonic(AmbiOrder::Third);
+        assert_eq!(fold_into(field, 16), None);
+        assert_eq!(fold_into(field, 2), Some(ChannelLayout::Stereo));
+        assert!(
+            matches!(fold_into(field, 8), Some(ChannelLayout::Surround(f)) if f.channels() == 8)
+        );
     }
 }

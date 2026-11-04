@@ -29,6 +29,10 @@ pub struct Rig<P> {
     pub transport: TransportInfo,
     /// Frames run so far.
     pub at: usize,
+    /// The key and chord track the processor sees.
+    pub harmony: crate::Harmony,
+    /// Events on its note input for the next block (cleared after it).
+    pub events: Vec<faderframe_midi::MidiBuffer>,
 }
 
 impl<P: PluginProcessor> Rig<P> {
@@ -61,6 +65,8 @@ impl<P: PluginProcessor> Rig<P> {
             outs,
             transport: TransportInfo::default(),
             at: 0,
+            harmony: crate::Harmony::default(),
+            events: Vec::new(),
         }
     }
 
@@ -90,7 +96,7 @@ impl<P: PluginProcessor> Rig<P> {
             let ctx = PluginProcessContext {
                 transport: &self.transport,
                 param_events: &[],
-                harmony: &crate::NO_HARMONY,
+                harmony: &self.harmony,
                 param_mods: &[],
                 note_mods: &[],
             };
@@ -98,10 +104,13 @@ impl<P: PluginProcessor> Rig<P> {
                 frames: BLOCK,
                 audio_in: &self.ins,
                 audio_out: &mut self.outs,
-                events_in: &[],
+                events_in: &self.events,
                 events_out: &mut [],
             };
             self.p.process(&ctx, &mut io);
+            for e in &mut self.events {
+                e.clear();
+            }
             l.extend_from_slice(self.outs[0].channel(0));
             r.extend_from_slice(self.outs[0].channel(1));
             self.at += BLOCK;
@@ -116,6 +125,23 @@ pub fn tone(f: f64, amp: f64) -> impl Fn(usize) -> (f32, f32) {
         let v = (amp * (std::f64::consts::TAU * f * n as f64 / SR).sin()) as f32;
         (v, v)
     }
+}
+
+/// White noise of unit variance at frame `n` (nearly Gaussian; `seed`
+/// picks the stream): a hash per frame, so any frame is known alone.
+pub fn white(n: usize, seed: u64) -> f64 {
+    let mut sum = 0.0;
+    for k in 0..4u64 {
+        let mut z = (n as u64)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(seed.wrapping_mul(0xbf58_476d_1ce4_e5b9))
+            .wrapping_add(k.wrapping_mul(0x94d0_49bb_1331_11eb));
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        sum += (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+    }
+    sum * 0.866_025_403_784_438_6
 }
 
 pub fn silence(_: usize) -> (f32, f32) {

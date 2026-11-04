@@ -1,4 +1,4 @@
-use crate::{AccessNode, Cursor, Painter, Point, Rect, Size, Theme, ViewEvent};
+use crate::{AccessNode, AccessPress, Cursor, Painter, Point, Rect, Size, Theme, ViewEvent};
 
 /// An entry of a context menu requested by a view.
 #[derive(Clone)]
@@ -290,5 +290,28 @@ pub trait CanvasView<M, A> {
     /// its controls only with Ctrl+Tab).
     fn uses_tab(&self) -> bool {
         false
+    }
+
+    /// The keyboard asks the view to do for control `id` of its tree what
+    /// only the view can ([`AccessPress`]: open the menu, text entry or
+    /// chooser the pointer's press opens, change its own presentation),
+    /// answered through `cx` as for an event. `false`: nothing done.
+    fn access_press(
+        &mut self,
+        _id: u64,
+        _press: AccessPress,
+        _size: Size,
+        _model: &M,
+        _cx: &mut EventCx<'_, A>,
+    ) -> bool {
+        false
+    }
+
+    /// What a screen reader should hear that changed by itself since the
+    /// last call (a clip launched, an analysis finished, a level past a
+    /// limit): asked a few times a second while the view is shown, the
+    /// view remembering what it told (the first call only looks).
+    fn access_news(&mut self, _model: &M) -> Vec<String> {
+        Vec::new()
     }
 }

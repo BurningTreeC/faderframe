@@ -408,8 +408,11 @@ pub fn humanize(notes: &mut [MidiNote], timing: MusicalTime, velocity: u8, seed:
     for n in notes {
         let dt = (rng.signed() * timing.ticks() as f64).round() as i64;
         n.start = (n.start + MusicalTime(dt)).max(MusicalTime::ZERO);
-        let dv = (rng.signed() * velocity as f64).round() as i32;
-        n.velocity = (n.velocity as i32 + dv).clamp(1, 127) as u8;
+        let r = rng.signed() * velocity as f64;
+        let dv = r.round() as i32;
+        // Notes with MIDI 2.0's resolution move by the unrounded amount.
+        let wanted = f64::from(n.velocity16()) + r * 512.0;
+        n.set_velocity_keeping((n.velocity as i32 + dv).clamp(1, 127) as u8, wanted);
     }
 }
 
@@ -480,15 +483,53 @@ pub fn invert(notes: &mut [MidiNote]) {
 }
 
 /// `v * factor + offset`, clamped to 1..=127.
+/// `v * factor + offset` in MIDI 1.0 steps (notes with MIDI 2.0's
+/// resolution keep it, see [`MidiNote::set_velocity_keeping`]).
 pub fn scale_velocity(notes: &mut [MidiNote], factor: f32, offset: i32) {
     for n in notes {
-        n.velocity = ((n.velocity as f32 * factor).round() as i32 + offset).clamp(1, 127) as u8;
+        let v = ((n.velocity as f32 * factor).round() as i32 + offset).clamp(1, 127) as u8;
+        let wanted = f64::from(n.velocity16()) * f64::from(factor) + f64::from(offset) * 512.0;
+        n.set_velocity_keeping(v, wanted);
     }
 }
 
+/// Every velocity at seven bits (MIDI 2.0's resolution goes).
 pub fn set_velocity(notes: &mut [MidiNote], velocity: u8) {
     for n in notes {
-        n.velocity = velocity.clamp(1, 127);
+        n.set_velocity16(
+            faderframe_midi::ump::scale_up(u32::from(velocity.clamp(1, 127)), 7, 16) as u16,
+        );
+    }
+}
+
+/// Every velocity at MIDI 2.0's 16 bits.
+pub fn set_velocity16(notes: &mut [MidiNote], velocity: u16) {
+    for n in notes {
+        n.set_velocity16(velocity);
+    }
+}
+
+/// Every velocity moved by `by` at 16 bits (a 7-bit step is 512).
+pub fn offset_velocity16(notes: &mut [MidiNote], by: i32) {
+    for n in notes {
+        n.set_velocity16((i32::from(n.velocity16()) + by).clamp(0, 65535) as u16);
+    }
+}
+
+/// Velocities at 16 bits in a straight line from `from` (earliest note) to
+/// `to` (latest).
+pub fn ramp_velocity16(notes: &mut [MidiNote], from: u16, to: u16) {
+    let (Some(a), Some(b)) = (
+        notes.iter().map(|n| n.start).min(),
+        notes.iter().map(|n| n.start).max(),
+    ) else {
+        return;
+    };
+    let span = (b - a).ticks().max(1) as f64;
+    for n in notes {
+        let t = (n.start - a).ticks() as f64 / span;
+        let v = f64::from(from) + (f64::from(to) - f64::from(from)) * t;
+        n.set_velocity16(v.round().clamp(0.0, 65535.0) as u16);
     }
 }
 
@@ -504,9 +545,11 @@ pub fn ramp_velocity(notes: &mut [MidiNote], from: u8, to: u8) {
     let span = (b - a).ticks().max(1) as f32;
     for n in notes {
         let t = (n.start - a).ticks() as f32 / span;
-        n.velocity = (from as f32 + (to as f32 - from as f32) * t)
+        let v = (from as f32 + (to as f32 - from as f32) * t)
             .round()
             .clamp(1.0, 127.0) as u8;
+        let wanted = (from as f32 + (to as f32 - from as f32) * t) as f64 * 512.0;
+        n.set_velocity_keeping(v, wanted);
     }
 }
 
@@ -548,6 +591,9 @@ mod tests {
             channel: 0,
             muted: false,
             release: None,
+            time_locked: false,
+            articulation: None,
+            fine: None,
         }
     }
 

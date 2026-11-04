@@ -3,18 +3,37 @@
 
 use crate::{
     BLACK_KEY_W, CHORD_ROW_H, Drag, KEY_ROW_H, LaneKind, Layout, PianoRollView, is_black,
-    note_name, track_color,
+    track_color,
 };
 use faderframe_project::midi_ops::Scale;
-use faderframe_project::{Clip, MidiClip, MidiController, MidiNote};
+use faderframe_project::{Clip, ControllerPoint, MidiClip, MidiController, MidiNote};
 use faderframe_session::Session;
 use faderframe_timeline::{
     GridDensity, GridDivision, GridLineKind, MusicalTime, for_each_grid_line, for_each_visible_line,
 };
 use faderframe_ui_canvas::{
     Align, Color, FontFamily, GridEmphasis, Paint, Painter, Path, Point, Rect, Size, TextStyle,
-    Theme,
+    Theme, controls,
 };
+
+/// Where a note placed in time shows its padlock: inside a bar at its
+/// start, beside a diamond (`None`: no room).
+pub(crate) fn lock_rect(r: Rect, diamond: bool) -> Option<Rect> {
+    if diamond {
+        let h = (r.h * 0.8).clamp(5.0, 9.0);
+        return Some(Rect::new(
+            r.right() + 1.5,
+            r.center().y - h / 2.0,
+            h * 0.7,
+            h,
+        ));
+    }
+    if r.w < 10.0 || r.h < 7.0 {
+        return None;
+    }
+    let h = (r.h - 4.0).min(9.0);
+    Some(Rect::new(r.x + 2.5, r.center().y - h / 2.0, h * 0.7, h))
+}
 
 impl PianoRollView {
     pub(crate) fn paint_view(
@@ -261,6 +280,17 @@ impl PianoRollView {
                     pr.white_row
                 },
             );
+            // A tuning of its own: its degrees, not the key track's
+            // twelve-tone scales (they name keys, not pitches).
+            if let Some(t) = &self.tuning {
+                if !t.in_scale(key) {
+                    p.fill(row, pr.off_scale);
+                } else if t.is_tonic(key) {
+                    p.fill(row, pr.root_row);
+                    p.hline(g.x, g.right(), row.bottom(), pr.octave_line);
+                }
+                continue;
+            }
             for (x0, x1, scale) in &spans {
                 if scale.is_chromatic() || x1 <= x0 {
                     continue;
@@ -480,6 +510,11 @@ impl PianoRollView {
             let c = Self::note_color(color, n.velocity);
             if self.diamonds {
                 self.paint_diamond(p, r, c, n.muted, selected || preview, swept);
+                if n.time_locked
+                    && let Some(g) = lock_rect(r, true)
+                {
+                    controls::lock_glyph(p, g, th.arranger.time_lock);
+                }
                 continue;
             }
             if n.muted {
@@ -516,15 +551,36 @@ impl PianoRollView {
                 tri.close();
                 p.fill_path(&tri, th.tools.level_warn);
             }
-            if r.w > 28.0 && self.row_h >= 11.0 {
-                let text_c = if n.muted || c.luminance() < 0.45 {
-                    Color::hex(0xf0eee8)
-                } else {
-                    Color::hex(0x141414)
+            let text_c = if n.muted || c.luminance() < 0.45 {
+                Color::hex(0xf0eee8)
+            } else {
+                Color::hex(0x141414)
+            };
+            let mut name = r.inset_xy(3.0, 0.0);
+            // Placed in time: a padlock at its start, the name after it.
+            if n.time_locked
+                && let Some(g) = lock_rect(r, false)
+            {
+                controls::lock_glyph(p, g, text_c.with_alpha(0.85));
+                name = Rect::new(
+                    g.right() + 2.0,
+                    r.y,
+                    (r.right() - g.right() - 4.0).max(0.0),
+                    r.h,
+                );
+            }
+            if name.w > 22.0 && self.row_h >= 11.0 {
+                // The articulation the note carries, by its symbol.
+                let label = match n
+                    .articulation
+                    .and_then(|a| model.editor_articulation_map()?.get(a))
+                {
+                    Some(a) => format!("{} {}", self.key_label(n.key), a.short()),
+                    None => self.key_label(n.key),
                 };
                 p.text(
-                    &note_name(n.key),
-                    r.inset_xy(3.0, 0.0),
+                    &label,
+                    name,
                     &TextStyle::new(th.fonts.tiny, text_c).family(FontFamily::Condensed),
                 );
             }
@@ -543,6 +599,9 @@ impl PianoRollView {
                     channel: 0,
                     muted: false,
                     release: None,
+                    time_locked: false,
+                    articulation: None,
+                    fine: None,
                 };
                 if let Some(r) = self.note_rect(&n) {
                     let c = Self::note_color(color, pr.velocity);
@@ -608,6 +667,10 @@ impl PianoRollView {
     }
 
     fn paint_keyboard(&self, p: &mut dyn Painter, rect: Rect, clip: &Clip, model: &Session) {
+        if self.drum_rows {
+            self.paint_drum_names(p, rect, model);
+            return;
+        }
         let pr = &self.theme.piano;
         let th = &self.theme;
         p.fill(rect, pr.key_white_shade);
@@ -687,19 +750,29 @@ impl PianoRollView {
                 };
                 p.fill_rounded(black, 1.5, &Paint::horizontal(black, c.lighten(0.15), c));
             }
-            let in_scale = scale.is_chromatic() || scale.contains(key);
+            let (in_scale, root) = match &self.tuning {
+                Some(t) => (t.in_scale(key), t.is_tonic(key)),
+                None => (
+                    scale.is_chromatic() || scale.contains(key),
+                    !scale.is_chromatic() && scale.is_root(key),
+                ),
+            };
             if !in_scale {
                 p.fill(
                     Rect::new(rect.right() - 6.0, y, 6.0, self.row_h),
                     Color::rgba(0.0, 0.0, 0.0, 0.25),
                 );
-            } else if !scale.is_chromatic() && scale.is_root(key) {
+            } else if root {
                 p.fill(
                     Rect::new(rect.right() - 6.0, y + 1.0, 4.0, self.row_h - 2.0),
                     th.ui.accent,
                 );
             }
-            let label = key.is_multiple_of(12) || self.row_h >= 15.0 || self.rows.len() < 60;
+            let label = match &self.tuning {
+                // Degrees: the tonic's always, the others with room.
+                Some(t) => t.is_tonic(key) || self.row_h >= 13.0 || self.rows.len() < 60,
+                None => key.is_multiple_of(12) || self.row_h >= 15.0 || self.rows.len() < 60,
+            };
             if label {
                 // A black key's name on the key itself.
                 let (area, color) = if is_black(key) {
@@ -711,7 +784,7 @@ impl PianoRollView {
                     (Rect::new(rect.x, y, rect.w - 8.0, self.row_h), pr.key_text)
                 };
                 p.text(
-                    &note_name(key),
+                    &self.key_label(key),
                     area,
                     &TextStyle::new(th.fonts.tiny, color).right(),
                 );
@@ -857,6 +930,7 @@ impl PianoRollView {
             LaneKind::Velocity => self.paint_velocity(p, area, m, color, model),
             LaneKind::Controller(c) => self.paint_controller(p, area, clip, m, c),
             LaneKind::Expression(k) => self.paint_expression(p, area, clip, m, k, model),
+            LaneKind::Articulation => {}
         }
         p.pop_clip();
         // Header: lane name and a hint that it is a menu.
@@ -867,6 +941,25 @@ impl PianoRollView {
             }
             k => k.label(),
         };
+        if self.lane == LaneKind::Articulation {
+            // The title on top, the articulations' names by their rows.
+            faderframe_ui_canvas::controls::engraved(
+                p,
+                &format!("{} ▾", name.to_uppercase()),
+                Rect::new(
+                    l.lane_header.x + 6.0,
+                    l.lane_header.y,
+                    l.lane_header.w - 6.0,
+                    14.0,
+                ),
+                th,
+                Align::Start,
+            );
+            p.push_clip(v.union(&l.lane_header));
+            self.paint_articulations(p, l.lane_header, area, m, model);
+            p.pop_clip();
+            return;
+        }
         faderframe_ui_canvas::controls::engraved(
             p,
             &format!("{} ▾", name.to_uppercase()),
@@ -885,17 +978,19 @@ impl PianoRollView {
         model: &Session,
     ) {
         let th = &self.theme;
+        // At full resolution (16 bits).
         let value_of = |n: &MidiNote| match &self.drag {
             Some(Drag::Velocity { note, value, .. }) if note.id == n.id => *value,
-            _ => n.velocity,
+            _ => n.velocity16(),
         };
         for (n, _) in self.previewed(m) {
             let x = self.x_of(n.start);
             if x < area.x - 4.0 || x > area.right() + 4.0 {
                 continue;
             }
-            let vel = value_of(&n);
-            let h = area.h * vel as f32 / 127.0;
+            let full = value_of(&n);
+            let vel = (full >> 9).max(1) as u8;
+            let h = area.h * f32::from(full) / 65535.0;
             let selected = model.selection.notes.contains(&n.id);
             let c = if selected {
                 th.ui.selection
@@ -923,6 +1018,8 @@ impl PianoRollView {
         let pr = &self.theme.piano;
         let max = c.max() as f32;
         let y_of = |v: u16| area.bottom() - area.h * v as f32 / max;
+        // Points at full resolution (MIDI 2.0's 32 bits where they have them).
+        let y_at = |pt: &ControllerPoint| area.bottom() - area.h * pt.unit(c) as f32;
         if c == MidiController::PitchBend {
             p.hline(
                 area.x,
@@ -936,8 +1033,7 @@ impl PianoRollView {
         if let Some(lane) = lane {
             let mut path = Path::new();
             let mut fill = Path::new();
-            let first = lane.value_at(a).unwrap_or(c.rest());
-            let mut y = y_of(first);
+            let mut y = lane.point_at(a).map_or(y_of(c.rest()), y_at);
             path.move_to(Point::new(area.x, y));
             fill.move_to(Point::new(area.x, area.bottom()));
             fill.line_to(Point::new(area.x, y));
@@ -945,7 +1041,7 @@ impl PianoRollView {
                 let x = self.x_of(pt.time);
                 path.line_to(Point::new(x, y));
                 fill.line_to(Point::new(x, y));
-                y = y_of(pt.value);
+                y = y_at(pt);
                 path.line_to(Point::new(x, y));
                 fill.line_to(Point::new(x, y));
             }
@@ -956,11 +1052,7 @@ impl PianoRollView {
             p.stroke_path(&path, 1.5, pr.lane_curve);
             if self.ppq > 30.0 {
                 for pt in lane.points.iter().filter(|pt| pt.time >= a && pt.time <= b) {
-                    p.circle(
-                        Point::new(self.x_of(pt.time), y_of(pt.value)),
-                        2.0,
-                        pr.lane_curve,
-                    );
+                    p.circle(Point::new(self.x_of(pt.time), y_at(pt)), 2.0, pr.lane_curve);
                 }
             }
         } else {

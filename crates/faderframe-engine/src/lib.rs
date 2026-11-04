@@ -19,14 +19,21 @@
 #![forbid(unsafe_code)]
 
 pub mod ahead;
+mod ara;
+pub mod articulation;
 mod build;
+pub mod cache;
 pub mod capture;
 mod click;
 mod context;
 mod engine;
+mod glide;
 pub mod history;
+pub mod input_capture;
+pub mod input_tap;
 pub mod launch;
 pub mod midi;
+pub mod midi_preview;
 pub mod modulation;
 pub mod nodes;
 pub mod offline;
@@ -35,6 +42,8 @@ pub mod preview;
 pub mod record;
 mod slots;
 mod snapshot;
+pub mod transition;
+pub mod tuning;
 pub mod varispeed;
 pub mod voice;
 

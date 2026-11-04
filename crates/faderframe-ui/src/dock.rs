@@ -182,6 +182,48 @@ fn create_view(app: &Rc<AppState>, kind: ViewKind) -> ViewHost {
             false,
             true,
         ),
+        ViewKind::MixScenes => ViewHost::new(
+            app,
+            Box::new(faderframe_view_scenes::ScenesView::new(theme)),
+            false,
+            false,
+        ),
+        ViewKind::InteractiveMusic => ViewHost::new(
+            app,
+            Box::new(faderframe_view_adaptive::AdaptiveView::new(theme)),
+            false,
+            false,
+        ),
+        ViewKind::Maps => ViewHost::new(
+            app,
+            Box::new(faderframe_view_maps::MapsView::new(theme)),
+            true,
+            true,
+        ),
+        ViewKind::Browser => {
+            // The browser reads its index and lists its place once it is
+            // first shown (after this rebuild; nothing is read before).
+            let weak = Rc::downgrade(app);
+            glib::idle_add_local_once(move || {
+                if let Some(a) = weak.upgrade() {
+                    a.dispatch(faderframe_session::Action::Browser(
+                        faderframe_session::browser::BrowserOp::Refresh,
+                    ));
+                }
+            });
+            ViewHost::new(
+                app,
+                Box::new(faderframe_view_browser::BrowserView::new(theme)),
+                false,
+                true,
+            )
+        }
+        ViewKind::Score => ViewHost::new(
+            app,
+            Box::new(faderframe_view_score::ScoreView::new(theme)),
+            true,
+            true,
+        ),
     };
     app.register_canvas(&host.canvas);
     host
@@ -626,10 +668,11 @@ pub fn realize(app: &Rc<AppState>) {
 /// A dock view: its action's name and its id.
 type DockView = (&'static str, fn() -> ViewId);
 
-pub(crate) const DOCK_VIEWS: [DockView; 23] = [
+pub(crate) const DOCK_VIEWS: [DockView; 28] = [
     ("inspector", ViewId::inspector),
     ("mixer", ViewId::mixer),
     ("channel-overview", ViewId::channel_overview),
+    ("mix-scenes", ViewId::mix_scenes),
     ("piano-roll", ViewId::piano_roll),
     ("events", ViewId::events),
     ("automation", ViewId::automation),
@@ -650,6 +693,10 @@ pub(crate) const DOCK_VIEWS: [DockView; 23] = [
     ("adr", ViewId::adr),
     ("lead-sheet", ViewId::lead_sheet),
     ("setlist", ViewId::setlist),
+    ("browser", ViewId::browser),
+    ("score", ViewId::score),
+    ("interactive-music", ViewId::interactive_music),
+    ("maps", ViewId::maps),
 ];
 
 /// Tick the View menu's views that are on screen, and the bottom dock

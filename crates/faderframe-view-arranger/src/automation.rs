@@ -122,7 +122,8 @@ impl ArrangerView {
     pub(crate) fn lane_geoms(&self, model: &Session, t: &Track, row: Rect) -> Vec<LaneGeom> {
         let mut y = row.y
             + self.base_h(model, t.id)
-            + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id);
+            + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id)
+            + Self::lyric_row_h(t, model);
         model
             .shown_lanes(t.id)
             .iter()

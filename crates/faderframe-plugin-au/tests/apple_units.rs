@@ -278,14 +278,14 @@ fn notes_play_the_dls_synth() {
     let silent = rig.run(&mut *p, &[]);
     assert!(silent.iter().all(|s| s.abs() < 1e-6));
     rig.events[0]
-        .push(TimedMidiEvent {
-            sample_offset: 10,
-            event: MidiEvent::NoteOn {
+        .push(TimedMidiEvent::new(
+            10,
+            MidiEvent::NoteOn {
                 channel: 0,
                 key: 60,
                 velocity: 110,
             },
-        })
+        ))
         .unwrap();
     let mut out = Vec::new();
     for _ in 0..20 {

@@ -102,6 +102,9 @@ pub(crate) struct ClipFxState {
     generation: u64,
     /// Parameters by plugin (format and id).
     infos: HashMap<String, Vec<faderframe_plugin_host::ParameterInfo>>,
+    /// The ones a card shows (not what a device measured, as De-noise's
+    /// profile: `devices::hidden`).
+    shown_infos: HashMap<String, Vec<faderframe_plugin_host::ParameterInfo>>,
     /// The clip the editor shows.
     pub(crate) shown: Option<ClipId>,
     /// Devices in editor windows of their own, by slot.
@@ -152,16 +155,30 @@ impl Session {
             return v.clone();
         }
         let v = self.engine.describe_parameters(plugin).unwrap_or_default();
+        let shown = v
+            .iter()
+            .filter(|p| {
+                plugin.format != faderframe_project::PluginFormat::Builtin
+                    || !faderframe_plugin_host::devices::hidden(&plugin.id, p.id)
+            })
+            .cloned()
+            .collect();
+        self.clip_fx.shown_infos.insert(k.clone(), shown);
         self.clip_fx.infos.insert(k, v.clone());
         v
     }
 
-    /// A device's parameters if they are known already (views).
+    /// A device's parameters as a card shows them, if they are known
+    /// already (views): without what the device measured (De-noise's
+    /// profile).
     pub fn clip_fx_known_parameters(
         &self,
         plugin: &PluginRef,
     ) -> Option<&[faderframe_plugin_host::ParameterInfo]> {
-        self.clip_fx.infos.get(&key(plugin)).map(Vec::as_slice)
+        self.clip_fx
+            .shown_infos
+            .get(&key(plugin))
+            .map(Vec::as_slice)
     }
 
     /// Show a clip in the clip-effects editor.
@@ -690,6 +707,7 @@ impl Session {
                     pitch: original.pitch.clone(),
                     effects: None,
                     spectral: None,
+                    envelope: None,
                 }),
             },
         );

@@ -57,6 +57,21 @@ pub enum NoteOp {
         start: MusicalTime,
         end: MusicalTime,
     },
+    /// Place the notes in time (`true`: a tempo change keeps them on their
+    /// samples) or with the music (see `faderframe_project::time_lock`).
+    SetTimeLocked(bool),
+    /// Locked unless all of them are.
+    ToggleTimeLocked,
+    /// Every velocity at MIDI 2.0's 16 bits (the velocity lane's drags).
+    SetVelocity16(u16),
+    /// Every velocity moved at 16 bits (a 7-bit step is 512).
+    OffsetVelocity16(i32),
+    /// Velocities at 16 bits in a line from the earliest note to the
+    /// latest.
+    RampVelocity16 {
+        from: u16,
+        to: u16,
+    },
 }
 
 impl NoteOp {
@@ -69,15 +84,20 @@ impl NoteOp {
             NoteOp::SetLength(_) | NoteOp::ScaleLength(_) => "Change Length",
             NoteOp::Reverse => "Reverse",
             NoteOp::Invert => "Invert",
-            NoteOp::SetVelocity(_) | NoteOp::ScaleVelocity { .. } | NoteOp::RampVelocity { .. } => {
-                "Change Velocity"
-            }
+            NoteOp::SetVelocity(_)
+            | NoteOp::ScaleVelocity { .. }
+            | NoteOp::RampVelocity { .. }
+            | NoteOp::SetVelocity16(_)
+            | NoteOp::OffsetVelocity16(_)
+            | NoteOp::RampVelocity16 { .. } => "Change Velocity",
             NoteOp::FoldToScale(_) => "Fold to Scale",
             NoteOp::RemoveOverlaps => "Remove Overlaps",
             NoteOp::SetMuted(_) | NoteOp::ToggleMuted => "Mute Notes",
             NoteOp::SetChannel(_) => "Change Channel",
             NoteOp::Move { .. } => "Move Notes",
             NoteOp::Resize { .. } => "Resize Notes",
+            NoteOp::SetTimeLocked(true) | NoteOp::ToggleTimeLocked => "Lock Notes to Time",
+            NoteOp::SetTimeLocked(false) => "Unlock Notes from Time",
         }
     }
 }
@@ -151,6 +171,9 @@ pub struct PianoRollSettings {
     pub lane: Option<(MidiController, u8)>,
     /// Per-note expression in the lane instead (overrides `lane`).
     pub expression: Option<ExpressionKind>,
+    /// The track's articulations in the lane instead (overrides `lane` and
+    /// `expression`; see [`crate::maps`]).
+    pub articulations: bool,
     /// The MIDI Tools panel's tool (`None`: the panel is closed).
     pub tool: Option<Tool>,
     /// Every tool's settings.
@@ -172,6 +195,7 @@ impl Default for PianoRollSettings {
             fold: KeyFold::Off,
             lane: None,
             expression: None,
+            articulations: false,
             tool: None,
             tools: ToolSettings::default(),
             note_style: NoteStyle::Auto,
@@ -192,7 +216,7 @@ pub struct ToolPreview {
 }
 
 impl Session {
-    fn midi_clip(&self, clip: ClipId) -> Result<(MusicalTime, MidiClip)> {
+    pub(crate) fn midi_clip(&self, clip: ClipId) -> Result<(MusicalTime, MidiClip)> {
         let c = self
             .project
             .clip(clip)
@@ -203,7 +227,12 @@ impl Session {
         Ok((c.start, m.clone()))
     }
 
-    fn set_midi_clip(&mut self, clip: ClipId, label: &str, mut m: MidiClip) -> Result<()> {
+    pub(crate) fn set_midi_clip(
+        &mut self,
+        clip: ClipId,
+        label: &str,
+        mut m: MidiClip,
+    ) -> Result<()> {
         let start = self
             .project
             .clip(clip)
@@ -244,11 +273,29 @@ impl Session {
             return Ok(());
         }
         let meter = &self.project.timeline.meter;
+        // Notes placed in time keep their timing through Quantize and
+        // Humanize (a hit on a picture cut is not moved to the grid).
+        let placed: Vec<(NoteId, MusicalTime, MusicalTime)> = sel
+            .iter()
+            .filter(|n| n.time_locked)
+            .map(|n| (n.id, n.start, n.length))
+            .collect();
+        let keep_placed = |sel: &mut Vec<MidiNote>| {
+            for n in sel.iter_mut() {
+                if let Some(&(_, start, length)) = placed.iter().find(|p| p.0 == n.id) {
+                    (n.start, n.length) = (start, length);
+                }
+            }
+        };
         match op {
-            NoteOp::Quantize(q) => midi_ops::quantize(&mut sel, clip_start, q, meter),
+            NoteOp::Quantize(q) => {
+                midi_ops::quantize(&mut sel, clip_start, q, meter);
+                keep_placed(&mut sel);
+            }
             NoteOp::Humanize { timing, velocity } => {
                 let seed = self.history.revision() ^ (sel.len() as u64).wrapping_mul(0x9e37_79b9);
                 midi_ops::humanize(&mut sel, *timing, *velocity, seed);
+                keep_placed(&mut sel);
             }
             NoteOp::Legato => midi_ops::legato(&mut sel),
             NoteOp::Transpose(n) => midi_ops::transpose(&mut sel, *n),
@@ -284,6 +331,14 @@ impl Session {
                     n.length = e - s;
                 }
             }
+            NoteOp::SetTimeLocked(on) => sel.iter_mut().for_each(|n| n.time_locked = *on),
+            NoteOp::ToggleTimeLocked => {
+                let all = sel.iter().all(|n| n.time_locked);
+                sel.iter_mut().for_each(|n| n.time_locked = !all);
+            }
+            NoteOp::SetVelocity16(v) => midi_ops::set_velocity16(&mut sel, *v),
+            NoteOp::OffsetVelocity16(by) => midi_ops::offset_velocity16(&mut sel, *by),
+            NoteOp::RampVelocity16 { from, to } => midi_ops::ramp_velocity16(&mut sel, *from, *to),
         }
         for n in &mut m.notes {
             if let Some(new) = sel.iter().find(|s| s.id == n.id) {
@@ -465,6 +520,10 @@ impl Session {
         let Some(track) = self.project.track(c.track) else {
             return false;
         };
+        // A drum map: a drum track.
+        if track.drum_map.is_some() {
+            return true;
+        }
         let player = match track.output {
             faderframe_project::OutputRouting::Track { track: to }
                 if track.kind == faderframe_project::TrackKind::Midi =>
@@ -570,6 +629,9 @@ impl Session {
                 channel: 0,
                 muted: false,
                 release: None,
+                time_locked: false,
+                articulation: None,
+                fine: None,
             })
             .collect();
         self.add_notes(clip, &notes)

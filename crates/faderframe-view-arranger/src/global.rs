@@ -9,6 +9,9 @@ use faderframe_session::ColorTarget;
 use faderframe_session::lanes::GlobalLane;
 use faderframe_timeline::{TempoCurve, TempoMap, TimeSignature};
 
+/// Room a padlock takes before a marker's or section's name.
+const LOCK_W: f32 = 10.0;
+
 /// Lane heights.
 fn lane_height(lane: GlobalLane) -> f32 {
     match lane {
@@ -274,7 +277,14 @@ impl ArrangerView {
     }
 
     fn marker_width(&self, m: &Marker) -> f32 {
-        (m.name.chars().count() as f32 * 5.6 + 14.0).min(160.0)
+        let lock = if m.is_time_locked() { LOCK_W } else { 0.0 };
+        (m.name.chars().count() as f32 * 5.6 + 14.0 + lock).min(160.0 + lock)
+    }
+
+    /// The padlock of a marker or section placed in time, at the left of
+    /// its flag or name (`at`: the rect it starts in).
+    pub(crate) fn lane_lock_rect(at: Rect) -> Rect {
+        Rect::new(at.x + 5.0, at.center().y - 4.5, 6.0, 9.0)
     }
 
     // --- painting ------------------------------------------------------------------
@@ -394,9 +404,15 @@ impl ArrangerView {
             let flag = Rect::new(x, r.y + 2.0, w, r.h - 4.0);
             p.fill_rounded(flag, 2.0, &Paint::Solid(th.ui.accent.with_alpha(0.28)));
             p.fill(Rect::new(x, r.y, 2.0, r.h), th.ui.accent);
+            let mut name = flag.inset_xy(6.0, 0.0);
+            // Placed in time: a padlock before its name.
+            if m.is_time_locked() {
+                controls::lock_glyph(p, Self::lane_lock_rect(flag), th.arranger.time_lock);
+                name = Rect::new(name.x + LOCK_W, name.y, (name.w - LOCK_W).max(0.0), name.h);
+            }
             p.text(
                 &m.name,
-                flag.inset_xy(6.0, 0.0),
+                name,
                 &TextStyle::new(th.fonts.small, th.ui.text).bold(),
             );
         }
@@ -453,12 +469,18 @@ impl ArrangerView {
                 p.stroke_rounded(rr, 3.0, 1.0, c.lighten(0.25));
                 Color::hex(0x141518)
             };
-            let text = Rect::new(
+            let mut text = Rect::new(
                 rr.x.max(r.x) + 6.0,
                 rr.y,
                 rr.right() - rr.x.max(r.x) - 8.0,
                 rr.h,
             );
+            // Placed in time: a padlock before its name.
+            if s.is_time_locked() && text.w > LOCK_W + 6.0 {
+                let from = Rect::new(rr.x.max(r.x), rr.y, text.w, rr.h);
+                controls::lock_glyph(p, Self::lane_lock_rect(from), ink.with_alpha(0.85));
+                text = Rect::new(text.x + LOCK_W, text.y, text.w - LOCK_W, text.h);
+            }
             p.text(&s.name, text, &TextStyle::new(th.fonts.small, ink).bold());
         }
         if let Some(GlobalDrag::NewSection { anchor, to }) = &self.global_drag {
@@ -970,6 +992,11 @@ impl ArrangerView {
                         "Go to Marker",
                         Action::Transport(TransportAction::Locate(m.position)),
                     ));
+                    // Placed in time: tempo changes keep it where it is (a
+                    // hit point, a picture cut).
+                    if let Some(lock) = model.marker_time_lock(id, !m.is_time_locked()) {
+                        items.push(MenuItem::new("Lock to Time", lock).checked(m.is_time_locked()));
+                    }
                 }
                 items.push(MenuItem::new(
                     "Delete Marker",
@@ -1005,9 +1032,16 @@ impl ArrangerView {
                         "Go to Section",
                         Action::Transport(TransportAction::Locate(s.start)),
                     ),
+                ];
+                // Placed in time: tempo changes keep its bounds where they
+                // are (a scene, a reel).
+                if let Some(lock) = model.section_time_lock(id, !s.is_time_locked()) {
+                    items.push(MenuItem::new("Lock to Time", lock).checked(s.is_time_locked()));
+                }
+                items.push(
                     MenuItem::new("Colour…", Action::PickColor(ColorTarget::Section(id)))
                         .separated(),
-                ];
+                );
                 for (i, c) in TrackColor::PALETTE.iter().enumerate() {
                     items.push(
                         MenuItem::new(
@@ -1309,19 +1343,29 @@ impl ArrangerView {
             GlobalHit::Marker(id) => {
                 let m = p.markers.iter().find(|m| m.id == id)?;
                 format!(
-                    "{} · {} · Click to go there · Drag to move · Double-click to rename",
+                    "{} · {}{} · Click to go there · Drag to move · Double-click to rename",
                     m.name,
-                    format_bbt(&p.timeline, m.position)
+                    format_bbt(&p.timeline, m.position),
+                    if m.is_time_locked() {
+                        " · locked to time"
+                    } else {
+                        ""
+                    }
                 )
             }
             GlobalHit::Section(id, part) => {
                 let s = p.sections.iter().find(|s| s.id == id)?;
                 match part {
                     SectionPart::Body => format!(
-                        "{} · {} – {} · Drag to move with its content (Ctrl: copy, Shift: the section only) · Double-click to rename · Right-click for more",
+                        "{} · {} – {}{} · Drag to move with its content (Ctrl: copy, Shift: the section only) · Double-click to rename · Right-click for more",
                         s.name,
                         format_bbt(&p.timeline, s.start),
-                        format_bbt(&p.timeline, s.end)
+                        format_bbt(&p.timeline, s.end),
+                        if s.is_time_locked() {
+                            " · locked to time"
+                        } else {
+                            ""
+                        }
                     ),
                     SectionPart::Start | SectionPart::End => "Drag to resize the section".into(),
                 }

@@ -322,6 +322,11 @@ pub struct AlbumSettings {
     /// The vinyl premaster.
     #[serde(skip_serializing_if = "VinylSettings::is_default")]
     pub vinyl: VinylSettings,
+    /// The delivery spec the export's QC report checks against (a
+    /// `faderframe_qc` spec id): with one, every export writes the report
+    /// beside the files. `None`: no report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qc_spec: Option<String>,
 }
 
 /// A record: its size and speed.
@@ -434,6 +439,7 @@ impl Default for AlbumSettings {
             cd_text: true,
             copy_permitted: false,
             vinyl: VinylSettings::default(),
+            qc_spec: None,
         }
     }
 }

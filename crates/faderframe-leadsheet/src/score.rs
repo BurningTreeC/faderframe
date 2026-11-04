@@ -1,7 +1,8 @@
 //! What a lead sheet says: bars of notes and rests with their values, ties,
 //! beams and words, the chord symbols over them, the key, the clef, the
 //! metre and the tempo — on one staff, or on several one below the other
-//! (a score: a part a track, the same bars in each). A fretted
+//! (a score: a part a track, the same bars in each; a piano's two hands a
+//! grand staff, two parts braced). A fretted
 //! instrument's part may also be (or be followed by) tablature: its notes
 //! as strings and frets. Both the MusicXML writer and the engraver read
 //! this, so they agree note for note.
@@ -24,6 +25,28 @@ pub struct LeadSheet {
 }
 
 impl LeadSheet {
+    /// Whether part `i` is the lower staff of a grand staff.
+    pub fn lower_staff(&self, i: usize) -> bool {
+        i > 0 && self.parts[i - 1].brace
+    }
+
+    /// The instruments: each part's first staff and how many staves it
+    /// has (a grand staff two).
+    pub fn instruments(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.parts.len() {
+            let n = if self.parts[i].brace && i + 1 < self.parts.len() {
+                2
+            } else {
+                1
+            };
+            out.push((i, n));
+            i += n;
+        }
+        out
+    }
+
     /// How many bars (every part has as many).
     pub fn bars(&self) -> usize {
         self.parts.first().map_or(0, |p| p.measures.len())
@@ -50,6 +73,10 @@ pub struct Part {
     pub measures: Vec<Measure>,
     /// Drawn as tablature (the events' frets), not as notes on a staff.
     pub tab: Option<TabStaff>,
+    /// The upper staff of a grand staff: the next part is its lower staff
+    /// (a piano's left hand; braced to this one, one instrument, its name
+    /// this part's).
+    pub brace: bool,
 }
 
 /// A tablature staff's instrument.
@@ -150,14 +177,29 @@ pub struct Measure {
     pub time: (u8, u8),
     /// The signature is shown (the first bar, or a change).
     pub show_time: bool,
+    /// The (first) voice's notes and rests.
     pub events: Vec<Event>,
     pub chords: Vec<ChordSymbol>,
+    /// A second voice on the same staff, its stems down (and the first
+    /// voice's up while it has one); empty: one voice.
+    pub under: Vec<Event>,
 }
 
 impl Measure {
     /// Its length in divisions.
     pub fn length(&self) -> u32 {
         bar_length(self.time)
+    }
+
+    /// Whether a second voice sounds in it.
+    pub fn two_voices(&self) -> bool {
+        !self.under.is_empty()
+    }
+
+    /// Its events of both voices: the first voice's, then the second's
+    /// (the order an engraved sheet's map numbers them in).
+    pub fn all_events(&self) -> impl Iterator<Item = &Event> + '_ {
+        self.events.iter().chain(&self.under)
     }
 }
 
@@ -296,6 +338,9 @@ pub struct Lyric {
     pub extend: bool,
     /// Where the syllable is in its word (hyphens join a word's).
     pub syllabic: Syllabic,
+    /// The last of its line (MusicXML's `<end-line/>`: reading programs
+    /// know where the lines of words were).
+    pub end_line: bool,
 }
 
 /// A syllable's place in its word.
@@ -350,6 +395,14 @@ pub struct Event {
     /// On a fretted instrument: where `pitch` and then each of `chord` is
     /// played (empty: not fretted).
     pub frets: Vec<Fret>,
+    /// The notes it was written from, a note a pitch (as
+    /// [`Event::pitches`]): what an editor selects when it is pointed at
+    /// (empty: a rest, or a sheet made without them).
+    pub sources: Vec<u64>,
+    /// Its articulations.
+    pub marks: Marks,
+    /// A dynamic from it on.
+    pub dynamic: Option<Dynamic>,
 }
 
 impl Event {
@@ -364,6 +417,110 @@ impl Event {
 
     pub fn is_rest(&self) -> bool {
         self.pitch.is_none()
+    }
+}
+
+/// A note's articulations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Marks {
+    pub staccato: bool,
+    pub accent: bool,
+    pub tenuto: bool,
+    pub marcato: bool,
+}
+
+impl Marks {
+    pub const NONE: Marks = Marks {
+        staccato: false,
+        accent: false,
+        tenuto: false,
+        marcato: false,
+    };
+
+    pub fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+
+    /// Each mark set: its SMuFL glyph (the one over the note; `Below`
+    /// replaces `Above` under it) and MusicXML's name, nearest the note
+    /// first.
+    pub fn glyphs(self) -> impl Iterator<Item = (&'static str, &'static str)> {
+        [
+            (self.staccato, "articStaccatoAbove", "staccato"),
+            (self.tenuto, "articTenutoAbove", "tenuto"),
+            (self.accent, "articAccentAbove", "accent"),
+            (self.marcato, "articMarcatoAbove", "strong-accent"),
+        ]
+        .into_iter()
+        .filter(|(on, _, _)| *on)
+        .map(|(_, g, x)| (g, x))
+    }
+}
+
+/// A dynamic marking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Dynamic {
+    Ppp,
+    Pp,
+    P,
+    Mp,
+    Mf,
+    F,
+    Ff,
+    Fff,
+}
+
+impl Dynamic {
+    pub const ALL: [Dynamic; 8] = [
+        Dynamic::Ppp,
+        Dynamic::Pp,
+        Dynamic::P,
+        Dynamic::Mp,
+        Dynamic::Mf,
+        Dynamic::F,
+        Dynamic::Ff,
+        Dynamic::Fff,
+    ];
+
+    /// As written ("mf"), also MusicXML's element name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Dynamic::Ppp => "ppp",
+            Dynamic::Pp => "pp",
+            Dynamic::P => "p",
+            Dynamic::Mp => "mp",
+            Dynamic::Mf => "mf",
+            Dynamic::F => "f",
+            Dynamic::Ff => "ff",
+            Dynamic::Fff => "fff",
+        }
+    }
+
+    pub fn of_name(name: &str) -> Option<Dynamic> {
+        Self::ALL.into_iter().find(|d| d.name() == name)
+    }
+
+    /// The velocity a note marked so is played at.
+    pub fn velocity(self) -> u8 {
+        match self {
+            Dynamic::Ppp => 16,
+            Dynamic::Pp => 33,
+            Dynamic::P => 49,
+            Dynamic::Mp => 64,
+            Dynamic::Mf => 80,
+            Dynamic::F => 96,
+            Dynamic::Ff => 112,
+            Dynamic::Fff => 127,
+        }
+    }
+
+    /// Its SMuFL glyphs, letter by letter.
+    pub fn glyphs(self) -> impl Iterator<Item = &'static str> {
+        self.name().chars().map(|c| match c {
+            'p' => "dynamicPiano",
+            'm' => "dynamicMezzo",
+            _ => "dynamicForte",
+        })
     }
 }
 

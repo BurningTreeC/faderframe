@@ -1239,6 +1239,22 @@ fn keeps_audition(action: &Action) -> bool {
     if let Action::Several(all) = action {
         return all.iter().all(keeps_audition);
     }
+    // The media browser's own (previews, search, tags) edit nothing.
+    if let Action::Browser(op) = action {
+        return !op.edits();
+    }
+    // Looking round a 360° picture edits nothing.
+    if let Action::Video(crate::video::VideoOp::Sphere(op)) = action {
+        return !op.edits();
+    }
+    // Nor an interactive score's preview and export.
+    if let Action::Adaptive(op) = action {
+        return !op.edits();
+    }
+    // Nor the map editor's own (showing a map, learning, user files).
+    if let Action::Maps(op) = action {
+        return !op.edits();
+    }
     matches!(
         action,
         Action::Mix(_)
@@ -1262,6 +1278,31 @@ fn keeps_audition(action: &Action) -> bool {
             | Action::SetStripWidth { .. }
             | Action::AuditionOff
             | Action::ResetPerformance
+            | Action::Codec(_)
+            // (The QC report and a later null test read the delivery
+            // and the project as it was rendered.)
+            | Action::SaveQcReport { .. }
+            | Action::NullTestStems
+            | Action::KeepPluginLive { .. }
+            | Action::DownloadSeparationModel(_)
+            | Action::CancelSeparations
+            | Action::Head(_)
+            | Action::SetTimingAlign(_)
+            | Action::WebRemote(_)
+            | Action::Device(
+                crate::device_states::DeviceOp::Watch { .. }
+                    | crate::device_states::DeviceOp::MatchLevels { .. }
+            )
+            | Action::Score(
+                crate::score::ScoreOp::Show(_)
+                    | crate::score::ScoreOp::Settings(_)
+                    | crate::score::ScoreOp::Cursor(_)
+            )
+            | Action::Collab(
+                crate::collab::CollabOp::Chat(_)
+                    | crate::collab::CollabOp::ListenAlong(_)
+                    | crate::collab::CollabOp::NewInvite
+            )
     )
 }
 

@@ -10,11 +10,19 @@
 //! Probing for devices runs on a thread of its own (enumerating a system
 //! API's devices can take a while); nothing here touches the audio
 //! thread: streams are only opened and closed through the backends.
+//!
+//! A stream that joins several devices (the first output's clock drives,
+//! the others follow it: `faderframe_audio::follow`) says how each is
+//! getting on ([`Session::stream_devices`]): a follower that goes away
+//! only silences its own channels and joins again by itself when it is
+//! back — said once each way, the master never stops. Its inputs come a
+//! little later than the master's (its ring and resampler):
+//! [`Session::input_latency_of`] is what recording compensates per take.
 
 use crate::{AudioPreferences, NoticeLevel, Result, Session, SessionError};
 use faderframe_audio::{
-    AudioBackend, AudioError, Capabilities, DeviceInfo, RateControl, Request, StreamConfig,
-    StreamInfo, StreamRouting, find_device,
+    AudioBackend, AudioError, Capabilities, DeviceInfo, DeviceStatus, RateControl, Request,
+    StreamConfig, StreamInfo, StreamRouting, find_device,
 };
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -77,6 +85,10 @@ pub struct AudioDeviceStatus {
     pub routing: StreamRouting,
     /// The devices the backend reported when the stream opened.
     pub devices: Vec<DeviceInfo>,
+    /// The devices the running stream joins and how each is getting on
+    /// (empty for one device, or where the audio system keeps them in
+    /// step itself).
+    pub joined: Vec<DeviceStatus>,
 }
 
 /// A probe's answer: is the backend there, and its devices.
@@ -109,6 +121,9 @@ pub(crate) struct AudioDevice {
     probe: Option<mpsc::Receiver<Probe>>,
     next_probe: Option<Instant>,
     next_maintain: Option<Instant>,
+    /// Followers of the running stream seen away (by id), to say when
+    /// they go and come back once.
+    followers_away: Vec<String>,
 }
 
 impl std::fmt::Debug for AudioDevice {
@@ -359,6 +374,7 @@ impl Session {
         d.next_probe = None;
         d.missing = missing;
         d.notes = notes.clone();
+        d.followers_away.clear();
         self.set_engine_rate(info.sample_rate)?;
         for n in notes {
             self.notify(NoticeLevel::Warning, n);
@@ -546,6 +562,7 @@ impl Session {
             notes: d.notes.clone(),
             routing: self.stream_routing(),
             devices: d.devices.clone(),
+            joined: self.stream_devices(),
         }
     }
 
@@ -621,8 +638,37 @@ impl Session {
             if let Some(a) = &mut self.audio {
                 a.stream.maintain();
             }
+            self.watch_followers();
         }
         self.poll_probe(now);
+    }
+
+    /// Say once when a device following the master goes away (its
+    /// channels fall silent, the master plays on) and when it is back.
+    fn watch_followers(&mut self) {
+        let devices = self.stream_devices();
+        for d in devices.iter().filter(|d| !d.master) {
+            let was_away = self.device.followers_away.contains(&d.id);
+            if !d.present && !was_away {
+                self.device.followers_away.push(d.id.clone());
+                self.notify(
+                    NoticeLevel::Warning,
+                    format!(
+                        "{} went away: its channels are silent until it is back (the other \
+                         devices play on)",
+                        d.name
+                    ),
+                );
+                self.revision += 1;
+            } else if d.present && was_away {
+                self.device.followers_away.retain(|id| *id != d.id);
+                self.notify(
+                    NoticeLevel::Info,
+                    format!("{} is back: its channels follow again", d.name),
+                );
+                self.revision += 1;
+            }
+        }
     }
 
     fn poll_probe(&mut self, now: Instant) {

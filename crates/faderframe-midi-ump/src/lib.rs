@@ -6,8 +6,13 @@
 //! programs) listed as [`UmpPort`]s, packets read on a thread of its own
 //! and written straight to a port. The sequencer translates between it and
 //! MIDI 1.0 clients, so a MIDI 1.0 sender reaches it as MIDI 2.0 too.
-//! Elsewhere [`UmpClient::open`] reports that there is no MIDI 2.0 here
-//! (CoreMIDI and Windows MIDI Services are not wired yet).
+//!
+//! On macOS it is a CoreMIDI client (macOS 11 and later): an input port
+//! and an output port speaking MIDI 2.0, the MIDI 2.0 endpoints listed as
+//! [`UmpPort`]s with addresses of FaderFrame's (`addresses`), and a
+//! destination of its own programs send to. Elsewhere (Windows: see
+//! docs/ARCHITECTURE.md, "MIDI 2.0") [`UmpClient::open`] reports that
+//! there is no MIDI 2.0 here.
 //!
 //! Packets are plain words ([`faderframe_midi::ump`] reads and writes
 //! them); this crate only moves them.
@@ -21,6 +26,16 @@ mod alsa;
 
 #[cfg(target_os = "linux")]
 pub use alsa::{UmpClient, UmpWriter};
+
+// CoreMIDI through the `coremidi` crate (safe code).
+#[cfg(target_os = "macos")]
+mod core_midi;
+
+#[cfg(target_os = "macos")]
+pub use core_midi::{UmpClient, UmpWriter};
+
+#[cfg(any(target_os = "macos", test))]
+mod addresses;
 
 /// The client's name in the sequencer.
 pub const CLIENT_NAME: &str = "FaderFrame MIDI 2.0";
@@ -67,6 +82,32 @@ impl UmpPort {
     }
 }
 
+/// The sequencer client number at the end of a port's full name as midir
+/// gives it on Linux ("MPK mini 3:MPK mini 3 MIDI 1 32:0" → 32).
+pub fn sequencer_client(full: &str) -> Option<u8> {
+    let (_, tail) = full.rsplit_once(' ')?;
+    let (c, p) = tail.split_once(':')?;
+    p.parse::<u32>().ok()?;
+    c.parse().ok()
+}
+
+/// The MIDI 1.0 ports (as midir lists them) of devices read as MIDI 2.0,
+/// not to be opened again as MIDI 1.0 ones: by sequencer client on Linux,
+/// by name on macOS.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Claimed {
+    pub clients: Vec<u8>,
+    pub names: Vec<String>,
+}
+
+impl Claimed {
+    /// A port by its full midir name.
+    pub fn contains(&self, full: &str) -> bool {
+        sequencer_client(full).is_some_and(|c| self.clients.contains(&c))
+            || self.names.iter().any(|n| n == full)
+    }
+}
+
 /// Which ports of a client list stand for it: its endpoint port when it has
 /// one (it carries every group), else every port.
 pub fn chosen_ports(ports: &[UmpPort]) -> Vec<UmpPort> {
@@ -85,9 +126,9 @@ pub fn chosen_ports(ports: &[UmpPort]) -> Vec<UmpPort> {
     out
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod none {
-    use super::UmpPort;
+    use super::{Claimed, UmpPort};
     use std::io;
 
     /// No MIDI 2.0 client on this system yet.
@@ -114,6 +155,10 @@ mod none {
 
         pub fn ump_clients(&self) -> Vec<u8> {
             Vec::new()
+        }
+
+        pub fn claimed(&self) -> Claimed {
+            Claimed::default()
         }
 
         pub fn connect_input(&self, _addr: (u8, u8)) -> io::Result<()> {
@@ -149,7 +194,7 @@ mod none {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use none::{UmpClient, UmpWriter};
 
 #[cfg(test)]
@@ -189,5 +234,21 @@ mod tests {
         assert_eq!(chosen[0].display_name(), "Synth 24 (MIDI 2.0)");
         assert_eq!(chosen[1].display_name(), "Synth 130 Group 0 (MIDI 2.0)");
         assert_eq!(chosen[0].key(), "ump:Synth 24:MIDI 2.0");
+    }
+
+    #[test]
+    fn claimed_ports_go_by_client_or_by_name() {
+        let linux = Claimed {
+            clients: vec![32],
+            names: Vec::new(),
+        };
+        assert!(linux.contains("MPK mini 3:MPK mini 3 MIDI 1 32:0"));
+        assert!(!linux.contains("Midi Through:Midi Through Port-0 14:0"));
+        let mac = Claimed {
+            clients: Vec::new(),
+            names: vec!["Keystage".into()],
+        };
+        assert!(mac.contains("Keystage") && !mac.contains("Keystage 2"));
+        assert_eq!(sequencer_client("Plain"), None);
     }
 }

@@ -137,6 +137,7 @@ fn tone_track(p: &mut Project, sources: &mut SourceMap, layout: ChannelLayout) -
                 pitch: None,
                 effects: None,
                 spectral: None,
+                envelope: None,
             }),
         },
     );
@@ -190,6 +191,9 @@ fn installed_plugins_pass_audio_and_play_notes() {
                         channel: 0,
                         muted: false,
                         release: None,
+                        time_locked: false,
+                        articulation: None,
+                        fine: None,
                     })
                     .collect();
                 p.clips.insert(
@@ -207,6 +211,7 @@ fn installed_plugins_pass_audio_and_play_notes() {
                             controllers: Vec::new(),
                             expressions: Vec::new(),
                             sysex: Vec::new(),
+                            articulations: Vec::new(),
                         }),
                     },
                 );

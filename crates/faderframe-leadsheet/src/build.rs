@@ -3,10 +3,15 @@
 //! a score (each staff written as below on the same bars, one key found
 //! from them all, the chords over the top staff):
 //!
-//! 1. One voice: overlapping notes end where the next begins.
-//! 2. Quantised per beat to sixteenths or eighth triplets (whichever fits
-//!    the beat's onsets better; triplets only in simple metres), short gaps
-//!    closed (a sung line is legato on paper).
+//! 1. One voice: overlapping notes end where the next begins (a part
+//!    written as played keeps notes starting together as one chord).
+//! 2. Quantised per beat to a grid chosen by cost from the beat's onsets:
+//!    the coarsest of quarters, eighths, eighth triplets (only in simple
+//!    metres) and sixteenths that keeps every onset within the tolerance
+//!    (50 ms at the tempo), a finer one only when it fits clearly better;
+//!    no note shorter than its beat's grid, ends on the grid too; short
+//!    gaps closed (a sung line is legato on paper), so rests are the
+//!    grid's and come merged.
 //! 3. Cut into bars (ties across bar lines), gaps filled with rests, and
 //!    every note and rest split into values a reader expects: nothing
 //!    crosses a beat unless it starts on one, nothing crosses the middle of
@@ -21,10 +26,13 @@
 //! starting together on the grid sound as one, until the next) and is
 //! fingered ([`crate::tab::finger`]); it is written as notes on a staff
 //! followed by their tablature, or as tablature alone with its rhythm.
+//! A staff written as played ([`Staff::chords`]) keeps its chords the
+//! same way; a piano's part goes on a grand staff ([`hands`] splits it,
+//! [`Staff::brace`] joins the two staves).
 
 use crate::score::{
-    Beam, ChordSymbol, Clef, DIVISIONS, Duration, Event, Fret, KeySig, LeadSheet, Lyric, Measure,
-    Part, Pitch, Syllabic, TabStaff, Tuplet, Value, bar_length,
+    Beam, ChordSymbol, Clef, DIVISIONS, Duration, Event, Fret, KeySig, LeadSheet, Lyric, Marks,
+    Measure, Part, Pitch, Syllabic, TabStaff, Tuplet, Value, bar_length,
 };
 use crate::tab::Tuning;
 use faderframe_midi::theory::{Chord, Key, Quality};
@@ -77,6 +85,13 @@ pub struct Staff {
     pub lines: Vec<Line>,
     /// A fretted instrument's: its chords kept and fingered.
     pub tab: Option<StaffTab>,
+    /// Notes starting together are kept as one chord (a part written as
+    /// played; tab staves always), else the longest is the voice's.
+    pub chords: bool,
+    /// Its clef (None: by its notes; a tab staff's by its strings).
+    pub clef: Option<Clef>,
+    /// The upper staff of a grand staff: the next staff is its lower one.
+    pub brace: bool,
 }
 
 /// How a fretted instrument's staff is written.
@@ -107,7 +122,7 @@ pub struct Input {
 
 /// The beat a metre counts in (divisions) and whether its beats take
 /// triplets.
-fn beat_of((num, den): (u8, u8)) -> (u32, bool) {
+pub(crate) fn beat_of((num, den): (u8, u8)) -> (u32, bool) {
     match den {
         8 if num % 3 == 0 && num > 3 => (DIVISIONS * 3 / 2, false),
         8 | 16 => (DIVISIONS / 2, false),
@@ -277,10 +292,23 @@ pub fn split(pos: u32, len: u32, time: (u8, u8), triplet_beats: &[bool]) -> Vec<
                 in_beat + v <= beat
             }
         };
+        // A quarter triplet may cross into the next beat of its pair
+        // when that beat is in triplets too (three of them fill two
+        // beats).
+        let pair = p / (2 * beat) * (2 * beat);
+        let next_swung = triplet_beats.get(b + 1).copied().unwrap_or(false);
+        let crosses = |v: u32| {
+            v == 8
+                && beat == DIVISIONS
+                && next_swung
+                && in_beat + v > beat
+                && v <= left
+                && p + v <= (pair + 2 * beat).min(bar)
+        };
         let choice = if swung {
             triplet
                 .iter()
-                .find(|(v, _)| fits(*v) && p.is_multiple_of(4))
+                .find(|(v, _)| (fits(*v) || crosses(*v)) && p.is_multiple_of(4))
                 .copied()
                 .unwrap_or((4.min(left), trip(Value::Eighth)))
         } else {
@@ -320,12 +348,12 @@ const fn trip(value: Value) -> Duration {
 }
 
 /// Bars with their offsets (divisions from the first bar's start).
-struct Grid2 {
-    bars: Vec<(Bar, u32, u32)>,
+pub(crate) struct Grid2 {
+    pub(crate) bars: Vec<(Bar, u32, u32)>,
 }
 
 impl Grid2 {
-    fn new(bars: &[Bar]) -> Self {
+    pub(crate) fn new(bars: &[Bar]) -> Self {
         let mut off = 0;
         let bars = bars
             .iter()
@@ -339,14 +367,14 @@ impl Grid2 {
         Self { bars }
     }
 
-    fn total(&self) -> u32 {
+    pub(crate) fn total(&self) -> u32 {
         self.bars.last().map_or(0, |(_, o, l)| o + l)
     }
 
     /// The bar `q` (quarters) falls in and its position there (divisions,
     /// unrounded); before the first bar: the first, after the last: the
     /// last's end.
-    fn place(&self, q: f64) -> (usize, f64) {
+    pub(crate) fn place(&self, q: f64) -> (usize, f64) {
         let Some(first) = self.bars.first() else {
             return (0, 0.0);
         };
@@ -376,7 +404,13 @@ pub fn build(input: &Input) -> LeadSheet {
     let placed: Vec<Placed> = staves
         .iter()
         .map(|s| {
-            let (swung, mut items) = place(&grid, &s.notes, input.grid, s.tab.is_some());
+            let (swung, mut items) = place(
+                &grid,
+                &s.notes,
+                input.grid,
+                s.tab.is_some() || s.chords,
+                tolerance(input.tempo),
+            );
             if let Some(t) = &s.tab {
                 let chords: Vec<Vec<u8>> = items.iter().map(|i| i.keys.clone()).collect();
                 for (item, played) in items
@@ -420,17 +454,21 @@ pub fn build(input: &Input) -> LeadSheet {
     let mut parts: Vec<Part> = Vec::new();
     for (staff, (swung, placed)) in staves.iter().zip(&placed) {
         // A fretted instrument's clef: by its strings.
-        let clef = staff.tab.map(|t| {
-            if t.tuning.bass {
-                Clef::Bass8vb
-            } else if t.tuning.strings.iter().min().is_some_and(|s| *s >= 55) {
-                Clef::Treble
-            } else {
-                Clef::Treble8vb
-            }
-        });
+        let clef = staff
+            .tab
+            .map(|t| {
+                if t.tuning.bass {
+                    Clef::Bass8vb
+                } else if t.tuning.strings.iter().min().is_some_and(|s| *s >= 55) {
+                    Clef::Treble
+                } else {
+                    Clef::Treble8vb
+                }
+            })
+            .or(staff.clef);
         let mut part = write_staff(&grid, swung, placed, sig, &staff.lines, origin, clef);
         part.name.clone_from(&staff.name);
+        part.brace = staff.brace && staff.tab.is_none();
         match staff.tab {
             None => parts.push(part),
             Some(t) => {
@@ -469,6 +507,134 @@ pub fn build(input: &Input) -> LeadSheet {
     }
 }
 
+/// Notes from here up go to the right hand, below [`LEFT_BELOW`] to the
+/// left; between them a note goes to the hand nearer to it.
+const RIGHT_FROM: u8 = 64;
+const LEFT_BELOW: u8 = 55;
+/// A hand reaches a tenth at most in one chord.
+const REACH: i32 = 16;
+
+/// A piano part split between the hands for a grand staff: the right
+/// hand's notes (the treble staff) and the left's (the bass staff). Notes
+/// from E4 up go right, below G3 left; in between each goes to the hand
+/// nearer to where it has been playing, the hand that took the last such
+/// note keeping the next a little longer (hysteresis, so a line round
+/// middle C does not hop between the staves), and no hand stretches past a
+/// tenth in one chord.
+pub fn hands(notes: &[Note]) -> (Vec<Note>, Vec<Note>) {
+    let mut sorted: Vec<Note> = notes.iter().copied().filter(|n| n.end > n.start).collect();
+    sorted.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.key.cmp(&b.key)));
+    let (right, left) = split_hands(&sorted);
+    (
+        right.into_iter().map(|i| sorted[i]).collect(),
+        left.into_iter().map(|i| sorted[i]).collect(),
+    )
+}
+
+/// [`hands`] note by note: whether each of `notes` goes to the right hand
+/// (in their own order).
+pub fn hand_of(notes: &[Note]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..notes.len()).collect();
+    order.sort_by(|a, b| {
+        notes[*a]
+            .start
+            .total_cmp(&notes[*b].start)
+            .then(notes[*a].key.cmp(&notes[*b].key))
+    });
+    let sorted: Vec<Note> = order.iter().map(|i| notes[*i]).collect();
+    let mut out = vec![false; notes.len()];
+    for i in split_hands(&sorted).0 {
+        out[order[i]] = true;
+    }
+    out
+}
+
+/// [`hands`] on notes sorted by start, then key: the right hand's and the
+/// left's, as indices into `sorted`.
+fn split_hands(sorted: &[Note]) -> (Vec<usize>, Vec<usize>) {
+    let (mut right, mut left) = (Vec::new(), Vec::new());
+    // Where each hand is (a running mean of its keys).
+    let (mut rh, mut lh) = (67.0f32, 48.0f32);
+    let mut last_right: Option<bool> = None;
+    let mut i = 0;
+    while i < sorted.len() {
+        // A chord: the notes starting within a 32nd of the first.
+        let mut j = i;
+        while j < sorted.len() && sorted[j].start - sorted[i].start < 0.125 {
+            j += 1;
+        }
+        let (mut r, mut l, mut between) = (Vec::new(), Vec::new(), Vec::new());
+        for (k, n) in sorted.iter().enumerate().take(j).skip(i) {
+            if n.key >= RIGHT_FROM {
+                r.push(k);
+            } else if n.key < LEFT_BELOW {
+                l.push(k);
+            } else {
+                between.push(k);
+            }
+        }
+        let reaches = |hand: &[usize], k: u8| {
+            hand.iter()
+                .all(|m| (i32::from(sorted[*m].key) - i32::from(k)).abs() <= REACH)
+        };
+        for b in between {
+            let key = sorted[b].key;
+            let k = f32::from(key);
+            let mut to_right = match last_right {
+                Some(true) => (k - rh).abs() - 3.0 <= (k - lh).abs(),
+                Some(false) => (k - rh).abs() < (k - lh).abs() - 3.0,
+                None => (k - rh).abs() <= (k - lh).abs(),
+            };
+            if to_right && !reaches(&r, key) && reaches(&l, key) {
+                to_right = false;
+            } else if !to_right && !reaches(&l, key) && reaches(&r, key) {
+                to_right = true;
+            }
+            last_right = Some(to_right);
+            if to_right {
+                r.push(b);
+            } else {
+                l.push(b);
+            }
+        }
+        let mean =
+            |h: &[usize]| h.iter().map(|n| f32::from(sorted[*n].key)).sum::<f32>() / h.len() as f32;
+        if !r.is_empty() {
+            rh = 0.6 * rh + 0.4 * mean(&r);
+        }
+        if !l.is_empty() {
+            lh = 0.6 * lh + 0.4 * mean(&l);
+        }
+        right.extend(r);
+        left.extend(l);
+        i = j;
+    }
+    (right, left)
+}
+
+/// Whether a part wants a grand staff: it plays chords (a fifth of its
+/// notes sound with another) and reaches well below and well above middle
+/// C (a fifth of its notes on each side).
+pub fn wants_grand_staff(notes: &[Note]) -> bool {
+    let n = notes.len();
+    if n < 4 {
+        return false;
+    }
+    let low = notes.iter().filter(|x| x.key < LEFT_BELOW).count();
+    let high = notes.iter().filter(|x| x.key >= RIGHT_FROM).count();
+    let together = notes
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            notes
+                .iter()
+                .enumerate()
+                .any(|(j, b)| j != *i && a.end.min(b.end) - a.start.max(b.start) > 0.125)
+        })
+        .count();
+    5 * low >= n && 5 * high >= n && 5 * together >= n
+}
+
 /// A note (or a chord) on the grid: from `s` to `e` (divisions from the
 /// first bar), its keys ascending and, fingered, where each is played.
 #[derive(Clone, Debug, PartialEq)]
@@ -483,9 +649,74 @@ struct Item {
 /// and its notes.
 type Placed = (Vec<Vec<bool>>, Vec<Item>);
 
+/// The onset tolerance (divisions) at `tempo` quarters a minute: 50 ms,
+/// within reason.
+pub(crate) fn tolerance(tempo: Option<f64>) -> f64 {
+    let bpm = tempo.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(120.0);
+    (0.05 * bpm / 60.0 * f64::from(DIVISIONS)).clamp(0.8, 1.6)
+}
+
+/// The grids a beat's onsets may sit on (divisions), coarsest first, each
+/// with what it costs to read: a simple beat's quarter, eighth, eighth
+/// triplet (where the metre and the grid allow) and sixteenth; a compound
+/// beat's dotted quarter, eighth and sixteenth; an eighth beat's eighth
+/// and sixteenth.
+pub(crate) fn grids(beat: u32, triplets: bool, how: Grid) -> &'static [(u32, f64)] {
+    const SIMPLE: [(u32, f64); 4] = [(12, 0.0), (6, 0.15), (4, 0.5), (3, 0.4)];
+    const STRAIGHT: [(u32, f64); 3] = [(12, 0.0), (6, 0.15), (3, 0.4)];
+    const TRIPLETS: [(u32, f64); 2] = [(12, 0.0), (4, 0.15)];
+    const COMPOUND: [(u32, f64); 3] = [(18, 0.0), (6, 0.15), (3, 0.4)];
+    const SMALL: [(u32, f64); 2] = [(6, 0.0), (3, 0.4)];
+    if beat == DIVISIONS * 3 / 2 {
+        &COMPOUND
+    } else if beat == DIVISIONS / 2 {
+        &SMALL
+    } else if !triplets {
+        &STRAIGHT
+    } else {
+        match how {
+            Grid::Straight => &STRAIGHT,
+            Grid::Triplets => &TRIPLETS,
+            Grid::Auto => &SIMPLE,
+        }
+    }
+}
+
+/// The grid for a beat with onsets `offsets` (divisions into it): of the
+/// grids keeping every onset within `tol`, the cheapest (the squared
+/// distances plus its reading cost) — the coarsest unless a finer one fits
+/// clearly better; when none keeps them, the closest.
+pub(crate) fn grid_for(offsets: &[f64], choices: &[(u32, f64)], tol: f64) -> u32 {
+    let Some(&(coarsest, _)) = choices.first() else {
+        return 3;
+    };
+    if offsets.is_empty() {
+        return coarsest;
+    }
+    let off = |o: f64, u: u32| {
+        let u = f64::from(u);
+        (o - (o / u).round() * u).abs()
+    };
+    let mut fit: Option<(f64, u32)> = None;
+    let mut near: Option<(f64, u32)> = None;
+    for &(u, reading) in choices {
+        let worst = offsets.iter().map(|o| off(*o, u)).fold(0.0, f64::max);
+        let squares: f64 = offsets.iter().map(|o| off(*o, u).powi(2)).sum();
+        let sum: f64 = offsets.iter().map(|o| off(*o, u)).sum();
+        if worst <= tol && fit.is_none_or(|(c, _)| squares + reading < c - 1e-9) {
+            fit = Some((squares + reading, u));
+        }
+        if near.is_none_or(|(c, _)| sum < c - 1e-9) {
+            near = Some((sum, u));
+        }
+    }
+    fit.or(near).map_or(coarsest, |(_, u)| u)
+}
+
 /// Steps 1 and 2 for one staff (`chords`: notes starting together are kept
-/// as one chord, else the longest is the voice's).
-fn place(grid: &Grid2, notes: &[Note], how: Grid, chords: bool) -> Placed {
+/// as one chord, else the longest is the voice's; `tol`: the onsets' room
+/// in divisions).
+fn place(grid: &Grid2, notes: &[Note], how: Grid, chords: bool, tol: f64) -> Placed {
     // 1. One voice (a chord at a time).
     let mut notes: Vec<Note> = notes.iter().copied().filter(|n| n.end > n.start).collect();
     notes.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -497,62 +728,54 @@ fn place(grid: &Grid2, notes: &[Note], how: Grid, chords: bool) -> Placed {
         }
     }
     notes.retain(|n| n.end - n.start > 1e-6);
-    // 2. Each bar's beats: straight or triplets, by their onsets.
-    let mut swung: Vec<Vec<bool>> = grid
+    // 2. Each beat's grid, by the onsets in it.
+    let mut offsets: Vec<Vec<Vec<f64>>> = grid
         .bars
         .iter()
         .map(|(b, _, len)| {
             let (beat, _) = beat_of(b.time);
-            vec![false; (*len).div_ceil(beat) as usize]
+            vec![Vec::new(); (*len).div_ceil(beat) as usize]
         })
         .collect();
-    if how != Grid::Straight {
-        let mut errs: Vec<Vec<(f64, f64, u32)>> =
-            swung.iter().map(|v| vec![(0.0, 0.0, 0); v.len()]).collect();
-        for n in &notes {
-            for q in [n.start, n.end] {
-                let (b, p) = grid.place(q);
-                let (beat, triplets) = beat_of(grid.bars[b].0.time);
-                if !triplets {
-                    continue;
-                }
-                let i = ((p / f64::from(beat)) as usize).min(errs[b].len().saturating_sub(1));
-                let off = p - f64::from(i as u32 * beat);
-                let e = &mut errs[b][i];
-                e.0 += (off - (off / 3.0).round() * 3.0).abs();
-                e.1 += (off - (off / 4.0).round() * 4.0).abs();
-                let t = (off / 4.0).round() * 4.0;
-                if (t - 4.0).abs() < 0.5 || (t - 8.0).abs() < 0.5 {
-                    e.2 += 1;
-                }
-            }
-        }
-        for (b, beats) in swung.iter_mut().enumerate() {
-            for (i, s) in beats.iter_mut().enumerate() {
-                let (straight, triplet, on_triplets) = errs[b][i];
-                *s = match how {
-                    Grid::Triplets => beat_of(grid.bars[b].0.time).1,
-                    _ => on_triplets >= 2 && triplet * 1.6 < straight,
-                };
-            }
-        }
+    for n in &notes {
+        let (b, p) = grid.place(n.start);
+        let (beat, _) = beat_of(grid.bars[b].0.time);
+        let i = ((p / f64::from(beat)) as usize).min(offsets[b].len().saturating_sub(1));
+        offsets[b][i].push(p - f64::from(i as u32 * beat));
     }
-    let quantise = |q: f64| -> u32 {
+    let units: Vec<Vec<u32>> = offsets
+        .iter()
+        .zip(&grid.bars)
+        .map(|(beats, (bar, _, _))| {
+            let (beat, triplets) = beat_of(bar.time);
+            beats
+                .iter()
+                .map(|o| grid_for(o, grids(beat, triplets, how), tol))
+                .collect()
+        })
+        .collect();
+    let swung: Vec<Vec<bool>> = units
+        .iter()
+        .map(|beats| beats.iter().map(|u| *u == 4).collect())
+        .collect();
+    // A time's beat grid and its place on it.
+    let unit_at = |q: f64| -> (u32, u32) {
         let (b, p) = grid.place(q);
         let (bar, off, len) = grid.bars[b];
         let (beat, _) = beat_of(bar.time);
-        let i = ((p / f64::from(beat)) as usize).min(swung[b].len().saturating_sub(1));
-        let unit = if swung[b][i] { 4.0 } else { 3.0 };
+        let i = ((p / f64::from(beat)) as usize).min(units[b].len().saturating_sub(1));
+        let unit = units[b][i];
         let start = f64::from(i as u32 * beat);
-        let snapped = start + ((p - start) / unit).round() * unit;
-        off + (snapped.max(0.0) as u32).min(len)
+        let snapped = start + ((p - start) / f64::from(unit)).round() * f64::from(unit);
+        (unit, off + (snapped.max(0.0) as u32).min(len))
     };
+    let quantise = |q: f64| unit_at(q).1;
     // Starts and ends on the grid; one note (or chord) a start; short gaps
     // closed.
     let mut placed: Vec<Item> = Vec::new();
     for n in &notes {
-        let s = quantise(n.start);
-        let e = quantise(n.end).max(s + 3);
+        let (unit, s) = unit_at(n.start);
+        let e = quantise(n.end).max(s + unit);
         match placed.last_mut() {
             Some(last) if last.s == s && chords => {
                 if !last.keys.contains(&n.key) {
@@ -673,6 +896,9 @@ fn write_staff(
                     held: false,
                     chord: item.keys.iter().skip(1).map(|k| pitch(*k)).collect(),
                     frets: item.frets.clone(),
+                    sources: Vec::new(),
+                    marks: Marks::NONE,
+                    dynamic: None,
                 });
                 at += d.divisions();
             }
@@ -694,6 +920,7 @@ fn write_staff(
             show_time: last_time != Some(time),
             events,
             chords: Vec::new(),
+            under: Vec::new(),
         });
         last_time = Some(time);
     }
@@ -715,12 +942,13 @@ fn write_staff(
         clef,
         measures,
         tab: None,
+        brace: false,
     }
 }
 
 /// The chord symbols over the bars, each on the nearest beat; one the same
 /// as the chord sounding is not written again.
-fn lay_chords(measures: &mut [Measure], grid: &Grid2, chords: &[ChordAt], sig: KeySig) {
+pub(crate) fn lay_chords(measures: &mut [Measure], grid: &Grid2, chords: &[ChordAt], sig: KeySig) {
     for c in chords {
         let (b, p) = grid.place(c.start);
         let (bar, _, len) = grid.bars.get(b).copied().unwrap_or((
@@ -766,7 +994,7 @@ fn lay_chords(measures: &mut [Measure], grid: &Grid2, chords: &[ChordAt], sig: K
     }
 }
 
-fn rest(at: u32, duration: Duration) -> Event {
+pub(crate) fn rest(at: u32, duration: Duration) -> Event {
     Event {
         at,
         duration,
@@ -780,14 +1008,31 @@ fn rest(at: u32, duration: Duration) -> Event {
         held: false,
         chord: Vec::new(),
         frets: Vec::new(),
+        sources: Vec::new(),
+        marks: Marks::NONE,
+        dynamic: None,
     }
 }
 
 /// Accidentals where a note differs from the key or from what the bar
-/// had on that line before.
-fn accidentals(m: &mut Measure, key: KeySig) {
+/// had on that line before (both voices, in the order they sound: an
+/// alteration in one voice holds for the other after it).
+pub(crate) fn accidentals(m: &mut Measure, key: KeySig) {
+    let mut order: Vec<(u32, bool, usize)> = m
+        .events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.at, false, i))
+        .chain(m.under.iter().enumerate().map(|(i, e)| (e.at, true, i)))
+        .collect();
+    order.sort_unstable();
     let mut state: Vec<((u8, i8), i8)> = Vec::new();
-    for e in &mut m.events {
+    for (_, under, i) in order {
+        let e = if under {
+            &mut m.under[i]
+        } else {
+            &mut m.events[i]
+        };
         let tied = e.tied_from;
         for p in e.pitch.iter_mut().chain(e.chord.iter_mut()) {
             let place = (p.step, p.octave);
@@ -804,40 +1049,47 @@ fn accidentals(m: &mut Measure, key: KeySig) {
     }
 }
 
-/// Beams within each beat: runs of two or more eighths or shorter.
-fn beam(m: &mut Measure) {
-    let (beat, _) = beat_of(m.time);
+/// Beams within each beat (each voice's own): runs of two or more eighths
+/// or shorter.
+pub(crate) fn beam(m: &mut Measure) {
+    let time = m.time;
+    beam_voice(&mut m.events, time);
+    beam_voice(&mut m.under, time);
+}
+
+fn beam_voice(events: &mut [Event], time: (u8, u8)) {
+    let (beat, _) = beat_of(time);
     let group = if beat == DIVISIONS / 2 {
         DIVISIONS
     } else {
         beat
     };
-    let n = m.events.len();
+    let n = events.len();
     let mut i = 0;
     while i < n {
-        let g = m.events[i].at / group;
+        let g = events[i].at / group;
         let mut j = i;
         while j < n
-            && m.events[j].at / group == g
-            && !m.events[j].is_rest()
-            && m.events[j].duration.value.beams() > 0
-            && (m.events[j].end() - 1) / group == g
+            && events[j].at / group == g
+            && !events[j].is_rest()
+            && events[j].duration.value.beams() > 0
+            && (events[j].end() - 1) / group == g
         {
             j += 1;
         }
         if j - i >= 2 {
             for k in i..j {
-                m.events[k].beams[0] = Some(if k == i {
+                events[k].beams[0] = Some(if k == i {
                     Beam::Begin
                 } else if k + 1 == j {
                     Beam::End
                 } else {
                     Beam::Continue
                 });
-                if m.events[k].duration.value.beams() >= 2 {
-                    let prev = k > i && m.events[k - 1].duration.value.beams() >= 2;
-                    let next = k + 1 < j && m.events[k + 1].duration.value.beams() >= 2;
-                    m.events[k].beams[1] = Some(match (prev, next) {
+                if events[k].duration.value.beams() >= 2 {
+                    let prev = k > i && events[k - 1].duration.value.beams() >= 2;
+                    let next = k + 1 < j && events[k + 1].duration.value.beams() >= 2;
+                    events[k].beams[1] = Some(match (prev, next) {
                         (false, true) => Beam::Begin,
                         (true, true) => Beam::Continue,
                         (true, false) => Beam::End,
@@ -853,22 +1105,41 @@ fn beam(m: &mut Measure) {
     }
 }
 
-/// Triplet brackets: the triplet values of each beat.
-fn triplets(m: &mut Measure) {
+/// Triplet brackets: the triplet values of each beat (each voice's own).
+pub(crate) fn triplets(m: &mut Measure) {
+    triplets_voice(&mut m.events);
+    triplets_voice(&mut m.under);
+}
+
+fn triplets_voice(events: &mut [Event]) {
     let mut i = 0;
-    let n = m.events.len();
+    let n = events.len();
     while i < n {
-        if !m.events[i].duration.triplet {
+        if !events[i].duration.triplet {
             i += 1;
             continue;
         }
-        let beat = m.events[i].at / DIVISIONS;
+        // A run with a quarter triplet across a beat is bracketed by the
+        // pair of beats it fills, else by the beat.
+        let mut run = i;
+        while run < n && events[run].duration.triplet {
+            run += 1;
+        }
+        let span = if events[i..run]
+            .iter()
+            .any(|e| e.at / DIVISIONS != (e.end() - 1) / DIVISIONS)
+        {
+            2 * DIVISIONS
+        } else {
+            DIVISIONS
+        };
+        let group = events[i].at / span;
         let mut j = i;
-        while j < n && m.events[j].duration.triplet && m.events[j].at / DIVISIONS == beat {
+        while j < run && events[j].at / span == group {
             j += 1;
         }
-        for k in i..j {
-            m.events[k].tuplet = Some(if k == i {
+        for (k, e) in events.iter_mut().enumerate().take(j).skip(i) {
+            e.tuplet = Some(if k == i {
                 Tuplet::Start
             } else if k + 1 == j {
                 Tuplet::Stop
@@ -877,7 +1148,7 @@ fn triplets(m: &mut Measure) {
             });
         }
         if j - i == 1 {
-            m.events[i].tuplet = Some(Tuplet::Start);
+            events[i].tuplet = Some(Tuplet::Start);
         }
         i = j;
     }
@@ -994,6 +1265,7 @@ fn lay_words(
         // A word's last syllable held over the notes after it draws its
         // line; within a word the hyphen spans them.
         let mut last_word: Option<usize> = None;
+        let mut last_sung: Option<(usize, usize)> = None;
         for (k, t) in text.into_iter().enumerate() {
             let (_, b, e) = onsets[notes[k]];
             used[notes[k]] = true;
@@ -1003,8 +1275,10 @@ fn lay_words(
                         text: t,
                         extend: false,
                         syllabic,
+                        end_line: false,
                     });
                     last_word = (!syllabic.continues()).then_some(k);
+                    last_sung = Some((b, e));
                 }
                 None => {
                     if let Some(lw) = last_word {
@@ -1016,6 +1290,11 @@ fn lay_words(
                     }
                 }
             }
+        }
+        if let Some((b, e)) = last_sung
+            && let Some(l) = &mut measures[b].events[e].lyric
+        {
+            l.end_line = true;
         }
     }
 }
@@ -1437,13 +1716,12 @@ mod tests {
                         end: 8.0,
                         text: "Here we go a gain".into(),
                     }],
-                    tab: None,
+                    ..Staff::default()
                 },
                 Staff {
                     name: "Bass".into(),
                     notes: vec![note(0.0, 2.0, 43), note(2.0, 4.0, 38), note(4.0, 8.0, 43)],
-                    lines: vec![],
-                    tab: None,
+                    ..Staff::default()
                 },
                 // A staff with nothing in it keeps its bars of rest.
                 Staff {
@@ -1491,16 +1769,141 @@ mod tests {
             name: "Lead Vocal".into(),
             clef: Clef::Treble,
             measures: vec![],
+            brace: false,
         };
         assert_eq!(lead.abbreviation(), "Lead Voc.");
     }
 
+    /// Each beat takes the coarsest grid its onsets keep to: eighths a
+    /// little early or late stay eighths (no sixteenths, no rests between
+    /// them), a dotted rhythm is sixteenths, a swung one triplets; nothing
+    /// is shorter than its beat's grid.
+    #[test]
+    fn each_beat_is_written_on_the_coarsest_grid_that_fits() {
+        let input = Input {
+            bars: bars(2, (4, 4)),
+            key: Some(Key::new(0, Scale::Major)),
+            tempo: Some(120.0),
+            staves: melody(
+                vec![
+                    // Eighths played loosely (±40 ms), short of their ends.
+                    note(0.04, 0.42, 60),
+                    note(0.46, 0.9, 62),
+                    note(1.07, 1.4, 64),
+                    note(1.45, 1.9, 65),
+                    // A dotted eighth and a sixteenth.
+                    note(2.0, 2.75, 67),
+                    note(2.75, 3.0, 65),
+                    // Swung: long, short.
+                    note(3.0, 3.66, 64),
+                    note(3.66, 4.0, 62),
+                    // A short note alone on its beat: a quarter's grid.
+                    note(4.02, 4.2, 60),
+                ],
+                vec![],
+            ),
+            ..Input::default()
+        };
+        let s = build(&input);
+        let m = &s.parts[0].measures[0];
+        let notes: Vec<(u32, u32, bool)> = m
+            .events
+            .iter()
+            .filter(|e| !e.is_rest())
+            .map(|e| (e.at, e.duration.divisions(), e.duration.triplet))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                (0, 6, false),
+                (6, 6, false),
+                (12, 6, false),
+                (18, 6, false),
+                (24, 9, false),
+                (33, 3, false),
+                (36, 8, true),
+                (44, 4, true),
+            ]
+        );
+        assert!(m.events.iter().all(|e| !e.is_rest()), "legato: no rests");
+        // The lone short note: a quarter, no sixteenth.
+        let next = &s.parts[0].measures[1].events[0];
+        assert_eq!((next.at, next.duration.divisions()), (0, 12));
+        // Straight writes the swing as sixteenths, triplets as triplets.
+        let straight = build(&Input {
+            grid: Grid::Straight,
+            ..input.clone()
+        });
+        assert!(
+            straight.parts[0].measures[0]
+                .events
+                .iter()
+                .all(|e| !e.duration.triplet)
+        );
+    }
+
+    #[test]
+    fn a_piano_part_is_split_between_the_hands() {
+        // Block chords low, a tune high, a line wandering round middle C
+        // that stays in the hand that took it.
+        let mut notes = Vec::new();
+        for (i, chord) in [[48u8, 52, 55], [41, 45, 48]].iter().enumerate() {
+            for k in chord {
+                notes.push(note(4.0 * i as f64, 4.0 * i as f64 + 4.0, *k));
+            }
+        }
+        for (i, k) in [72u8, 67, 62, 60, 59, 60, 64, 76].iter().enumerate() {
+            notes.push(note(i as f64, i as f64 + 1.0, *k));
+        }
+        assert!(wants_grand_staff(&notes));
+        let (right, left) = hands(&notes);
+        let keys = |v: &[Note]| {
+            let mut k: Vec<u8> = v.iter().map(|n| n.key).collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(keys(&left), [41, 45, 48, 48, 52, 55]);
+        assert_eq!(keys(&right), [59, 60, 60, 62, 64, 67, 72, 76]);
+        // A melody alone wants one staff.
+        assert!(!wants_grand_staff(&notes[6..]));
+        // Written as a grand staff: two parts braced, treble over bass.
+        let s = build(&Input {
+            bars: bars(2, (4, 4)),
+            staves: vec![
+                Staff {
+                    name: "Piano".into(),
+                    notes: right,
+                    chords: true,
+                    clef: Some(Clef::Treble),
+                    brace: true,
+                    ..Staff::default()
+                },
+                Staff {
+                    notes: left,
+                    chords: true,
+                    clef: Some(Clef::Bass),
+                    ..Staff::default()
+                },
+            ],
+            ..Input::default()
+        });
+        assert!(s.parts[0].brace && !s.parts[1].brace);
+        assert_eq!(
+            (s.parts[0].clef, s.parts[1].clef),
+            (Clef::Treble, Clef::Bass)
+        );
+        assert_eq!(s.instruments(), [(0, 2)]);
+        assert!(s.lower_staff(1));
+        // The left hand's chords on one stem.
+        let first = &s.parts[1].measures[0].events[0];
+        assert_eq!(first.pitches().count(), 3);
+    }
+
     fn melody(notes: Vec<Note>, lines: Vec<Line>) -> Vec<Staff> {
         vec![Staff {
-            name: String::new(),
             notes,
             lines,
-            tab: None,
+            ..Staff::default()
         }]
     }
 }
@@ -1587,6 +1990,7 @@ mod tab_tests {
                     capo: 0,
                     notation,
                 }),
+                ..Staff::default()
             }],
             key: Some(Key::new(0, faderframe_midi::theory::Scale::Major)),
             ..Input::default()

@@ -17,8 +17,18 @@
 //! - [`mux`]: a movie with the picture copied untouched and new sound.
 //! - [`service`]: decoders on threads and a frame cache, answering at once
 //!   with the best frame there is.
-//! - `zero_copy` (Linux): playback decoded by VA-API into dmabufs the
-//!   display imports as they are.
+//! - `zero_copy` (Linux, Windows): playback decoded by VA-API into dmabufs
+//!   the display imports as they are; on Windows converted by GStreamer's
+//!   Direct3D 12 converter into textures the shell hands GTK (untested
+//!   there).
+//! - [`camera`] and [`calibration`]: a camera's frames timed on a clock
+//!   the audio engine's is related to, and when they saw the screen flash
+//!   and a microphone heard the beep (A/V calibration).
+//! - [`track`]: an object followed through a clip's frames (template
+//!   tracking, no learned model).
+//! - [`spherical`] and [`reproject`]: 360° pictures — their layout read
+//!   from and written into movie files (and an ambisonic sound's), and a
+//!   flat view into them drawn on the CPU.
 //!
 //! Each job decodes only the streams it needs: parsing (`parsebin`) comes
 //! first and only the stream asked for is decoded.
@@ -26,6 +36,8 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod calibration;
+pub mod camera;
 pub mod colour;
 pub mod cuts;
 pub mod decode;
@@ -35,10 +47,13 @@ pub mod output;
 pub mod probe;
 pub mod proxy;
 pub mod qt_timecode;
+pub mod reproject;
 pub mod service;
+pub mod spherical;
 mod streams;
 pub mod sync_test;
-#[cfg(target_os = "linux")]
+pub mod track;
+#[cfg(any(target_os = "linux", windows))]
 pub mod zero_copy;
 
 pub use decode::{Decoder, Frame, fit};
