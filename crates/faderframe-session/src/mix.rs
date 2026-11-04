@@ -997,12 +997,8 @@ fn source_worker(
         let mut builder = ProfileBuilder::new(shared.rate, outputs, &shared.config, &p.spans)
             .map_err(|e| e.to_string())?;
         let bytes = held::HeldAudio::bytes_for(outputs, shared.frames);
-        let mut holding = room
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |r| {
-                r.checked_sub(bytes)
-            })
-            .is_ok()
-            .then(|| held::HeldAudio::new(outputs, shared.frames));
+        let mut holding =
+            take_room(&room, bytes).then(|| held::HeldAudio::new(outputs, shared.frames));
         let mut failed = None;
         // Beside the others: streams of its own.
         let sources = own_sources(&project, sources);
@@ -3138,6 +3134,22 @@ impl Session {
                 NoticeLevel::Warning,
                 format!("Mix Intelligence: not analysed again: {e}"),
             );
+        }
+    }
+}
+
+/// Take `bytes` of the room left for held signals, if that much is left.
+/// (A compare-and-swap loop: `fetch_update` is deprecated on newer
+/// toolchains and `try_update` missing on older ones.)
+fn take_room(room: &std::sync::atomic::AtomicUsize, bytes: usize) -> bool {
+    let mut left = room.load(Ordering::Relaxed);
+    loop {
+        let Some(after) = left.checked_sub(bytes) else {
+            return false;
+        };
+        match room.compare_exchange_weak(left, after, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => left = now,
         }
     }
 }

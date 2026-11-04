@@ -103,12 +103,23 @@ impl PluginInstance for Instance {
     }
 }
 
+/// One of the [`STALLS`] left, if any (a compare-and-swap loop:
+/// `fetch_update` is deprecated on newer toolchains, `try_update` missing
+/// on older ones).
+fn take_stall() -> bool {
+    let mut left = STALLS.load(Ordering::Acquire);
+    while left > 0 {
+        match STALLS.compare_exchange_weak(left, left - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+    false
+}
+
 impl PluginProcessor for Stall {
     fn process(&mut self, _ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
-        if STALLS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take_stall() {
             // The deep tier's thread, kept from rendering ahead.
             std::thread::sleep(STALL);
         }
