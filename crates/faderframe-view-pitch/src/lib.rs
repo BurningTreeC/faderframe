@@ -105,6 +105,8 @@ pub struct PitchView {
     drift: f32,
     /// The size last painted (for fitting a new clip).
     last_size: Size,
+    /// A scrollbar is held: the view does not follow the playhead.
+    bar_held: bool,
 }
 
 /// The clip shown and what places it.
@@ -217,6 +219,7 @@ impl PitchView {
             amount: 1.0,
             drift: 0.5,
             last_size: Size::new(0.0, 0.0),
+            bar_held: false,
         }
     }
 
@@ -277,6 +280,25 @@ impl PitchView {
         heard.sort_by(f32::total_cmp);
         let mid = heard.get(heard.len() / 2).copied().unwrap_or(60.0);
         self.scroll_y = (TOP as f32 - mid + 0.5) * self.row_h - g.h / 2.0;
+    }
+
+    /// Page along with the playhead while playing (Follow Playhead), as
+    /// the piano roll does: while it plays inside the clip and has left
+    /// the view, the view moves on to show it near the left edge.
+    fn follow(&mut self, size: Size, model: &Session, s: &Shown<'_>) {
+        let t = model.transport();
+        if !t.playing || !model.editor.follow_playhead || self.drag.is_some() || self.bar_held {
+            return;
+        }
+        let at = (t.position - s.start) as f64 / s.rate;
+        if !(0.0..=s.seconds()).contains(&at) {
+            return;
+        }
+        let g = self.grid(size);
+        let x = self.x_of(at, g);
+        if x > g.right() - 20.0 || x < g.x {
+            self.scroll_x += x - g.x - 20.0;
+        }
     }
 
     /// The blob of note `n`, where it plays now.
@@ -1474,6 +1496,9 @@ impl CanvasView<Session, Action> for PitchView {
             self.seen = now;
         }
         self.last_size = size;
+        if let Some(s) = &s {
+            self.follow(size, model, s);
+        }
         self.clamp(size, model);
         let th = self.theme.clone();
         p.fill(Rect::from_size(size), th.ui.background);
@@ -1679,6 +1704,10 @@ impl CanvasView<Session, Action> for PitchView {
             ScrollAxis::Horizontal => self.scroll_x = offset.max(0.0),
         }
     }
+
+    fn scroll_held(&mut self, _axis: ScrollAxis, held: bool) {
+        self.bar_held = held;
+    }
 }
 
 #[cfg(test)]
@@ -1827,6 +1856,72 @@ mod tests {
         );
         assert!(view.drag.is_none());
         assert!(shifts(&s, clip).iter().all(|v| *v == 0.0), "no note moved");
+    }
+
+    /// With Follow Playhead the view pages along with the playhead while
+    /// it plays inside the clip (#39) — not with the setting off, nor while
+    /// a scrollbar is held.
+    #[test]
+    fn the_view_follows_the_playhead_while_playing() {
+        let (mut s, clip) = session();
+        s.start_audio(
+            vec![Box::new(faderframe_audio::dummy::DummyBackend::default())],
+            &faderframe_session::AudioPreferences::default(),
+        )
+        .unwrap();
+        let theme = Theme::default();
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(theme.clone());
+        let paint = |view: &mut PitchView, s: &Session| {
+            view.paint(&mut RecordingPainter::new(), size, s, &theme);
+        };
+        paint(&mut view, &s);
+        // Zoomed in: the view shows under half a second, the playhead
+        // plays a second into the clip.
+        (view.px_per_sec, view.scroll_x) = (2_000.0, 0.0);
+        let rate = s.project().sample_rate as f64;
+        let c = s.project().clip(clip).unwrap();
+        let start = s.project().timeline.to_samples(c.start, rate);
+        assert!(c.as_audio().unwrap().length as f64 > 3.0 * rate);
+        let at = s.project().timeline.to_musical(start + rate as i64, rate);
+        s.dispatch(Action::Transport(TransportAction::Locate(at)))
+            .unwrap();
+        s.dispatch(Action::Transport(TransportAction::Play))
+            .unwrap();
+        let t0 = std::time::Instant::now();
+        while !s.transport().playing && t0.elapsed().as_secs() < 5 {
+            s.tick(0.016);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(s.transport().playing);
+        let g = view.grid(size);
+        let follow = |s: &mut Session, on: bool| {
+            s.dispatch(Action::SetEditFlag(
+                faderframe_session::EditFlag::FollowPlayhead,
+                on,
+            ))
+            .unwrap();
+        };
+        // Off: the view stays where it is.
+        follow(&mut s, false);
+        paint(&mut view, &s);
+        assert_eq!(view.scroll_x, 0.0);
+        // On, with a scrollbar held: still there.
+        follow(&mut s, true);
+        view.scroll_held(ScrollAxis::Horizontal, true);
+        paint(&mut view, &s);
+        assert_eq!(view.scroll_x, 0.0);
+        // Let go: it pages on to the playhead.
+        view.scroll_held(ScrollAxis::Horizontal, false);
+        paint(&mut view, &s);
+        let x = view.x_of((s.transport().position - start) as f64 / rate, g);
+        assert!(
+            view.scroll_x > 0.0 && x >= g.x && x <= g.right(),
+            "the playhead at {x}, the view {}…{} scrolled {}",
+            g.x,
+            g.right(),
+            view.scroll_x
+        );
     }
 
     #[test]

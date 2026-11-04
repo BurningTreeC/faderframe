@@ -1684,8 +1684,8 @@ pub fn album_details_in(
     win.present();
 }
 
-/// GTK's colour chooser for a track (the selected tracks follow, as with
-/// any edit of one of them) or a section.
+/// The colour chooser (GTK's palette first) for a track (the selected
+/// tracks follow, as with any edit of one of them) or a section.
 pub fn pick_color(app: &Rc<AppState>, target: faderframe_session::ColorTarget) {
     use faderframe_project::{Command, TrackColor};
     use faderframe_session::ColorTarget;
@@ -1706,10 +1706,6 @@ pub fn pick_color(app: &Rc<AppState>, target: faderframe_session::ColorTarget) {
             },
         }
     };
-    let dialog = gtk::ColorDialog::new();
-    dialog.set_title(&title);
-    dialog.set_modal(true);
-    dialog.set_with_alpha(false);
     let rgba = gdk::RGBA::new(
         initial.r as f32 / 255.0,
         initial.g as f32 / 255.0,
@@ -1717,12 +1713,13 @@ pub fn pick_color(app: &Rc<AppState>, target: faderframe_session::ColorTarget) {
         1.0,
     );
     let weak = Rc::downgrade(app);
-    dialog.choose_rgba(
-        Some(&main),
-        Some(&rgba),
-        gio::Cancellable::NONE,
-        move |res| {
-            let (Ok(c), Some(app)) = (res, weak.upgrade()) else {
+    crate::color_chooser::choose(
+        Some(main.upcast_ref()),
+        &title,
+        rgba,
+        crate::color_chooser::Page::Palette,
+        move |c| {
+            let Some(app) = weak.upgrade() else {
                 return;
             };
             let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;

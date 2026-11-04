@@ -25,6 +25,7 @@ mod capture_audio;
 mod clip_tools_actions;
 mod codec_monitor;
 mod collab;
+mod color_chooser;
 mod compare;
 mod console;
 pub mod crash;

@@ -4,6 +4,7 @@
 //! with can be changed, by section, and is seen at once. Each theme is a
 //! file in the themes folder ([`crate::user_themes`]).
 
+use crate::color_chooser::{self, ColorButton};
 use crate::state::AppState;
 use crate::user_themes;
 use faderframe_ui_canvas::custom::{self, COLORS, CustomTheme, GROUPS};
@@ -31,7 +32,7 @@ struct Editor {
     chooser: gtk::DropDown,
     name: gtk::Entry,
     base: gtk::DropDown,
-    rows: RefCell<Vec<(&'static str, gtk::ColorDialogButton, gtk::Button)>>,
+    rows: RefCell<Vec<(&'static str, ColorButton, gtk::Button)>>,
     editing: gtk::Box,
     empty: gtk::Box,
     duplicate: gtk::Button,
@@ -198,15 +199,14 @@ pub fn open(app: &Rc<AppState>) {
             let label = gtk::Label::new(Some(k.label));
             label.set_xalign(0.0);
             label.set_hexpand(true);
-            let dialog = gtk::ColorDialog::new();
-            dialog.set_with_alpha(false);
-            dialog.set_title(k.label);
-            let button = gtk::ColorDialogButton::new(Some(dialog));
+            // The chooser opens on its editor: a theme's colours are
+            // rarely the palette's.
+            let button = ColorButton::new(k.label, color_chooser::Page::Editor);
             let reset = gtk::Button::from_icon_name("edit-undo-symbolic");
             reset.add_css_class("flat");
             reset.set_tooltip_text(Some("As the skin it is based on has it"));
             grid.attach(&label, 0, r as i32, 1, 1);
-            grid.attach(&button, 1, r as i32, 1, 1);
+            grid.attach(button.widget(), 1, r as i32, 1, 1);
             grid.attach(&reset, 2, r as i32, 1, 1);
             rows.push((k.id, button, reset));
         }
@@ -289,12 +289,12 @@ pub fn open(app: &Rc<AppState>) {
     for (id, button, reset) in ed.rows.borrow().iter() {
         let (ed2, id) = (Rc::clone(&ed), *id);
         let r = reset.clone();
-        button.connect_rgba_notify(move |b| {
+        button.connect_chosen(move |c| {
             if ed2.loading.get() {
                 return;
             }
             if let Some(t) = ed2.shown.borrow_mut().as_mut() {
-                t.set_color(id, color(&b.rgba()));
+                t.set_color(id, color(&c));
                 r.set_sensitive(t.colors.iter().any(|(k, _)| k == id));
             }
             ed2.commit();
@@ -309,9 +309,7 @@ pub fn open(app: &Rc<AppState>) {
             };
             r.set_sensitive(false);
             if let Some(c) = base {
-                ed2.loading.set(true);
                 b.set_rgba(&rgba(c));
-                ed2.loading.set(false);
             }
             ed2.commit();
         });
