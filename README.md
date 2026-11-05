@@ -22,12 +22,87 @@ delivery down to CD and vinyl masters, video for working to picture with
 time-locked tracks, lead sheets, scratch pads, project templates, and
 dockable, detachable editors.
 
-> **Status: in active development** (version 0.35.0). Most of a working
+> **Status: in active development** (version 0.39.0). Most of a working
 > DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
 > comes next.
 
-## What's new in 0.36
+## What's new in 0.39
+
+* **The phone and web remote says when the firewall is in the way.** A
+  firewall that drops what it does not allow — ufw, on by default on
+  Omarchy, or firewalld — left a phone's page loading for ever, while the
+  remote worked on the computer itself (its own connections pass every
+  firewall). FaderFrame now reads the firewall's settings: when it blocks
+  the remote's port, a notice says so as the remote starts, and
+  Preferences → Remote shows the command that lets in devices on your
+  network only — that port, over TCP, from your local network — with a
+  Copy button. The settings are read again every few seconds, so the note
+  goes, with a notice, once the port is open. See
+  [A phone or tablet cannot open the remote](#a-phone-or-tablet-cannot-open-the-remote).
+
+### 0.38
+
+* The pitch editor follows the playhead (Follow Playhead) as the piano
+  roll does (#39).
+* Colours are chosen in a resizable window of FaderFrame's own, sized for
+  the custom-colour editor: GTK's dialog cut its colour plane off on some
+  desktops (#40).
+
+### 0.37
+
+* **Undo tree and Audio Bisect**: steps undone stay as branches in the
+  History view, any step can be heard A/B against the mix as it is, and
+  Edit → Audio Bisect finds the edit that made the mix worse by listening
+  — A or B, a step at a time, without touching the project.
+* **Codec monitor and platform previews** (Audio → Listen → Codec
+  Monitor): hear the mix through Opus at a bitrate of your choice, or at
+  the loudness Spotify, Apple Music, YouTube, Tidal, Amazon Music or
+  Deezer play it (YouTube's Opus as it is, the others' codecs emulated
+  with Opus), with the decoded true peak, overs and the codec's difference
+  to listen to; Preview on Platforms from the Render window.
+* **Mix scenes** (View → Mix Scenes): console snapshots stored, recalled,
+  crossfaded, morphed and compared, with safe tracks and scopes, from MIDI,
+  control surfaces and OSC too.
+* **Delivery QC**: stems null-tested against the mix (and a shared
+  processing stem that makes them null), QC reports as PDF and JSON
+  against loudness specs (EBU R128, ATSC A/85, streaming, CD and more).
+* **Self-freezing** (Preferences → Audio → Self-freeze): while the machine
+  struggles, tracks you don't touch play from a disk cache of their chain;
+  faders, pans and sends stay live and plugins stay loaded.
+* **New devices**: restoration (De-noise with a learned noise profile,
+  De-click, De-hum, De-clip, De-reverb), Convolution Reverb (your
+  impulse responses or eight built-in spaces), Multiband Dynamics,
+  Vocoder, Pitch Correct, and three instruments: Wavetable, FM (DX7 banks
+  read) and Granular.
+* **Audio editing**: stem separation (vocals, drums, bass and the rest,
+  with the X-UMXL model, downloaded once), Align Timing of doubles to a
+  guide, Capture Audio (Ctrl+Alt+C: what was played before you pressed
+  Record), Strip Silence, clip envelopes for volume and pan, slicing to
+  Drum Sampler pads or Sampler keys, a device's own A/B and undo in its
+  window's header, Hardware Insert Mono → Stereo, batch processing of
+  files (File → Batch Processing…) and a media browser that previews in
+  the project's tempo and key (View → Browser, Ctrl+Shift+B).
+* **MIDI and notation**: a score editor (View → Score), articulation and
+  drum maps with a map editor, microtonal tuning (Scala files, MTS, MPE;
+  Audio → Tuning), MIDI 2.0 resolution in clips (and MIDI 2.0 ports on
+  macOS), polyphonic lead sheets with grand staves, notes, markers and
+  sections locked to time, comping vocals by their words, gear changes
+  for each song in show mode.
+* **Spatial audio and picture**: Ambisonics (AmbiX, first to third order)
+  with head-tracked listening on headphones, 360° video, A/V calibration
+  with a camera, panning that follows an object in the picture.
+* **Working with others and other programs**: live collaboration over the
+  network (File → Collaborate…), merging project versions, DAWproject,
+  MusicXML and AAF interchange, ARA 2 plugins, Lua scripts and macros
+  (the Scripts menu), a phone and web remote (Transport → Phone and Web
+  Remote…), adaptive music for games (exports for FMOD and Wwise), AES67
+  network audio, several audio interfaces at once, and screen readers in
+  the remaining views.
+* Render-ahead leaves no gap at a locate; external MIDI out keeps its
+  order on each port.
+
+### 0.36
 
 * **Mix Intelligence answers right after a change**: applying a proposal
   analyses again by itself. The tracks the change reached are rendered
@@ -938,6 +1013,17 @@ cyan-to-violet accent:
   modes and Shift functions) — only what their makers or open integrations
   document. In a cue mix, faders, pans and mutes follow the mixer and set
   the cue sends.
+* Phone and web remote (Transport → Phone and Web Remote…, Preferences →
+  Remote; off until you turn it on): the transport, the mixer, cue mixes,
+  the setlist and show mode, the lyrics as a teleprompter, the clip
+  launcher, mix scenes and macros in a phone's or tablet's browser on the
+  same network — nothing to install. A device pairs once with a six-digit
+  code (typed, or the QR code scanned) and gets a role: full control, a
+  performer's own cue mix, or reading the lyrics and setlist. Only devices
+  on the local network are answered; there is no encryption, so keep it
+  to networks you trust. When the computer's firewall blocks the port,
+  Preferences → Remote says so and gives the command that opens it to
+  your network.
 * Stock dynamics with editors of their own: a compressor (seven styles —
   Clean, Punch, Opto, Vintage, Bus, Mastering, Pumping — soft knee, hold,
   lookahead, auto release and makeup, range, upward compression, left/right
@@ -1664,6 +1750,38 @@ grep -E 'realtime|locked' /proc/"$(pgrep -o -x faderframe)"/limits
 Realtime rights let your programs run ahead of everything else on the
 system, so a program that hangs at realtime priority can make the desktop
 sluggish. That is the usual trade-off on audio workstations.
+
+### A phone or tablet cannot open the remote
+
+The page keeps loading and then gives up: most often the computer's
+firewall drops the connection. On the computer itself the remote still
+works — its own connections pass the firewall — so the address answering
+there proves nothing. When ufw or firewalld blocks the port, Preferences →
+Remote shows a **Firewall** row with the command that lets in your
+network only. With ufw (on by default on Omarchy) it looks like this —
+your network interface, your network and the remote's port (8642 unless
+you changed it):
+
+```sh
+sudo ufw allow in on enp4s0 from 192.168.178.0/24 to any port 8642 proto tcp comment 'FaderFrame remote'
+sudo ufw status numbered    # the rule is there
+```
+
+That lets in only devices on your network, on that port, over TCP, on
+the interface the computer is on that network with (not a VPN's). The
+remote answers IPv4 only, so no IPv6 rule is needed; and when the remote
+is off, nothing listens on the port. To close it again: `sudo ufw delete
+allow in on enp4s0 from 192.168.178.0/24 to any port 8642 proto tcp`.
+Don't forward the port on your router: nothing needs to reach it from the
+internet.
+
+If the firewall lets it in and the page still doesn't load:
+
+* The phone must be on the same network, not a guest Wi-Fi (a FRITZ!Box's
+  guest network, for example, is kept apart from the computers).
+* A VPN app on the phone can keep it from local addresses.
+* Preferences → Remote's Status names the address to open; it changes
+  when the computer gets another address on the network.
 
 ### Options to narrow a problem down
 

@@ -6,7 +6,8 @@
 //! files, [`ws`] WebSockets for everything else; no TLS — the stance is
 //! the local network's: only peers in its address ranges are answered and
 //! only requests that name this computer, see [`net`]) is off until it is
-//! turned on. A device pairs by the code FaderFrame shows, typed or
+//! turned on. [`firewall`] reads whether this computer's firewall lets
+//! phones in (a test from here cannot tell: loopback passes). A device pairs by the code FaderFrame shows, typed or
 //! scanned from a QR code ([`qr`]); from then on it shows its token
 //! ([`pairing`]). Roles decide what a device sees and does: everything, a
 //! performer's own cue mix, or reading the lyrics and setlist.
@@ -22,6 +23,7 @@
 
 pub mod client;
 pub mod diff;
+pub mod firewall;
 pub mod hash;
 pub mod http;
 pub mod net;

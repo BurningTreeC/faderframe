@@ -3,7 +3,8 @@
 //! a fader drag from it is one undo step; the transport, markers and the
 //! setlist answer it; a device that has not paired changes nothing; a
 //! performer sees and moves only their own cue mix; a device's role
-//! changes while it is connected and forgetting it disconnects it.
+//! changes while it is connected and forgetting it disconnects it; a
+//! firewall in the way of devices on the network is told.
 #![allow(clippy::unwrap_used)]
 
 use faderframe_core::{FaderLaw, TrackId};
@@ -462,4 +463,90 @@ fn serve_the_demo_for_a_browser() {
         s.tick(0.02);
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A firewall in the way of devices on the network (ufw's files under a
+/// pretend root) is told when the remote starts, once while it stays on,
+/// and shown with the command that lets them in until it does. Answering
+/// this computer only, it is not in the way. (Linux: the remote answers
+/// the network here, on 0.0.0.0.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_firewall_in_the_way_is_told_with_the_command_that_lets_devices_in() {
+    use faderframe_session::NoticeLevel;
+    use std::fs;
+    let root =
+        std::env::temp_dir().join(format!("faderframe-remote-firewall-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let write = |file: &str, text: &str| {
+        let path = root.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    };
+    write("etc/ufw/ufw.conf", "ENABLED=yes\n");
+    write("etc/default/ufw", "DEFAULT_INPUT_POLICY=\"DROP\"\n");
+    let localsend = "-A ufw-user-input -p tcp --dport 53317 -j ACCEPT\n";
+    write("etc/ufw/user.rules", localsend);
+    let warnings = |s: &Session| {
+        s.notices()
+            .filter(|n| n.level == NoticeLevel::Warning && n.text.contains("firewall (ufw)"))
+            .count()
+    };
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    s.set_firewall_root(Some(root.clone()));
+    let on = |listen| WebRemoteSettings {
+        on: true,
+        port: 0,
+        listen,
+        ..WebRemoteSettings::default()
+    };
+    s.set_web_remote(on(RemoteListen::Network));
+    let st = s.web_remote_status();
+    assert!(st.running, "{st:?}");
+    let note = st.firewall.expect("ufw is in the way");
+    assert!(note.certain);
+    assert!(
+        note.command.starts_with("sudo ufw allow"),
+        "{}",
+        note.command
+    );
+    assert!(
+        note.command.contains(&st.port.unwrap().to_string()),
+        "{}",
+        note.command
+    );
+    assert_eq!(warnings(&s), 1);
+    // This computer only: loopback passes the firewall.
+    s.set_web_remote(on(RemoteListen::ThisComputer));
+    assert_eq!(s.web_remote_status().firewall, None);
+    // Back to the network: shown again, not told again.
+    s.set_web_remote(on(RemoteListen::Network));
+    let port = s.web_remote_status().port.unwrap();
+    assert!(s.web_remote_status().firewall.is_some());
+    assert_eq!(warnings(&s), 1);
+    // The port let in: gone, and said so.
+    write(
+        "etc/ufw/user.rules",
+        &format!("{localsend}-A ufw-user-input -p tcp --dport {port} -j ACCEPT\n"),
+    );
+    s.set_firewall_root(Some(root.clone()));
+    assert_eq!(s.web_remote_status().firewall, None);
+    assert!(
+        s.notices()
+            .any(|n| n.level == NoticeLevel::Info && n.text.contains("reach the remote now"))
+    );
+    // Read again as it runs (every few seconds), whoever changes the rules.
+    write("etc/ufw/user.rules", localsend);
+    let end = Instant::now() + Duration::from_secs(10);
+    while s.web_remote_status().firewall.is_none() && Instant::now() < end {
+        s.tick(0.05);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(s.web_remote_status().firewall.is_some());
+    // Off and on again: told again.
+    s.set_web_remote(WebRemoteSettings::default());
+    assert_eq!(s.web_remote_status().firewall, None);
+    s.set_web_remote(on(RemoteListen::Network));
+    assert_eq!(warnings(&s), 2);
+    let _ = fs::remove_dir_all(&root);
 }

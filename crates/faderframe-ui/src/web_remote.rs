@@ -10,6 +10,7 @@
 use crate::prefs::Preferences;
 use crate::state::AppState;
 use faderframe_remote::Role;
+use faderframe_remote::firewall::FirewallNote;
 use faderframe_remote::qr::QrCode;
 use faderframe_session::web_remote::{RemoteListen, RemoteOp, WebRemoteSettings};
 use faderframe_session::{Action, Session};
@@ -115,6 +116,9 @@ fn log_status(s: &Session) {
         tracing::info!("web-remote: off");
         return;
     }
+    if let Some(f) = &st.firewall {
+        tracing::info!("web-remote: firewall: {} {}", f.text(), f.command);
+    }
     tracing::info!(
         "web-remote: {} code {} ({}), {} device(s) paired, {} connected",
         st.url.as_deref().unwrap_or("(no network address)"),
@@ -207,6 +211,72 @@ fn qr_area(code: &Rc<RefCell<Option<QrCode>>>) -> gtk::DrawingArea {
     area
 }
 
+/// A firewall in the way of devices on the network: what it does and the
+/// command that lets them in (selectable, with a Copy button). Hidden with
+/// its label while there is none.
+struct Firewall {
+    root: gtk::Box,
+    /// The row's label.
+    label: Option<gtk::Widget>,
+    text: gtk::Label,
+    command: gtk::Label,
+    shown: RefCell<Option<FirewallNote>>,
+}
+
+impl Firewall {
+    fn new() -> Firewall {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let text = gtk::Label::new(None);
+        text.set_xalign(0.0);
+        text.set_wrap(true);
+        text.set_max_width_chars(70);
+        text.add_css_class("warning");
+        let command = gtk::Label::new(None);
+        command.set_xalign(0.0);
+        command.set_wrap(true);
+        command.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        command.set_max_width_chars(70);
+        command.set_selectable(true);
+        command.add_css_class("monospace");
+        command.set_hexpand(true);
+        let copy = gtk::Button::with_label("Copy");
+        copy.set_valign(gtk::Align::Center);
+        copy.set_tooltip_text(Some("Copy the command, to paste in a terminal"));
+        {
+            let command = command.clone();
+            copy.connect_clicked(move |b| b.clipboard().set_text(&command.text()));
+        }
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        line.append(&command);
+        line.append(&copy);
+        root.append(&text);
+        root.append(&line);
+        root.set_visible(false);
+        Firewall {
+            root,
+            label: None,
+            text,
+            command,
+            shown: RefCell::new(None),
+        }
+    }
+
+    fn show(&self, note: Option<&FirewallNote>) {
+        if self.shown.borrow().as_ref() == note {
+            return;
+        }
+        if let Some(n) = note {
+            self.text.set_text(&n.text());
+            self.command.set_text(&n.command);
+        }
+        self.root.set_visible(note.is_some());
+        if let Some(label) = &self.label {
+            label.set_visible(note.is_some());
+        }
+        *self.shown.borrow_mut() = note.cloned();
+    }
+}
+
 /// "123 456".
 fn spaced(code: &str) -> String {
     if code.len() == 6 {
@@ -261,42 +331,48 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     status.set_wrap(true);
     status.set_selectable(true);
     row(&g, 5, "Status", status.upcast_ref());
+    let mut firewall = Firewall::new();
+    row(&g, 6, "Firewall", firewall.root.upcast_ref());
+    firewall.label = g.child_at(0, 6);
+    if let Some(l) = &firewall.label {
+        l.set_visible(false);
+    }
 
     let pair_title = gtk::Label::new(Some("Pair a Device"));
     pair_title.set_xalign(0.0);
     pair_title.add_css_class("heading");
     pair_title.set_margin_top(10);
-    g.attach(&pair_title, 0, 6, 2, 1);
+    g.attach(&pair_title, 0, 7, 2, 1);
     let code_roles = Rc::new(RefCell::new(roles(&app.session.borrow(), None)));
     let pair_as = role_menu(&code_roles.borrow(), &Role::Full);
     let new_code = gtk::Button::with_label("New Code");
     let as_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     as_box.append(&pair_as);
     as_box.append(&new_code);
-    row(&g, 7, "As", as_box.upcast_ref());
+    row(&g, 8, "As", as_box.upcast_ref());
     let code = gtk::Label::new(None);
     code.set_xalign(0.0);
     code.set_selectable(true);
     code.add_css_class("title-1");
-    row(&g, 8, "Code", code.upcast_ref());
+    row(&g, 9, "Code", code.upcast_ref());
     let qr = Rc::new(RefCell::new(None::<QrCode>));
     let area = qr_area(&qr);
-    row(&g, 9, "", area.upcast_ref());
+    row(&g, 10, "", area.upcast_ref());
     let warning = gtk::Label::new(None);
     warning.set_xalign(0.0);
     warning.set_wrap(true);
     warning.add_css_class("warning");
-    row(&g, 10, "", warning.upcast_ref());
+    row(&g, 11, "", warning.upcast_ref());
 
     let devices_title = gtk::Label::new(Some("Paired Devices"));
     devices_title.set_xalign(0.0);
     devices_title.add_css_class("heading");
     devices_title.set_margin_top(10);
-    g.attach(&devices_title, 0, 11, 2, 1);
+    g.attach(&devices_title, 0, 12, 2, 1);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::None);
     list.add_css_class("boxed-list");
-    g.attach(&list, 0, 12, 2, 1);
+    g.attach(&list, 0, 13, 2, 1);
     let note = gtk::Label::new(Some(
         "A performer's device shows only their cue mix (and the lyrics and setlist); a \
          viewer's reads the lyrics and setlist and changes nothing. Each code pairs one \
@@ -307,7 +383,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
     note.set_xalign(0.0);
     note.add_css_class("dim-label");
     note.set_max_width_chars(70);
-    g.attach(&note, 0, 13, 2, 1);
+    g.attach(&note, 0, 14, 2, 1);
 
     // The user's changes.
     {
@@ -422,6 +498,7 @@ pub fn page(app: &Rc<AppState>, row: impl Fn(&gtk::Grid, i32, &str, &gtk::Widget
         if status.text() != text {
             status.set_text(&text);
         }
+        firewall.show(st.firewall.as_ref());
         // The roles the code may give (cue mixes come and go).
         if *code_roles.borrow() != now_roles {
             let labels: Vec<String> = now_roles.iter().map(Role::label).collect();

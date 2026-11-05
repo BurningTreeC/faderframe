@@ -8664,6 +8664,32 @@ stance instead is the local network's, enforced by the server:
   what a role may not do, whatever the app shows. Roles change while a
   device is connected (it is sent `welcome` again and the whole state);
   a forgotten device is told `bye` and disconnected.
+* **The computer's firewall** (`firewall`). A firewall that drops what
+  it does not allow (ufw — on by default on Omarchy —, firewalld) leaves
+  a phone's page loading for ever, while the remote answers on this
+  computer: loopback passes every firewall, so no test from here can
+  tell. `firewall::check(port, lan)` reads the firewall's own files
+  instead (no root, nothing run; Linux — Windows and macOS ask the user
+  when a program first listens): ufw by `ufw.conf` `ENABLED`, its
+  systemd unit enabled and not masked, `DEFAULT_INPUT_POLICY` and
+  `user.rules` in order (first deciding rule; protocol, ports and port
+  lists/ranges, `-s`/`-d`/`-i` against the LAN route from
+  `/proc/net/route`; what is not understood counts as allowing when it
+  allows and as missing when it denies — a note only when sure); firewalld
+  when it runs (`/proc/*/comm`) by the zone an administrator bound the
+  interface to, else `DefaultZone`, open when its target is ACCEPT or a
+  port, rich rule's port or service's port holds the remote's (runtime
+  rules and NetworkManager's zones are not in files: "most likely").
+  `FirewallNote { firewall, port, certain, zone, lan, command }`: the
+  command lets in the local network only, TCP, the remote's port (ufw:
+  `allow in on <interface> from <network> to any port <port> proto tcp`;
+  firewalld: a permanent rich rule for the network). The session reads it
+  when the remote starts answering the network (one warning notice per
+  turning on) and every `FIREWALL_EVERY` 3 s while it runs (an Info
+  notice when it lets devices in), `WebRemoteStatus::firewall`;
+  Preferences → Remote shows it under Status with the command and Copy.
+  `check_in(root, …)` / `Session::set_firewall_root` read a pretend root
+  (tests).
 
 The app's files are served with a content security policy of their own
 files only (`web::CSP`), `nosniff`, no caching, no referrer; text from

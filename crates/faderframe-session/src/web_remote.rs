@@ -14,12 +14,18 @@
 //! their cue mix); meters go out a dozen times a second to screens that
 //! show them. Inputs a device's role does not allow are refused here
 //! (`RemoteInput::allowed`), whatever the app shows.
+//!
+//! While it answers the network, this computer's firewall is read every
+//! few seconds (`faderframe_remote::firewall`): one in the way is told
+//! when the remote starts and shown in the status with the command that
+//! lets devices on the local network in, until it does.
 
 use crate::{Action, NoticeLevel, Session, TransportAction};
 use faderframe_control::{SceneLight, SlotKind};
 use faderframe_core::{CueId, FaderLaw, MarkerId, MixSceneId, SceneId, SectionId, SendId, TrackId};
 use faderframe_project::cue::feeds_cues;
 use faderframe_project::{Command, Track, TrackKind};
+use faderframe_remote::firewall::{self, FirewallNote};
 use faderframe_remote::protocol::{
     self, ColumnView, CueSendView, CueView, LauncherView, LyricView, MacroView, MarkerView,
     MixSceneView, SceneStep, SceneView, SectionView, SendView, SetlistView, ShowControl, SlotView,
@@ -33,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// The port the remote listens on unless set otherwise.
@@ -45,6 +52,8 @@ const METERS_EVERY: Duration = Duration::from_millis(80);
 const QUIET: Duration = Duration::from_millis(400);
 /// The undo step's name.
 const GESTURE: &str = "Web Remote";
+/// How often the firewall's settings are read again.
+const FIREWALL_EVERY: Duration = Duration::from_secs(3);
 
 /// Who may connect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +155,9 @@ pub struct WebRemoteStatus {
     pub wrong_codes: u32,
     /// Why it is not running.
     pub error: Option<String>,
+    /// A firewall in the way of devices on the network (and the command
+    /// that lets them in).
+    pub firewall: Option<FirewallNote>,
     pub connected: Vec<RemoteClient>,
 }
 
@@ -172,6 +184,15 @@ pub(crate) struct WebRemoteState {
     last_meters: Option<Instant>,
     /// The address phones are told (looked up when it starts).
     lan: Option<Ipv4Addr>,
+    /// The firewall in the way, and when it was last read.
+    firewall: Option<FirewallNote>,
+    firewall_read: Option<Instant>,
+    /// The warning was given since the remote was turned on (restarts for
+    /// a new port do not give it again).
+    firewall_told: bool,
+    /// Where the firewall's settings are read (tests; the system's
+    /// otherwise).
+    firewall_root: Option<PathBuf>,
 }
 
 fn rgb(c: faderframe_project::TrackColor) -> String {
@@ -275,6 +296,7 @@ impl Session {
             code_role: server.code_role(),
             wrong_codes: server.wrong_codes(),
             error: None,
+            firewall: r.firewall.clone(),
             connected,
         }
     }
@@ -294,6 +316,9 @@ impl Session {
         let restart = old.on != settings.on
             || old.server_config() != settings.server_config()
             || (settings.on && self.web_remote.server.is_none());
+        if !settings.on {
+            self.web_remote.firewall_told = false;
+        }
         if restart {
             self.stop_web_remote();
             if settings.on {
@@ -339,6 +364,28 @@ impl Session {
                 };
                 self.web_remote.server = Some(server);
                 self.web_remote.error = None;
+                self.read_firewall();
+                if let Some(note) = self
+                    .web_remote
+                    .firewall
+                    .as_ref()
+                    .filter(|_| !self.web_remote.firewall_told)
+                {
+                    let text = format!(
+                        "The firewall ({}) {} the remote's port {}: phones and tablets {}. \
+                         Preferences → Remote has the command that lets them in.",
+                        note.firewall.name(),
+                        if note.certain { "blocks" } else { "may block" },
+                        note.port,
+                        if note.certain {
+                            "cannot open it"
+                        } else {
+                            "may not reach it"
+                        },
+                    );
+                    self.web_remote.firewall_told = true;
+                    self.notify(NoticeLevel::Warning, text);
+                }
             }
             Err(e) => {
                 let why = if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -358,6 +405,50 @@ impl Session {
         self.web_remote.clients.clear();
         self.web_remote.server = None;
         self.web_remote.error = None;
+        self.web_remote.firewall = None;
+        self.web_remote.firewall_read = None;
+    }
+
+    /// Read where the firewall's settings are under `root` from now on
+    /// (tests; `None`: the system's), and read them.
+    pub fn set_firewall_root(&mut self, root: Option<PathBuf>) {
+        self.web_remote.firewall_root = root;
+        if self.read_firewall() {
+            self.revision += 1;
+        }
+    }
+
+    /// Read whether a firewall is in the way of devices on the network
+    /// (nothing to read while the remote is off or answers this computer
+    /// only): `true` when that changed.
+    fn read_firewall(&mut self) -> bool {
+        let r = &mut self.web_remote;
+        r.firewall_read = Some(Instant::now());
+        let port = r
+            .server
+            .as_ref()
+            .filter(|_| r.settings.listen == RemoteListen::Network)
+            .map(|s| s.local_addr().port());
+        let note = port.and_then(|port| match &r.firewall_root {
+            Some(root) => firewall::check_in(root, port, r.lan),
+            None => firewall::check(port, r.lan),
+        });
+        if note == r.firewall {
+            return false;
+        }
+        let was = std::mem::replace(&mut r.firewall, note);
+        match (&was, &r.firewall) {
+            (_, Some(n)) => tracing::warn!("remote: {} {}", n.text(), n.command),
+            (Some(n), None) if port.is_some() => {
+                let text = format!(
+                    "The firewall ({}) lets phones and tablets reach the remote now.",
+                    n.firewall.name()
+                );
+                self.notify(NoticeLevel::Info, text);
+            }
+            _ => {}
+        }
+        true
     }
 
     pub(crate) fn web_remote_op(&mut self, op: RemoteOp) -> crate::Result<()> {
@@ -390,6 +481,15 @@ impl Session {
     // --- every tick ----------------------------------------------------
 
     pub(crate) fn tick_web_remote(&mut self) {
+        if self.web_remote.server.is_some()
+            && self
+                .web_remote
+                .firewall_read
+                .is_none_or(|t| t.elapsed() >= FIREWALL_EVERY)
+            && self.read_firewall()
+        {
+            self.revision += 1;
+        }
         let Some(server) = &self.web_remote.server else {
             return;
         };
