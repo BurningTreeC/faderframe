@@ -3,11 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-<meta name="theme-color" content="#15161a">
+<meta name="theme-color" content="#101115">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="mobile-web-app-capable" content="yes">
 <title>FaderFrame Remote</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="stylesheet" href="app.css">
 <script src="app.js" defer></script>
@@ -15,26 +17,29 @@
 <body class="not-engineer">
 <header id="bar">
   <div id="where">
-    <div id="project">FaderFrame</div>
+    <div id="project"><span id="link" class="link" aria-hidden="true"></span><span id="project-name">FaderFrame</span></div>
     <div id="position"><span id="bars">—</span><span id="time"></span></div>
   </div>
   <div id="transport" class="engineer-only">
-    <button class="tbtn" data-button="rewind" aria-label="Back a bar">&#x23EA;</button>
-    <button class="tbtn" data-button="play_stop" id="play" aria-label="Play or stop">&#x25B6;</button>
-    <button class="tbtn" data-button="record" id="rec" aria-label="Record">&#x25CF;</button>
-    <button class="tbtn" data-button="loop" id="loop" aria-label="Loop">&#x27F3;</button>
+    <button class="tbtn" data-button="rewind" aria-label="Back a bar"><span data-icon="rewind"></span></button>
+    <button class="tbtn play" data-button="play_stop" id="play" aria-label="Play or stop"><span data-icon="play"></span><span data-icon="stop"></span></button>
+    <button class="tbtn rec" data-button="record" id="rec" aria-label="Record"><span data-icon="record"></span></button>
+    <button class="tbtn loop" data-button="loop" id="loop" aria-label="Loop"><span data-icon="loop"></span></button>
   </div>
 </header>
 <main id="main">
   <section id="pair" class="screen" hidden>
-    <h1>Pair with FaderFrame</h1>
-    <p>In FaderFrame, open <b>Preferences → Remote</b> and type the code it shows, or scan its QR code with this device's camera.</p>
-    <form id="pair-form" autocomplete="off">
-      <label>Code <input id="pair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" required></label>
-      <label>This device <input id="pair-name" maxlength="40"></label>
-      <button type="submit" class="wide primary">Pair</button>
-    </form>
-    <p id="pair-message" class="message" role="status"></p>
+    <div class="pair-card">
+      <img class="logo" src="icon.svg" alt="" width="72" height="72">
+      <h1>Pair with FaderFrame</h1>
+      <p>In FaderFrame, open <b>Preferences → Remote</b> and type the code it shows, or scan its QR code with this device's camera.</p>
+      <form id="pair-form" autocomplete="off">
+        <label>Code <input id="pair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" required></label>
+        <label>This device <input id="pair-name" maxlength="40"></label>
+        <button type="submit" class="wide primary">Pair</button>
+      </form>
+      <p id="pair-message" class="message" role="status"></p>
+    </div>
   </section>
   <section id="screen-transport" class="screen" hidden></section>
   <section id="screen-mixer" class="screen" hidden></section>
@@ -45,5 +50,42 @@
 </main>
 <nav id="tabs" role="tablist"></nav>
 <div id="status" role="status" aria-live="polite"></div>
+
+<!-- The icons (24 × 24, drawn in the text's colour), cloned where they
+     are shown. -->
+<div id="icons" hidden>
+  <svg id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13L19 12z" class="solid"/></svg>
+  <svg id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" class="solid"/></svg>
+  <svg id="i-record" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5" class="fill"/></svg>
+  <svg id="i-start" viewBox="0 0 24 24"><path d="M6 6v12" class="thick"/><path d="M18.5 6v12L9.5 12z" class="solid"/></svg>
+  <svg id="i-end" viewBox="0 0 24 24"><path d="M18 6v12" class="thick"/><path d="M5.5 6v12l9-6z" class="solid"/></svg>
+  <svg id="i-rewind" viewBox="0 0 24 24"><path d="M11.5 6.5v11L4 12zM20 6.5v11L12.5 12z" class="solid"/></svg>
+  <svg id="i-forward" viewBox="0 0 24 24"><path d="M4 6.5v11l7.5-5.5zM12.5 6.5v11L20 12z" class="solid"/></svg>
+  <svg id="i-loop" viewBox="0 0 24 24"><path d="M4 12v-2a4 4 0 0 1 4-4h11"/><path d="M16 3l3 3-3 3"/><path d="M20 12v2a4 4 0 0 1-4 4H5"/><path d="M8 21l-3-3 3-3"/></svg>
+  <svg id="i-click" viewBox="0 0 24 24"><path d="M9.3 3.5h5.4l3.8 16.5h-13z"/><path d="M12 15.5l5-8.5"/><circle cx="12" cy="15.5" r="1.3" class="fill"/></svg>
+  <svg id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a5.5 5.5 0 0 1 0 11h-3"/></svg>
+  <svg id="i-redo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H10a5.5 5.5 0 0 0 0 11h3"/></svg>
+  <svg id="i-marker-add" viewBox="0 0 24 24"><path d="M6 3.5h12V14l-6 6-6-6z"/><path d="M12 7v6M9 10h6"/></svg>
+  <svg id="i-marker" viewBox="0 0 24 24"><path d="M6.5 4h11v9.5L12 19l-5.5-5.5z" class="solid"/></svg>
+  <svg id="i-marker-previous" viewBox="0 0 24 24"><path d="M12.5 4.5h8v8l-4 4-4-4z"/><path d="M8 8l-4 4 4 4"/></svg>
+  <svg id="i-marker-next" viewBox="0 0 24 24"><path d="M3.5 4.5h8v8l-4 4-4-4z"/><path d="M16 8l4 4-4 4"/></svg>
+  <svg id="i-section" viewBox="0 0 24 24"><path d="M4 5v14M20 5v14"/><rect x="7.5" y="8.5" width="9" height="7" rx="1.6" class="solid"/></svg>
+  <svg id="i-section-previous" viewBox="0 0 24 24"><rect x="11.5" y="6" width="9.5" height="12" rx="2"/><path d="M7.5 8l-4 4 4 4"/></svg>
+  <svg id="i-section-next" viewBox="0 0 24 24"><rect x="3" y="6" width="9.5" height="12" rx="2"/><path d="M16.5 8l4 4-4 4"/></svg>
+  <svg id="i-previous" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
+  <svg id="i-next" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+  <svg id="i-transport" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8.5v7l5.5-3.5z" class="solid"/></svg>
+  <svg id="i-mixer" viewBox="0 0 24 24"><path d="M6 3.5v17M12 3.5v17M18 3.5v17"/><rect x="3" y="12.5" width="6" height="3.6" rx="1.2" class="fill"/><rect x="9" y="6" width="6" height="3.6" rx="1.2" class="fill"/><rect x="15" y="10" width="6" height="3.6" rx="1.2" class="fill"/></svg>
+  <svg id="i-cues" viewBox="0 0 24 24"><path d="M4 16v-4a8 8 0 0 1 16 0v4"/><rect x="3" y="13.5" width="4.5" height="7.5" rx="1.8" class="fill"/><rect x="16.5" y="13.5" width="4.5" height="7.5" rx="1.8" class="fill"/></svg>
+  <svg id="i-launcher" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7.5" height="7.5" rx="2"/><rect x="13" y="3.5" width="7.5" height="7.5" rx="2"/><rect x="3.5" y="13" width="7.5" height="7.5" rx="2"/><rect x="13" y="13" width="7.5" height="7.5" rx="2" class="solid"/></svg>
+  <svg id="i-setlist" viewBox="0 0 24 24"><path d="M9.5 6.5h11M9.5 12h11M9.5 17.5h11"/><circle cx="5" cy="6.5" r="1.5" class="fill"/><circle cx="5" cy="12" r="1.5" class="fill"/><circle cx="5" cy="17.5" r="1.5" class="fill"/></svg>
+  <svg id="i-lyrics" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21M8.5 21h7"/></svg>
+  <svg id="i-sends" viewBox="0 0 24 24"><path d="M4 12h11"/><path d="M11 7l5 5-5 5"/><path d="M20 4.5v15"/></svg>
+  <svg id="i-show" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/><path d="M10.5 7.8v5.4l4.2-2.7z" class="solid"/></svg>
+  <svg id="i-arrangement" viewBox="0 0 24 24"><rect x="3" y="4.5" width="11" height="4" rx="1.3"/><rect x="8" y="10" width="13" height="4" rx="1.3"/><rect x="4.5" y="15.5" width="9.5" height="4" rx="1.3"/></svg>
+  <svg id="i-macro" viewBox="0 0 24 24"><path d="M13.5 2.5L5 13.5h6l-1 8 8.5-11h-6z" class="solid"/></svg>
+  <svg id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8"/><path d="M6.7 6.7a7.5 7.5 0 1 0 10.6 0"/></svg>
+  <svg id="i-scenes" viewBox="0 0 24 24"><rect x="3" y="7" width="13" height="13" rx="2"/><path d="M7 4h11a3 3 0 0 1 3 3v11"/></svg>
+</div>
 </body>
 </html>

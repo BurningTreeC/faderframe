@@ -8753,6 +8753,30 @@ Lyrics (large lines centred as they are sung, A−/A+ remembered). The
 screen stays awake where the browser allows it. It reconnects by itself
 with growing waits and keeps its token in local storage.
 
+*Touch.* A drag on a slider starts only once the finger has moved 4 px
+along it, and only then sends `touch` on: a swipe across a control
+belongs to what it sits in. Vertical faders are `touch-action: pan-x`
+(a sideways swipe anywhere on a strip scrolls the mixer), horizontal
+sliders `pan-y` (an up/down swipe on a cue send scrolls the list). Under
+the strips an overview — every strip a cell in its colour with its
+level, the strips on screen framed — scrolls the mixer when dragged or
+tapped; the master strip is pinned beside the scroller; the strips
+snap. Faders are relative drags (double tap: unity), with a cap in the
+track's colour and a two-channel meter (−60…+6 dB, lit colours fixed
+under a moving cover, peak held 1.5 s).
+
+*Look.* Icons are SVGs in `index.html` (`#icons`, 24 × 24, stroked in
+`currentColor`; classes `solid`/`fill`/`thick`), cloned by `icon(name)`
+— no namespace strings or markup in the script, and nothing for the CSP
+to refuse. Tabs carry icons over labels; on phones held sideways
+(landscape, ≤ 540 px high) they become a rail on the left and the
+strips' M/S/R share a row. Colours are tokens on `:root`, a light set
+under `prefers-color-scheme: light`. Check the app in a phone-sized
+headless browser against the demo with
+`FADERFRAME_REMOTE_PLAY=1` (the demo plays, looping, on the dummy
+device) on the ignored `serve_the_demo_for_a_browser`; `node --check`
+the script.
+
 Tests: the crate's units (`hash`, `ws` incl. RFC 6455's examples,
 `http`, `net`, `pairing`, `diff`, `protocol`'s role filter, `qr` against
 the standard's worked examples, `web`), `faderframe-remote/tests/server.rs`

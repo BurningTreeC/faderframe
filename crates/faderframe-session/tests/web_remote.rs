@@ -385,7 +385,8 @@ fn turning_the_remote_off_closes_its_port() {
 /// web_remote -- --ignored serve_the_demo --nocapture` prints the address
 /// with a pairing code (also written to `FADERFRAME_REMOTE_URL_FILE` when
 /// set). The demo gets two cue mixes, a setlist, lyrics and a launcher
-/// scene to show.
+/// scene to show; with `FADERFRAME_REMOTE_PLAY=1` it plays, looping, on the
+/// dummy device (the meters and the playhead move).
 #[test]
 #[ignore = "serves for a browser until FADERFRAME_REMOTE_SECONDS pass"]
 fn serve_the_demo_for_a_browser() {
@@ -453,6 +454,26 @@ fn serve_the_demo_for_a_browser() {
         listen: RemoteListen::ThisComputer,
         ..WebRemoteSettings::default()
     });
+    if env("FADERFRAME_REMOTE_PLAY").is_some_and(|v| v == "1") {
+        s.start_audio(
+            vec![Box::new(faderframe_audio::dummy::DummyBackend::default())],
+            &faderframe_session::AudioPreferences {
+                sample_rate: Some(48_000),
+                buffer_size: Some(256),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.dispatch(Action::Transport(
+            faderframe_session::TransportAction::SetLoop(faderframe_project::MusicalRange::new(
+                q(0.0),
+                q(64.0),
+            )),
+        ))
+        .unwrap();
+        s.dispatch(Action::Transport(faderframe_session::TransportAction::Play))
+            .unwrap();
+    }
     let url = s.web_remote_status().pair_url.unwrap();
     println!("remote: {url}");
     if let Some(f) = env("FADERFRAME_REMOTE_URL_FILE") {
