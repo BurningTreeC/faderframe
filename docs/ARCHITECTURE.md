@@ -1033,7 +1033,22 @@ Preferences → Audio → Processing threads, `--threads`).
   pushed at most once per cycle). Threads pop jobs, run their nodes in
   order, decrement their dependents' counters and continue directly with
   one released dependent (cache-warm), queueing the others. The caller
-  returns when every job is done. Graphs whose width is one job, or whose
+  returns when every job is done. A helper that finds no ready job for
+  `LEAVE_AFTER` (15 µs) leaves the cycle (its seat freed,
+  `faderframe_realtime::leave_running_job`: it sleeps after 25 µs instead
+  of ~100) and a thread that queues jobs calls it back
+  (`WorkerPool::call_back`, the generation word the idle workers watch);
+  the caller keeps working the cycle. While one node runs long — a
+  sandboxed plugin waiting for its helper, a plugin waiting for threads of
+  its own — the helpers would otherwise spin through it at the audio
+  thread's priority: TONE3000's stereo engine (#49) hands its channels to
+  JUCE realtime threads that fall back to normal priority where
+  `RLIMIT_RTPRIO` is below 99, and those found no core free of spinning
+  FIFO threads — dropouts and a stuttering desktop. Measured (PipeWire, 64
+  frames, the demo stopped, 4 cores): pool workers 24 % → 9 % of a core
+  each with TONE3000's "Stereo Crunch Verb"; `helpers_do_not_spin_through_a_long_node`
+  (a 30 ms blocking node: 360 ms of worker CPU in 4 cycles before, under
+  32 ms now). Graphs whose width is one job, or whose
   measured work is below `parallel_min_ns` (40 µs, with hysteresis), stay
   on the audio thread — waking workers would cost more than it saves.
 * **Critical path first.** Every job's time is measured (two clock reads).
@@ -4385,8 +4400,17 @@ pagefile-backed file mapping, all named in the helper's environment).
 ### CLAP
 
 * **Scanning** runs each bundle in a throw-away helper process
-  (`faderframe --scan-clap <bundle>`, JSON on stdout), so a crashing plugin
-  cannot take the DAW down. Results are cached by bundle size and mtime
+  (`faderframe --scan-clap <bundle>`, JSON on stdout after
+  `scan::SCAN_MARKER`), so a crashing plugin cannot take the DAW down. Every
+  helper (scan, check, sandbox) — and the program after a clean quit —
+  ends with `faderframe_ui::plugins::end_process` (`_exit`,
+  `TerminateProcess`): modules stay loaded and never see their exit entry,
+  and some plugins crash in their static destructors (Native Instruments'
+  Qt plugins on macOS, #47: a crash report per bundle scanned, and the
+  bundle recorded as failed). An answer printed before the helper died
+  still counts; bundles failed under another scanner version, or when the
+  browser's Rescan is pressed (`ScanCache::forget_failures`), are scanned
+  again. Results are cached by bundle size and mtime
   (`$XDG_CACHE_HOME/faderframe/clap-scan.json`); the shell rescans in the
   background at start-up and the plugin browser refreshes when the global
   catalog generation changes. The scan cache, helper protocol and
@@ -8944,6 +8968,17 @@ labels out again. Three caches took it to 26 %, the views' paint from
 * **Text nodes** (`painter::TextCache`): the finished text node of a
   label (by text, style, width, colour) is appended again under a
   translation — pango and GTK's glyph measuring run once per label.
+  Text nodes do not depend on the display's scale (GSK rasterises glyphs
+  at the frame's), which matters on macOS: GDK there never notifies a
+  window's scale change when it moves to another display. The canvases'
+  font lists (`painter::families`, `faderframe-ui-gpu` `text::families`,
+  the stylesheet's `MONOSPACE`) name the platform's UI and monospace fonts
+  before the generic ones on macOS and Windows — Core Text takes "Sans"
+  for Helvetica and "Monospace" for Courier, thin and soft at the canvases'
+  sizes on a 1× display (#48), while GTK's widgets use the system font.
+  GTK draws glyph masks on macOS without Core Graphics' font smoothing (an
+  alpha-only bitmap), so 1× text stays lighter than native text whatever
+  options pango is given.
 * **Kept pictures** (`faderframe_ui_canvas::kept(p, key, rect, draw)`,
   `Painter::{show_kept, begin_keep, end_keep}`; the GSK painter's
   `KeptCache`): a layer that rarely changes under one that does is drawn

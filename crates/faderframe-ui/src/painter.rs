@@ -297,24 +297,77 @@ impl TextCache {
     }
 }
 
+/// A family list: the faces FaderFrame prefers, then the platform's own
+/// (`platform`), then the generic name.
+fn family_list(named: &str, platform: &[&str], generic: &str) -> String {
+    let mut list = named.to_string();
+    for p in platform.iter().filter(|p| !p.is_empty()) {
+        list.push_str(", ");
+        list.push_str(p);
+    }
+    list.push_str(", ");
+    list.push_str(generic);
+    list
+}
+
+/// The desktop's UI font family as GTK has it (`gtk-font-name`: the
+/// system font on macOS — San Francisco — and on Windows).
+fn ui_family() -> Option<String> {
+    let name = gtk::Settings::default()?.gtk_font_name()?;
+    pango::FontDescription::from_string(&name)
+        .family()
+        .map(|f| f.to_string())
+        .filter(|f| !f.is_empty())
+}
+
+/// The family lists of the sans, condensed and monospace faces. Where none
+/// of the named faces is installed (a stock Mac or Windows), the platform's
+/// UI and monospace fonts come before the generic names: pango's Core Text
+/// backend takes "Sans" for Helvetica and "Monospace" for Courier, thin and
+/// soft at these sizes on a 1× display (#48), while GTK's own widgets
+/// there use the system font.
+fn families() -> [String; 3] {
+    const SANS: &str = "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans";
+    const CONDENSED: &str =
+        "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed";
+    const MONO: &str = "JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono";
+    // Linux: "Sans" and "Monospace" are fontconfig's choices, the desktop's.
+    let ui = if cfg!(any(target_os = "macos", windows)) {
+        ui_family().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mono: &[&str] = if cfg!(target_os = "macos") {
+        &["SF Mono", "Menlo"]
+    } else if cfg!(windows) {
+        &["Cascadia Mono", "Consolas"]
+    } else {
+        &[]
+    };
+    [
+        family_list(SANS, &[&ui], "Sans"),
+        family_list(CONDENSED, &[&ui], "Sans"),
+        family_list(MONO, mono, "Monospace"),
+    ]
+}
+
+thread_local! {
+    /// [`families`], read once (on the UI thread, GTK's settings there).
+    static FAMILIES: [String; 3] = families();
+}
+
 fn font_description(style: &TextStyle) -> pango::FontDescription {
     let mut fd = pango::FontDescription::new();
-    match style.family {
+    FAMILIES.with(|[sans, condensed, mono]| match style.family {
         // Figures: the same face; its tabular figures are a layout
         // attribute (see `SnapshotPainter::layout`).
-        FontFamily::Sans | FontFamily::Figures => {
-            fd.set_family("Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, Sans")
-        }
+        FontFamily::Sans | FontFamily::Figures => fd.set_family(sans),
         FontFamily::Condensed => {
-            fd.set_family(
-                "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, Sans",
-            );
+            fd.set_family(condensed);
             fd.set_stretch(pango::Stretch::SemiCondensed);
         }
-        FontFamily::Mono => {
-            fd.set_family("JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono, Monospace")
-        }
-    }
+        FontFamily::Mono => fd.set_family(mono),
+    });
     fd.set_weight(match style.weight {
         FontWeight::Normal => pango::Weight::Normal,
         FontWeight::Medium => pango::Weight::Medium,
@@ -906,6 +959,20 @@ impl Painter for SnapshotPainter<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn family_lists_end_on_the_platform_fonts_before_the_generic_name() {
+        assert_eq!(
+            family_list("Inter, Noto Sans", &[".AppleSystemUIFont"], "Sans"),
+            "Inter, Noto Sans, .AppleSystemUIFont, Sans"
+        );
+        assert_eq!(
+            family_list("JetBrains Mono", &["SF Mono", "Menlo"], "Monospace"),
+            "JetBrains Mono, SF Mono, Menlo, Monospace"
+        );
+        // No UI family known (Linux, no settings): nothing in between.
+        assert_eq!(family_list("Inter", &[""], "Sans"), "Inter, Sans");
+    }
     use super::*;
     use faderframe_ui_canvas::Point;
 

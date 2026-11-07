@@ -266,6 +266,16 @@ fn css_color(c: Color) -> String {
     }
 }
 
+/// Monospaced text in GTK's widgets: CSS's `monospace` is Courier on macOS
+/// (pango's Core Text backend), thin and soft on a 1× display (#48).
+const MONOSPACE: &str = if cfg!(target_os = "macos") {
+    "\"SF Mono\", Menlo, monospace"
+} else if cfg!(windows) {
+    "\"Cascadia Mono\", Consolas, monospace"
+} else {
+    "monospace"
+};
+
 /// The stylesheet for `theme`.
 pub fn css(theme: &Theme) -> String {
     let ui = &theme.ui;
@@ -296,7 +306,8 @@ pub fn css(theme: &Theme) -> String {
     for (name, color) in defines {
         out.push_str(&format!("@define-color {name} {};\n", css_color(color)));
     }
-    out.push_str(CSS);
+    let mono = format!("font-family: {MONOSPACE};");
+    out.push_str(&CSS.replace("font-family: monospace;", &mono));
     if theme.chrome == Chrome::Planes {
         let planes = [
             ("ff_accent_2", ui.accent_2),
@@ -308,7 +319,7 @@ pub fn css(theme: &Theme) -> String {
         for (name, color) in planes {
             out.push_str(&format!("@define-color {name} {};\n", css_color(color)));
         }
-        out.push_str(PLANES_CSS);
+        out.push_str(&PLANES_CSS.replace("font-family: monospace;", &mono));
     }
     out
 }
@@ -403,6 +414,20 @@ pub fn add_display(display: &gdk::Display, theme: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monospaced_labels_ask_for_the_platforms_monospace() {
+        for theme in Theme::all() {
+            let css = css(&theme);
+            assert_eq!(
+                css.matches(&format!("font-family: {MONOSPACE};")).count(),
+                3
+            );
+            if cfg!(any(target_os = "macos", windows)) {
+                assert!(!css.contains("font-family: monospace;"));
+            }
+        }
+    }
 
     #[test]
     fn every_skin_defines_every_colour_it_uses() {

@@ -455,3 +455,95 @@ fn a_panicking_node_does_not_hang_the_cycle() {
         "the others play"
     );
 }
+
+/// A node that blocks for a while (a sandboxed plugin waiting for its
+/// helper process, a plugin waiting for threads of its own).
+#[cfg(target_os = "linux")]
+struct Blocking(Duration);
+
+#[cfg(target_os = "linux")]
+impl Processor<Ctx> for Blocking {
+    fn process(&mut self, _cx: &ProcessContext<'_, Ctx>, io: &mut NodeIo<'_>) {
+        std::thread::sleep(self.0);
+        for c in 0..io.audio_out[0].num_channels() {
+            io.audio_out[0].channel_mut(c).fill(0.25);
+        }
+    }
+}
+
+/// CPU time the pool's worker threads (`ff-dsp-*`) have used, in ns.
+#[cfg(target_os = "linux")]
+fn worker_cpu_ns() -> u64 {
+    let mut total = 0;
+    for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+        let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        if !comm.starts_with("ff-dsp-") {
+            continue;
+        }
+        // schedstat: time on the CPU (ns), waiting, slices.
+        let stat = std::fs::read_to_string(task.path().join("schedstat")).unwrap_or_default();
+        total += stat
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+    }
+    total
+}
+
+/// While one node takes long, the helpers leave the cycle instead of
+/// spinning through it at the audio thread's priority (#49: TONE3000's
+/// stereo engine waits for threads of its own, which had no core left),
+/// and they come back for the work that node releases.
+#[cfg(target_os = "linux")]
+#[test]
+fn helpers_do_not_spin_through_a_long_node() {
+    let threads = Arc::new(Mutex::new(HashSet::new()));
+    let mut b = GraphBuilder::<Ctx>::new();
+    let master = b.add_node(
+        NodeSpec::new("master").audio_in(Stereo).audio_out(Stereo),
+        Box::new(faderframe_audio_graph::nodes::Passthrough),
+    );
+    let slow = b.add_node(
+        NodeSpec::new("slow").audio_out(Stereo),
+        Box::new(Blocking(Duration::from_millis(30))),
+    );
+    // After it, chains run in parallel again: the helpers must come back.
+    for _ in 0..4 {
+        let (first, last) = chain(&mut b, 3, Duration::from_micros(200), &threads);
+        b.connect_audio(slow, 0, first, 0).unwrap();
+        b.connect_audio(last, 0, master, 0).unwrap();
+    }
+    for _ in 0..6 {
+        let src = b.add_node(
+            NodeSpec::new("src").audio_out(Stereo),
+            Box::new(faderframe_audio_graph::nodes::Constant { value: 0.5 }),
+        );
+        let (first, last) = chain(&mut b, 2, Duration::from_micros(50), &threads);
+        b.connect_audio(src, 0, first, 0).unwrap();
+        b.connect_audio(last, 0, master, 0).unwrap();
+    }
+    let mut g = b.compile(&PrepareConfig::new(48_000.0, BLOCK)).unwrap();
+    let pool = WorkerPool::new(PoolConfig::new(3));
+    // Measured costs make it parallel.
+    for _ in 0..2 {
+        g.process_parallel(&cx(BLOCK), &pool);
+    }
+    assert!(g.runs_parallel());
+    let cycles = 4;
+    let before = worker_cpu_ns();
+    let mut used = 0;
+    for _ in 0..cycles {
+        threads.lock().unwrap().clear();
+        g.process_parallel(&cx(BLOCK), &pool);
+        used = used.max(threads.lock().unwrap().len());
+    }
+    let spent = Duration::from_nanos(worker_cpu_ns() - before);
+    // Their jobs take about 0.9 ms a cycle (spread over all the threads);
+    // spinning through the slow node took 3 × 30 ms.
+    assert!(
+        spent < Duration::from_millis(8 * cycles),
+        "the workers used {spent:?} in {cycles} cycles"
+    );
+    assert!(used >= 2, "only {used} thread(s) ran the chains");
+}

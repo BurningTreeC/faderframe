@@ -423,7 +423,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
         gtk::prelude::WidgetExt::display(&window).type_().name()
     );
     state.start_audio();
-    *state.plugin_scan.borrow_mut() = Some(plugins::scan_in_background());
+    *state.plugin_scan.borrow_mut() = Some(plugins::scan_in_background(false));
     if let Some(e) = error {
         state.report(faderframe_session::SessionError::Other(e), true);
     }

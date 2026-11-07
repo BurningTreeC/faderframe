@@ -153,8 +153,9 @@ fn main() -> ExitCode {
     // Where RealtimeKit grants realtime, a thread of this process asks it
     // for the threads that want it (they never wait for the answer).
     faderframe_realtime::priority::start_requests();
-    // Plugin scan helper (run by FaderFrame itself; a crashing plugin only
-    // takes this process down).
+    // Helpers (run by FaderFrame itself; a crashing plugin only takes the
+    // helper down) end with `end_process` once they answered: the plugins
+    // they loaded never run their static destructors (some crash in them).
     let args: Vec<String> = std::env::args().collect();
     // Plugin sandbox helper: hosts one plugin for FaderFrame.
     if args.get(1).map(String::as_str) == Some("--plugin-sandbox") {
@@ -169,7 +170,7 @@ fn main() -> ExitCode {
             .init();
         lock_memory();
         let code = faderframe_ui::plugins::sandbox_helper();
-        return ExitCode::from(code.clamp(0, 255) as u8);
+        faderframe_ui::plugins::end_process(code.clamp(0, 255));
     }
     // Plugin check helper: plays one plugin under measurement.
     if args.get(1).map(String::as_str) == Some("--check-plugin")
@@ -184,19 +185,19 @@ fn main() -> ExitCode {
         let block = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(128);
         let paced = args.get(6).map(String::as_str) != Some("unpaced");
         let code = faderframe_ui::plugins::check_helper(format, id, rate, block, paced);
-        return ExitCode::from(code.clamp(0, 255) as u8);
+        faderframe_ui::plugins::end_process(code.clamp(0, 255));
     }
     if args.get(1).map(String::as_str) == Some("--scan-clap")
         && let Some(bundle) = args.get(2)
     {
         let code = faderframe_plugin_clap::scan::run_scan_subprocess(std::path::Path::new(bundle));
-        return ExitCode::from(code.clamp(0, 255) as u8);
+        faderframe_ui::plugins::end_process(code.clamp(0, 255));
     }
     if args.get(1).map(String::as_str) == Some("--scan-vst3")
         && let Some(bundle) = args.get(2)
     {
         let code = faderframe_plugin_vst3::scan::run_scan_subprocess(std::path::Path::new(bundle));
-        return ExitCode::from(code.clamp(0, 255) as u8);
+        faderframe_ui::plugins::end_process(code.clamp(0, 255));
     }
 
     let options = match parse(std::env::args().skip(1)) {
@@ -233,11 +234,9 @@ fn main() -> ExitCode {
     let code = faderframe_ui::run(options);
     // Closed, not crashed: nothing to offer next time.
     faderframe_ui::crash::finished();
-    if code == gtk_exit_success() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    // Plugins hosted in this process (sandboxing off, ARA) stay loaded:
+    // leave without their static destructors, as the helpers do.
+    faderframe_ui::plugins::end_process(if code == gtk_exit_success() { 0 } else { 1 })
 }
 
 fn gtk_exit_success() -> faderframe_ui::ExitCode {

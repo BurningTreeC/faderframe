@@ -226,6 +226,9 @@ struct Schedule {
     finished: AtomicUsize,
     /// Threads still allowed to join this cycle.
     seats: AtomicUsize,
+    /// Helpers that left this cycle for want of work (they come back when
+    /// called: `Exec::call_back`).
+    left: AtomicUsize,
 }
 
 impl Schedule {
@@ -307,6 +310,7 @@ impl Schedule {
         *self.finished.get_mut() = 0;
         // The caller always works; helpers take the other seats.
         *self.seats.get_mut() = seats.saturating_sub(1);
+        *self.left.get_mut() = 0;
     }
 
     /// A ready job to the queue of the seat that ran it (else `seat`'s).
@@ -985,6 +989,7 @@ fn build_schedule(
         cycle: 0,
         finished: AtomicUsize::new(0),
         seats: AtomicUsize::new(0),
+        left: AtomicUsize::new(0),
     }
 }
 
@@ -1010,8 +1015,32 @@ fn take_seat(seats: &std::sync::atomic::AtomicUsize) -> bool {
 struct Exec<'a, 'c, C> {
     graph: &'a CompiledGraph<C>,
     cx: &'a ProcessContext<'c, C>,
+    pool: &'a WorkerPool,
     frames: usize,
     measure: bool,
+}
+
+/// How long a helper waits for a job before it leaves the cycle (the
+/// pool's idle wait; it is called back when jobs are queued). Waits
+/// longer than this are a long node running: a sandboxed plugin, one
+/// waiting for threads of its own — and helpers spinning meanwhile at the
+/// audio thread's priority keep those threads off every core (#49).
+const LEAVE_AFTER: std::time::Duration = std::time::Duration::from_micros(15);
+
+impl<C> Exec<'_, '_, C> {
+    /// Jobs were queued: helpers that left come back for them (as many as
+    /// left, while seats are free).
+    #[inline]
+    fn call_back(&self) {
+        let s = &self.graph.schedule;
+        let left = s.left.load(Ordering::Acquire);
+        if left > 0 {
+            let free = s.seats.load(Ordering::Acquire);
+            if free > 0 {
+                self.pool.call_back(left.min(free));
+            }
+        }
+    }
 }
 
 impl<C: Sync> PoolJob for Exec<'_, '_, C> {
@@ -1026,6 +1055,9 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
         }
         let total = s.jobs.len();
         let mut next: Option<u32> = None;
+        // Spins without a job, and since when (taken after the first 64).
+        let mut idle = 0u32;
+        let mut idle_since: Option<std::time::Instant> = None;
         loop {
             let j = match next.take().or_else(|| s.pop(seat)) {
                 Some(j) => j,
@@ -1033,10 +1065,24 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
                     if s.finished.load(Ordering::Acquire) >= total {
                         return;
                     }
+                    idle = idle.wrapping_add(1);
+                    if seat != 0 && idle.is_multiple_of(64) {
+                        let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= LEAVE_AFTER {
+                            // Leave the cycle (its seat for whoever comes
+                            // back); a job queued from now on calls back.
+                            s.left.fetch_add(1, Ordering::AcqRel);
+                            s.seats.fetch_add(1, Ordering::AcqRel);
+                            faderframe_realtime::leave_running_job();
+                            return;
+                        }
+                    }
                     std::hint::spin_loop();
                     continue;
                 }
             };
+            idle = 0;
+            idle_since = None;
             let Some(job) = s.jobs.get(j as usize) else {
                 continue;
             };
@@ -1050,19 +1096,27 @@ impl<C: Sync> PoolJob for Exec<'_, '_, C> {
             // Continue with the most expensive released dependent (it reads
             // what this thread just wrote), queue the others.
             let rank = |d: u32| s.rank[d as usize].load(Ordering::Relaxed);
+            let mut queued = false;
             for &d in job.dependents.iter() {
                 if s.remaining[d as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
                     match next {
                         None => next = Some(d),
                         Some(n) if rank(d) > rank(n) => {
                             s.push(n, seat);
+                            queued = true;
                             next = Some(d);
                         }
-                        Some(_) => s.push(d, seat),
+                        Some(_) => {
+                            s.push(d, seat);
+                            queued = true;
+                        }
                     }
                 }
             }
             s.finished.fetch_add(1, Ordering::AcqRel);
+            if queued {
+                self.call_back();
+            }
         }
     }
 }
@@ -1336,6 +1390,7 @@ impl<C> CompiledGraph<C> {
         let exec = Exec {
             graph: &*self,
             cx,
+            pool,
             frames,
             measure: self.measuring(),
         };

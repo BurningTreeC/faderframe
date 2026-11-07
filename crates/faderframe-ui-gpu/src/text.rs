@@ -7,18 +7,39 @@ use std::collections::HashMap;
 use vello::kurbo::Affine;
 use vello::peniko::Fill;
 
-/// Font family lists as the toolkit painter asks for them.
+/// Font family lists as the toolkit painter asks for them: where none of
+/// the named faces is installed, the platform's UI and monospace fonts
+/// before the generic names (fontique takes `sans-serif` for Helvetica and
+/// `monospace` for Courier on macOS, Arial on Windows — #48).
 fn families(f: FontFamily) -> &'static str {
+    #[cfg(target_os = "macos")]
+    const SANS: &str = "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, system-ui, sans-serif";
+    #[cfg(target_os = "macos")]
+    const CONDENSED: &str = "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, system-ui, \
+         sans-serif";
+    #[cfg(target_os = "macos")]
+    const MONO: &str =
+        "JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono, SF Mono, Menlo, monospace";
+    #[cfg(windows)]
+    const SANS: &str =
+        "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, Segoe UI, system-ui, sans-serif";
+    #[cfg(windows)]
+    const CONDENSED: &str = "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, Segoe UI, \
+         system-ui, sans-serif";
+    #[cfg(windows)]
+    const MONO: &str = "JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono, Cascadia Mono, Consolas, \
+         monospace";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    const SANS: &str = "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, sans-serif";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    const CONDENSED: &str =
+        "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, sans-serif";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    const MONO: &str = "JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono, monospace";
     match f {
-        FontFamily::Sans | FontFamily::Figures => {
-            "Inter, Noto Sans, Fira Sans, Cantarell, DejaVu Sans, sans-serif"
-        }
-        FontFamily::Condensed => {
-            "Fira Sans Condensed, Roboto Condensed, Noto Sans, DejaVu Sans Condensed, sans-serif"
-        }
-        FontFamily::Mono => {
-            "JetBrains Mono, Fira Mono, Noto Sans Mono, DejaVu Sans Mono, monospace"
-        }
+        FontFamily::Sans | FontFamily::Figures => SANS,
+        FontFamily::Condensed => CONDENSED,
+        FontFamily::Mono => MONO,
     }
 }
 

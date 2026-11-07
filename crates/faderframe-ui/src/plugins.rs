@@ -120,6 +120,45 @@ pub fn install() {
     );
 }
 
+/// End this process at once with `code`, once what it printed is out: no
+/// exit handlers, no static destructors. Helpers (scan, check, sandbox)
+/// end this way, and the program after a clean quit: plugin modules are
+/// loaded for good (never unloaded, their `ModuleExit`/`bundleExit` never
+/// called), and some come apart in their static destructors at `exit` —
+/// Native Instruments' Qt-based plugins crash there on macOS, which the
+/// system reported as a crash of FaderFrame for every one scanned (#47).
+pub fn end_process(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    exit_now(code)
+}
+
+#[cfg(unix)]
+fn exit_now(code: i32) -> ! {
+    // SAFETY: `_exit` ends the process; nothing runs after it (the point:
+    // no handler of a plugin's), and every file we wrote went through the
+    // kernel already (no C stdio buffers of ours).
+    unsafe { libc::_exit(code) }
+}
+
+#[cfg(windows)]
+fn exit_now(code: i32) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: ends this process without telling its DLLs (their static
+    // destructors are what must not run); the pseudo handle is always
+    // valid.
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), code as u32);
+    }
+    std::process::exit(code)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn exit_now(code: i32) -> ! {
+    std::process::exit(code)
+}
+
 /// `faderframe --plugin-sandbox`: host the one plugin FaderFrame asks for;
 /// returns the exit code.
 pub fn sandbox_helper() -> i32 {
@@ -202,9 +241,10 @@ pub struct ScanReport {
 }
 
 /// Rescan the CLAP and VST3 folders in the background (each new or changed
-/// bundle in a `faderframe --scan-clap` / `--scan-vst3` helper process).
+/// bundle in a `faderframe --scan-clap` / `--scan-vst3` helper process;
+/// `retry_failed`: the ones that failed before too — the user asked).
 /// The catalogs are updated when it finishes.
-pub fn scan_in_background() -> mpsc::Receiver<ScanReport> {
+pub fn scan_in_background(retry_failed: bool) -> mpsc::Receiver<ScanReport> {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("faderframe-plugin-scan".into())
@@ -217,6 +257,9 @@ pub fn scan_in_background() -> mpsc::Receiver<ScanReport> {
             let mut scan = |name: &str, bundles: Vec<PathBuf>, flag: &str| {
                 let path = cache_path(name);
                 let mut cache = ScanCache::load(&path);
+                if retry_failed {
+                    cache.forget_failures();
+                }
                 errors.extend(cache.update(&bundles, |b| {
                     tracing::info!("scanning {}", b.display());
                     faderframe_plugin_host::scan::scan_in_subprocess(&exe, flag, b, timeout)

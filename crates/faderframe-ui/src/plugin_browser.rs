@@ -1457,7 +1457,7 @@ pub fn open(app: &Rc<AppState>, track: TrackId, target: PluginTarget) {
     let weak_app = Rc::downgrade(app);
     rescan.connect_clicked(move |_| {
         if let Some(app) = weak_app.upgrade() {
-            *app.plugin_scan.borrow_mut() = Some(crate::plugins::scan_in_background());
+            *app.plugin_scan.borrow_mut() = Some(crate::plugins::scan_in_background(true));
             app.session
                 .borrow_mut()
                 .notify(faderframe_session::NoticeLevel::Info, "rescanning plugins…");

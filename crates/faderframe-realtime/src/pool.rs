@@ -12,6 +12,12 @@
 //! * idle workers spin for a short while after a run (consecutive chunks of
 //!   a callback catch them awake), then sleep on a futex — one non-blocking
 //!   `FUTEX_WAKE` from the audio thread wakes as many as needed;
+//! * a job may let a worker go before it is over ([`leave_running_job`]:
+//!   nothing for it to do for now, e.g. while one long node runs) and call
+//!   workers back to it when there is ([`WorkerPool::call_back`]): workers
+//!   at the audio thread's priority must not spin through a plugin's whole
+//!   block — a plugin waiting for threads of its own at normal priority
+//!   (TONE3000's stereo engine, #49) would wait behind them;
 //! * workers run at the audio thread's urgency, so they are not preempted
 //!   by ordinary threads while the audio thread waits for them: on Linux
 //!   they adopt its scheduling policy and priority (`SCHED_FIFO` under
@@ -180,6 +186,22 @@ struct JobRef<'a>(&'a dyn PoolJob);
 thread_local! {
     /// 1 + this thread's index among its pool's workers (0: not a worker).
     static SEAT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// This worker's job let it go before it was over.
+    static LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long a worker that left a running job spins before it sleeps (a
+/// call back finds it awake meanwhile; the next run is not before the
+/// job's end in any case).
+const LEFT_SPIN: Duration = Duration::from_micros(25);
+
+/// Called by a job's `work` on a pool worker that returns before the job
+/// is over (it found nothing to do for now): the worker sleeps sooner
+/// after it, and comes back when the job calls ([`WorkerPool::call_back`]).
+/// Realtime-safe.
+#[inline]
+pub fn leave_running_job() {
+    LEFT.with(|l| l.set(true));
 }
 
 /// Which pool worker this thread is: 1 + its index, 0 for any other
@@ -554,8 +576,14 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
         }
     };
     loop {
-        // Wait for the next run: spin briefly, then sleep.
+        // Wait for the next run: spin briefly, then sleep (sooner after
+        // leaving a job that is still running).
         let idle_since = Instant::now();
+        let spin_ns = if LEFT.with(|l| l.replace(false)) {
+            shared.spin_ns.min(LEFT_SPIN.as_nanos() as u64)
+        } else {
+            shared.spin_ns
+        };
         let mut spins = 0u32;
         loop {
             if shared.stop.load(Ordering::Relaxed) {
@@ -578,7 +606,7 @@ fn worker(shared: Arc<Shared>, on_start: Option<fn()>, index: usize) {
                 crate::priority::breathe();
                 continue;
             }
-            if spins.is_multiple_of(64) && idle_since.elapsed().as_nanos() as u64 > shared.spin_ns {
+            if spins.is_multiple_of(64) && idle_since.elapsed().as_nanos() as u64 > spin_ns {
                 // Sitting out (below): not asleep where the caller's
                 // wake-ups for its cycle's workers would find it.
                 if !realtime && sched::is_realtime(shared.sched.load(Ordering::Relaxed)) {
@@ -818,6 +846,30 @@ impl WorkerPool {
         if let Some(t) = self.shared.threads.get() {
             for t in t.iter().take(n) {
                 t.unpark();
+            }
+        }
+    }
+
+    /// Call workers back to the running job (up to `n` asleep are woken;
+    /// those still awake come by themselves): it has work again for some
+    /// that left it ([`leave_running_job`]). A worker that comes back may
+    /// find the job over, or nothing left for it. Realtime-safe: one
+    /// atomic add, a non-blocking wake while some sleep.
+    pub fn call_back(&self, n: usize) {
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        if self.shared.sleeping.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        wait::wake(&self.shared.generation, n);
+        // Parked threads cannot be told apart: every one is woken.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = n;
+            if let Some(t) = self.shared.threads.get() {
+                for t in t.iter() {
+                    t.unpark();
+                }
             }
         }
     }
