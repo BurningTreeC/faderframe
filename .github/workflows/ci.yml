@@ -30,6 +30,8 @@ jobs:
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
           sudo docker image prune --all --force > /dev/null || true
           df -h /
+      # plugins-bad: the parsers video reads JPEG and VP9 movies with
+      # (jpegparse, vp9parse), as the packages bundle them.
       - name: System dependencies
         run: |
           sudo apt-get update
@@ -37,7 +39,8 @@ jobs:
             libgtk-4-dev pkg-config libjack-jackd2-dev libasound2-dev xvfb \
             libpipewire-0.3-dev libclang-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -49,10 +52,9 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Real-time tests (dummy device, paced render-ahead) can miss a
-      # deadline on a shared runner: a failure is tried twice more.
+      # Retries and what needs a quiet machine: .config/nextest.toml.
       - name: Tests
-        run: cargo nextest run --workspace --no-fail-fast --retries 2
+        run: cargo nextest run --workspace --profile ci
       - name: Build application
         run: cargo build -p faderframe-app
       - name: GUI smoke test (headless X11)
