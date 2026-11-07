@@ -22,6 +22,7 @@ fn slot(tp: &mut TestProject, id: &str, set: &[(u32, f64)]) -> PluginSlot {
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 

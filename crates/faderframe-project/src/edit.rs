@@ -357,6 +357,13 @@ pub enum Command {
         plugin: PluginInstanceId,
         source: Option<TrackId>,
     },
+    /// Mono → Stereo on a slot ([`crate::PluginSlot::mono_to_stereo`]): a
+    /// mono track keeps the plugin's stereo output and is stereo from it on.
+    SetPluginMonoToStereo {
+        track: TrackId,
+        plugin: PluginInstanceId,
+        on: bool,
+    },
     /// Add a track group (members join with `SetTrackGroup`).
     AddGroup {
         group: Box<crate::TrackGroup>,
@@ -1059,6 +1066,8 @@ impl Command {
             SetPluginParameter { .. } => "Change Plugin Parameter".into(),
             SetPluginState { .. } => "Load Preset".into(),
             SetPluginSidechain { .. } => "Set Sidechain".into(),
+            SetPluginMonoToStereo { on: true, .. } => "Mono → Stereo".into(),
+            SetPluginMonoToStereo { on: false, .. } => "Mono → Stereo Off".into(),
             AddGroup { .. } => "Add Group".into(),
             RemoveGroup { .. } => "Delete Group".into(),
             UpdateGroup { .. } => "Change Group".into(),
@@ -1375,7 +1384,8 @@ impl Command {
             | SetTrackFreeze { .. }
             | SetFolderBus { .. }
             | SetAraSlot { .. }
-            | SetPluginSidechain { .. } => Impact::Graph,
+            | SetPluginSidechain { .. }
+            | SetPluginMonoToStereo { .. } => Impact::Graph,
             // VCA automation travels with the timeline snapshot.
             SetTrackVca { .. } => Impact::Timeline,
             // Folder mutes and solos reach the tracks inside (in or out of
@@ -1850,6 +1860,17 @@ impl Command {
                     track,
                     plugin,
                     source: old,
+                }
+            }
+            SetPluginMonoToStereo { track, plugin, on } => {
+                let slot = track_mut(p, track)?
+                    .plugin_mut(plugin)
+                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let old = std::mem::replace(&mut slot.mono_to_stereo, on);
+                SetPluginMonoToStereo {
+                    track,
+                    plugin,
+                    on: old,
                 }
             }
             AddGroup { group } => {

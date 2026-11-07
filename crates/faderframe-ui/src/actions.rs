@@ -3852,6 +3852,30 @@ pub fn install(app: &Rc<AppState>) {
                 None => tracing::warn!("insert-program: no insert {n}"),
             }
         }),
+        // `mono-to-stereo:<n>=<on|off>`: Mono → Stereo on insert n.
+        named("mono-to-stereo", |a, arg| {
+            let (n, on) = arg.split_once('=').unwrap_or((arg, "on"));
+            let Ok(n) = n.trim().parse::<usize>() else {
+                return;
+            };
+            let Some(plugin) = insert_of(a, n) else {
+                tracing::warn!("mono-to-stereo: no insert {n}");
+                return;
+            };
+            let track = a.session.borrow().plugin_slot(plugin).map(|(t, _)| t.id);
+            if let Some(track) = track {
+                a.dispatch(Action::Edit(
+                    faderframe_project::Command::SetPluginMonoToStereo {
+                        track,
+                        plugin,
+                        on: on.trim() != "off",
+                    },
+                ));
+                let s = a.session.borrow();
+                let layout = s.project().track(track).map(|t| t.chain_layout());
+                tracing::info!("mono-to-stereo: insert {n} {on}, the track after it {layout:?}");
+            }
+        }),
         named("log-programs", |a, arg| {
             let n = arg.trim().parse::<usize>().unwrap_or(0);
             let Some(plugin) = insert_of(a, n) else {

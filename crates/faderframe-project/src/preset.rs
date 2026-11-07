@@ -52,6 +52,9 @@ pub struct PresetPlugin {
     /// A container's chains.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chains: Vec<PresetChain>,
+    /// Mono → Stereo ([`PluginSlot::mono_to_stereo`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mono_to_stereo: bool,
 }
 
 /// A container's chain in a preset.
@@ -143,6 +146,7 @@ impl PresetPlugin {
             parameters: slot.parameters.clone(),
             state: slot.state.clone(),
             chains,
+            mono_to_stereo: slot.mono_to_stereo,
         }
     }
 
@@ -155,6 +159,7 @@ impl PresetPlugin {
             parameters: self.parameters.clone(),
             state: self.state.clone(),
             sidechain: None,
+            mono_to_stereo: self.mono_to_stereo,
         };
         built.order.push(slot.id);
         if self.plugin.is_container() && !self.chains.is_empty() {
@@ -656,6 +661,7 @@ mod tests {
             }],
             state: Some("c3RhdGU=".into()),
             sidechain: None,
+            mono_to_stereo: false,
         });
         t.sends.push(AuxSend {
             id: p.ids.allocate(),
@@ -705,6 +711,23 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_mono_to_stereo_insert_stays_one_in_a_preset() {
+        let (mut p, vox, _) = project();
+        let t = p.track_mut(vox).unwrap();
+        t.layout = ChannelLayout::Mono;
+        t.inserts[0].mono_to_stereo = true;
+        let preset = TrackPreset::capture(&p, p.track(vox).unwrap());
+        let path =
+            std::env::temp_dir().join(format!("ff-preset-m2s-{}.fftrack", std::process::id()));
+        save(&path, &preset).unwrap();
+        let loaded = load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let (t, _) = loaded.instantiate(&mut p, Some("Guitar"));
+        assert!(t.inserts[0].mono_to_stereo);
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
     }
 
     #[test]
@@ -761,6 +784,7 @@ mod tests {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let echo = PluginSlot {
             id: p.ids.allocate(),
@@ -769,6 +793,7 @@ mod tests {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let mut wet = Chain::new("Wet");
         wet.gain_db = -6.0;

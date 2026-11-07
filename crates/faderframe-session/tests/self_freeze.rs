@@ -34,6 +34,7 @@ fn slot(p: &mut Project, id: &str) -> PluginSlot {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 

@@ -21,6 +21,7 @@ fn demo_renders_bit_identically_in_parallel() {
         parameters: vec![],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     project
         .tracks

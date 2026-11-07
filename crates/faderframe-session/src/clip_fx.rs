@@ -216,6 +216,7 @@ impl Session {
                     parameters: Vec::new(),
                     state: None,
                     sidechain: None,
+                    mono_to_stereo: false,
                 });
             }
             ClipFxOp::Remove(i) if i < chain.len() => {

@@ -41,6 +41,7 @@ fn echoes() -> TestProject {
         ],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project.track_mut(t).unwrap().inserts.push(slot);
     let later = tp.track(TrackKind::Audio, "Later", ChannelLayout::Stereo);
@@ -161,6 +162,7 @@ fn a_panic_empties_the_compensating_delays() {
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         tp.project.track_mut(late).unwrap().inserts.push(slot);
         let config = EngineConfig {

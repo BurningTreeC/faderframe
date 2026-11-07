@@ -330,7 +330,8 @@ impl Session {
             | Command::RemovePlugin { track, .. }
             | Command::SetPreamp { track, .. }
             | Command::SetInstrument { track, .. }
-            | Command::SetPluginState { track, .. } => frozen(Some(*track)),
+            | Command::SetPluginState { track, .. }
+            | Command::SetPluginMonoToStereo { track, .. } => frozen(Some(*track)),
             // Its own tuning is in its frozen audio (the project's moves
             // only what plays live).
             Command::SetTuning {

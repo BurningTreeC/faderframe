@@ -97,6 +97,7 @@ fn project(
             parameters: step.parameters.clone(),
             state: step.state.clone(),
             sidechain: None,
+            mono_to_stereo: false,
         }];
     }
     let mut sources = faderframe_engine::SourceMap::new();

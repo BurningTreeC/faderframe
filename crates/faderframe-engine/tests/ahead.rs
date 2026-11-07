@@ -53,6 +53,7 @@ fn project_with(plugin: &str) -> Project {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
     }
     p
@@ -221,6 +222,7 @@ fn rendered_ahead_sounds_the_same() {
         parameters: vec![],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     project
         .tracks
@@ -390,6 +392,7 @@ fn containers_and_synced_modulators_render_ahead_alike() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let container = PluginSlot {
         id: PluginInstanceId(9_100),
@@ -398,6 +401,7 @@ fn containers_and_synced_modulators_render_ahead_alike() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let mut wet = Chain::new("Wet");
     wet.inserts.push(utility(9_101));
@@ -547,6 +551,7 @@ fn a_folder_bus_renders_ahead_as_it_plays() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     folder.volume_db = -2.0;
     folder.pan = 0.3;
@@ -650,6 +655,7 @@ fn latency_reaching_a_bus_rendered_ahead_is_compensated() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let drums = drums.id;
     let bus = project
@@ -712,6 +718,7 @@ fn faders_reaching_buses_rendered_ahead_answer_within_milliseconds() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let t = tp.project.track_mut(track).unwrap();
     t.output = OutputRouting::Track { track: bus };
@@ -783,6 +790,7 @@ fn tone_project(bus: bool) -> (Project, faderframe_engine::SourceMap) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project
         .track_mut(track)
@@ -1210,6 +1218,7 @@ fn automation_behind_latency_renders_ahead_as_it_plays() {
         parameters,
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let utility = PluginInstanceId(9_401);
     {

@@ -347,6 +347,7 @@ fn rich(dir: &Path) -> Project {
         }],
         state: Some(faderframe_engine::encode_state(b"clap state \x00\xff")),
         sidechain: None,
+        mono_to_stereo: false,
     });
     let vst3: PluginInstanceId = p.ids.allocate();
     let mut ffv3 = b"FFV3".to_vec();
@@ -365,6 +366,7 @@ fn rich(dir: &Path) -> Project {
         parameters: Vec::new(),
         state: Some(faderframe_engine::encode_state(&ffv3)),
         sidechain: None,
+        mono_to_stereo: false,
     });
     let lane = |p: &mut Project, target, pts: &[(f64, f64, CurveShape)]| AutomationLane {
         id: p.ids.allocate(),
@@ -461,6 +463,7 @@ fn rich(dir: &Path) -> Project {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let mut n1 = MidiNote {
         id: p.ids.allocate(),

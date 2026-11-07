@@ -2252,6 +2252,22 @@ impl MixerView {
                         );
                     }
                 }
+                // On a mono track: keep the plugin's stereo output (the
+                // track is stereo from here on) or fold it to mono.
+                if model.mono_to_stereo_offered(s.id) {
+                    items.push(
+                        MenuItem::new(
+                            "Mono → Stereo",
+                            Action::Edit(Command::SetPluginMonoToStereo {
+                                track: t.id,
+                                plugin: s.id,
+                                on: !s.mono_to_stereo,
+                            }),
+                        )
+                        .checked(s.mono_to_stereo)
+                        .separated(),
+                    );
+                }
                 items.push(
                     MenuItem::new(
                         if s.bypass { "Enable" } else { "Bypass" },

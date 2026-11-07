@@ -886,6 +886,7 @@ fn utility_slot(project: &mut Project, params: &[(u32, f64)]) -> PluginSlot {
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 
@@ -905,6 +906,7 @@ fn eq_slot(
             .collect(),
         state: None,
         sidechain,
+        mono_to_stereo: false,
     }
 }
 

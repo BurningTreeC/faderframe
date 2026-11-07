@@ -1181,6 +1181,7 @@ impl Session {
                     parameters: Vec::new(),
                     state: None,
                     sidechain: None,
+                    mono_to_stereo: false,
                 });
                 self.edit(Command::SetSongInserts { song, inserts })?;
                 // Like an insert on a track: a hosted plugin shows its editor.

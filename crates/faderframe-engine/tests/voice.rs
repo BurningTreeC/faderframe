@@ -32,6 +32,7 @@ fn voice_to_sound(key: f64, r: Responsiveness) -> f64 {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let track = tp.project.track_mut(t).unwrap();
     track.instrument = Some(slot);
@@ -115,6 +116,7 @@ fn chord_in_engine(glide: Glide, disconnect_input: bool) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     track.input = InputRouting::all_midi();
     let mut rd = OfflineRenderer::new(

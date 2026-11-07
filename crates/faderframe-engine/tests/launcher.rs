@@ -242,6 +242,7 @@ fn a_launched_midi_clip_plays_and_releases_the_arrangements_notes() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project.track_mut(t).unwrap().inserts.push(synth);
     let note = |tp: &mut TestProject, start: f64, length: f64| MidiNote {

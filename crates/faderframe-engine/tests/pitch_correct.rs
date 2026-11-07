@@ -52,6 +52,7 @@ fn vocal(tp: &mut TestProject, note: f64, seconds: f64) -> TrackId {
         .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project.track_mut(t).unwrap().inserts = vec![slot];
     t

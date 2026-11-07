@@ -55,6 +55,7 @@ fn delay(tp: &mut TestProject, track: TrackId, latency: u32) -> faderframe_core:
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
     id
 }
@@ -282,6 +283,7 @@ fn plugin_automation_behind_latency_follows_its_audio() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     lane(
         &mut tp,
@@ -439,6 +441,7 @@ fn a_latency_change_rebuilds_the_alignment() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let impact = h
         .apply(
@@ -491,6 +494,7 @@ fn the_linear_phase_eq_with_a_spectral_band_is_6912_late_and_compensated() {
             ],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
         let r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
         assert_eq!(r.controller.graph_stats().output_latency, 6912);
@@ -642,6 +646,7 @@ fn a_latency_change_while_playing_dips_instead_of_clicking() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let impact = h
         .apply(
@@ -754,6 +759,7 @@ fn latency_changes_in_quick_succession_all_go_in_without_a_click() {
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let impact = h
             .apply(

@@ -52,6 +52,7 @@ fn session() -> (Session, Ids) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     p.tracks.insert(0, v);
     p.tracks.insert(

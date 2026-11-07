@@ -75,6 +75,7 @@ fn processing_takes_no_page_faults() {
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let index = project.track(track).unwrap().inserts.len();
         let impact = h

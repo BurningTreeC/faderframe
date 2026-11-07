@@ -37,6 +37,7 @@ fn device(p: &mut Project, id: &str, name: &str, set: &[(u32, f64)]) -> PluginSl
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 
@@ -294,6 +295,7 @@ pub fn demo_project(sample_rate: u32) -> Project {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     echo_track.volume_db = -4.0;
     let mut space_track = Track::new(space, TrackKind::Aux, "Space", TrackColor::palette(3))

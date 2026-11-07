@@ -1327,6 +1327,33 @@ of the analysed track (the Tools view) copies its post-fader output into a
   nodes: a clip player plays the rendered file into the strip, and the
   plugin host unloads their plugins (state stays in the slots).
 
+### Mono → Stereo inserts
+
+A hosted plugin's node takes the plugin's own main port widths
+(`PluginCx::node`); the graph converts at its edges
+(`for_each_channel_route`: mono → N duplicated, N → mono averaged). So a
+stereo plugin on a mono track gets the track twice and its pair is folded
+back into the track, `(L + R) / 2` — an amp simulator's stereo preset
+(TONE3000's "Stereo Crunch Verb") plays folded to mono. A slot set to
+**Mono → Stereo** (`PluginSlot::mono_to_stereo`, `Command::SetPluginMonoToStereo`,
+Impact Graph; written in the file only when on) keeps the pair: it is one
+of the slots that widen a mono track (`PluginSlot::widens_mono`, beside the
+Guitar Station and the Hardware Insert's own switch), so the track is
+stereo from it on — `Track::chain_layout`, `layout_into`, the graph (live,
+render-ahead, captures), freezes and renders agree. Offered
+(`Session::mono_to_stereo_offered`) in the mixer's insert menu where a mono
+signal reaches a device whose main output has two channels or more, never
+for devices that widen by themselves, have their own switch, hold chains
+or sit in the input stage; refused on frozen tracks (their audio is mono).
+Not automatic: most effects report stereo ports, and every compressor
+would widen its track. Plugins are not asked for a mono input bus (their
+stereo input gets the track twice). Dev action
+`mono-to-stereo:<insert n>=<on|off>` (the selected or first audio track).
+Tests: project `a_slot_set_to_mono_to_stereo_turns_a_mono_track_stereo_after_it`,
+engine `tests/mono_to_stereo.rs` (a hosted stereo effect: folded to the
+average, or kept), session `tests/mono_to_stereo.rs`, mixer
+`a_mono_strips_insert_menu_turns_it_stereo_after_the_insert`.
+
 ### Panning
 
 Positions are −1…1 (hard left … hard right, 0 centre) everywhere: the

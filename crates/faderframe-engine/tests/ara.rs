@@ -79,6 +79,7 @@ fn song(name: &str) -> Song {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let id = slot.id;
     tp.project.track_mut(track).unwrap().inserts.push(slot);
@@ -216,6 +217,7 @@ fn an_ara_insert_behind_latency_lines_up() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     s.tp.project
         .track_mut(s.track)

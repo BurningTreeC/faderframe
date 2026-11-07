@@ -43,6 +43,7 @@ fn small_session(name: &str) -> (Session, TrackId, std::path::PathBuf) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     t.clips.push(clip);
     let at = p.tracks.len() - 1;

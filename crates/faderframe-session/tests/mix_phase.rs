@@ -296,6 +296,7 @@ fn compressor(p: &mut Project, track: TrackId, params: &[(u32, f64)]) {
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     track_mut(p, track).inserts.push(slot);
 }

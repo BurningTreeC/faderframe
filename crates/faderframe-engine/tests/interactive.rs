@@ -43,6 +43,7 @@ fn ramp_project() -> (TestProject, TrackId) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     (tp, t)
 }

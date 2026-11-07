@@ -15,6 +15,7 @@ fn preamp(p: &mut Project, model: usize) -> PluginSlot {
         parameters: vec![],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 fn render(tp: &TestProject, block: usize) -> Vec<Vec<f32>> {
@@ -49,6 +50,7 @@ fn every_console_bus_passes_audio_and_gain_zero_mutes_the_sum() {
             parameters: vec![],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         tp.project.track_mut(master).unwrap().preamp = Some(slot);
         let unity = render(&tp, 128);

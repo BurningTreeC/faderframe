@@ -48,6 +48,7 @@ fn device(
                 .collect(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
     plugin
 }

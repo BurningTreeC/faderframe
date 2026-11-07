@@ -81,6 +81,7 @@ fn plugin(tp: &mut TestProject, track: TrackId, id: &str, params: &[(u32, f64)])
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project.track_mut(track).unwrap().inserts.push(slot);
 }

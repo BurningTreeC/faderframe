@@ -22,6 +22,7 @@ fn gain(id: u64, db: f64) -> PluginSlot {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 

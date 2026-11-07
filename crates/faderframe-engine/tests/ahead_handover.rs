@@ -170,6 +170,7 @@ fn rig() -> (
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
     tp.project.track_mut(bus).unwrap().inserts.push(PluginSlot {
         id: PluginInstanceId(9_801),
@@ -178,6 +179,7 @@ fn rig() -> (
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let config = EngineConfig {
         sample_rate: SR,

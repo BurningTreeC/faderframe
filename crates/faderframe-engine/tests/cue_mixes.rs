@@ -319,6 +319,7 @@ fn delay(tp: &mut TestProject, track: TrackId, latency: u32) {
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
 }
 
@@ -478,6 +479,7 @@ fn gain(tp: &mut TestProject, track: TrackId, db: f32) {
             }],
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         });
 }
 

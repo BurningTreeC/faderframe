@@ -116,6 +116,7 @@ mod tests {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let id = slot.id;
         Command::InsertPlugin {

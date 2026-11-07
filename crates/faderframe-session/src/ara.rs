@@ -138,6 +138,7 @@ impl Session {
                     parameters: Vec::new(),
                     state: None,
                     sidechain: None,
+                    mono_to_stereo: false,
                 };
                 let id = slot.id;
                 let name = slot.plugin.name.clone();
@@ -250,6 +251,7 @@ impl Session {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let clip_id: ClipId = p.ids.allocate();
         let count = notes.len();

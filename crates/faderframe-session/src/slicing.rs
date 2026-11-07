@@ -829,6 +829,7 @@ impl Session {
                         parameters: Vec::new(),
                         state: Some(state),
                         sidechain: None,
+                        mono_to_stereo: false,
                     },
                 });
                 track = id;

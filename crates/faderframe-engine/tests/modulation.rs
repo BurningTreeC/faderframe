@@ -83,6 +83,7 @@ fn a_macro_moves_a_device_parameter_and_routes_to_one_parameter_add_up() {
         parameters: vec![],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let gain = ModTarget::Plugin {
         plugin: slot.id,
@@ -207,6 +208,7 @@ fn synth_track(tp: &mut TestProject, velocity: u8) -> (faderframe_core::TrackId,
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     tp.project.track_mut(t).unwrap().inserts.push(slot.clone());
     let note = MidiNote {
@@ -307,6 +309,7 @@ fn modulation_behind_latency_follows_its_audio() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let m = modulator(&mut tp, square.clone(), &[(ModTarget::Volume, 0.1)]);
     tp.project.track_mut(t).unwrap().modulators.push(m);
@@ -330,6 +333,7 @@ fn modulation_behind_latency_follows_its_audio() {
         }],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let utility = PluginSlot {
         id: tp.project.ids.allocate(),
@@ -338,6 +342,7 @@ fn modulation_behind_latency_follows_its_audio() {
         parameters: vec![],
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     };
     let gain = ModTarget::Plugin {
         plugin: utility.id,

@@ -231,6 +231,7 @@ fn builtin_slot(tp: &mut TestProject, id: &str, set: &[(u32, f64)]) -> PluginSlo
             .collect(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 
@@ -246,6 +247,7 @@ fn voices_slot(tp: &mut TestProject, id: &str) -> PluginSlot {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     }
 }
 

@@ -132,6 +132,7 @@ fn plugin_parameters_are_automated_through_events() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let reference = render(&tp, 1000)[500];
     lane(
@@ -167,6 +168,7 @@ fn automated_bypass_keeps_latency_alignment() {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     let plain = render(&tp, Q * 3);
     lane(

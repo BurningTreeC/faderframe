@@ -83,6 +83,7 @@ impl Session {
             parameters: from.map(|s| s.parameters.clone()).unwrap_or_default(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         }
     }
 

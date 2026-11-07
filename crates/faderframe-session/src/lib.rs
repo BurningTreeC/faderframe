@@ -23,6 +23,7 @@ mod meters;
 pub mod midi;
 pub mod midi_events;
 pub mod modulators;
+mod mono_stereo;
 pub mod notes;
 pub mod performance;
 pub mod picture_out;
@@ -4670,6 +4671,7 @@ impl Session {
                         parameters: Vec::new(),
                         state: None,
                         sidechain: None,
+                        mono_to_stereo: false,
                     })
                 } else {
                     None
@@ -4729,6 +4731,7 @@ impl Session {
                     parameters: Vec::new(),
                     state: None,
                     sidechain: None,
+                    mono_to_stereo: false,
                 };
                 // A container comes with its first chains.
                 if slot.plugin.is_container() {
@@ -5275,6 +5278,7 @@ impl Session {
                         parameters: Vec::new(),
                         state: None,
                         sidechain: None,
+                        mono_to_stereo: false,
                     };
                     commands.push(Command::InsertPlugin { track, index, slot });
                 }

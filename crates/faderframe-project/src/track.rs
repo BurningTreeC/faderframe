@@ -395,6 +395,12 @@ pub struct PluginSlot {
     /// solo) feeds the plugin's sidechain input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidechain: Option<TrackId>,
+    /// Mono → Stereo: on a mono track, the plugin's stereo output is kept
+    /// and the track is stereo from this slot on (off: the graph folds its
+    /// stereo output to the mono track, `(L + R) / 2`). Pro Tools' and
+    /// Logic's mono-to-stereo insert; see [`Self::widens_mono`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mono_to_stereo: bool,
 }
 
 impl PluginSlot {
@@ -404,10 +410,12 @@ impl PluginSlot {
     }
 
     /// Turns a mono track stereo from here on: a device that always does
-    /// ([`PluginRef::widens_mono`]) or a Hardware Insert set to Mono →
-    /// Stereo (a mono track sent to two outputs, its return a pair).
+    /// ([`PluginRef::widens_mono`]), a slot set to Mono → Stereo
+    /// ([`Self::mono_to_stereo`]) or a Hardware Insert set to Mono → Stereo
+    /// (a mono track sent to two outputs, its return a pair).
     pub fn widens_mono(&self) -> bool {
         self.plugin.widens_mono()
+            || self.mono_to_stereo
             || (self.plugin.format == PluginFormat::Builtin
                 && self.plugin.id == faderframe_core::builtin::HARDWARE_INSERT
                 && self
@@ -921,6 +929,7 @@ mod tests {
             parameters: Vec::new(),
             state: None,
             sidechain: None,
+            mono_to_stereo: false,
         };
         let mut t = Track::new(
             TrackId(1),
@@ -944,6 +953,52 @@ mod tests {
         let bed = ChannelLayout::Surround(faderframe_core::surround::SurroundFormat::S51);
         t.layout = bed;
         assert_eq!(t.chain_layout(), bed);
+    }
+
+    #[test]
+    fn a_slot_set_to_mono_to_stereo_turns_a_mono_track_stereo_after_it() {
+        let slot = |id: u64| PluginSlot {
+            id: PluginInstanceId(id),
+            plugin: PluginRef {
+                format: PluginFormat::Clap,
+                id: "com.tone3000.plugin".into(),
+                name: "TONE3000".into(),
+            },
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+            mono_to_stereo: false,
+        };
+        let mut t = Track::new(
+            TrackId(1),
+            TrackKind::Audio,
+            "Guitar",
+            TrackColor::palette(0),
+        );
+        t.inserts.push(slot(2));
+        t.inserts.push(slot(3));
+        assert_eq!(t.chain_layout(), ChannelLayout::Mono);
+        // Written only when on: older files load as they were.
+        let json = serde_json::to_string(&t.inserts[0]).unwrap();
+        assert!(!json.contains("mono_to_stereo"), "{json}");
+        t.inserts[0].mono_to_stereo = true;
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
+        assert_eq!(
+            t.layout_into(PluginInstanceId(2)),
+            Some(ChannelLayout::Mono)
+        );
+        assert_eq!(
+            t.layout_into(PluginInstanceId(3)),
+            Some(ChannelLayout::Stereo),
+            "the insert after it gets the pair"
+        );
+        let json = serde_json::to_string(&t.inserts[0]).unwrap();
+        let back: PluginSlot = serde_json::from_str(&json).unwrap();
+        assert!(back.mono_to_stereo);
+        // A stereo track stays as it is.
+        t.layout = ChannelLayout::Stereo;
+        assert_eq!(t.chain_layout(), ChannelLayout::Stereo);
     }
 
     #[test]

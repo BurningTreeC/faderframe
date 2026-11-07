@@ -2679,6 +2679,7 @@ fn small_session(name: &str) -> (Session, TrackId, std::path::PathBuf) {
         parameters: Vec::new(),
         state: None,
         sidechain: None,
+        mono_to_stereo: false,
     });
     t.clips.push(clip);
     let at = p.tracks.len() - 1;
@@ -2869,6 +2870,70 @@ fn an_inserts_menu_shows_its_ara_binding() {
     );
     // Not an ARA plug-in: it plays as an ordinary insert.
     assert!(s.ara_rendered_tracks().is_empty());
+}
+
+/// A mono strip's insert menu offers Mono → Stereo for a device with a
+/// stereo output: checked once set, and the strip is stereo after it.
+#[test]
+fn a_mono_strips_insert_menu_turns_it_stereo_after_the_insert() {
+    let mut s = session();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    s.dispatch(Action::Edit(Command::SetTrackLayout {
+        track: t,
+        layout: faderframe_core::ChannelLayout::Mono,
+    }))
+    .unwrap();
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::REVERB, "Reverb"),
+    })
+    .unwrap();
+    let slot = s.project().track(t).unwrap().inserts[0].id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1600.0, 760.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let entry = |view: &mut MixerView, s: &Session| {
+        let l = view.layout_of(s, t, size).unwrap();
+        let at = l.inserts.unwrap()[0];
+        let (_, req) = run(view, right(at.center()), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("the insert menu")
+        };
+        items.into_iter().find(|i| i.label == "Mono → Stereo")
+    };
+    let off = entry(&mut view, &s).expect("offered on a mono track");
+    assert_eq!(off.checked, Some(false));
+    let Some(action) = off.action else {
+        panic!("it does something")
+    };
+    assert_eq!(
+        action,
+        Action::Edit(Command::SetPluginMonoToStereo {
+            track: t,
+            plugin: slot,
+            on: true
+        })
+    );
+    s.dispatch(action).unwrap();
+    assert_eq!(
+        s.project().track(t).unwrap().chain_layout(),
+        faderframe_core::ChannelLayout::Stereo
+    );
+    view.paint(&mut p, size, &s, &theme);
+    let on = entry(&mut view, &s).expect("offered to turn it off");
+    assert_eq!(on.checked, Some(true));
 }
 
 /// An instrument strip's menu chooses the tuning it plays and how its
