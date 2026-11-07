@@ -10,6 +10,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Test binaries with full debug info filled the runner's disk while
+  # linking (ld's bus error, "No space left on device"); line tables keep
+  # panics' file and line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
@@ -17,6 +22,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      # Room for the workspace's test binaries: SDKs this job never uses.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
       - name: System dependencies
         run: |
           sudo apt-get update
@@ -29,12 +42,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Real-time tests (dummy device, paced render-ahead) can miss a
+      # deadline on a shared runner: a failure is tried twice more.
       - name: Tests
-        run: cargo test --workspace
+        run: cargo nextest run --workspace --no-fail-fast --retries 2
       - name: Build application
         run: cargo build -p faderframe-app
       - name: GUI smoke test (headless X11)

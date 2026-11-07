@@ -31,6 +31,12 @@ pub use alsa::{UmpClient, UmpWriter};
 #[cfg(target_os = "macos")]
 mod core_midi;
 
+// FaderFrame's own CoreMIDI destination (the C API: the crate's version
+// dereferences a null pointer).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod own_destination;
+
 #[cfg(target_os = "macos")]
 pub use core_midi::{UmpClient, UmpWriter};
 

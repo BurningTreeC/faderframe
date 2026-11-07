@@ -206,7 +206,11 @@ fn a_jump_cancels_first_frame_changes_not_yet_sent() {
     // Jump away before the program change (a second behind the dump) went.
     s.dispatch(Action::Transport(TransportAction::Locate(q(1.0))))
         .unwrap();
-    for _ in 0..400 {
+    // Past the program change's time, by the wall clock — not by ticks: a
+    // slow machine's sleeps overshoot, and from beat 1 the song plays into
+    // C again 2.75 s on (its gear sent anew, rightly).
+    let watch = Instant::now();
+    while watch.elapsed() < Duration::from_millis(1600) {
         s.tick(0.003);
         std::thread::sleep(Duration::from_millis(3));
     }

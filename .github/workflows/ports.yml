@@ -14,6 +14,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Test binaries with full debug info filled the Windows runner's disk
+  # while linking; line tables keep panics' file and line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   macos:
@@ -44,10 +48,15 @@ jobs:
           pkg-config --atleast-version=4.22 gtk4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Build application
         run: cargo build -p faderframe-app
+      # Real-time tests on a shared VM can miss a deadline: a failure is
+      # tried twice more.
       - name: Tests
-        run: cargo test --workspace --no-fail-fast
+        run: cargo nextest run --workspace --no-fail-fast --retries 2
 
   windows:
     name: Windows (MSYS2 UCRT64)

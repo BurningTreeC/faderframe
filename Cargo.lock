@@ -1091,7 +1091,10 @@ name = "faderframe-midi-ump"
 version = "0.41.0"
 dependencies = [
  "alsa-sys",
+ "block2",
+ "core-foundation",
  "coremidi",
+ "coremidi-sys",
  "faderframe-midi",
  "faderframe-realtime",
  "libc",

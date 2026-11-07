@@ -71,10 +71,27 @@ pub struct Graph {
 }
 
 /// `path` as a `file://` URL (bytes outside the unreserved set and `/`
-/// percent-encoded).
+/// percent-encoded; Windows paths as `file:///C:/…`).
 pub fn file_url(path: &Path) -> String {
+    url_of(&path.to_string_lossy(), cfg!(windows))
+}
+
+fn url_of(path: &str, windows: bool) -> String {
+    // Windows: separators as `/`, a drive's path after the empty host
+    // (else the whole path is taken for the host, and names relative to a
+    // file in the bundle do not resolve).
+    let path = if windows {
+        let p = path.replace('\\', "/");
+        if p.as_bytes().get(1) == Some(&b':') {
+            format!("/{p}")
+        } else {
+            p
+        }
+    } else {
+        path.to_string()
+    };
     let mut out = String::from("file://");
-    for b in path.to_string_lossy().bytes() {
+    for b in path.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
             out.push(b as char);
         } else {
@@ -86,6 +103,10 @@ pub fn file_url(path: &Path) -> String {
 
 /// The path of a `file://` URL.
 pub fn url_path(url: &str) -> Option<PathBuf> {
+    path_of(url, cfg!(windows)).map(PathBuf::from)
+}
+
+fn path_of(url: &str, windows: bool) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     // `file://localhost/…` or `file:///…`.
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
@@ -106,7 +127,12 @@ pub fn url_path(url: &str) -> Option<PathBuf> {
         out.push(bytes[i]);
         i += 1;
     }
-    Some(PathBuf::from(String::from_utf8_lossy(&out).into_owned()))
+    let path = String::from_utf8_lossy(&out).into_owned();
+    // Windows: `/C:/…` is the drive's.
+    if windows && path.as_bytes().get(2) == Some(&b':') && path.starts_with('/') {
+        return Some(path[1..].replace('/', "\\"));
+    }
+    Some(path)
 }
 
 impl Graph {
@@ -276,5 +302,22 @@ mod tests {
             "file:///a%20b/c",
             "spaces are encoded"
         );
+    }
+
+    #[test]
+    fn windows_paths_are_urls_with_a_drive_after_the_host() {
+        let url = url_of(r"C:\Users\a b\x.lv2\manifest.ttl", true);
+        assert_eq!(url, "file:///C%3A/Users/a%20b/x.lv2/manifest.ttl");
+        assert_eq!(
+            path_of(&url, true).as_deref(),
+            Some(r"C:\Users\a b\x.lv2\manifest.ttl")
+        );
+        // A name relative to the manifest resolves inside the bundle.
+        assert_eq!(
+            path_of("file:///C%3A/Users/a%20b/x.lv2/none_ui.so", true).as_deref(),
+            Some(r"C:\Users\a b\x.lv2\none_ui.so")
+        );
+        // Unix paths as they were.
+        assert_eq!(path_of("file:///a%20b/c", false).as_deref(), Some("/a b/c"));
     }
 }

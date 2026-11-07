@@ -20,3 +20,8 @@ libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coremidi = "0.9"
+# FaderFrame's own destination (`own_destination`): the versions coremidi
+# uses.
+coremidi-sys = "3.2"
+block2 = "0.6"
+core-foundation = "0.10"

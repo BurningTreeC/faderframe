@@ -1048,7 +1048,9 @@ pub(crate) mod tests {
             s += b.power_a + b.power_b + 2.0 * f(b);
             e += b.power_a + b.power_b;
         }
-        10.0 * (s / e).log10()
+        // A sum that cancels is zero give or take rounding, either side of
+        // it (Windows' maths library lands below): as `ratio_db` does.
+        10.0 * (s.max(0.0) / e).log10()
     }
 
     fn lag(p: &PairPhase) -> LagEstimate {

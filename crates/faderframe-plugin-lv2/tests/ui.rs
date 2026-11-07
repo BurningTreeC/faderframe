@@ -339,7 +339,7 @@ fn serial_of(line: &str) -> u32 {
 
 #[test]
 fn the_bundles_uis_are_found_by_either_binary() {
-    let _turn = TURN.lock().unwrap();
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let m = model("ui:ui <urn:faderframe:test#x11-ui> , <urn:faderframe:test#external-ui>");
     assert_eq!(m.uis.len(), 2, "{:?}", m.uis);
     let x11 = m.uis.iter().find(|u| u.is_x11()).unwrap();
@@ -357,7 +357,7 @@ fn the_bundles_uis_are_found_by_either_binary() {
 
 #[test]
 fn an_embedded_ui_reaches_its_instance_and_is_made_again_with_it() {
-    let _turn = TURN.lock().unwrap();
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     KIND.with(|k| k.set(Kind::X11));
     take_log();
     let mut inst =
@@ -406,7 +406,7 @@ fn an_embedded_ui_reaches_its_instance_and_is_made_again_with_it() {
 
 #[test]
 fn an_external_ui_shows_its_own_window_until_the_user_closes_it() {
-    let _turn = TURN.lock().unwrap();
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     KIND.with(|k| k.set(Kind::External));
     take_log();
     let mut inst = instance("ui:ui <urn:faderframe:test#external-ui>");

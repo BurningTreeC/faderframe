@@ -1,5 +1,7 @@
 //! CoreMIDI's MIDI 2.0 API (macOS 11 and later), through the `coremidi`
-//! crate (which holds the FFI; nothing here is `unsafe`).
+//! crate (which holds the FFI; nothing here is `unsafe`) — but for
+//! FaderFrame's own destination, made in `crate::own_destination` (the
+//! crate's dereferences a null pointer at every message).
 //!
 //! One CoreMIDI client: an input port speaking MIDI 2.0
 //! (`MIDIInputPortCreateWithProtocol`) connected to the MIDI 2.0 sources
@@ -12,10 +14,11 @@
 //! each one a stable `(client, port)` pair by its unique id — FaderFrame's
 //! own destination is `(0, 0)`.
 
+use crate::own_destination::OwnDestination;
 use crate::{Claimed, UmpPort};
 use coremidi::{
     Client, Destination, Destinations, EventBuffer, EventList, InputPortWithContext, Object,
-    OutputPort, Properties, Protocol, Source, Sources, VirtualDestination,
+    OutputPort, Properties, Protocol, Source, Sources,
 };
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -39,16 +42,21 @@ struct Reader(Mutex<Option<OnPacket>>);
 
 impl Reader {
     fn deliver(&self, from: (u8, u8), list: &EventList) {
+        for p in list.iter() {
+            self.deliver_words(from, p.data());
+        }
+    }
+
+    /// One event packet's words.
+    fn deliver_words(&self, from: (u8, u8), words: &[u32]) {
         let Ok(mut reader) = self.0.lock() else {
             return;
         };
         let Some(on_packet) = reader.as_mut() else {
             return;
         };
-        for p in list.iter() {
-            for ump in faderframe_midi::ump::packets(p.data()) {
-                on_packet(from, ump.words());
-            }
+        for ump in faderframe_midi::ump::packets(words) {
+            on_packet(from, ump.words());
         }
     }
 }
@@ -61,7 +69,7 @@ pub struct UmpClient {
     input: Mutex<InputPortWithContext<(u8, u8)>>,
     output: Arc<OutputPort>,
     /// Programs send here; disposed of when the client goes.
-    own: VirtualDestination,
+    _own: OwnDestination,
     own_id: Option<u32>,
     reader: Arc<Reader>,
     addresses: Mutex<crate::addresses::Addresses>,
@@ -92,19 +100,16 @@ impl UmpClient {
             .output_port(&format!("{name} Out"))
             .map_err(|s| err("MIDI 2.0 output port", s))?;
         let r = Arc::clone(&reader);
-        let own = client
-            .virtual_destination_with_protocol(
-                &format!("{name} In"),
-                Protocol::Midi20,
-                move |list: &EventList| r.deliver(OWN_INPUT, list),
-            )
-            .map_err(|s| err("MIDI 2.0 destination", s))?;
+        let own = OwnDestination::create(name, &format!("{name} In"), move |words| {
+            r.deliver_words(OWN_INPUT, words)
+        })
+        .map_err(|s| err("MIDI 2.0 destination", s))?;
         let own_id = own.unique_id();
         Ok(Self {
             _client: client,
             input: Mutex::new(input),
             output: Arc::new(output),
-            own,
+            _own: own,
             own_id,
             reader,
             addresses: Mutex::default(),
@@ -252,7 +257,11 @@ impl UmpClient {
 
     /// The name of FaderFrame's own destination as other programs see it.
     pub fn input_name(&self) -> Option<String> {
-        self.own.display_name()
+        let id = self.own_id?;
+        Destinations
+            .into_iter()
+            .find(|d| d.unique_id() == Some(id))
+            .and_then(|d| d.display_name())
     }
 }
 
