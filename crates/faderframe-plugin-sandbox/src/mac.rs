@@ -132,6 +132,16 @@ impl EditorWindow {
         self.window.orderOut(None);
     }
 
+    /// Above the windows of every application (the floating level), or
+    /// not.
+    pub fn set_above(&mut self, on: bool) {
+        self.window.setLevel(if on {
+            objc2_app_kit::NSFloatingWindowLevel
+        } else {
+            objc2_app_kit::NSNormalWindowLevel
+        });
+    }
+
     pub fn resize(&mut self, size: (u32, u32)) {
         let s = NSSize::new(f64::from(size.0.max(1)), f64::from(size.1.max(1)));
         self.size = size;

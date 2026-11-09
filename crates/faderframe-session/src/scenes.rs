@@ -338,6 +338,7 @@ fn keeps_scene_work(action: &Action) -> bool {
             | Action::Head(_)
             | Action::OpenPluginEditor { .. }
             | Action::SetDeviceView { .. }
+            | Action::SetPluginWindowOnTop { .. }
             | Action::SetAnalysisSource(_)
             | Action::ResetAnalysis
             | Action::ShowGlobalLane(..)

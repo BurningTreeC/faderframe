@@ -325,6 +325,12 @@ pub trait PluginEditor {
     fn close(&mut self);
     /// Bring a floating editor's window to the front.
     fn raise(&mut self) {}
+    /// Keep a floating editor's window above every other window, or not,
+    /// where that window is one its format's host side owns (a sandbox
+    /// helper's own window); `false`: it cannot.
+    fn set_above(&mut self, _on: bool) -> bool {
+        false
+    }
     fn is_open(&self) -> bool;
     fn can_resize(&mut self) -> bool;
     /// Ask for a new size; returns the size actually applied.

@@ -522,6 +522,12 @@ impl Helper {
                 }
                 return (Response::Done, Vec::new());
             }
+            EditorCall::SetAbove(on) => {
+                if let Some(w) = self.window.as_mut() {
+                    w.set_above(on);
+                    return (Response::Flag(true), Vec::new());
+                }
+            }
             _ => {}
         }
         let resp = match call {
@@ -552,6 +558,7 @@ impl Helper {
             }
             EditorCall::CanResize => Response::Flag(ed.can_resize()),
             EditorCall::SetSize { width, height } => Response::Size(ed.set_size(width, height)),
+            EditorCall::SetAbove(on) => Response::Flag(ed.set_above(on)),
         };
         (resp, Vec::new())
     }

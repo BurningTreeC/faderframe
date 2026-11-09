@@ -22,6 +22,34 @@ use gtk::{gdk, prelude::*};
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// A window of another display (GDK's X11 one) editor windows there are
+/// transient for; never shown. GTK marks a window with a transient parent
+/// a dialog (`WM_TRANSIENT_FOR`, `_NET_WM_WINDOW_TYPE_DIALOG`) and writes
+/// "normal" over a type set by hand when it maps one without: window
+/// managers, tiling ones too, float dialogs.
+pub fn anchor(display: &gdk::Display) -> gtk::Window {
+    thread_local! {
+        static ANCHORS: std::cell::RefCell<Vec<gtk::Window>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    ANCHORS.with(|a| {
+        if let Some(w) = a
+            .borrow()
+            .iter()
+            .find(|w| WidgetExt::display(*w) == *display)
+        {
+            return w.clone();
+        }
+        let w = gtk::Window::builder()
+            .display(display)
+            .title("FaderFrame")
+            .build();
+        WidgetExt::realize(&w);
+        a.borrow_mut().push(w.clone());
+        w
+    })
+}
+
 /// A rectangle in backend pixels: x, y, width, height.
 pub type Room = (i32, i32, u32, u32);
 
@@ -78,6 +106,7 @@ impl Frame {
             // work here and it looks like the others.
             window.insert_action_group("app", Some(&app.app));
             crate::style::add_display(&display, &app.theme.borrow());
+            window.set_transient_for(Some(&anchor(&display)));
         }
         window.set_titlebar(Some(header));
         let area = gtk::DrawingArea::new();

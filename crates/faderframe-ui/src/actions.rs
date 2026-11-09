@@ -1273,6 +1273,28 @@ pub fn install(app: &Rc<AppState>) {
                 crate::plugin_window::click_device(x, y, button);
             }
         }),
+        // Development aid: `window-on-top:<on|off>` keeps the windows of the
+        // editor opened last (a device's or a plugin's own GUI) on top (or
+        // `<plugin id>=<on|off>`).
+        named("window-on-top", |a, arg| {
+            let (plugin, on) = match arg.split_once('=') {
+                Some((id, on)) => (
+                    id.trim()
+                        .parse::<u64>()
+                        .ok()
+                        .map(faderframe_core::PluginInstanceId),
+                    on,
+                ),
+                None => (crate::plugin_window::latest_editor(), arg),
+            };
+            match plugin {
+                Some(plugin) => a.dispatch(Action::SetPluginWindowOnTop {
+                    plugin,
+                    on: on.trim() == "on",
+                }),
+                None => tracing::warn!("window-on-top: no plugin ({arg})"),
+            }
+        }),
         // Development aid: `device-set:<id>=<value>[/<id>=<value>…]` sets
         // parameters of the device editor opened last.
         named("device-set", |a, arg| {

@@ -1004,6 +1004,10 @@ impl PluginEditor for RemoteInstance {
         }
     }
 
+    fn set_above(&mut self, on: bool) -> bool {
+        self.editor_open && self.flag(EditorCall::SetAbove(on))
+    }
+
     fn close(&mut self) {
         self.changes.editor += 1;
         if self.editor_open {

@@ -5023,8 +5023,11 @@ plugins size their editors in). Backends add `frame_display`,
   layout, font and icon theme. The embedding window is an X11 child of
   the frame's with the screen's default depth, visual and colormap (GTK's
   windows are often 32-bit ARGB, which plugins drawing with the default
-  visual cannot use). The frame is marked a dialog (window managers float
-  it). On close the embedding window is reparented to the root and
+  visual cannot use). The frame is transient for a hidden anchor window
+  of that display (`frame::anchor`), so GTK marks it a dialog
+  (`WM_TRANSIENT_FOR`, `_NET_WM_WINDOW_TYPE_DIALOG`) and window managers,
+  tiling ones too, float it — a type set by hand GTK writes over with
+  "normal" when it maps a window without a transient parent. On close the embedding window is reparented to the root and
   retired like the plain windows (`release_child`, with a round trip so
   the server has done that before GTK destroys its window).
 * Windows: a `WS_CHILD` window of GTK's (from `Win32Surface::handle`,
@@ -5052,6 +5055,52 @@ plugin's own resize with another). Frames are moved to their stored place
 once shown (GTK cannot place windows; the backends can). The plugin
 closes its GUI before its window and the frame go.
 `FADERFRAME_EDITOR_HEADER=0` keeps the plain windows.
+
+**Keep on Top.** A plugin's editor windows stay above every other window
+while `Session::plugin_window_on_top` says so (`WorkspaceSet::plugin_windows_on_top`,
+saved with the project like the positions; `Action::SetPluginWindowOnTop`,
+not an undo step), set by the pin at the right of the editor header
+(`on_top::button`, following changes made elsewhere) or the mixer insert
+menu's "Keep Window on Top". `on_top::keep` (every sixth UI tick) brings
+the open windows in line, asking each window once per change (and again
+while one is not on screen yet, `PATIENCE`):
+
+* Backends' `set_above(win, on)` / `set_surface_above(surface, on)` /
+  `mapped`: Windows `SetWindowPos(HWND_TOPMOST | HWND_NOTOPMOST)` (the
+  plugin's child window comes along); macOS the floating window level on
+  GTK's `NSWindow` and the frame's child window; X11 the EWMH request to
+  the root window (`_NET_WM_STATE` add/remove `_NET_WM_STATE_ABOVE`, source
+  1), which X11 window managers and GNOME's, KDE's and most other Wayland
+  compositors honour for XWayland windows (test
+  `the_window_manager_is_asked_to_keep_a_window_above`, ignored: needs an
+  X server).
+* Wayland has no such request (a "keep above" protocol is only proposed,
+  wayland-protocols MR 369): on the Native route a built-in editor or
+  parameter window kept on top opens on GDK's X11 display instead
+  (`on_top::display_for` in `editor_window`; an open one is reopened
+  there, `reopen_on_its_display`), transient for the anchor like the
+  frames.
+* Hyprland reads no `_NET_WM_STATE_ABOVE` (its XWM lists no such atom)
+  and pins instead (pinned floating windows are drawn above all, on every
+  workspace): `crate::hyprland` over `$XDG_RUNTIME_DIR/hypr/<sig>/.socket.sock`
+  finds FaderFrame's windows by pid and title in `j/clients` and floats
+  and pins them — Hyprland 0.56's Lua dispatchers
+  (`hl.dsp.window.pin({ action = "on", window = "address:…" })`) first,
+  else the older `setfloating`/`pin` (`commands`, the syntax remembered).
+  The route is chosen once (`on_top::route`; `FADERFRAME_ON_TOP=x11|hyprland`
+  forces one).
+* A plugin's own floating window: its host side keeps it where it owns
+  it (`PluginEditor::set_above`; the sandbox's `EditorCall::SetAbove`, the
+  macOS helper's window at the floating level); else on Linux it is found
+  by title among the windows of FaderFrame and its helpers (Hyprland's
+  list, or the window manager's `_NET_CLIENT_LIST` with `_NET_WM_PID`,
+  `Parents::windows_titled`).
+* Where nothing can (Wayland without XWayland, not Hyprland) the pin is
+  insensitive and says why. Sway honours neither request; its floating
+  windows (the editors are dialogs) stay above tiled ones.
+
+Dev action `window-on-top:<on|off>` (the editor opened last,
+`latest_editor`) or `<plugin id>=<on|off>`.
 
 ### A/B compare and a device's own undo
 

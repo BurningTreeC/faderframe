@@ -117,6 +117,7 @@ fn view_only(action: &Action) -> bool {
             | Action::SetStripWidth { .. }
             | Action::SetMixerInsertSlots(_)
             | Action::SetPluginWindowPosition { .. }
+            | Action::SetPluginWindowOnTop { .. }
             | Action::SetMeterMode { .. }
             | Action::SetVuReference(_)
             | Action::SetMeterBridge(_)

@@ -40,6 +40,8 @@ pub mod gpu;
 #[cfg(windows)]
 mod gpu_win32;
 mod head_tracking;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod hyprland;
 mod icons;
 mod interchange;
 mod learn;

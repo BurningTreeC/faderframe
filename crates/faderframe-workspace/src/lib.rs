@@ -202,6 +202,10 @@ pub struct WorkspaceSet {
     /// its top-left corner); new editors open centred.
     #[serde(default)]
     pub plugin_windows: std::collections::BTreeMap<faderframe_core::PluginInstanceId, (i32, i32)>,
+    /// Plugins whose editor windows stay above other windows ("Keep on
+    /// Top").
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub plugin_windows_on_top: std::collections::BTreeSet<faderframe_core::PluginInstanceId>,
     /// Insert slots per mixer strip (`None` = [`DEFAULT_INSERT_SLOTS`]).
     #[serde(default)]
     pub mixer_insert_slots: Option<u16>,
@@ -340,6 +344,7 @@ impl Default for WorkspaceSet {
             automation_shown: Default::default(),
             header_width: None,
             plugin_windows: Default::default(),
+            plugin_windows_on_top: Default::default(),
             mixer_insert_slots: None,
             strip_width: None,
             strip_widths: Default::default(),

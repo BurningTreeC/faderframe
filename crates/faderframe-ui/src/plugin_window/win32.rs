@@ -22,11 +22,12 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    GWL_STYLE, GetWindowLongPtrW, GetWindowRect, IDC_ARROW, IsIconic, LoadCursorW,
-    RegisterClassExW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WM_CLOSE, WM_SIZE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW, WS_SYSMENU,
+    GWL_STYLE, GetWindowLongPtrW, GetWindowRect, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, IsIconic,
+    IsWindowVisible, LoadCursorW, RegisterClassExW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_SIZE, WNDCLASSEXW, WS_CAPTION,
+    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
+    WS_SYSMENU,
 };
 
 thread_local! {
@@ -272,6 +273,39 @@ impl Parents {
 
     /// Window types are an X11 matter.
     pub fn set_dialog(&self, _win: u64) {}
+
+    /// Keep a window above every other one (topmost), or not; its child
+    /// windows (the plugin's GUI) come with it.
+    pub fn set_above(&self, win: u64, on: bool) {
+        // SAFETY: `win` is a window of ours or GTK's on this thread.
+        unsafe {
+            SetWindowPos(
+                hwnd(win),
+                if on { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Whether a window is on screen.
+    pub fn mapped(&self, win: u64) -> bool {
+        // SAFETY: a plain query of a window handle.
+        unsafe { IsWindowVisible(hwnd(win)) != 0 }
+    }
+
+    /// [`set_above`](Self::set_above) for a GTK window's surface.
+    pub fn set_surface_above(&self, surface: &gdk::Surface, on: bool) -> Option<bool> {
+        let win = self.frame_handle(surface)?;
+        if !self.mapped(win) {
+            return Some(false);
+        }
+        self.set_above(win, on);
+        Some(true)
+    }
 
     /// A window's size.
     pub fn size(&self, win: u64) -> Option<(u32, u32)> {

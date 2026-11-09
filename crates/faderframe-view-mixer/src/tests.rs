@@ -2872,6 +2872,59 @@ fn an_inserts_menu_shows_its_ara_binding() {
     assert!(s.ara_rendered_tracks().is_empty());
 }
 
+/// An insert's menu keeps its editor windows on top, and shows it.
+#[test]
+fn an_inserts_menu_keeps_its_window_on_top() {
+    let mut s = session();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Gain"),
+    })
+    .unwrap();
+    let slot = s.project().track(t).unwrap().inserts[0].id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1600.0, 760.0);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let entry = |view: &mut MixerView, s: &Session| {
+        let l = view.layout_of(s, t, size).unwrap();
+        let at = l.inserts.unwrap()[0];
+        let (_, req) = run(view, right(at.center()), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("the insert menu")
+        };
+        items
+            .into_iter()
+            .find(|i| i.label == "Keep Window on Top")
+            .unwrap()
+    };
+    let item = entry(&mut view, &s);
+    assert_eq!(item.checked, Some(false));
+    s.dispatch(item.action.unwrap()).unwrap();
+    assert!(s.plugin_window_on_top(slot));
+    let item = entry(&mut view, &s);
+    assert_eq!(item.checked, Some(true));
+    assert_eq!(
+        item.action,
+        Some(Action::SetPluginWindowOnTop {
+            plugin: slot,
+            on: false
+        })
+    );
+}
+
 /// A mono strip's insert menu offers Mono → Stereo for a device with a
 /// stereo output: checked once set, and the strip is stereo after it.
 #[test]

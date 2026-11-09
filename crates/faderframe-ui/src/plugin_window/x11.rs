@@ -28,6 +28,9 @@ struct Atoms {
     net_wm_window_type: xproto::Atom,
     net_wm_window_type_dialog: xproto::Atom,
     net_wm_pid: xproto::Atom,
+    net_wm_state: xproto::Atom,
+    net_wm_state_above: xproto::Atom,
+    net_client_list: xproto::Atom,
 }
 
 pub struct Parents {
@@ -129,6 +132,9 @@ impl Parents {
             net_wm_window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
             net_wm_window_type_dialog: atom(b"_NET_WM_WINDOW_TYPE_DIALOG")?,
             net_wm_pid: atom(b"_NET_WM_PID")?,
+            net_wm_state: atom(b"_NET_WM_STATE")?,
+            net_wm_state_above: atom(b"_NET_WM_STATE_ABOVE")?,
+            net_client_list: atom(b"_NET_CLIENT_LIST")?,
         };
         Ok(Self {
             conn,
@@ -366,6 +372,99 @@ impl Parents {
         let _ = self.conn.flush();
     }
 
+    /// Whether a window is on screen (the window manager has it).
+    pub fn mapped(&self, win: u64) -> bool {
+        self.conn
+            .get_window_attributes(id(win))
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|a| a.map_state == xproto::MapState::VIEWABLE)
+    }
+
+    /// Ask the window manager to keep a mapped window above the others,
+    /// or not (EWMH `_NET_WM_STATE_ABOVE`: a mapped window's state is the
+    /// window manager's, so it is asked by a message to the root window).
+    /// Honoured by X11 window managers and by GNOME's, KDE's and other
+    /// Wayland compositors for XWayland windows.
+    pub fn set_above(&self, win: u64, on: bool) {
+        let a = &self.atoms;
+        // Action (1 add, 0 remove), the state, no second one, source 1
+        // (an application).
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            id(win),
+            a.net_wm_state,
+            [u32::from(on), a.net_wm_state_above, 0, 1, 0],
+        );
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            event,
+        );
+        let _ = self.conn.flush();
+    }
+
+    /// The window manager's windows (`_NET_CLIENT_LIST`) titled `title` of
+    /// processes `ours` takes (`_NET_WM_PID`): a plugin's own window.
+    pub fn windows_titled(&self, title: &str, ours: &dyn Fn(u32) -> bool) -> Vec<u64> {
+        let a = &self.atoms;
+        let list = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                a.net_client_list,
+                xproto::AtomEnum::WINDOW,
+                0,
+                4096,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let Some(list) = list else {
+            return Vec::new();
+        };
+        let Some(windows) = list.value32() else {
+            return Vec::new();
+        };
+        let property = |win: xproto::Window, atom: xproto::Atom, kind: xproto::Atom| {
+            self.conn
+                .get_property(false, win, atom, kind, 0, 1024)
+                .ok()
+                .and_then(|c| c.reply().ok())
+        };
+        windows
+            .filter(|&win| {
+                let pid = property(win, a.net_wm_pid, xproto::AtomEnum::CARDINAL.into())
+                    .and_then(|r| r.value32().and_then(|mut v| v.next()));
+                let name = property(win, a.net_wm_name, a.utf8_string)
+                    .filter(|r| !r.value.is_empty())
+                    .or_else(|| {
+                        property(
+                            win,
+                            xproto::AtomEnum::WM_NAME.into(),
+                            xproto::AtomEnum::ANY.into(),
+                        )
+                    })
+                    .map(|r| String::from_utf8_lossy(&r.value).into_owned());
+                pid.is_some_and(ours) && name.as_deref() == Some(title)
+            })
+            .map(u64::from)
+            .collect()
+    }
+
+    /// [`set_above`](Self::set_above) for a GTK window's surface; `None`
+    /// where it is no X11 window (a Wayland one: Wayland has no such
+    /// request), `Some(false)` while it is not mapped yet.
+    pub fn set_surface_above(&self, surface: &gdk::Surface, on: bool) -> Option<bool> {
+        let win = self.frame_handle(surface)?;
+        if !self.mapped(win) {
+            return Some(false);
+        }
+        self.set_above(win, on);
+        Some(true)
+    }
+
     /// A window's size.
     pub fn size(&self, win: u64) -> Option<(u32, u32)> {
         let g = self.conn.get_geometry(id(win)).ok()?.reply().ok()?;
@@ -564,4 +663,56 @@ impl Parents {
 
 fn id(win: u64) -> xproto::Window {
     win as xproto::Window
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "Keep on Top" asks as EWMH says (a message to the root window:
+    /// add/remove `_NET_WM_STATE_ABOVE`, source an application), seen
+    /// where a window manager sees it. Needs an X server
+    /// (`cargo test -p faderframe-ui -- --ignored the_window_manager`).
+    #[test]
+    #[ignore = "needs an X server (DISPLAY)"]
+    fn the_window_manager_is_asked_to_keep_a_window_above() {
+        let x = Parents::connect().expect("an X server");
+        let win = x
+            .create_window("Above", (200, 100), false, (0, 0))
+            .expect("a window");
+        // A second client listening on the root as a window manager does
+        // (only one may redirect; anyone may be told).
+        let (watcher, _) = x11rb::connect(None).expect("an X server");
+        watcher
+            .change_window_attributes(
+                x.root,
+                &xproto::ChangeWindowAttributesAux::new()
+                    .event_mask(xproto::EventMask::SUBSTRUCTURE_NOTIFY),
+            )
+            .expect("listening")
+            .check()
+            .expect("listening");
+        for on in [true, false] {
+            x.set_above(win, on);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let message = loop {
+                assert!(std::time::Instant::now() < deadline, "no request seen");
+                match watcher.poll_for_event().expect("events") {
+                    Some(Event::ClientMessage(m))
+                        if m.window == id(win) && m.type_ == x.atoms.net_wm_state =>
+                    {
+                        break m;
+                    }
+                    Some(_) => {}
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            };
+            assert_eq!(message.format, 32);
+            assert_eq!(
+                message.data.as_data32(),
+                [u32::from(on), x.atoms.net_wm_state_above, 0, 1, 0]
+            );
+        }
+        x.destroy(win);
+    }
 }

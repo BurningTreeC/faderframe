@@ -19,7 +19,8 @@ use gtk::{gdk, glib, prelude::*};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBackingStoreType, NSResponder, NSScreen, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
+    NSBackingStoreType, NSFloatingWindowLevel, NSNormalWindowLevel, NSResponder, NSScreen,
+    NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString};
 use std::cell::{Cell, RefCell};
@@ -236,6 +237,57 @@ impl Parents {
 
     /// Window types are an X11 matter.
     pub fn set_dialog(&self, _win: u64) {}
+
+    /// Keep a window above the windows of every application (the floating
+    /// level), or not: a frame's GTK window and its editor's child window
+    /// together, or a window of ours.
+    pub fn set_above(&self, win: u64, on: bool) {
+        let level = if on {
+            NSFloatingWindowLevel
+        } else {
+            NSNormalWindowLevel
+        };
+        if let Some(top) = self.tops.borrow().get(&win) {
+            top.setLevel(level);
+            for e in self.windows.borrow().values() {
+                if e.child_of == Some(win) {
+                    e.window.setLevel(level);
+                }
+            }
+            return;
+        }
+        self.with(win, |e| e.window.setLevel(level));
+    }
+
+    /// Whether a window is on screen.
+    pub fn mapped(&self, win: u64) -> bool {
+        if let Some(top) = self.tops.borrow().get(&win) {
+            return top.isVisible();
+        }
+        self.windows
+            .borrow()
+            .get(&win)
+            .is_some_and(|e| e.window.isVisible())
+    }
+
+    /// [`set_above`](Self::set_above) for a GTK window's surface.
+    pub fn set_surface_above(&self, surface: &gdk::Surface, on: bool) -> Option<bool> {
+        let macos = glib::Type::from_name("GdkMacosSurface")?;
+        if !surface.type_().is_a(macos) {
+            return None;
+        }
+        let f = native_window()?;
+        // SAFETY: a macOS surface (checked above), borrowed for the call.
+        let ptr = unsafe { f(surface.to_glib_none().0) };
+        // SAFETY: GDK's live `NSWindow` (or NULL), retained for the call.
+        let window = unsafe { Retained::retain(ptr.cast::<NSWindow>()) }?;
+        window.setLevel(if on {
+            NSFloatingWindowLevel
+        } else {
+            NSNormalWindowLevel
+        });
+        Some(true)
+    }
 
     /// A window's frame (ours or a frame's GTK window).
     fn frame_of(&self, win: u64) -> Option<NSRect> {

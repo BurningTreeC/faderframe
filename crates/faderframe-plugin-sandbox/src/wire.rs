@@ -447,6 +447,9 @@ pub enum EditorCall {
         width: u32,
         height: u32,
     },
+    /// Keep the editor's window (one the helper owns) above every other
+    /// window, or not.
+    SetAbove(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

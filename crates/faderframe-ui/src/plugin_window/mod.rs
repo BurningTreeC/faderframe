@@ -20,6 +20,7 @@
 #[cfg(target_os = "macos")]
 mod cocoa;
 mod frame;
+mod on_top;
 #[cfg(windows)]
 mod win32;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -65,6 +66,9 @@ struct Editors {
     fds: RefCell<HashMap<(PluginInstanceId, i32), FdWatch>>,
     timers: RefCell<HashMap<(PluginInstanceId, u32), (u32, glib::SourceId)>>,
     ticks: Cell<u64>,
+    /// Editor windows' "Keep on Top" as last carried out (by window:
+    /// native handle or GTK window), [`on_top::keep`].
+    on_top: RefCell<HashMap<u64, on_top::Applied>>,
 }
 
 /// What a backend reports about its windows.
@@ -211,6 +215,84 @@ fn store_position(app: &Rc<AppState>, plugin: PluginInstanceId, pos: (i32, i32))
             x: pos.0,
             y: pos.1,
         });
+    }
+}
+
+/// Connect the platform's parent windows once (a failure is reported
+/// once and remembered).
+fn ensure_parents() {
+    EDITORS.with(|e| {
+        e.parents.borrow_mut().get_or_insert_with(|| {
+            let r = Parents::connect();
+            if let Err(err) = &r {
+                tracing::warn!("no windows for plugin editors ({err}); using generic editors");
+            }
+            r
+        });
+    });
+}
+
+/// A built-in device's or the generic parameters' editor window: on the
+/// application's display, attached to the main window — or, kept on top
+/// where only XWayland can do that (`on_top::display_for`), on GDK's X11
+/// display (as the frames of plugin GUIs; not one of the application's
+/// windows there, but its actions work and it looks the same).
+fn editor_window(
+    app: &Rc<AppState>,
+    plugin: PluginInstanceId,
+    title: &str,
+    (w, h): (i32, i32),
+) -> gtk::Window {
+    let window = match on_top::display_for(app, plugin) {
+        Some(display) => {
+            let window = gtk::Window::builder()
+                .display(&display)
+                .title(title)
+                .default_width(w)
+                .default_height(h)
+                .build();
+            window.insert_action_group("app", Some(&app.app));
+            crate::style::add_display(&display, &app.theme.borrow());
+            // A dialog, as the frames (window managers float those).
+            window.set_transient_for(Some(&frame::anchor(&display)));
+            window
+        }
+        None => {
+            let window = gtk::Window::builder()
+                .application(&app.app)
+                .title(title)
+                .default_width(w)
+                .default_height(h)
+                .build();
+            if let Some(main) = app.window.borrow().as_ref() {
+                window.set_transient_for(Some(main));
+            }
+            window
+        }
+    };
+    window.add_css_class("plugin-editor");
+    window
+}
+
+/// Open a device editor (`device`) or a parameter window of `plugin`
+/// again, on the display it belongs on now (kept on top: XWayland).
+fn reopen_on_its_display(app: &Rc<AppState>, plugin: PluginInstanceId, device: bool) {
+    if on_top::display_for(app, plugin).is_none() {
+        return;
+    }
+    let window = EDITORS.with(|e| {
+        if device {
+            e.devices.borrow_mut().remove(&plugin)
+        } else {
+            e.generic.borrow_mut().remove(&plugin)
+        }
+    });
+    let Some(window) = window else { return };
+    window.close();
+    if device {
+        open_device(app, plugin);
+    } else {
+        open_generic(app, plugin);
     }
 }
 
@@ -366,6 +448,8 @@ fn editor_header(app: &Rc<AppState>, plugin: PluginInstanceId, h: &Heading) -> g
     if let Some(compare) = crate::device_states::header_controls(app, plugin) {
         header.pack_start(&compare);
     }
+    // Rightmost: the window above every other one.
+    header.pack_end(&on_top::button(app, plugin));
     header
 }
 
@@ -648,6 +732,21 @@ fn presets_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> gtk::MenuButt
 /// Deliver a click at `(x, y)` (view pixels) to the newest device editor
 /// (development aid for scripted checks).
 /// The plugin of the device editor opened last (dev actions).
+/// The plugin whose editor (a device's, or its own GUI) opened last and
+/// is still open.
+pub fn latest_editor() -> Option<PluginInstanceId> {
+    EDITORS.with(|e| {
+        let devices = e.devices.borrow();
+        let native = e.native.borrow();
+        e.opened
+            .borrow()
+            .iter()
+            .rev()
+            .find(|p| devices.contains_key(p) || native.iter().any(|n| n.plugin == **p))
+            .copied()
+    })
+}
+
 pub fn latest_device() -> Option<PluginInstanceId> {
     EDITORS.with(|e| {
         let devices = e.devices.borrow();
@@ -721,16 +820,7 @@ fn open_device(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     };
     let (w, h) = faderframe_view_devices::editor_size(&plugin_id).unwrap_or((900, 600));
     let title = title_of(app, plugin).map_or_else(|| name.clone(), |(_, t)| t);
-    let window = gtk::Window::builder()
-        .application(&app.app)
-        .title(&title)
-        .default_width(w)
-        .default_height(h)
-        .build();
-    window.add_css_class("plugin-editor");
-    if let Some(main) = app.window.borrow().as_ref() {
-        window.set_transient_for(Some(main));
-    }
+    let window = editor_window(app, plugin, &title, (w, h));
     let header = editor_header(
         app,
         plugin,
@@ -799,15 +889,7 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     let Some((_, title)) = title_of(app, plugin) else {
         return false;
     };
-    EDITORS.with(|e| {
-        e.parents.borrow_mut().get_or_insert_with(|| {
-            let r = Parents::connect();
-            if let Err(err) = &r {
-                tracing::warn!("no windows for plugin editors ({err}); using generic editors");
-            }
-            r
-        });
-    });
+    ensure_parents();
     let api = WindowApi::NATIVE;
     let (embed, float) = {
         let Ok(mut s) = app.session.try_borrow_mut() else {
@@ -857,7 +939,12 @@ fn open_native(app: &Rc<AppState>, plugin: PluginInstanceId) -> bool {
     match opened {
         Some(n) => {
             let framed = matches!(n.host, Host::Framed(_));
-            EDITORS.with(|e| e.native.borrow_mut().push(n));
+            EDITORS.with(|e| {
+                e.native.borrow_mut().push(n);
+                let mut opened = e.opened.borrow_mut();
+                opened.retain(|p| *p != plugin);
+                opened.push(plugin);
+            });
             if framed {
                 EDITORS.with(|e| {
                     if let Some(f) = e.frames.borrow().get(&plugin) {
@@ -1051,6 +1138,10 @@ pub fn tick(app: &Rc<AppState>) {
     });
     if n.is_multiple_of(30) {
         track_positions(app);
+    }
+    // "Keep on Top" carried out (ten times a second).
+    if n.is_multiple_of(6) {
+        on_top::keep(app);
     }
     // Plugins being edited play on the audio thread (not rendered ahead):
     // what is turned is heard at once.
@@ -1508,16 +1599,7 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
     };
     let params: Vec<PluginParameterView> = app.session.borrow_mut().plugin_parameter_views(plugin);
 
-    let window = gtk::Window::builder()
-        .application(&app.app)
-        .title(&title)
-        .default_width(520)
-        .default_height(640)
-        .build();
-    window.add_css_class("plugin-editor");
-    if let Some(main) = app.window.borrow().as_ref() {
-        window.set_transient_for(Some(main));
-    }
+    let window = editor_window(app, plugin, &title, (520, 640));
 
     let header = editor_header(app, plugin, &heading);
     if has_native(app, plugin) {

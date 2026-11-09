@@ -1106,6 +1106,12 @@ pub enum Action {
         x: i32,
         y: i32,
     },
+    /// Keep a plugin's editor windows above other windows, or not (saved
+    /// with the layout; the shell applies it to open windows).
+    SetPluginWindowOnTop {
+        plugin: faderframe_core::PluginInstanceId,
+        on: bool,
+    },
     SetGrid(GridDivision),
     ToggleSnap,
     SetEditMode(EditMode),
@@ -2432,6 +2438,11 @@ impl Session {
     /// workspace's layout).
     pub fn master_panel(&self) -> bool {
         self.workspace.active().layout.master_panel
+    }
+
+    /// Whether `plugin`'s editor windows are kept above other windows.
+    pub fn plugin_window_on_top(&self, plugin: faderframe_core::PluginInstanceId) -> bool {
+        self.workspace.plugin_windows_on_top.contains(&plugin)
     }
 
     pub fn workspace(&self) -> &WorkspaceSet {
@@ -5339,6 +5350,15 @@ impl Session {
             }
             Action::SetPluginWindowPosition { plugin, x, y } => {
                 self.workspace.plugin_windows.insert(plugin, (x, y));
+            }
+            Action::SetPluginWindowOnTop { plugin, on } => {
+                let w = &mut self.workspace.plugin_windows_on_top;
+                if on {
+                    w.insert(plugin)
+                } else {
+                    w.remove(&plugin)
+                };
+                self.revision += 1;
             }
             Action::ShowAutomation { track, target } => {
                 self.show_automation(track, target)?;

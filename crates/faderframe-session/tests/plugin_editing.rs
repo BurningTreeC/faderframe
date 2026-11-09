@@ -133,6 +133,13 @@ fn editor_positions_are_saved_with_the_project() {
         y: 810,
     })
     .unwrap();
+    // Kept on top (the shell applies it to the windows).
+    assert!(!s.plugin_window_on_top(plugin));
+    let steps = s.history_steps().0.len();
+    s.dispatch(Action::SetPluginWindowOnTop { plugin, on: true })
+        .unwrap();
+    assert!(s.plugin_window_on_top(plugin));
+    assert_eq!(s.history_steps().0.len(), steps, "not an undo step");
     let dir = std::env::temp_dir().join(format!("ff-session-editors-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -145,5 +152,13 @@ fn editor_positions_are_saved_with_the_project() {
         reopened.workspace().plugin_windows.get(&plugin),
         Some(&(1335, 810))
     );
+    assert!(
+        reopened.plugin_window_on_top(plugin),
+        "on top after reopening"
+    );
+    reopened
+        .dispatch(Action::SetPluginWindowOnTop { plugin, on: false })
+        .unwrap();
+    assert!(!reopened.plugin_window_on_top(plugin));
     let _ = std::fs::remove_dir_all(&dir);
 }

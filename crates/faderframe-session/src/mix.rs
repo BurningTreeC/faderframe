@@ -1268,6 +1268,7 @@ fn keeps_audition(action: &Action) -> bool {
             | Action::SetHeadphones(_)
             | Action::OpenPluginEditor { .. }
             | Action::SetDeviceView { .. }
+            | Action::SetPluginWindowOnTop { .. }
             | Action::SetAnalysisSource(_)
             | Action::ResetAnalysis
             | Action::ShowGlobalLane(..)

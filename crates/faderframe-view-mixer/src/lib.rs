@@ -2093,6 +2093,19 @@ impl MixerView {
                         },
                     ));
                 }
+                // Its editor windows above every other window (also the
+                // pin in their header).
+                let on_top = model.plugin_window_on_top(s.id);
+                items.push(
+                    MenuItem::new(
+                        "Keep Window on Top",
+                        Action::SetPluginWindowOnTop {
+                            plugin: s.id,
+                            on: !on_top,
+                        },
+                    )
+                    .checked(on_top),
+                );
                 // A multi-output plugin: tracks for its outputs (the main
                 // too).
                 if model.plugin_has_extra_outputs(s.id) {
