@@ -34,7 +34,7 @@ use std::collections::{BTreeSet, HashSet};
 
 /// Changes when what a key covers (or how a cache is made) changes:
 /// older caches are not taken for newer ones.
-pub(crate) const KEY_VERSION: u64 = 1;
+pub(crate) const KEY_VERSION: u64 = 2;
 
 /// The tracks whose signal reaches `track`'s chain (itself included),
 /// sorted by id.

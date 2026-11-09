@@ -415,6 +415,10 @@ impl PluginProcessor for Lv2Processor {
 }
 
 impl PluginInstance for Lv2Instance {
+    fn third_party(&self) -> bool {
+        true
+    }
+
     fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
         self.shared.reduction.as_ref().map(|(_, c)| Arc::clone(c))
     }

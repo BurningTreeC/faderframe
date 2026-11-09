@@ -180,6 +180,12 @@ impl PluginHost {
         self.instances.values().any(|h| h.instance.loading())
     }
 
+    /// Whether any instance is a third-party plugin (which may still be
+    /// preparing its state on threads of its own, saying nothing).
+    pub fn hosts_third_party(&self) -> bool {
+        self.instances.values().any(|h| h.instance.third_party())
+    }
+
     /// Process plugins in 64-bit floating point where they can (applies
     /// with the next graph build); `true` when it changed.
     pub fn set_double_precision(&mut self, on: bool) -> bool {

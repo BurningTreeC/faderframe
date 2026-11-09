@@ -649,6 +649,10 @@ impl Drop for RemoteInstance {
 }
 
 impl PluginInstance for RemoteInstance {
+    fn third_party(&self) -> bool {
+        true
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }

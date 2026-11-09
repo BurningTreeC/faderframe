@@ -668,6 +668,10 @@ impl Vst3Instance {
 }
 
 impl FfInstance for Vst3Instance {
+    fn third_party(&self) -> bool {
+        true
+    }
+
     fn configure_outputs(&mut self, buses: usize) {
         self.output_buses = buses.max(1);
     }

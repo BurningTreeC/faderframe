@@ -12,6 +12,9 @@ use faderframe_transport::TransportCommand;
 
 /// How long a render waits for ARA plug-ins' analyses.
 const ARA_SETTLE_SECONDS: u64 = 120;
+/// Real time third-party plugins get before an offline render starts
+/// ([`OfflineRenderer::warm_up`]).
+pub const WARM_UP_SECONDS: f64 = 2.0;
 
 /// Drives an engine without an audio device.
 pub struct OfflineRenderer {
@@ -82,7 +85,8 @@ impl OfflineRenderer {
         {
             tracing::warn!("an ARA plug-in is still analysing: rendering anyway");
         }
-        Ok(Self {
+        let third_party = controller.plugins().hosts_third_party();
+        let mut r = Self {
             controller,
             processor,
             buffers: OwnedBuffers::new(2, output_channels, block.max(1)),
@@ -91,7 +95,35 @@ impl OfflineRenderer {
             scratch: Vec::new(),
             steps: 0,
             stream_errors: 0,
-        })
+        };
+        if third_party {
+            r.warm_up();
+        }
+        Ok(r)
+    }
+
+    /// Give third-party plugins [`WARM_UP_SECONDS`] of real time before
+    /// the render starts, the transport stopped, blocks of silence paced
+    /// like a device's: a plugin preparing its state on threads of its own
+    /// (TONE3000 queues its models after the state loads and plays silence
+    /// until they are ready) has it ready by the first frame. Faster than
+    /// real time, the render would otherwise be seconds into the music
+    /// first — a self-frozen track's cache silent at its start.
+    fn warm_up(&mut self) {
+        let rate = f64::from(self.controller.config().sample_rate.max(1));
+        let block = std::time::Duration::from_secs_f64(self.block as f64 / rate);
+        let start = std::time::Instant::now();
+        let warm = std::time::Duration::from_secs_f64(WARM_UP_SECONDS);
+        // One that says it is loading is waited for, a while at most.
+        let most = std::time::Duration::from_secs(60);
+        while start.elapsed() < warm
+            || (start.elapsed() < most && self.controller.plugins().loading())
+        {
+            self.buffers.set_frames(self.block);
+            self.processor.process_device(&mut self.buffers);
+            self.controller.collect_garbage();
+            std::thread::sleep(block);
+        }
     }
 
     /// Locate and start playback.

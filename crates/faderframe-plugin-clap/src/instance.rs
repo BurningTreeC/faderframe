@@ -303,6 +303,10 @@ impl ClapInstance {
 }
 
 impl FfInstance for ClapInstance {
+    fn third_party(&self) -> bool {
+        true
+    }
+
     fn output_bus_names(&mut self) -> Vec<String> {
         self.port_names()
     }

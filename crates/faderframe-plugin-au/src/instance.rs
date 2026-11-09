@@ -715,6 +715,10 @@ fn plist_from(data: &[u8]) -> CFPropertyListRef {
 }
 
 impl PluginInstance for AuInstance {
+    fn third_party(&self) -> bool {
+        true
+    }
+
     fn configure_outputs(&mut self, buses: usize) {
         self.output_buses = buses.max(1);
     }

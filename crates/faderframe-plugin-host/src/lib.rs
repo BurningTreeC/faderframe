@@ -451,6 +451,14 @@ pub trait PluginInstance {
     fn loading(&self) -> bool {
         false
     }
+    /// A third-party plugin (CLAP, VST3, LV2, AU, or one in the sandbox):
+    /// it may prepare what its state names on threads of its own after
+    /// `load_state` returns, saying nothing (TONE3000 queues its models
+    /// and plays silence until they are ready). Offline renders give such
+    /// instances a moment before they start.
+    fn third_party(&self) -> bool {
+        false
+    }
     /// Wait for answers already on their way (a helper process answers
     /// polls at a later tick): the next [`poll`](Self::poll) has them.
     /// For tests and checks that need a poll's answer now.
