@@ -22,7 +22,7 @@ delivery down to CD and vinyl masters, video for working to picture with
 time-locked tracks, lead sheets, scratch pads, project templates, and
 dockable, detachable editors.
 
-> **Status: in active development** (version 0.44.0). Most of a working
+> **Status: in active development** (version 0.45.0). Most of a working
 > DAW is there; see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-and-roadmap) for what
 > comes next.
