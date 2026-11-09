@@ -1073,6 +1073,12 @@ pub enum Action {
         track: TrackId,
         height: f32,
     },
+    /// Height of an automation lane in the arranger; not undoable, saved
+    /// with the layout.
+    SetAutomationLaneHeight {
+        lane: faderframe_core::AutomationLaneId,
+        height: f32,
+    },
     /// Play take `take` of a take folder instead of its comp (`None`: the
     /// comp again); not undoable, not saved. Stopped, playback starts at
     /// the folder (unless the playhead is in it).
@@ -2914,6 +2920,11 @@ impl Session {
     /// Height of a track's take lanes in the arranger.
     pub fn take_lane_height(&self, track: TrackId) -> f32 {
         self.workspace.take_lane_height(track)
+    }
+
+    /// Height of an automation lane in the arranger.
+    pub fn automation_lane_height(&self, lane: faderframe_core::AutomationLaneId) -> f32 {
+        self.workspace.automation_lane_height(lane)
     }
 
     /// A mixer strip's width, if not the theme's.
@@ -5329,6 +5340,10 @@ impl Session {
             }
             Action::SetTakeLaneHeight { track, height } => {
                 self.workspace.set_take_lane_height(track, height);
+                self.revision += 1;
+            }
+            Action::SetAutomationLaneHeight { lane, height } => {
+                self.workspace.set_automation_lane_height(lane, height);
                 self.revision += 1;
             }
             Action::AuditionTake { clip, take } => self.audition_take(clip, take)?,

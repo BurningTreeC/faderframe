@@ -349,6 +349,7 @@ fn keeps_scene_work(action: &Action) -> bool {
             | Action::SetVuReference(_)
             | Action::SetMeterBridge(_)
             | Action::SetTrackHeight { .. }
+            | Action::SetAutomationLaneHeight { .. }
             | Action::ResetClipIndicators
             | Action::AuditionOff
             | Action::ResetPerformance

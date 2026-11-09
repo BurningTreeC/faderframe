@@ -2863,3 +2863,65 @@ fn midi_clips_and_tracks_are_edited_as_notation_from_their_menus() {
         Some(Action::Score(ScoreOp::Show(ScoreOf::Tracks(vec![a, b]))))
     );
 }
+
+#[test]
+fn an_automation_lane_resizes_by_its_bottom_edge() {
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let t = ArrangerView::lane_tracks(&s)[0].id;
+    s.dispatch(Action::ToggleTrackAutomation(t)).unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let lane = s.shown_lanes(t)[0].id;
+    let row = view.row_rect(0, size);
+    let next = view.row_rect(1, size).y;
+    assert_eq!(row.h, view.row_h() + AUTO_LANE_H);
+    // Either side of the lane's bottom edge, in the header column.
+    for dy in [-2.0, 2.0] {
+        assert_eq!(
+            view.hit_test(Point::new(100.0, row.bottom() + dy), size, &s),
+            Some(Hit::AutomationEdge { track: t, lane }),
+            "{dy}"
+        );
+    }
+    let grip = Point::new(100.0, row.bottom() - 1.0);
+    let to = Point::new(grip.x, grip.y + 40.0);
+    let mut actions = run(&mut view, down(grip), size, &s).0;
+    actions.extend(run(&mut view, mv(to), size, &s).0);
+    actions.extend(run(&mut view, up(to), size, &s).0);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(s.automation_lane_height(lane), AUTO_LANE_H + 40.0);
+    assert_eq!(
+        s.track_height(t),
+        None,
+        "the track's own part keeps its height"
+    );
+    assert_eq!(view.row_rect(0, size).h, view.row_h() + AUTO_LANE_H + 40.0);
+    assert_eq!(
+        view.row_rect(1, size).y,
+        next + 40.0,
+        "rows below move down"
+    );
+    // The lane (its points' area) is the taller one.
+    let g = view.lane_geoms(&s, ArrangerView::lane_tracks(&s)[0], view.row_rect(0, size));
+    assert_eq!(g[0].row.h, AUTO_LANE_H + 40.0);
+
+    // Double-click: the default height again.
+    let edge = Point::new(100.0, view.row_rect(0, size).bottom() - 1.0);
+    let dbl = ViewEvent::PointerDown {
+        pos: edge,
+        button: PointerButton::Primary,
+        modifiers: Modifiers::NONE,
+        clicks: 2,
+    };
+    let (a, _) = run(&mut view, dbl, size, &s);
+    for a in a {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.automation_lane_height(lane), AUTO_LANE_H);
+}

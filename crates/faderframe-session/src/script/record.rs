@@ -113,6 +113,7 @@ fn view_only(action: &Action) -> bool {
             | Action::Zoom(_)
             | Action::SetTrackHeight { .. }
             | Action::SetTakeLaneHeight { .. }
+            | Action::SetAutomationLaneHeight { .. }
             | Action::SetHeaderWidth(_)
             | Action::SetStripWidth { .. }
             | Action::SetMixerInsertSlots(_)

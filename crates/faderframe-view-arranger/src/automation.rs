@@ -22,7 +22,7 @@ use faderframe_ui_canvas::{
 };
 
 /// Height of one automation lane.
-pub const AUTO_LANE_H: f32 = 56.0;
+pub const AUTO_LANE_H: f32 = faderframe_workspace::AUTOMATION_LANE_HEIGHT;
 /// Pointer distance that picks a point.
 const POINT_HIT: f32 = 6.0;
 const MODES: [AutomationMode; 5] = [
@@ -128,12 +128,13 @@ impl ArrangerView {
             .shown_lanes(t.id)
             .iter()
             .map(|l| {
+                let h = model.automation_lane_height(l.id);
                 let g = LaneGeom {
                     track: t.id,
                     lane: l.id,
-                    row: Rect::new(0.0, y, row.w, AUTO_LANE_H),
+                    row: Rect::new(0.0, y, row.w, h),
                 };
-                y += AUTO_LANE_H;
+                y += h;
                 g
             })
             .collect()

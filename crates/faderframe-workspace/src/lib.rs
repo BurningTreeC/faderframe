@@ -238,6 +238,10 @@ pub struct WorkspaceSet {
     /// [`TAKE_LANE_HEIGHT`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub take_lane_heights: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
+    /// Height of each automation lane in the arranger (missing =
+    /// [`AUTOMATION_LANE_HEIGHT`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub automation_lane_heights: std::collections::BTreeMap<faderframe_core::AutomationLaneId, f32>,
 }
 
 /// Where a timeline editor looks: its zoom and scroll.
@@ -327,6 +331,9 @@ pub const TRACK_HEIGHT_RANGE: (f32, f32) = (40.0, 480.0);
 /// A take lane's height in the arranger unless set, and the range.
 pub const TAKE_LANE_HEIGHT: f32 = 30.0;
 pub const TAKE_LANE_HEIGHT_RANGE: (f32, f32) = (20.0, 240.0);
+/// An automation lane's height in the arranger unless sized.
+pub const AUTOMATION_LANE_HEIGHT: f32 = 56.0;
+pub const AUTOMATION_LANE_HEIGHT_RANGE: (f32, f32) = (32.0, 400.0);
 
 impl Default for WorkspaceSet {
     fn default() -> Self {
@@ -355,6 +362,7 @@ impl Default for WorkspaceSet {
             meter_bridge: false,
             arranger_place: None,
             take_lane_heights: Default::default(),
+            automation_lane_heights: Default::default(),
         }
     }
 }
@@ -397,6 +405,29 @@ impl WorkspaceSet {
             self.take_lane_heights.remove(&track);
         } else {
             self.take_lane_heights.insert(track, h);
+        }
+    }
+
+    /// Height of an automation lane.
+    pub fn automation_lane_height(&self, lane: faderframe_core::AutomationLaneId) -> f32 {
+        self.automation_lane_heights
+            .get(&lane)
+            .copied()
+            .unwrap_or(AUTOMATION_LANE_HEIGHT)
+    }
+
+    /// Set an automation lane's height (clamped; the default forgets it).
+    pub fn set_automation_lane_height(
+        &mut self,
+        lane: faderframe_core::AutomationLaneId,
+        height: f32,
+    ) {
+        let (lo, hi) = AUTOMATION_LANE_HEIGHT_RANGE;
+        let h = height.clamp(lo, hi);
+        if (h - AUTOMATION_LANE_HEIGHT).abs() < 0.5 {
+            self.automation_lane_heights.remove(&lane);
+        } else {
+            self.automation_lane_heights.insert(lane, h);
         }
     }
 
