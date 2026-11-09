@@ -989,7 +989,7 @@ impl FfInstance for Vst3Instance {
             self.active_outputs = self.output_buses;
             self.deactivate();
             let fail = |what: &str| PluginError::Failed(format!("{}: {what}", self.scanned.name));
-            use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
+            use vst3::Steinberg::Vst::ProcessModes_::{kOffline, kRealtime};
             use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
             let max = config.max_block_size.max(1);
             // SAFETY: plain queries on the control thread while inactive (no
@@ -1007,8 +1007,11 @@ impl FfInstance for Vst3Instance {
                 if double { 64 } else { 32 }
             );
             let (inputs, outputs, events) = self.set_bus_states(config.sidechain);
+            // An offline render says so (plugins finish work they would
+            // leave to a background thread live, or render finer).
+            let process_mode = if config.offline { kOffline } else { kRealtime } as i32;
             let mut setup = ProcessSetup {
-                processMode: kRealtime as i32,
+                processMode: process_mode,
                 symbolicSampleSize: if double { kSample64 } else { kSample32 } as i32,
                 maxSamplesPerBlock: max as i32,
                 sampleRate: config.sample_rate,
@@ -1040,6 +1043,7 @@ impl FfInstance for Vst3Instance {
                 self.processor.clone(),
                 ActiveConfig {
                     double,
+                    process_mode,
                     inputs,
                     outputs,
                     has_event_input: events,

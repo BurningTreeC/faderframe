@@ -651,7 +651,7 @@ impl Core {
             if let Some(r) = self.responses.as_mut() {
                 // SAFETY: the worker interface of this handle, on the
                 // thread that runs it.
-                unsafe { r.deliver(self.handle) };
+                unsafe { r.deliver(self.handle, self.shared.freewheel.load(Ordering::Relaxed)) };
             }
             self.collect_outputs(io, start, ui_open);
             start = end;

@@ -1019,14 +1019,18 @@ pub enum Action {
     PromptSaveTrackPreset {
         tracks: Vec<TrackId>,
     },
-    /// Tracks for a plugin's extra output buses (`buses`: those, else all
-    /// that have none), routed like its track, in a folder under it.
+    /// Tracks for a plugin's output buses (`buses`: those, else all that
+    /// have none), routed like its track, in a folder under it; `mono`: a
+    /// mono track per channel instead (each microphone of a drum
+    /// instrument on its own, whatever the plugin grouped them into).
     CreateOutputTracks {
         plugin: faderframe_core::PluginInstanceId,
         buses: Option<Vec<u16>>,
+        mono: bool,
     },
-    /// Remove the track taking a plugin's output `bus` (its folder too
-    /// when that empties): the output is back in the plugin's own mix.
+    /// Remove the tracks taking a plugin's output `bus` (all of it or a
+    /// channel each; their folder too when that empties): the output is
+    /// back in the plugin's own mix.
     RemoveOutputTrack {
         plugin: faderframe_core::PluginInstanceId,
         bus: u16,
@@ -5111,8 +5115,12 @@ impl Session {
             Action::PromptSaveTrackPreset { tracks } => {
                 self.ui_requests.push(UiRequest::SaveTrackPreset { tracks });
             }
-            Action::CreateOutputTracks { plugin, buses } => {
-                self.create_output_tracks(plugin, buses.as_deref())?;
+            Action::CreateOutputTracks {
+                plugin,
+                buses,
+                mono,
+            } => {
+                self.create_output_tracks(plugin, buses.as_deref(), mono)?;
             }
             Action::RemoveOutputTrack { plugin, bus } => {
                 self.remove_output_track(plugin, bus)?;
@@ -6731,16 +6739,35 @@ impl Session {
                         let input = InputRouting::Plugin {
                             plugin: slot.id,
                             bus: o.bus,
+                            channel: None,
                         };
                         let layout =
                             ChannelLayout::from_channel_count(usize::from(o.channels.max(1)));
+                        let prefix = format!("{} · {}", other.name, other.name_of(slot));
                         out.push(InputChoice {
-                            label: format!("{} · {} · {}", other.name, other.name_of(slot), o.name),
+                            label: format!("{prefix} · {}", o.name),
                             action: set(input.clone(), layout),
                             checked: t.input == input,
                             group_start: first,
                         });
                         first = false;
+                        // One channel of a wider bus (a mono track: one
+                        // microphone).
+                        if o.channels > 1 {
+                            for (c, name) in o.channel_names.iter().enumerate() {
+                                let input = InputRouting::Plugin {
+                                    plugin: slot.id,
+                                    bus: o.bus,
+                                    channel: Some(c as u16),
+                                };
+                                out.push(InputChoice {
+                                    label: format!("{prefix} · {name}"),
+                                    action: set(input.clone(), ChannelLayout::Mono),
+                                    checked: t.input == input,
+                                    group_start: false,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -6767,15 +6794,20 @@ impl Session {
                     None => format!("MIDI · {port}"),
                 }
             }
-            faderframe_project::InputRouting::Plugin { plugin, bus } => {
+            faderframe_project::InputRouting::Plugin {
+                plugin,
+                bus,
+                channel,
+            } => {
                 let Some((owner, slot)) = self.plugin_slot(*plugin) else {
                     return "Plugin output (missing)".into();
                 };
                 let name = self
-                    .plugin_output_buses(*plugin)
-                    .into_iter()
-                    .find(|o| o.bus == *bus)
-                    .map_or_else(|| format!("Output {}", bus + 1), |o| o.name);
+                    .plugin_output_name(&t.input)
+                    .unwrap_or_else(|| match channel {
+                        Some(c) => format!("Output {} · {}", bus + 1, c + 1),
+                        None => format!("Output {}", bus + 1),
+                    });
                 format!("{} · {name}", owner.name_of(slot))
             }
         }

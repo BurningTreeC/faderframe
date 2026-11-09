@@ -415,16 +415,16 @@ impl PluginProcessor for Lv2Processor {
 }
 
 impl PluginInstance for Lv2Instance {
-    fn configure_realtime(&mut self, realtime: bool) {
-        self.shared.freewheel.store(!realtime, Ordering::Relaxed);
-    }
-
     fn reduction(&self) -> Option<Arc<faderframe_plugin_host::Reduction>> {
         self.shared.reduction.as_ref().map(|(_, c)| Arc::clone(c))
     }
 
     fn output_bus_names(&mut self) -> Vec<String> {
         self.model.output_bus_names()
+    }
+
+    fn output_channel_names(&mut self) -> Vec<Vec<String>> {
+        self.model.output_channel_names()
     }
 
     fn descriptor(&self) -> &PluginDescriptor {
@@ -569,6 +569,11 @@ impl PluginInstance for Lv2Instance {
         &mut self,
         config: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+        // `lv2:freeWheeling` reads 1 in an offline render (never in a live
+        // session's graphs, those rendered ahead included).
+        self.shared
+            .freewheel
+            .store(config.offline, Ordering::Relaxed);
         let frames = (config.max_block_size.max(1)) as usize;
         if config.sample_rate != self.rate || frames > self.max_frames {
             self.reinstantiate(config.sample_rate, frames.max(START_BLOCK))?;

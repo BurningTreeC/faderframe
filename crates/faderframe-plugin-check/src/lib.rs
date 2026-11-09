@@ -591,6 +591,7 @@ pub fn check(instance: &mut dyn PluginInstance, opts: &CheckOptions) -> CheckRep
         max_block_size: opts.block,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let mut processor = match instance.create_processor(&config) {
         Ok(p) => p,

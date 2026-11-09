@@ -20,6 +20,7 @@ use clack_extensions::params::{
 };
 #[cfg(unix)]
 use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
+use clack_extensions::render::PluginRender;
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_extensions::thread_check::{HostThreadCheck, HostThreadCheckImpl};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
@@ -43,6 +44,8 @@ pub struct PluginExtensions {
     #[cfg(unix)]
     pub posix_fd: Option<PluginPosixFd>,
     pub gain_adjustment: Option<PluginGainAdjustment>,
+    /// Told whether a render is offline (`clap.render`).
+    pub render: Option<PluginRender>,
 }
 
 /// Thread-safe host state of one instance.
@@ -158,6 +161,7 @@ impl<'a> SharedHandler<'a> for FfShared {
             #[cfg(unix)]
             posix_fd: instance.get_extension(),
             gain_adjustment: instance.get_extension(),
+            render: instance.get_extension(),
         });
     }
 
@@ -485,6 +489,7 @@ pub fn query_extensions(h: &PluginMainThreadHandle<'_>) -> PluginExtensions {
         #[cfg(unix)]
         posix_fd: h.get_extension(),
         gain_adjustment: h.get_extension(),
+        render: h.get_extension(),
     }
 }
 

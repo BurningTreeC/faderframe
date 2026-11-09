@@ -463,6 +463,9 @@ pub(crate) struct Active {
     program: Option<(ParamID, u32)>,
     continuous: i64,
     max_frames: usize,
+    /// `kRealtime`, or `kOffline` in an offline render (every block says
+    /// so, as the setup did).
+    process_mode: int32,
     /// The gain-reduction meter (see `ActiveConfig::reduction`).
     reduction: Option<(
         ParamID,
@@ -480,6 +483,8 @@ unsafe impl Send for Active {}
 pub(crate) struct ActiveConfig {
     /// Process in 64-bit floating point.
     pub double: bool,
+    /// The process mode the setup gave (`ProcessModes_`).
+    pub process_mode: int32,
     pub inputs: Vec<u16>,
     pub outputs: Vec<u16>,
     pub has_event_input: bool,
@@ -538,6 +543,7 @@ impl Active {
             program: c.program,
             continuous: 0,
             max_frames: c.max_frames,
+            process_mode: c.process_mode,
             reduction: c.reduction,
         }
     }
@@ -801,7 +807,6 @@ impl Active {
     }
 
     fn process(&mut self, ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
-        use vst3::Steinberg::Vst::ProcessModes_::kRealtime;
         use vst3::Steinberg::Vst::SymbolicSampleSizes_::{kSample32, kSample64};
         let n = io.frames.min(self.max_frames);
         let last = n.saturating_sub(1) as i32;
@@ -870,7 +875,7 @@ impl Active {
                 .map_or(std::ptr::null_mut(), |r| r.as_ptr())
         };
         let mut data = ProcessData {
-            processMode: kRealtime as int32,
+            processMode: self.process_mode,
             symbolicSampleSize: if self.inputs.double {
                 kSample64
             } else {

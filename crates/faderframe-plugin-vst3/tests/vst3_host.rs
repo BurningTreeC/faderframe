@@ -65,6 +65,9 @@ const PROGRAM_LIST: i32 = 7;
 const LATENCY: u32 = 64;
 /// The sample size of the last processed block.
 static SAMPLE_SIZE: AtomicI64 = AtomicI64::new(-1);
+/// The process mode of the last setup and of the last processed block.
+static SETUP_MODE: AtomicI64 = AtomicI64::new(-1);
+static PROCESS_MODE: AtomicI64 = AtomicI64::new(-1);
 
 /// What the processor got through its connection point.
 static MESSAGE_VALUE: AtomicI64 = AtomicI64::new(0);
@@ -250,7 +253,9 @@ impl IAudioProcessorTrait for TestProcessor {
     unsafe fn getLatencySamples(&self) -> u32 {
         LATENCY
     }
-    unsafe fn setupProcessing(&self, _setup: *mut ProcessSetup) -> tresult {
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        let mode = unsafe { (*setup).processMode };
+        SETUP_MODE.store(i64::from(mode), Ordering::Relaxed);
         kResultOk
     }
     unsafe fn setProcessing(&self, state: TBool) -> tresult {
@@ -316,6 +321,7 @@ impl IAudioProcessorTrait for TestProcessor {
         let ins = unsafe { std::slice::from_raw_parts(d.inputs, 1) };
         let outs = unsafe { std::slice::from_raw_parts(d.outputs, 1) };
         SAMPLE_SIZE.store(d.symbolicSampleSize as i64, Ordering::Relaxed);
+        PROCESS_MODE.store(i64::from(d.processMode), Ordering::Relaxed);
         let double = d.symbolicSampleSize == SymbolicSampleSizes_::kSample64 as i32;
         let mut peak = 0.0f32;
         for ch in 0..2 {
@@ -878,6 +884,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
     max_block_size: BLOCK as u32,
     sidechain: false,
     double_precision: false,
+    offline: false,
 };
 
 #[test]
@@ -1299,6 +1306,29 @@ fn programs_and_double_precision() {
     assert_eq!(other.current_program(), Some(1));
     drop(proc);
     drop(other);
+}
+
+/// An offline render is `kOffline` in the setup and in every block
+/// (issue #50); a live one `kRealtime`.
+#[test]
+fn an_offline_render_processes_in_offline_mode() {
+    use ProcessModes_::{kOffline, kRealtime};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inst = instantiate();
+    let mut rig = Rig::new();
+    let offline = ProcessConfig {
+        offline: true,
+        ..CONFIG
+    };
+    let mut proc = inst.create_processor(&offline).unwrap();
+    rig.run(proc.as_mut(), &[]);
+    assert_eq!(SETUP_MODE.load(Ordering::Relaxed), kOffline as i64);
+    assert_eq!(PROCESS_MODE.load(Ordering::Relaxed), kOffline as i64);
+    drop(proc);
+    let mut proc = inst.create_processor(&CONFIG).unwrap();
+    rig.run(proc.as_mut(), &[]);
+    assert_eq!(SETUP_MODE.load(Ordering::Relaxed), kRealtime as i64);
+    assert_eq!(PROCESS_MODE.load(Ordering::Relaxed), kRealtime as i64);
 }
 
 /// `FADERFRAME_TEST_VST3=/path/to/Plugin.vst3 cargo test -p

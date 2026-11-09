@@ -129,7 +129,7 @@ cc = "1.2"
 audioadapter-buffers = "5"
 # CLAP plugin hosting (MIT OR Apache-2.0).
 clack-host = "0.2"
-clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "posix-fd", "state", "tail", "thread-check", "timer"] }
+clack-extensions = { version = "0.2", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "posix-fd", "render", "state", "tail", "thread-check", "timer"] }
 clack-plugin = "0.2"
 # VST3 hosting: bindings generated from the (MIT-licensed) VST 3 SDK headers
 # (MIT OR Apache-2.0); bundles are loaded with libloading.

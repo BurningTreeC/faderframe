@@ -328,6 +328,7 @@ fn an_ara_clap_plugin_is_bound_and_renders_at_the_song_position() {
             max_block_size: 256,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     assert!(instance.bind_ara(doc.controller(), Roles::ALL).is_err());

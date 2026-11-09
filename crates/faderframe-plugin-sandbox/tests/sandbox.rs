@@ -53,6 +53,7 @@ impl PluginFactory for Broken {
             broken_descriptor("test.sysex"),
             broken_descriptor("test.slow"),
             broken_descriptor("test.lagging"),
+            broken_descriptor("test.offline"),
         ]
     }
     fn instantiate(&self, id: &str) -> Result<Box<dyn PluginInstance>, PluginError> {
@@ -92,8 +93,11 @@ impl PluginInstance for BrokenInstance {
     }
     fn create_processor(
         &mut self,
-        _c: &ProcessConfig,
+        c: &ProcessConfig,
     ) -> Result<Box<dyn PluginProcessor>, PluginError> {
+        if self.0.id == "test.offline" {
+            return Ok(Box::new(Offline(c.offline)));
+        }
         if self.0.id == "test.sysex" {
             return Ok(Box::new(SysexSum));
         }
@@ -129,6 +133,25 @@ impl PluginProcessor for Lagging {
         }
         for out in io.audio_out.iter_mut() {
             out.clear();
+        }
+        ProcessStatus::Continue
+    }
+    fn reset(&mut self) {}
+}
+
+/// Told it renders offline: takes its time (slower than real time) and
+/// plays 1.0; live: plays 0.5 at once.
+struct Offline(bool);
+
+impl PluginProcessor for Offline {
+    fn process(&mut self, _ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
+        if self.0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for out in io.audio_out.iter_mut() {
+            for c in 0..out.num_channels() {
+                out.channel_mut(c).fill(if self.0 { 1.0 } else { 0.5 });
+            }
         }
         ProcessStatus::Continue
     }
@@ -189,6 +212,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
     max_block_size: FRAMES as u32,
     sidechain: false,
     double_precision: false,
+    offline: false,
 };
 
 /// Run `blocks` blocks of a sine (and `events` in the first) through `p`;
@@ -565,6 +589,30 @@ fn a_hanging_plugin_is_given_up_after_the_deadline() {
     drop(p);
     drop(inst);
     assert!(t.elapsed() < Duration::from_secs(1));
+}
+
+/// An offline render (issue #50) reaches the helper's plugin, and its
+/// blocks — slower than real time here — are waited for: none is given up
+/// on (live, one is after a block's duration).
+#[test]
+fn an_offline_render_is_told_and_waits_for_every_block() {
+    let mut inst = remote(PluginFormat::Vst3, "test.offline");
+    let offline = ProcessConfig {
+        offline: true,
+        ..CONFIG
+    };
+    let mut p = inst.create_processor(&offline).unwrap();
+    for b in 0..5 {
+        let (out, status) = run(p.as_mut(), 1, &[], &[]);
+        assert_eq!(status, ProcessStatus::Continue, "block {b}");
+        assert!(out.iter().all(|&s| s == 1.0), "block {b}: {}", out[0]);
+    }
+    assert_eq!(p.take_underruns(), 0, "no block given up on");
+    drop(p);
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    let (out, status) = run(p.as_mut(), 1, &[], &[]);
+    assert_eq!(status, ProcessStatus::Continue);
+    assert!(out.iter().all(|&s| s == 0.5), "live: {}", out[0]);
 }
 
 #[test]

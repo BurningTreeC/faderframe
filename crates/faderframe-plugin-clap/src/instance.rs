@@ -481,6 +481,21 @@ impl FfInstance for ClapInstance {
         if self.config.as_ref() != Some(config) || self.rt.is_none() || self.needs_restart {
             self.needs_restart = false;
             self.deactivate();
+            // An offline render says so before activation (plugins finish
+            // work they would leave to a background thread live, or render
+            // finer); one that declines keeps working as it does live.
+            if let Some(render) = self.ext().render {
+                use clack_extensions::render::RenderMode;
+                let mode = if config.offline {
+                    RenderMode::Offline
+                } else {
+                    RenderMode::Realtime
+                };
+                let h = self.instance.plugin_handle();
+                if render.set(&h, mode).is_err() {
+                    tracing::debug!("{}: render mode {mode:?} declined", self.scanned.name);
+                }
+            }
             let stopped = self
                 .instance
                 .activate(

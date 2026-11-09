@@ -1184,11 +1184,9 @@ impl MixerView {
                     channel: Some(c), ..
                 } => format!("MIDI {}", c + 1),
                 // A plugin's extra output: its name there.
-                InputRouting::Plugin { plugin, bus } => model
-                    .plugin_output_buses(*plugin)
-                    .into_iter()
-                    .find(|o| o.bus == *bus)
-                    .map_or_else(|| "PLUG —".to_string(), |o| o.name.to_uppercase()),
+                InputRouting::Plugin { .. } => model
+                    .plugin_output_name(&t.input)
+                    .map_or_else(|| "PLUG —".to_string(), |n| n.to_uppercase()),
             };
             controls::well_label(p, row.input, &label, t.input == InputRouting::None, th);
             controls::led_button(p, row.phase, "Ø", t.phase_invert, c.led.phase, th);
@@ -2099,12 +2097,13 @@ impl MixerView {
                 // too).
                 if model.plugin_has_extra_outputs(s.id) {
                     let outs = model.plugin_output_buses(s.id);
-                    let missing = outs.iter().filter(|o| o.track.is_none()).count();
+                    let missing = model.missing_output_tracks(s.id, false);
                     let mut item = MenuItem::new(
                         format!("Create Output Tracks ({missing})"),
                         Action::CreateOutputTracks {
                             plugin: s.id,
                             buses: None,
+                            mono: false,
                         },
                     )
                     .separated();
@@ -2112,27 +2111,49 @@ impl MixerView {
                         item = MenuItem::disabled("Every Output Has a Track").separated();
                     }
                     items.push(item);
-                    items.push(MenuItem::submenu(
-                        "Outputs",
-                        outs.iter()
-                            .map(|o| {
-                                // Checked: a track takes it; unchecking
-                                // removes that track.
-                                let action = if o.track.is_some() {
-                                    Action::RemoveOutputTrack {
-                                        plugin: s.id,
-                                        bus: o.bus,
-                                    }
-                                } else {
-                                    Action::CreateOutputTracks {
-                                        plugin: s.id,
-                                        buses: Some(vec![o.bus]),
-                                    }
-                                };
-                                MenuItem::new(o.name.clone(), action).checked(o.track.is_some())
-                            })
-                            .collect(),
-                    ));
+                    // A mono track per channel: each microphone of a drum
+                    // instrument on its own, however the plugin grouped
+                    // them.
+                    let mono = model.missing_output_tracks(s.id, true);
+                    if model.plugin_has_wide_outputs(s.id) && mono > 0 {
+                        items.push(MenuItem::new(
+                            format!("Create Mono Output Tracks ({mono})"),
+                            Action::CreateOutputTracks {
+                                plugin: s.id,
+                                buses: None,
+                                mono: true,
+                            },
+                        ));
+                    }
+                    let mut entries = Vec::new();
+                    for o in &outs {
+                        // Checked: a track takes it (or a channel of
+                        // it); unchecking removes those tracks.
+                        let action = if o.taken() {
+                            Action::RemoveOutputTrack {
+                                plugin: s.id,
+                                bus: o.bus,
+                            }
+                        } else {
+                            Action::CreateOutputTracks {
+                                plugin: s.id,
+                                buses: Some(vec![o.bus]),
+                                mono: false,
+                            }
+                        };
+                        entries.push(MenuItem::new(o.name.clone(), action).checked(o.taken()));
+                        if o.channels > 1 && o.track.is_none() && !o.free_channels().is_empty() {
+                            entries.push(MenuItem::new(
+                                format!("{} as Mono Tracks", o.name),
+                                Action::CreateOutputTracks {
+                                    plugin: s.id,
+                                    buses: Some(vec![o.bus]),
+                                    mono: true,
+                                },
+                            ));
+                        }
+                    }
+                    items.push(MenuItem::submenu("Outputs", entries));
                 }
                 // Presets: the user's and the plugin format's own.
                 let presets = model.plugin_presets(s.id);

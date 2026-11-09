@@ -299,6 +299,7 @@ fn a_latency_reported_before_the_activation_restarts_nothing() {
         max_block_size: 64,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let _processor = inst.create_processor(&config).unwrap();
     assert_eq!(inst.latency_samples(), LATENCY);

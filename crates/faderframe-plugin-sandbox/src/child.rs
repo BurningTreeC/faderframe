@@ -282,6 +282,7 @@ impl Helper {
                 shm_size,
                 double_precision,
                 output_buses,
+                offline,
             } => {
                 if let Some(inst) = self.instance.as_mut() {
                     inst.configure_outputs(usize::from(output_buses.max(1)));
@@ -292,6 +293,7 @@ impl Helper {
                         max_block_size: max_block,
                         sidechain,
                         double_precision,
+                        offline,
                     },
                     &shm,
                     shm_size as usize,
@@ -371,6 +373,7 @@ impl Helper {
             has_editor: inst.editor().is_some(),
             programs: inst.programs(),
             output_names: inst.output_bus_names(),
+            output_channel_names: inst.output_channel_names(),
         };
         self.instance = Some(inst);
         (Response::Instantiated(Box::new(info)), Vec::new())

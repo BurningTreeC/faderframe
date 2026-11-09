@@ -21,6 +21,7 @@ const CONFIG: ProcessConfig = ProcessConfig {
     max_block_size: BLOCK as u32,
     sidechain: false,
     double_precision: false,
+    offline: false,
 };
 
 const DELAY: &str = "aufx:dely:appl";

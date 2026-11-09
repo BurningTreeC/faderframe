@@ -23,9 +23,12 @@
 //! * **Late blocks**: one not answered within the callback's budget plays
 //!   silence (counted); the blocks after it, while the helper is still
 //!   busy with it, are not sent and report [`ProcessStatus::Missed`] (the
-//!   engine keeps their note-offs for the next block that is).
+//!   engine keeps their note-offs for the next block that is). Offline
+//!   renders ([`ProcessConfig::offline`]) have no budget: every block
+//!   waits for its answer.
 //! * **Failure**: a helper that dies is noticed at once (its pipe closes;
-//!   Windows: its process handle is signalled); one that does not answer within [`BLOCK_TIMEOUT`] is given up. Either way
+//!   Windows: its process handle is signalled); one that does not answer
+//!   within [`BLOCK_TIMEOUT`] ([`OFFLINE_BLOCK_TIMEOUT`] offline) is given up. Either way
 //!   the processor reports [`ProcessStatus::Error`] (the engine bypasses
 //!   the plugin) and the instance answers from its cache until it is
 //!   reloaded.
@@ -43,6 +46,7 @@
 //! [`PluginProcessor`]: faderframe_plugin_host::PluginProcessor
 //! [`ProcessStatus::Error`]: faderframe_plugin_host::ProcessStatus::Error
 //! [`ProcessStatus::Missed`]: faderframe_plugin_host::ProcessStatus::Missed
+//! [`ProcessConfig::offline`]: faderframe_plugin_host::ProcessConfig::offline
 
 pub mod wire;
 
@@ -67,6 +71,11 @@ pub const AVAILABLE: bool = cfg!(any(target_os = "linux", target_os = "macos", w
 /// How long the host's audio thread waits for a helper's block before it
 /// gives the plugin up.
 pub const BLOCK_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// [`BLOCK_TIMEOUT`] in an offline render: no device waits, and a plugin
+/// told it renders offline may take its time (finish background work in
+/// the block, a higher quality).
+pub const OFFLINE_BLOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How to start a helper process.
 #[derive(Clone, Debug, PartialEq, Eq)]

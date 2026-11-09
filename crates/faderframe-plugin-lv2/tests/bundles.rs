@@ -33,6 +33,7 @@ fn config() -> ProcessConfig {
         max_block_size: BLOCK as u32,
         sidechain: false,
         double_precision: false,
+        offline: false,
     }
 }
 

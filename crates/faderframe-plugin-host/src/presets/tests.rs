@@ -327,6 +327,7 @@ pub(crate) fn render(
         max_block_size: BLOCK as u32,
         sidechain,
         double_precision: false,
+        offline: false,
     };
     let mut p = inst.create_processor(&config).unwrap();
     let instrument = !notes.is_empty();
@@ -790,6 +791,7 @@ fn every_midi_effect_preset_plays_and_lets_go() {
                 max_block_size: BLOCK as u32,
                 sidechain: false,
                 double_precision: false,
+                offline: false,
             };
             let mut p = inst.create_processor(&config).unwrap();
             // Long enough for echoes and latched arpeggios to finish

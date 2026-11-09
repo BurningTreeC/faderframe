@@ -203,6 +203,7 @@ fn processor() -> (ParamValues, Arc<AnalysisTap>, ProgramEqProcessor) {
         max_block_size: 256,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let p = ProgramEqProcessor::new(params.clone(), Arc::clone(&tap), &config);
     (params, tap, p)

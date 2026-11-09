@@ -26,12 +26,16 @@ pub(crate) fn host_format(f: ProjectFormat) -> PluginFormat {
 pub struct OutputBus {
     pub name: String,
     pub channels: u16,
+    /// Its channels' names where the plugin names them (one each), else
+    /// empty.
+    pub channel_names: Vec<String>,
 }
 
 /// A plugin's output buses, main first, named by the plugin (or numbered).
 fn output_buses(instance: &mut dyn PluginInstance) -> Vec<OutputBus> {
     let names = instance.output_bus_names();
-    instance
+    let channel_names = instance.output_channel_names();
+    let mut buses: Vec<OutputBus> = instance
         .descriptor()
         .audio_outputs
         .iter()
@@ -52,8 +56,15 @@ fn output_buses(instance: &mut dyn PluginInstance) -> Vec<OutputBus> {
                     str::to_string,
                 ),
             channels: p.channels,
+            channel_names: Vec::new(),
         })
-        .collect()
+        .collect();
+    for (b, names) in buses.iter_mut().zip(channel_names) {
+        if names.len() == usize::from(b.channels) && names.iter().all(|n| !n.trim().is_empty()) {
+            b.channel_names = names.iter().map(|n| n.trim().to_string()).collect();
+        }
+    }
+    buses
 }
 
 struct Hosted {

@@ -382,6 +382,7 @@ fn an_embedded_ui_reaches_its_instance_and_is_made_again_with_it() {
         max_block_size: 256,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let processor = inst.create_processor(&config).unwrap();
     let second = first + 1;

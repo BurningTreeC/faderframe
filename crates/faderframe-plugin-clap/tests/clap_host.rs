@@ -11,6 +11,7 @@ use clack_extensions::params::{
     ParamDisplayWriter, ParamInfo, ParamInfoFlags, ParamInfoWriter, PluginAudioProcessorParams,
     PluginMainThreadParams, PluginParams,
 };
+use clack_extensions::render::{PluginRender, PluginRenderImpl, RenderMode};
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
@@ -30,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NOTES: Mutex<Vec<(String, i32, i16, f64)>> = Mutex::new(Vec::new());
 /// The sample width of the last block the test plugin processed (32/64).
 static WIDTH: AtomicU64 = AtomicU64::new(0);
+/// The render modes the host set (`clap.render`), in order.
+static RENDER_MODES: Mutex<Vec<RenderMode>> = Mutex::new(Vec::new());
 /// The tests share the statics above: one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -102,6 +105,17 @@ pub struct GainMain<'a> {
 }
 
 impl<'a> PluginMainThread<'a, GainShared> for GainMain<'a> {}
+
+impl PluginRenderImpl for GainMain<'_> {
+    fn has_hard_realtime_requirement(&self) -> bool {
+        false
+    }
+
+    fn set(&self, mode: RenderMode) -> Result<(), PluginError> {
+        RENDER_MODES.lock().unwrap().push(mode);
+        Ok(())
+    }
+}
 
 impl PluginMainThreadParams for GainMain<'_> {
     fn count(&self) -> u32 {
@@ -327,6 +341,7 @@ impl Plugin for TestGain {
             .register::<PluginParams>()
             .register::<PluginState>()
             .register::<PluginAudioPorts>()
+            .register::<PluginRender>()
             .register::<GainAdjustment>();
     }
 }
@@ -433,6 +448,7 @@ fn notes_carry_ids_and_note_expressions_reach_their_keys() {
             max_block_size: 64,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     NOTES.lock().unwrap().clear();
@@ -559,6 +575,7 @@ fn a_note_started_again_ends_the_one_sounding_by_its_id() {
             max_block_size: 64,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     NOTES.lock().unwrap().clear();
@@ -650,6 +667,7 @@ fn modulation_moves_the_plugin_not_its_value_and_reaches_single_voices() {
             max_block_size: 64,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     NOTES.lock().unwrap().clear();
@@ -759,6 +777,7 @@ fn parameters_state_and_processing() {
         max_block_size: 256,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let mut proc = inst.create_processor(&config).unwrap();
     let out = run_block(proc.as_mut(), &[], 256);
@@ -796,6 +815,7 @@ fn parameters_state_and_processing() {
             max_block_size: 512,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     let out = run_block(proc.as_mut(), &[], 64);
@@ -824,6 +844,7 @@ fn the_gain_adjustment_it_reports_reaches_the_host() {
             max_block_size: 64,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     let cell = inst.reduction().expect("it reports its gain adjustment");
@@ -852,6 +873,7 @@ fn double_precision_where_the_ports_take_it() {
         max_block_size: 256,
         sidechain: false,
         double_precision: true,
+        offline: false,
     };
     let mut proc = inst.create_processor(&config).unwrap();
     let out = run_block(proc.as_mut(), &[], 256);
@@ -866,6 +888,38 @@ fn double_precision_where_the_ports_take_it() {
         .unwrap();
     run_block(proc.as_mut(), &[], 256);
     assert_eq!(WIDTH.load(Ordering::Relaxed), 32);
+}
+
+/// An offline render sets the plugin's render mode before activation
+/// (issue #50), a live one sets it back.
+#[test]
+fn an_offline_render_sets_the_render_mode() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let f = factory();
+    let mut inst = f.instantiate("org.faderframe.test-gain").unwrap();
+    RENDER_MODES.lock().unwrap().clear();
+    let offline = ProcessConfig {
+        sample_rate: 48_000.0,
+        max_block_size: 256,
+        sidechain: false,
+        double_precision: false,
+        offline: true,
+    };
+    let mut proc = inst.create_processor(&offline).unwrap();
+    run_block(proc.as_mut(), &[], 256);
+    assert_eq!(*RENDER_MODES.lock().unwrap(), [RenderMode::Offline]);
+    drop(proc);
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            offline: false,
+            ..offline
+        })
+        .unwrap();
+    run_block(proc.as_mut(), &[], 256);
+    assert_eq!(
+        *RENDER_MODES.lock().unwrap(),
+        [RenderMode::Offline, RenderMode::Realtime]
+    );
 }
 
 /// Host a real installed plugin end to end (opt-in):
@@ -900,6 +954,7 @@ fn hosts_an_installed_plugin() {
                 max_block_size: 512,
                 sidechain: false,
                 double_precision: false,
+                offline: false,
             })
             .unwrap();
         let mut peak = 0.0f32;
@@ -1009,6 +1064,7 @@ fn play_a_note(f: &ClapFactory, p: &ScannedPlugin, offset: Option<(ParameterId, 
             max_block_size: 512,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     let (mut sum, mut n) = (0.0f64, 0usize);

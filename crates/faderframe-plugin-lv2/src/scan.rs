@@ -288,11 +288,44 @@ impl Lv2Plugin {
                 let shared = first[..common]
                     .trim_end_matches([' ', '-', '_', '('])
                     .trim();
-                if names.len() > 1 && !shared.is_empty() {
-                    shared.to_string()
-                } else {
-                    first.to_string()
+                // Numbered ports ("Out3", "Out4"): "Out 3/4", not "Out"
+                // for every pair — the number whole ("Out15"/"Out16" share
+                // "Out1", not a number).
+                let digits = first[..common]
+                    .trim_end_matches(|c: char| c.is_ascii_digit())
+                    .len();
+                let numbers: Option<Vec<&str>> = names
+                    .iter()
+                    .map(|n| {
+                        let rest = n.get(digits..).unwrap_or("").trim();
+                        (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                            .then_some(rest)
+                    })
+                    .collect();
+                let base = first[..digits]
+                    .trim_end_matches([' ', '-', '_', '('])
+                    .trim();
+                match numbers {
+                    Some(numbers) if names.len() > 1 && !base.is_empty() => {
+                        format!("{base} {}", numbers.join("/"))
+                    }
+                    _ if names.len() > 1 && !shared.is_empty() => shared.to_string(),
+                    _ => first.to_string(),
                 }
+            })
+            .collect()
+    }
+
+    /// Each output bus's ports' names, main first (a multi-microphone
+    /// instrument's microphones, for tracks taking one channel each).
+    pub fn output_channel_names(&self) -> Vec<Vec<String>> {
+        self.output_buses()
+            .iter()
+            .map(|bus| {
+                bus.iter()
+                    .filter_map(|i| self.ports.get(*i as usize))
+                    .map(|p| p.name.clone())
+                    .collect()
             })
             .collect()
     }
@@ -846,5 +879,89 @@ mod reduction_tests {
         assert_eq!(ReductionScale::Db.reduction_db(-4.5), 4.5);
         assert!((ReductionScale::Gain.reduction_db(0.5) - 6.0206).abs() < 1e-3);
         assert_eq!(ReductionScale::Gain.reduction_db(1.0), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod bus_tests {
+    use super::*;
+
+    /// A plugin described by a bundle of its own with these audio
+    /// outputs (symbol, name), without port groups.
+    fn with_outputs(tag: &str, outs: &[(&str, &str)]) -> Lv2Plugin {
+        let dir =
+            std::env::temp_dir().join(format!("ff-lv2-buses-{}-{tag}.lv2", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let ports: Vec<String> = outs
+            .iter()
+            .enumerate()
+            .map(|(i, (symbol, name))| {
+                format!(
+                    "[ a lv2:OutputPort , lv2:AudioPort ; lv2:index {i} ; \
+                     lv2:symbol \"{symbol}\" ; lv2:name \"{name}\" ]"
+                )
+            })
+            .collect();
+        let ttl = format!(
+            "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n\
+             <urn:faderframe:test#{tag}> a lv2:Plugin , lv2:InstrumentPlugin ;\n\
+             lv2:binary <none.so> ;\n\
+             <http://usefulinc.com/ns/doap#name> \"{tag}\" ;\n\
+             lv2:port {} .\n",
+            ports.join(" , ")
+        );
+        std::fs::write(dir.join("manifest.ttl"), ttl).unwrap_or_default();
+        let bundle = describe_bundle(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        bundle
+            .ok()
+            .and_then(|b| b.plugins.into_iter().next())
+            .unwrap_or_else(|| panic!("{tag} not described"))
+    }
+
+    /// Ungrouped ports stay paired as they were (projects keep their
+    /// routing); each port's own name is there for tracks taking one
+    /// channel (DrumGizmo's sixteen microphones, #52).
+    #[test]
+    fn ungrouped_ports_are_paired_and_name_their_channels() {
+        let names: Vec<(String, String)> = (1..=16)
+            .map(|i| (format!("out{i}"), format!("Out{i}")))
+            .collect();
+        let outs: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(s, n)| (s.as_str(), n.as_str()))
+            .collect();
+        let p = with_outputs("mics", &outs);
+        let buses = p.output_buses();
+        assert_eq!(buses.len(), 8);
+        assert!(buses.iter().all(|b| b.len() == 2), "{buses:?}");
+        let names = p.output_bus_names();
+        assert_eq!(names[0], "Out 1/2");
+        assert_eq!(names[7], "Out 15/16");
+        let channels = p.output_channel_names();
+        assert_eq!(channels[2], vec!["Out5", "Out6"]);
+    }
+
+    #[test]
+    fn shared_names_name_a_pair() {
+        let p = with_outputs(
+            "pairs",
+            &[
+                ("out_l", "Out L"),
+                ("out_r", "Out R"),
+                ("kick_l", "Kick L"),
+                ("kick_r", "Kick R"),
+                ("snare", "Snare"),
+            ],
+        );
+        assert_eq!(p.output_bus_names(), vec!["Out", "Kick", "Snare"]);
+        assert_eq!(
+            p.output_channel_names(),
+            vec![
+                vec!["Out L", "Out R"],
+                vec!["Kick L", "Kick R"],
+                vec!["Snare"]
+            ]
+        );
     }
 }

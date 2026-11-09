@@ -110,6 +110,7 @@ fn it_plays_live_and_a_pedal_added_while_playing_restarts_the_line() {
     s.dispatch(Action::CreateOutputTracks {
         plugin,
         buses: None,
+        mono: false,
     })
     .unwrap();
     // Main, DI and each microphone on tracks of their own; the station's

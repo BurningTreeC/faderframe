@@ -426,6 +426,8 @@ enum Role {
     Cached = 30,
     /// Its crossfade between the chain and the cache.
     Handover = 31,
+    /// One channel of a plugin's output bus, for the track taking it.
+    PickChannel = 32,
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
@@ -1048,6 +1050,9 @@ pub fn build_graph(
     let mut bus_used_rings: Vec<Arc<AheadRing>> = Vec::new();
     let mut warnings = Vec::new();
     let double_precision = plugins.double_precision();
+    // The engine as a whole renders offline (plugins are told); graphs
+    // rendered ahead in a live session (`pcx.realtime` false) are live.
+    let offline = !plugins.realtime();
     let mut pcx = PluginCx {
         realtime: plugins.realtime(),
         // Offline renders have no device: their output must not depend on
@@ -1063,6 +1068,7 @@ pub fn build_graph(
             max_block_size: config.max_block_size as u32,
             sidechain: false,
             double_precision,
+            offline,
         },
         warnings: &mut warnings,
         taken: project.taken_plugin_outputs(),
@@ -1807,14 +1813,49 @@ pub fn build_graph(
     // Plugins' outputs into the tracks taking them, the main one (right
     // after the plugin) too; both on the audio thread: neither renders
     // ahead.
-    for t in &project.tracks {
+    // A track taking one channel of a bus gets that channel alone (a
+    // pick, not the graph's mix of a wide output into a mono input).
+    for (gi, t) in project.tracks.iter().enumerate() {
         let Some((plugin, bus)) = t.input.plugin_output() else {
+            continue;
+        };
+        // An unavailable plugin (passing audio through) has no extra
+        // outputs: its tracks stay silent, the rest of the graph plays.
+        let Some(layout) = output_nodes
+            .get(&plugin)
+            .and_then(|&n| b.spec(n))
+            .and_then(|s| s.audio_outputs.get(usize::from(bus)).copied())
+        else {
             continue;
         };
         if let (Some(&node), Some(tn)) = (output_nodes.get(&plugin), nodes.get(&t.id))
             && let Some(input) = tn.input.filter(|_| !tn.input_ahead)
         {
-            b.connect_audio(node, bus, input, 0)?;
+            match t.input.plugin_channel() {
+                Some(c) if layout.channel_count() > 1 => {
+                    let pick = b.add_node(
+                        NodeSpec::new(format!("{} · Channel {}", t.name, c + 1))
+                            .key(node_key(
+                                t.id,
+                                Role::PickChannel,
+                                (u64::from(bus) << 16) | u64::from(c),
+                                &[layout],
+                            ))
+                            .group(gi as u32)
+                            .audio_in(layout)
+                            .audio_out(ChannelLayout::Mono),
+                        Box::new(faderframe_audio_graph::nodes::PickChannel {
+                            channel: usize::from(c),
+                        }),
+                    );
+                    own(&mut owners, pick, t.id, None, NodeWork::Input);
+                    b.connect_audio(node, bus, pick, 0)?;
+                    b.connect_audio(pick, 0, input, 0)?;
+                }
+                // A channel the bus does not have: nothing.
+                Some(c) if usize::from(c) >= layout.channel_count() => {}
+                _ => b.connect_audio(node, bus, input, 0)?,
+            }
         }
     }
 

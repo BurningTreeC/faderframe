@@ -3440,8 +3440,16 @@ fn the_instruments_do_not_allocate() {
         tp.project.track_mut(t).unwrap().input = faderframe_project::InputRouting::Plugin {
             plugin: ids[5],
             bus,
+            channel: None,
         };
     }
+    // And one channel of another on a mono track (a pick).
+    let t = tp.track(TrackKind::Aux, "Out 3 R", ChannelLayout::Mono);
+    tp.project.track_mut(t).unwrap().input = faderframe_project::InputRouting::Plugin {
+        plugin: ids[5],
+        bus: 3,
+        channel: Some(1),
+    };
     let config = EngineConfig {
         sample_rate: SR,
         ..EngineConfig::default()

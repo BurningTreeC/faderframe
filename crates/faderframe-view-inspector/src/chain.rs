@@ -324,12 +324,10 @@ pub fn contents_label(model: &Session, t: &Track) -> String {
 /// master: how many tracks (as they are routed: a folder bus's tracks
 /// with the default output play through it) and sends reach it.
 pub fn input_label(model: &Session, t: &Track) -> String {
-    if let Some((plugin, bus)) = t.input.plugin_output() {
+    if t.input.plugin_output().is_some() {
         return model
-            .plugin_output_buses(plugin)
-            .into_iter()
-            .find(|o| o.bus == bus)
-            .map_or_else(|| "a plugin output".into(), |o| o.name);
+            .plugin_output_name(&t.input)
+            .unwrap_or_else(|| "a plugin output".into());
     }
     match t.kind {
         TrackKind::Instrument | TrackKind::Midi => checked_label(&model.midi_input_choices(t.id)),

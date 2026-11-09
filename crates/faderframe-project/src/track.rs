@@ -164,8 +164,15 @@ pub enum InputRouting {
     },
     /// An output bus of a plugin on another track (a multi-output
     /// instrument's extra outputs; `bus` 1 is the first after the main
-    /// one).
-    Plugin { plugin: PluginInstanceId, bus: u16 },
+    /// one), or one `channel` of it (a mono track: one microphone of a
+    /// plugin that sends several on one bus, whatever its format says
+    /// they are).
+    Plugin {
+        plugin: PluginInstanceId,
+        bus: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel: Option<u16>,
+    },
 }
 
 /// How a headphone render places a track (Dolby's binaural render
@@ -260,10 +267,20 @@ impl InputRouting {
         matches!(self, InputRouting::Midi { .. })
     }
 
-    /// The plugin output bus it takes, if it takes one.
+    /// The plugin output bus it takes (all of it or one channel), if it
+    /// takes one.
     pub fn plugin_output(&self) -> Option<(PluginInstanceId, u16)> {
         match *self {
-            InputRouting::Plugin { plugin, bus } => Some((plugin, bus)),
+            InputRouting::Plugin { plugin, bus, .. } => Some((plugin, bus)),
+            _ => None,
+        }
+    }
+
+    /// The one channel of a plugin's output bus it takes (`None`: the
+    /// whole bus, or no plugin output).
+    pub fn plugin_channel(&self) -> Option<u16> {
+        match *self {
+            InputRouting::Plugin { channel, .. } => channel,
             _ => None,
         }
     }
@@ -919,6 +936,32 @@ impl Track {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin output taken whole is written as it always was (older
+    /// versions read it); one channel of it carries `channel`.
+    #[test]
+    fn a_plugin_outputs_channel_is_written_only_when_one_is_taken() {
+        let whole = InputRouting::Plugin {
+            plugin: PluginInstanceId(7),
+            bus: 2,
+            channel: None,
+        };
+        let text = serde_json::to_string(&whole).unwrap_or_default();
+        assert_eq!(text, r#"{"type":"plugin","plugin":7,"bus":2}"#);
+        let old: InputRouting =
+            serde_json::from_str(r#"{"type":"plugin","plugin":7,"bus":2}"#).unwrap_or_default();
+        assert_eq!(old, whole);
+        let one = InputRouting::Plugin {
+            plugin: PluginInstanceId(7),
+            bus: 2,
+            channel: Some(1),
+        };
+        let text = serde_json::to_string(&one).unwrap_or_default();
+        let back: InputRouting = serde_json::from_str(&text).unwrap_or_default();
+        assert_eq!(back, one);
+        assert_eq!(back.plugin_output(), Some((PluginInstanceId(7), 2)));
+        assert_eq!(back.plugin_channel(), Some(1));
+    }
 
     #[test]
     fn a_guitar_station_turns_a_mono_track_stereo_after_it() {

@@ -392,6 +392,9 @@ pub struct Instantiated {
     /// Its output buses' names.
     #[serde(default)]
     pub output_names: Vec<String>,
+    /// Its output buses' channels' names.
+    #[serde(default)]
+    pub output_channel_names: Vec<Vec<String>>,
 }
 
 /// What happened in the helper since the last poll.
@@ -482,6 +485,11 @@ pub enum Request {
         /// Output buses the graph takes (0: only the main one).
         #[serde(default)]
         output_buses: u16,
+        /// The host renders offline ([`ProcessConfig::offline`]).
+        ///
+        /// [`ProcessConfig::offline`]: faderframe_plugin_host::ProcessConfig::offline
+        #[serde(default)]
+        offline: bool,
     },
     Deactivate,
     Editor(EditorCall),

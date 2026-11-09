@@ -241,6 +241,7 @@ mod tests {
             max_block_size: 511,
             sidechain: false,
             double_precision: false,
+            offline: false,
         };
         for model in
             0..faderframe_circuit::preamp::MODELS + faderframe_circuit::preamp::CONSOLE_BUSES

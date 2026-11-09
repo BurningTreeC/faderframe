@@ -3300,11 +3300,7 @@ impl ArrangerView {
             if !model.plugin_has_extra_outputs(slot.id) {
                 continue;
             }
-            let missing = model
-                .plugin_output_buses(slot.id)
-                .iter()
-                .filter(|o| o.track.is_none())
-                .count();
+            let missing = model.missing_output_tracks(slot.id, false);
             let label = format!("Create Output Tracks · {} ({missing})", t.name_of(slot));
             items.push(
                 if missing == 0 {
@@ -3315,11 +3311,24 @@ impl ArrangerView {
                         Action::CreateOutputTracks {
                             plugin: slot.id,
                             buses: None,
+                            mono: false,
                         },
                     )
                 }
                 .separated(),
             );
+            // A mono track per channel (each microphone on its own).
+            let mono = model.missing_output_tracks(slot.id, true);
+            if model.plugin_has_wide_outputs(slot.id) && mono > 0 {
+                items.push(MenuItem::new(
+                    format!("Create Mono Output Tracks · {} ({mono})", t.name_of(slot)),
+                    Action::CreateOutputTracks {
+                        plugin: slot.id,
+                        buses: None,
+                        mono: true,
+                    },
+                ));
+            }
         }
         // A lead sheet of the whole track (its clips' melody).
         if matches!(

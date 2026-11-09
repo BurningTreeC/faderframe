@@ -96,6 +96,7 @@ fn the_guitar_station_does_not_allocate_live() {
         max_block_size: BLOCK as u32,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let mut p = GuitarProcessor::new(
         params.clone(),

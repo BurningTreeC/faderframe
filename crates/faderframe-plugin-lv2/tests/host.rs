@@ -77,14 +77,18 @@ const P_LATENCY: usize = 3;
 const P_CONTROL: usize = 4;
 /// What it "takes off": its gain below unity, as a coefficient.
 const P_GR: usize = 5;
+/// `lv2:freeWheeling`: 1 in an offline render.
+const P_FREEWHEEL: usize = 6;
 
 struct Test {
-    ports: [*mut c_void; 6],
+    ports: [*mut c_void; 7],
     map: *const sys::LV2_URID_Map,
     schedule: *const sys::LV2_Worker_Schedule,
     notes: i32,
     worked: i32,
     speed: f32,
+    /// The freewheel port as the last run read it.
+    freewheel: f32,
 }
 
 fn urid(t: &Test, uri: &CStr) -> u32 {
@@ -99,12 +103,13 @@ unsafe extern "C" fn instantiate(
     features: *const *const LV2_Feature,
 ) -> LV2_Handle {
     let mut t = Box::new(Test {
-        ports: [std::ptr::null_mut(); 6],
+        ports: [std::ptr::null_mut(); 7],
         map: std::ptr::null(),
         schedule: std::ptr::null(),
         notes: 0,
         worked: 0,
         speed: -1.0,
+        freewheel: -1.0,
     });
     let mut i = 0;
     // SAFETY: a null-terminated feature list.
@@ -142,6 +147,9 @@ unsafe extern "C" fn run(h: LV2_Handle, n: u32) {
         *t.ports[P_LATENCY].cast::<f32>() = 32.0;
         if !t.ports[P_GR].is_null() {
             *t.ports[P_GR].cast::<f32>() = gain.min(1.0);
+        }
+        if !t.ports[P_FREEWHEEL].is_null() {
+            t.freewheel = *t.ports[P_FREEWHEEL].cast::<f32>();
         }
         let midi = urid(t, c"http://lv2plug.in/ns/ext/midi#MidiEvent");
         let object = urid(t, c"http://lv2plug.in/ns/ext/atom#Object");
@@ -225,14 +233,19 @@ unsafe extern "C" fn save(
                 flags,
             );
         }
-        store(
-            handle,
-            urid(t, c"urn:faderframe:test#speed"),
-            (&t.speed as *const f32).cast(),
-            4,
-            float,
-            flags,
-        );
+        for (key, v) in [
+            (c"urn:faderframe:test#speed", &t.speed),
+            (c"urn:faderframe:test#freewheel", &t.freewheel),
+        ] {
+            store(
+                handle,
+                urid(t, key),
+                (v as *const f32).cast(),
+                4,
+                float,
+                flags,
+            );
+        }
     }
     0
 }
@@ -333,7 +346,9 @@ fn model() -> Arc<scan::Lv2Plugin> {
           lv2:symbol "control" ; lv2:name "Control" ;
           atom:supports <http://lv2plug.in/ns/ext/midi#MidiEvent> , <http://lv2plug.in/ns/ext/time#Position> ] ,
         [ a lv2:OutputPort , lv2:ControlPort ; lv2:index 5 ; lv2:symbol "gr" ; lv2:name "Gain Reduction" ;
-          <http://lv2plug.in/ns/extensions/units#unit> <http://lv2plug.in/ns/extensions/units#coef> ] .
+          <http://lv2plug.in/ns/extensions/units#unit> <http://lv2plug.in/ns/extensions/units#coef> ] ,
+        [ a lv2:InputPort , lv2:ControlPort ; lv2:index 6 ; lv2:symbol "freewheel" ; lv2:name "Freewheel" ;
+          lv2:designation lv2:freeWheeling ; lv2:portProperty lv2:toggled ] .
 "#,
     )
     .unwrap();
@@ -371,6 +386,7 @@ fn a_plugin_runs_with_the_host_features() {
         max_block_size: 256,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let mut proc = inst.create_processor(&config).unwrap();
     assert_eq!(inst.latency_samples(), 32, "measured after activation");
@@ -508,6 +524,86 @@ fn a_plugin_runs_with_the_host_features() {
     }
 }
 
+/// An offline render (issue #50) freewheels: the `lv2:freeWheeling` port
+/// reads 1, and the work a block schedules is done before the block
+/// returns (its response comes after that block's `run`). A live one
+/// reads 0.
+#[test]
+fn an_offline_render_freewheels_and_does_its_work_in_the_block() {
+    let mut inst = Lv2Instance::with_entry(model(), entry).unwrap();
+    let offline = ProcessConfig {
+        sample_rate: 44_100.0,
+        max_block_size: 256,
+        sidechain: false,
+        double_precision: false,
+        offline: true,
+    };
+    let inputs = {
+        let mut b = AudioBuffer::new(ChannelLayout::Mono, 256);
+        b.set_len(256);
+        vec![b]
+    };
+    let mut outputs = vec![AudioBuffer::new(ChannelLayout::Mono, 256)];
+    outputs[0].set_len(256);
+    let transport = TransportInfo {
+        sample_rate: 44_100.0,
+        ..TransportInfo::default()
+    };
+    let mut block = |proc: &mut Box<dyn faderframe_plugin_host::PluginProcessor>, note: bool| {
+        let mut midi = vec![MidiBuffer::with_capacity(8)];
+        if note {
+            midi[0]
+                .push(TimedMidiEvent::new(
+                    10,
+                    MidiEvent::NoteOn {
+                        channel: 0,
+                        key: 60,
+                        velocity: 90,
+                    },
+                ))
+                .unwrap();
+        }
+        let mut io = NodeIo {
+            frames: 256,
+            audio_in: &inputs,
+            audio_out: &mut outputs,
+            events_in: &midi,
+            events_out: &mut [],
+        };
+        let ctx = PluginProcessContext {
+            transport: &transport,
+            param_events: &[],
+            harmony: &faderframe_plugin_host::NO_HARMONY,
+            param_mods: &[],
+            note_mods: &[],
+        };
+        proc.process(&ctx, &mut io);
+    };
+    let freewheel = |inst: &mut Lv2Instance| {
+        let v = state_value(inst, "urn:faderframe:test#freewheel");
+        f32::from_le_bytes(v[..4].try_into().unwrap())
+    };
+    let mut proc = inst.create_processor(&offline).unwrap();
+    for n in 1..=3 {
+        block(&mut proc, true);
+        assert_eq!(
+            int(&state_value(&mut inst, "urn:faderframe:test#worked")),
+            n,
+            "the work of block {n} done in it"
+        );
+    }
+    assert_eq!(freewheel(&mut inst), 1.0);
+    drop(proc);
+    let mut proc = inst
+        .create_processor(&ProcessConfig {
+            offline: false,
+            ..offline
+        })
+        .unwrap();
+    block(&mut proc, false);
+    assert_eq!(freewheel(&mut inst), 0.0, "live: not freewheeling");
+}
+
 #[test]
 fn a_rate_change_makes_the_plugin_again_with_its_state() {
     let mut inst = Lv2Instance::with_entry(model(), entry).unwrap();
@@ -517,6 +613,7 @@ fn a_rate_change_makes_the_plugin_again_with_its_state() {
         max_block_size: 512,
         sidechain: false,
         double_precision: false,
+        offline: false,
     };
     let _a = inst.create_processor(&cfg(48_000.0)).unwrap();
     let first = inst.activation();
@@ -540,6 +637,7 @@ fn its_gain_reduction_port_reaches_the_host() {
             max_block_size: 64,
             sidechain: false,
             double_precision: false,
+            offline: false,
         })
         .unwrap();
     let cell = inst.reduction().expect("it has a gain-reduction port");

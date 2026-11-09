@@ -3788,8 +3788,33 @@ pub fn install(app: &Rc<AppState>) {
                 Some(plugin) => a.dispatch(Action::CreateOutputTracks {
                     plugin,
                     buses: bus.map(|b| vec![b]),
+                    mono: false,
                 }),
                 None => tracing::warn!("create-output-tracks: no plugin {arg}"),
+            }
+        }),
+        // `create-mono-output-tracks:<plugin id>[\n<bus>]` (or `insert=<n>`):
+        // a mono track per channel of the plugin's outputs (of `bus`).
+        named("create-mono-output-tracks", |a, arg| {
+            let (id, bus) = match arg.split_once('\n') {
+                Some((id, bus)) => (id, bus.trim().parse::<u16>().ok()),
+                None => (arg, None),
+            };
+            let plugin = match id.strip_prefix("insert=") {
+                Some(n) => n.trim().parse::<usize>().ok().and_then(|n| insert_of(a, n)),
+                None => id
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(faderframe_core::PluginInstanceId),
+            };
+            match plugin {
+                Some(plugin) => a.dispatch(Action::CreateOutputTracks {
+                    plugin,
+                    buses: bus.map(|b| vec![b]),
+                    mono: true,
+                }),
+                None => tracing::warn!("create-mono-output-tracks: no plugin {arg}"),
             }
         }),
         named("remove-output-track", |a, arg| {

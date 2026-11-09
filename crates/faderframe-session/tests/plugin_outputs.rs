@@ -4,7 +4,7 @@
 //! sent to an extra output sounds on its track and not on the plugin's.
 
 use faderframe_audio::dummy::DummyBackend;
-use faderframe_core::{ParameterId, PluginInstanceId, TrackId, builtin};
+use faderframe_core::{ChannelLayout, ParameterId, PluginInstanceId, TrackId, builtin};
 use faderframe_engine::EngineConfig;
 use faderframe_plugin_host::devices::drums;
 use faderframe_project::{Command, InputRouting, OutputRouting, PluginRef, Project, TrackKind};
@@ -77,6 +77,7 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     s.dispatch(Action::CreateOutputTracks {
         plugin,
         buses: None,
+        mono: false,
     })
     .unwrap();
     let p = s.project();
@@ -98,7 +99,8 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
             t.input,
             InputRouting::Plugin {
                 plugin,
-                bus: i as u16
+                bus: i as u16,
+                channel: None,
             }
         );
         assert_eq!(t.output, routed, "where the kit's track went");
@@ -117,7 +119,8 @@ fn output_tracks_are_made_in_one_step_and_carry_their_pads() {
     assert!(
         s.dispatch(Action::CreateOutputTracks {
             plugin,
-            buses: None
+            buses: None,
+            mono: false,
         })
         .is_err()
     );
@@ -209,7 +212,14 @@ fn a_track_can_take_one_output_by_hand() {
         });
     s.dispatch(pick.action.clone()).unwrap();
     let t = s.project().track(aux).unwrap();
-    assert_eq!(t.input, InputRouting::Plugin { plugin, bus: 2 });
+    assert_eq!(
+        t.input,
+        InputRouting::Plugin {
+            plugin,
+            bus: 2,
+            channel: None
+        }
+    );
     // The kit's own track cannot take its outputs (a loop).
     assert!(
         !s.input_choices(kit_track)
@@ -220,6 +230,7 @@ fn a_track_can_take_one_output_by_hand() {
     s.dispatch(Action::CreateOutputTracks {
         plugin,
         buses: None,
+        mono: false,
     })
     .unwrap();
     assert_eq!(
@@ -240,6 +251,7 @@ fn an_output_given_back_plays_in_the_main_again() {
         s.dispatch(Action::CreateOutputTracks {
             plugin,
             buses: Some(vec![bus]),
+            mono: false,
         })
         .unwrap();
     }
@@ -298,4 +310,142 @@ fn an_output_given_back_plays_in_the_main_again() {
     );
     s.dispatch(Action::Undo).unwrap();
     assert!(s.project().track(out5).is_some() && s.project().track(folder).is_some());
+}
+
+/// Mono output tracks (#52): a track per channel of every output, each
+/// taking one channel and named after it; the main's two take the place of
+/// the plugin's own track; the routing survives a save; a pad sounds on
+/// both of its output's tracks; giving the output back removes both and
+/// gives the plugin's track its routing back once the main's are gone.
+#[test]
+fn mono_output_tracks_take_a_channel_each() {
+    let (mut s, kit_track, plugin) = kit();
+    let routed = s.project().track(kit_track).unwrap().output;
+    let channels = 2 * (1 + drums::AUX);
+    assert!(s.plugin_has_wide_outputs(plugin));
+    assert_eq!(s.missing_output_tracks(plugin, true), channels);
+    s.dispatch(Action::CreateOutputTracks {
+        plugin,
+        buses: None,
+        mono: true,
+    })
+    .unwrap();
+    let p = s.project();
+    let outs = p.plugin_output_tracks(plugin);
+    assert_eq!(outs.len(), channels);
+    let host = p.track(kit_track).unwrap();
+    assert_eq!(host.output, OutputRouting::None, "the main is taken");
+    for (i, t) in outs.iter().enumerate() {
+        assert_eq!(t.layout, ChannelLayout::Mono);
+        assert_eq!(
+            t.input,
+            InputRouting::Plugin {
+                plugin,
+                bus: (i / 2) as u16,
+                channel: Some((i % 2) as u16),
+            }
+        );
+    }
+    assert_eq!(outs[0].name, format!("{} Main L", host.name));
+    assert_eq!(outs[7].name, format!("{} Out 3 R", host.name));
+    assert_eq!(s.input_label(outs[7]), "Drums · Out 3 R");
+    assert_eq!(s.missing_output_tracks(plugin, true), 0);
+    assert_eq!(s.missing_output_tracks(plugin, false), 0);
+    assert!(s.plugin_output_buses(plugin).iter().all(|o| o.covered()));
+    let (out3_l, out3_r) = (outs[6].id, outs[7].id);
+    let main = [outs[0].id, outs[1].id];
+    // Saved and read back: the channel is kept.
+    let text = faderframe_project::file::to_string(s.project(), None).unwrap();
+    let back = faderframe_project::file::from_str(&text).unwrap().project;
+    assert_eq!(
+        back.track(out3_r).unwrap().input,
+        s.project().track(out3_r).unwrap().input
+    );
+
+    // A pad sent to output 3 sounds on both of its tracks.
+    s.dispatch(Action::Edit(Command::SetPluginParameter {
+        track: kit_track,
+        plugin,
+        parameter: ParameterId(drums::id::pad(0) + drums::id::OUTPUT),
+        value: Some(3.0),
+    }))
+    .unwrap();
+    s.start_audio(
+        vec![Box::new(DummyBackend::default())],
+        &AudioPreferences::default(),
+    )
+    .unwrap();
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![kit_track],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    run(&mut s, 0.3);
+    s.midi_keyboard().send(&[0x90, 36, 120]);
+    run(&mut s, 0.15);
+    let (l, r) = (s.meter(out3_l).left.level_db, s.meter(out3_r).left.level_db);
+    s.midi_keyboard().send(&[0x80, 36, 0]);
+    s.stop_audio();
+    assert!(l > -30.0 && r > -30.0, "on both: {l:.1} / {r:.1} dBFS");
+
+    // Output 3 given back: both its tracks go in one step.
+    s.dispatch(Action::RemoveOutputTrack { plugin, bus: 3 })
+        .unwrap();
+    assert!(s.project().track(out3_l).is_none());
+    assert!(s.project().track(out3_r).is_none());
+    // The main's two: the kit's track plays again, once.
+    s.dispatch(Action::RemoveOutputTrack { plugin, bus: 0 })
+        .unwrap();
+    assert!(main.iter().all(|t| s.project().track(*t).is_none()));
+    assert_eq!(s.project().track(kit_track).unwrap().output, routed);
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(
+        s.project().track(kit_track).unwrap().output,
+        OutputRouting::None
+    );
+    // Only the main's left given back by hand: the right still takes it,
+    // the kit's track stays off.
+    s.dispatch(Action::Edit(Command::RemoveTrack { track: main[0] }))
+        .unwrap();
+    assert_eq!(
+        s.project().track(kit_track).unwrap().output,
+        OutputRouting::None
+    );
+}
+
+/// A track takes one channel of an output by hand (its input menu).
+#[test]
+fn a_track_can_take_one_channel_by_hand() {
+    let (mut s, _, plugin) = kit();
+    let aux = s.add_track(TrackKind::Aux).unwrap();
+    let choices = s.input_choices(aux);
+    let pick = choices
+        .iter()
+        .find(|c| c.label.ends_with("Out 2 R"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{:#?}",
+                choices.iter().map(|c| &c.label).collect::<Vec<_>>()
+            )
+        });
+    s.dispatch(pick.action.clone()).unwrap();
+    let t = s.project().track(aux).unwrap();
+    assert_eq!(
+        t.input,
+        InputRouting::Plugin {
+            plugin,
+            bus: 2,
+            channel: Some(1)
+        }
+    );
+    assert_eq!(t.layout, ChannelLayout::Mono);
+    // The bus is taken, one of its channels still free.
+    let o = &s.plugin_output_buses(plugin)[2];
+    assert!(o.taken());
+    assert_eq!(o.free_channels(), vec![0]);
+    assert!(
+        s.input_choices(aux)
+            .iter()
+            .any(|c| c.checked && c.label.ends_with("Out 2 R"))
+    );
 }

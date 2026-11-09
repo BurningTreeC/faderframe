@@ -451,8 +451,19 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
     let weak = Rc::downgrade(app);
     button.set_create_popup_func(move |button| {
         let Some(app) = weak.upgrade() else { return };
-        let outs = app.session.borrow().plugin_output_buses(plugin);
-        let missing = outs.iter().filter(|o| o.track.is_none()).count();
+        let (outs, missing, mono) = {
+            let s = app.session.borrow();
+            let mono = if s.plugin_has_wide_outputs(plugin) {
+                s.missing_output_tracks(plugin, true)
+            } else {
+                0
+            };
+            (
+                s.plugin_output_buses(plugin),
+                s.missing_output_tracks(plugin, false),
+                mono,
+            )
+        };
         let menu = gtk::gio::Menu::new();
         let all = gtk::gio::Menu::new();
         let item = gtk::gio::MenuItem::new(
@@ -470,27 +481,50 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
             );
         }
         all.append_item(&item);
+        // A mono track per channel: each microphone on its own, however
+        // the plugin grouped them.
+        if mono > 0 {
+            let item =
+                gtk::gio::MenuItem::new(Some(&format!("Create Mono Output Tracks ({mono})")), None);
+            item.set_action_and_target_value(
+                Some("app.create-mono-output-tracks"),
+                Some(&plugin.raw().to_string().to_variant()),
+            );
+            all.append_item(&item);
+        }
         menu.append_section(None, &all);
         let one = gtk::gio::Menu::new();
         for o in &outs {
-            let label = if o.track.is_some() {
+            let label = if o.taken() {
                 format!("✓ {}", o.name)
             } else {
                 o.name.clone()
             }
             .replace('_', "__");
             let item = gtk::gio::MenuItem::new(Some(&label), None);
-            // Ticked: a track takes it, and choosing it again removes that.
+            // Ticked: a track takes it (or a channel of it), and choosing
+            // it again removes those.
             let target = format!("{}\n{}", plugin.raw(), o.bus);
             item.set_action_and_target_value(
-                Some(if o.track.is_none() {
-                    "app.create-output-tracks"
-                } else {
+                Some(if o.taken() {
                     "app.remove-output-track"
+                } else {
+                    "app.create-output-tracks"
                 }),
                 Some(&target.to_variant()),
             );
             one.append_item(&item);
+            if o.channels > 1 && o.track.is_none() && !o.free_channels().is_empty() {
+                let item = gtk::gio::MenuItem::new(
+                    Some(&format!("{} as Mono Tracks", o.name).replace('_', "__")),
+                    None,
+                );
+                item.set_action_and_target_value(
+                    Some("app.create-mono-output-tracks"),
+                    Some(&target.to_variant()),
+                );
+                one.append_item(&item);
+            }
         }
         menu.append_section(Some("One Output"), &one);
         button.set_menu_model(Some(&menu));

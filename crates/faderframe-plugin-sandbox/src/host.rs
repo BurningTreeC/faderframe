@@ -6,7 +6,7 @@
 use crate::shm::{Block, BlockIn, MAX_OUT_BUFFERS, block_size};
 use crate::sys::{self, Control, Ready, Signal, Waiter};
 use crate::wire::{self, EditorCall, Request, Response};
-use crate::{BLOCK_TIMEOUT, Launcher};
+use crate::{BLOCK_TIMEOUT, Launcher, OFFLINE_BLOCK_TIMEOUT};
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
 use faderframe_midi::NoteExpressionKind;
@@ -53,6 +53,9 @@ struct Channel {
     frame_seconds: f64,
     /// Blocks given up on (silence played): the engine counts them.
     late: u64,
+    /// An offline render's: every block waits for its answer (up to
+    /// [`OFFLINE_BLOCK_TIMEOUT`]).
+    offline: bool,
 }
 
 /// How often the calling thread's scheduling is sent to the helper again.
@@ -91,9 +94,15 @@ impl Channel {
         // budget, else a block's duration (past it the callback is late in
         // any case) — a stuck helper costs its own track a block of
         // silence, never the engine a quarter of a second.
-        let limit = self.deadline.unwrap_or_else(|| {
-            started + Duration::from_secs_f64(frames as f64 * self.frame_seconds)
-        });
+        let limit = if self.offline {
+            // No device waits: the helper takes the time it needs (until
+            // it is given up).
+            started + OFFLINE_BLOCK_TIMEOUT
+        } else {
+            self.deadline.unwrap_or_else(|| {
+                started + Duration::from_secs_f64(frames as f64 * self.frame_seconds)
+            })
+        };
         if let Some(sent) = self.in_flight {
             // The block given up on last time: its answer first. Still
             // not here: this block's events never reach the helper (the
@@ -160,11 +169,16 @@ impl Channel {
     }
 
     /// Wait for the helper's answer to the last block until `limit`; a
-    /// block unanswered `BLOCK_TIMEOUT` after `sent` (or a helper gone)
-    /// means it is dead.
+    /// block unanswered `BLOCK_TIMEOUT` (offline: `OFFLINE_BLOCK_TIMEOUT`)
+    /// after `sent` (or a helper gone) means it is dead.
     fn wait_done(&self, limit: Instant, sent: Instant) -> Wait {
         let h = self.block.header();
-        let dead_at = sent + BLOCK_TIMEOUT;
+        let dead_at = sent
+            + if self.offline {
+                OFFLINE_BLOCK_TIMEOUT
+            } else {
+                BLOCK_TIMEOUT
+            };
         loop {
             if h.done.load(Ordering::Acquire) == self.seq {
                 return Wait::Done;
@@ -259,6 +273,7 @@ pub struct RemoteInstance {
     programs: Vec<String>,
     program: Option<usize>,
     output_names: Vec<String>,
+    output_channel_names: Vec<Vec<String>>,
     /// Output buses the graph takes, and how many the active helper has.
     output_buses: usize,
     active_outputs: usize,
@@ -370,6 +385,7 @@ impl RemoteInstance {
             programs: Vec::new(),
             program: None,
             output_names: Vec::new(),
+            output_channel_names: Vec::new(),
             output_buses: 1,
             active_outputs: 1,
             pending: false,
@@ -413,6 +429,7 @@ impl RemoteInstance {
                 inst.has_editor = i.has_editor;
                 inst.programs = i.programs;
                 inst.output_names = i.output_names;
+                inst.output_channel_names = i.output_channel_names;
                 tracing::info!(
                     "{} runs in a sandbox (process {})",
                     inst.descriptor.name,
@@ -714,6 +731,10 @@ impl PluginInstance for RemoteInstance {
         self.output_names.clone()
     }
 
+    fn output_channel_names(&mut self) -> Vec<Vec<String>> {
+        self.output_channel_names.clone()
+    }
+
     fn current_program(&self) -> Option<usize> {
         self.program
     }
@@ -887,6 +908,7 @@ impl PluginInstance for RemoteInstance {
                 shm_size: block.size() as u64,
                 double_precision: config.double_precision,
                 output_buses: self.output_buses.min(u16::MAX as usize) as u16,
+                offline: config.offline,
             };
             let latency = match self.request(&req, &[], LOAD_TIMEOUT)? {
                 (Response::Activated { latency }, _) => latency,
@@ -911,6 +933,7 @@ impl PluginInstance for RemoteInstance {
                     in_flight: None,
                     frame_seconds: 1.0 / config.sample_rate.max(1.0),
                     late: 0,
+                    offline: config.offline,
                 })),
                 Arc::new(AtomicBool::new(false)),
             ));

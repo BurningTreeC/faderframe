@@ -308,7 +308,10 @@ each:
   concealed at once (`frames_owed_from_an_earlier_callback_are_concealed_not_waited_for`).
   A sandboxed plugin's helper is waited for until the callback's deadline
   (else a block's duration), then its block is silent and counted
-  (`take_underruns`); it is dead only after `BLOCK_TIMEOUT`. A panicking
+  (`take_underruns`); it is dead only after `BLOCK_TIMEOUT`. Offline
+  renders wait for every block (dead after `OFFLINE_BLOCK_TIMEOUT`, 30 s):
+  nothing waits on a device, and a plugin told it renders offline may
+  take longer than real time. A panicking
   node counts as done (the pool and the executor catch it), so no thread
   waits for it for ever; the caller of a parallel cycle always keeps a seat
   (workers still spinning from the last cycle cannot leave it only
@@ -3146,6 +3149,27 @@ Failed plugins
 are bypassed and flagged; missing formats pass audio through with a
 warning.
 
+**Offline renders are told** (issue #50). `ProcessConfig::offline` is set
+by `build_graph` when the engine's `PluginHost` is not realtime — an
+`OfflineRenderer` (exports, stems, freezes, bounces, clip effects, batch
+processing, self-freeze caches) — and never in a live session, not even in
+the graphs rendered ahead (those are "not realtime" only for FaderFrame's
+own buffered built-ins, `configure_realtime`; they still play live). Each
+format passes it on at activation: VST3 `kOffline` in `ProcessSetup` and
+in every block's `ProcessData`, CLAP's `clap.render` `set(OFFLINE)` before
+`activate` (a plugin that declines keeps its live behaviour), LV2's
+`lv2:freeWheeling` port (and the worker: freewheeling, the audio thread
+waits after `run` for the work `run` scheduled, so responses come as if
+done synchronously — `worker::Responses::deliver`), the AU's
+`kAudioUnitProperty_OfflineRender`, the sandbox's `Activate` request.
+Plugins that keep background work going live (Aeolus's convolver on a
+worker thread) finish it in the block offline; otherwise a render far
+faster than real time outruns it. Tests: engine `tests/offline_mode.rs`,
+`an_offline_render_sets_the_render_mode` (CLAP),
+`an_offline_render_processes_in_offline_mode` (VST3),
+`an_offline_render_freewheels_and_does_its_work_in_the_block` (LV2),
+`an_offline_render_is_told_and_waits_for_every_block` (sandbox).
+
 **Favorites** (issue #15) are the user's, not a project's:
 `faderframe_session::plugin_favorites` (pure; `PluginFavorites` with
 `Favorite`s keyed by `FavoriteKey` = format + the format's id — never the
@@ -4343,7 +4367,9 @@ pagefile-backed file mapping, all named in the helper's environment).
   samples zeroed). A round trip costs 7–9 µs.
 * **Failure**: a dead helper is noticed at once (its pipe closes; on
   Windows the wait includes its process handle); one that misses
-  `BLOCK_TIMEOUT` (250 ms) is given up and killed by the next poll.
+  `BLOCK_TIMEOUT` (250 ms; `OFFLINE_BLOCK_TIMEOUT` 30 s in an offline
+  render, where every block is waited for) is given up and killed by the
+  next poll.
   The processor then returns `ProcessStatus::Error`, so the engine bypasses
   the plugin; the session reports it once (`session::sandbox`) and
   `Action::ReloadPlugin` drops the instance and builds it again from its
@@ -4766,9 +4792,26 @@ A plugin's output buses are listed main first
 gives their names. The engine caches buses and names per instance
 (`PluginHost::outputs`, `OutputBus`).
 
-* **Taking a bus.** A track takes an extra bus with
-  `InputRouting::Plugin { plugin, bus }`; bus 0, the main one, is the
-  plugin's own track.
+* **Taking a bus, or one channel of it.** A track takes an extra bus with
+  `InputRouting::Plugin { plugin, bus, channel: None }`; bus 0, the main
+  one, is the plugin's own track. With `channel: Some(c)` a (mono) track
+  takes channel *c* of the bus alone — the user decides how a plugin's
+  channels become tracks, whatever its format grouped them into: a drum
+  instrument that sends its microphones on stereo buses (DrumGizmo's
+  sixteen ungrouped LV2 ports become eight pairs) would otherwise play two
+  microphones hard left and right on one track, the close kick in one
+  ear and its overhead bleed a few milliseconds later in the other, which
+  sounds like flams (#52). `channel` is written only when set (older
+  files read as whole buses).
+  * `build_graph` puts a `PickChannel` node (`faderframe_audio_graph::nodes`,
+    `Role::PickChannel`, no latency) between the bus and such a track's
+    input — not the graph's own mix of a wide output into a mono input,
+    which averages the channels. A channel the bus does not have is
+    silence; a one-channel bus is connected as it is.
+  * `PluginInstance::output_channel_names` names a bus's channels where the
+    format does (LV2: each port; the sandbox forwards them in
+    `Instantiated`); otherwise the session names them after the bus
+    ("Out 3 L"/"Out 3 R", a number for wider ones).
   * `Project::taken_plugin_outputs` gives the highest bus taken per
     plugin. `plugin_output_source` adds a routing edge from the plugin's
     track to the taking track, so solo keeps both audible and cycle
@@ -4785,7 +4828,10 @@ gives their names. The engine caches buses and names per instance
   * Audio Units set a float format on each taken output element and
     render element *k* with the main render's time stamp
     (`tests/apple_units.rs` uses AUSplitter).
-  * LV2 groups its ports into buses (`Lv2Plugin::output_buses`).
+  * LV2 groups its ports into buses (`Lv2Plugin::output_buses`): by
+    port group, else the first two ports as the main bus and the rest in
+    pairs (named "Out 3/4" when the ports are numbered); tracks that want
+    single ports take channels.
   * The sandbox packs channels (`shm`: `IN_SLOTS`/`OUT_SLOTS` channel
     slots, up to `MAX_OUT_BUFFERS` = 32 output buffers; format version 4)
     and forwards `configure_outputs` with `Activate` and the names with
@@ -4801,18 +4847,37 @@ gives their names. The engine caches buses and names per instance
   more lanes of the amplifier's reservoir stage, so they stay in step with
   the main).
 * **Session** (`session::outputs`):
-  * `plugin_output_buses` gives each bus with the track taking it.
-  * `Action::CreateOutputTracks { plugin, buses }` is one undo step. It
-    makes Aux tracks named after the buses (prefixed with the plugin's
-    track when a name is only a number), with the layout from the bus's
-    channels, routed like the plugin's track, in a new folder under it or
-    in the folder earlier ones are in.
+  * `plugin_output_buses` gives each bus (`PluginOutput`) with the track
+    taking all of it (`track`), the tracks taking a channel each
+    (`channel_tracks`) and its channels' names; `taken`, `free_channels`,
+    `covered`; `missing_output_tracks(plugin, mono)`,
+    `plugin_has_wide_outputs`, `plugin_output_name(input)` (what a track
+    takes, as the menus and strips name it).
+  * `Action::CreateOutputTracks { plugin, buses, mono }` is one undo
+    step. It makes Aux tracks named after the buses (prefixed with the
+    plugin's track when a name is only a number), with the layout from
+    the bus's channels — or, `mono`, a mono track per channel no track
+    takes yet ("Create Mono Output Tracks" in the mixer's insert menu,
+    the arranger's track menu and the editor window's Outputs button;
+    "<bus> as Mono Tracks" per bus) —, routed like the plugin's track, in
+    a new folder under it or in the folder earlier ones are in. The
+    plugin's track goes silent once its main has a track or a track per
+    channel.
   * `Action::RemoveOutputTrack { plugin, bus }` gives an output back:
-    its track goes (its folder too when that empties), one undo step;
-    for the main, the plugin's track gets its routing back
-    (`keep_main_heard`, also when the track is removed by hand).
-  * The input choices list other tracks' extra outputs (not ones that
-    would loop).
+    the tracks taking it go (their folder too when that empties), one
+    undo step; for the main, the plugin's track gets its routing back
+    once no track takes any of it (`keep_main_heard`, also when tracks
+    are removed by hand).
+  * The input choices list other tracks' extra outputs and, for wider
+    ones, each of their channels (not ones that would loop).
+  * Tests: engine `tests/plugin_outputs.rs` (outputs meet on the same
+    sample whatever the latency, block, worker pool or render-ahead;
+    `a_track_taking_one_channel_gets_that_channel_alone`), session
+    `mono_output_tracks_take_a_channel_each`,
+    `a_track_can_take_one_channel_by_hand`, the pick in
+    `the_instruments_do_not_allocate`. A missing plugin leaves its output
+    tracks silent and the rest of the graph playing (it used to fail the
+    build).
   * Freezing a track whose plugin feeds output tracks is refused. Track
     presets drop a plugin-output input.
 * **UI**: the insert menu (Create Output Tracks, an Outputs submenu —

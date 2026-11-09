@@ -21,6 +21,35 @@ impl<C> Processor<C> for Passthrough {
     }
 }
 
+/// One channel of input 0 on every channel of output 0 (a mono output:
+/// a track taking one microphone of a plugin's multi-channel output).
+/// A channel the input does not have is silence.
+#[derive(Debug, Clone, Copy)]
+pub struct PickChannel {
+    pub channel: usize,
+}
+
+impl<C> Processor<C> for PickChannel {
+    fn process(&mut self, _cx: &ProcessContext<'_, C>, io: &mut NodeIo<'_>) {
+        let Some(out) = io.audio_out.first_mut() else {
+            return;
+        };
+        let source = io
+            .audio_in
+            .first()
+            .filter(|i| self.channel < i.num_channels());
+        for c in 0..out.num_channels() {
+            let o = out.channel_mut(c);
+            o.fill(0.0);
+            if let Some(i) = source {
+                for (o, s) in o.iter_mut().zip(i.channel(self.channel)) {
+                    *o = *s;
+                }
+            }
+        }
+    }
+}
+
 /// Fixed linear gain from input 0 to output 0.
 #[derive(Debug, Clone, Copy)]
 pub struct Gain {

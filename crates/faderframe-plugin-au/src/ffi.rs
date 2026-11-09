@@ -56,6 +56,7 @@ pub const kAudioUnitProperty_HostCallbacks: u32 = 27;
 pub const kAudioUnitProperty_ElementName: u32 = 30;
 pub const kAudioUnitProperty_CocoaUI: u32 = 31;
 pub const kAudioUnitProperty_ParameterStringFromValue: u32 = 33;
+pub const kAudioUnitProperty_OfflineRender: u32 = 37;
 
 // Parameter flags and units.
 pub const kAudioUnitParameterFlag_CFNameRelease: u32 = 1 << 4;

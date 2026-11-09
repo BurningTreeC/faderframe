@@ -31,6 +31,7 @@ fn reset_cost(id: &str, set: &[(faderframe_core::ParameterId, f64)], live: bool)
         max_block_size: BLOCK as u32,
         sidechain: true,
         double_precision: false,
+        offline: false,
     };
     let mut p = inst.create_processor(&config).ok()?;
     let mut ins = [

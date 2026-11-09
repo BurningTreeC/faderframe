@@ -476,6 +476,14 @@ impl AuInstance {
             0,
             &state.host_callbacks(),
         );
+        // An offline render says so (optional: units that do not care
+        // refuse the property).
+        let _ = self.set(
+            kAudioUnitProperty_OfflineRender,
+            kAudioUnitScope_Global,
+            0,
+            &u32::from(config.offline),
+        );
         // SAFETY: a configured, uninitialised unit.
         let status = unsafe { AudioUnitInitialize(self.unit) };
         if status != 0 {

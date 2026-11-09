@@ -2,11 +2,15 @@
 //! sample, say) done on a thread of its own, the responses handed back on
 //! the audio thread after `run`. Messages travel through byte rings
 //! (length-prefixed), so the audio thread never blocks or allocates.
+//! Freewheeling (an offline render) the audio thread waits for the work
+//! scheduled in its `run` before handing the responses back — as if it
+//! were done synchronously, which the extension allows then: the render
+//! never runs ahead of work a live session would have had in time.
 
 use crate::sys::{self, LV2_Handle, LV2_Worker_Interface};
 use faderframe_realtime::TryCell;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Bytes each ring holds.
@@ -14,10 +18,16 @@ const RING: usize = 1 << 18;
 /// The largest message.
 pub const MESSAGE: usize = 1 << 16;
 
+/// How long a freewheeling run waits for its work.
+const OFFLINE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the schedule feature points to.
 pub struct Shared {
     requests: TryCell<rtrb::Producer<u8>>,
     thread: OnceLock<std::thread::Thread>,
+    /// Messages scheduled, and those the thread has done `work` for.
+    scheduled: AtomicU64,
+    worked: AtomicU64,
 }
 
 /// An instance's worker: the schedule feature, the thread, the responses.
@@ -118,6 +128,7 @@ unsafe extern "C" fn schedule(handle: *mut c_void, size: u32, data: *const c_voi
     if !pushed {
         return sys::LV2_WORKER_ERR_NO_SPACE;
     }
+    shared.scheduled.fetch_add(1, Ordering::AcqRel);
     if let Some(t) = shared.thread.get() {
         t.unpark();
     }
@@ -148,6 +159,8 @@ impl Worker {
             shared: Arc::new(Shared {
                 requests: TryCell::new(req_tx),
                 thread: OnceLock::new(),
+                scheduled: AtomicU64::new(0),
+                worked: AtomicU64::new(0),
             }),
             pending: Some((req_rx, res_tx)),
             responses: Arc::new(TryCell::new(res_rx)),
@@ -182,6 +195,7 @@ impl Worker {
         let target = Target { handle, iface };
         let stop = Arc::clone(&self.stop);
         let gate = Arc::clone(&self.gate);
+        let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
             .name("faderframe-lv2-worker".into())
             .spawn(move || {
@@ -203,6 +217,7 @@ impl Worker {
                                 );
                             }
                         }
+                        shared.worked.fetch_add(1, Ordering::AcqRel);
                     }
                     std::thread::park_timeout(std::time::Duration::from_millis(50));
                 }
@@ -230,6 +245,7 @@ impl Drop for Worker {
 /// The audio thread's half: hand the responses to the plugin after `run`.
 pub struct Responses {
     responses: Arc<TryCell<rtrb::Consumer<u8>>>,
+    shared: Arc<Shared>,
     iface: *const LV2_Worker_Interface,
     scratch: Vec<u8>,
 }
@@ -242,17 +258,40 @@ impl Responses {
     pub fn new(worker: &Worker, iface: *const LV2_Worker_Interface) -> Responses {
         Responses {
             responses: Arc::clone(&worker.responses),
+            shared: Arc::clone(&worker.shared),
             iface,
             scratch: Vec::with_capacity(MESSAGE),
         }
     }
 
-    /// After `run`: every response, then `end_run`.
+    /// Freewheeling: wait (blocking: no device is waiting) until the
+    /// thread has done the work scheduled so far, so its responses come
+    /// after this `run` as they would synchronously.
+    fn wait_for_work(&self) {
+        if self.shared.thread.get().is_none() {
+            return;
+        }
+        let wanted = self.shared.scheduled.load(Ordering::Acquire);
+        let started = std::time::Instant::now();
+        while self.shared.worked.load(Ordering::Acquire) < wanted {
+            if started.elapsed() > OFFLINE_WAIT {
+                tracing::warn!("LV2 worker: work not done in {OFFLINE_WAIT:?}; rendering on");
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
+    /// After `run`: every response, then `end_run`. `freewheeling` (an
+    /// offline render): the work `run` scheduled is done first.
     ///
     /// # Safety
     /// `handle` is the instance the interface belongs to, on its audio
     /// thread.
-    pub unsafe fn deliver(&mut self, handle: LV2_Handle) {
+    pub unsafe fn deliver(&mut self, handle: LV2_Handle, freewheeling: bool) {
+        if freewheeling {
+            self.wait_for_work();
+        }
         if let Some(mut rx) = self.responses.try_lock() {
             while pop(&mut rx, &mut self.scratch) {
                 // SAFETY: as documented.

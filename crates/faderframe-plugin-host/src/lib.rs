@@ -138,6 +138,14 @@ pub struct ProcessConfig {
     /// Process in 64-bit floating point where the plugin can (the graph's
     /// audio stays 32-bit; the format layer converts around the plugin).
     pub double_precision: bool,
+    /// The host renders offline (an export, a freeze, a bounce: as fast as
+    /// it can, with no device waiting). Told to the plugin — VST3
+    /// `kOffline`, CLAP's render mode, LV2 freewheeling, the AU's offline
+    /// render property — so plugins that work differently then (finishing
+    /// background work before the block returns, higher quality) do.
+    /// A live session's graphs, those rendered ahead included, are never
+    /// offline (unlike [`PluginInstance::configure_realtime`]).
+    pub offline: bool,
 }
 
 /// Outcome of one `process` call. Kept `Copy` and allocation-free; detailed
@@ -456,6 +464,13 @@ pub trait PluginInstance {
     /// Names of the output buses, main first (empty: the format has none;
     /// the host numbers them).
     fn output_bus_names(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Names of each output bus's channels, main first (LV2's ports: a
+    /// multi-microphone instrument's microphones), for tracks taking one
+    /// channel of a bus. Empty (or a bus without its names): the host
+    /// names them after the bus.
+    fn output_channel_names(&mut self) -> Vec<Vec<String>> {
         Vec::new()
     }
     fn descriptor(&self) -> &PluginDescriptor;
