@@ -4830,8 +4830,10 @@ gives their names. The engine caches buses and names per instance
     (`tests/apple_units.rs` uses AUSplitter).
   * LV2 groups its ports into buses (`Lv2Plugin::output_buses`): by
     port group, else the first two ports as the main bus and the rest in
-    pairs (named "Out 3/4" when the ports are numbered); tracks that want
-    single ports take channels.
+    pairs (named "Out 3/4" when the ports are numbered). More than two
+    ports without groups are the host's pairs, not the plugin's
+    (`output_buses_declared` false, `PluginInstance::output_buses_declared`,
+    forwarded by the sandbox): tracks for them take one channel each.
   * The sandbox packs channels (`shm`: `IN_SLOTS`/`OUT_SLOTS` channel
     slots, up to `MAX_OUT_BUFFERS` = 32 output buffers; format version 4)
     and forwards `configure_outputs` with `Activate` and the names with
@@ -4856,7 +4858,9 @@ gives their names. The engine caches buses and names per instance
   * `Action::CreateOutputTracks { plugin, buses, mono }` is one undo
     step. It makes Aux tracks named after the buses (prefixed with the
     plugin's track when a name is only a number), with the layout from
-    the bus's channels — or, `mono`, a mono track per channel no track
+    the bus's channels — or, `mono` or a bus the plugin did not group
+    itself (`PluginOutput::declared`, `by_channel`: DrumGizmo's sixteen
+    ungrouped LV2 microphones, #52), a mono track per channel no track
     takes yet ("Create Mono Output Tracks" in the mixer's insert menu,
     the arranger's track menu and the editor window's Outputs button;
     "<bus> as Mono Tracks" per bus) —, routed like the plugin's track, in
@@ -5042,6 +5046,23 @@ plugins size their editors in). Backends add `frame_display`,
   every tick (macOS moves child windows with their parent, but a resize
   from the top or left moves the room too), detached while the frame is
   hidden. Events of windows not GDK's go to Cocoa.
+
+**The scale plugin GUIs are told** (`editor_scale`, passed to
+`open_embedded`: CLAP `gui.set_scale`, VST3 `setContentScaleFactor` on
+Windows and Linux, LV2 `ui:scaleFactor`; the sandbox forwards it) is how
+large the desktop shows a pixel of the window they draw in (#54). Linux on
+Wayland: the X11 size of the monitor the editor opens on (where it was
+last, else the main window's; RandR by connector name) over its Wayland
+logical size (`x11_ratio`) — 1 where the compositor scales X11 windows
+itself, the monitor's scale where X11 programs draw at full resolution
+(GNOME's native XWayland scaling, one scale for every monitor of the X11
+screen; KDE's "applications scale themselves"; Hyprland's
+`force_zero_scaling`). Else the backend's `scale()`: X11 sessions (and
+monitors that cannot be matched) GTK's integer window scale × the
+desktop's font DPI (`Xft/DPI` from XSETTINGS through GTK, else `Xft.dpi`
+from `RESOURCE_MANAGER`) / 96 (`desktop_scale`), Windows the DPI, macOS 1
+(points). An editor moved to a monitor of another scale is not told
+again (where X11 has one scale per monitor: Hyprland's zero scaling).
 
 On Windows and macOS the frame is an application window, transient for
 the main window, like the device editors. Plugin resize requests set the

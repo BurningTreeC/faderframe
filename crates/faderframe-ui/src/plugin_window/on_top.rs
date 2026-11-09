@@ -50,7 +50,7 @@ pub(super) fn route() -> Route {
 
 /// Is the application's own display a Wayland one (where windows cannot
 /// ask to stay on top)?
-fn on_wayland() -> bool {
+pub(super) fn on_wayland() -> bool {
     glib::Type::from_name("GdkWaylandDisplay")
         .is_some_and(|wayland| gdk::Display::default().is_some_and(|d| d.type_().is_a(wayland)))
 }

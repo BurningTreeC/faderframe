@@ -427,6 +427,10 @@ impl PluginInstance for Lv2Instance {
         self.model.output_channel_names()
     }
 
+    fn output_buses_declared(&mut self) -> bool {
+        self.model.output_buses_declared()
+    }
+
     fn descriptor(&self) -> &PluginDescriptor {
         &self.descriptor
     }

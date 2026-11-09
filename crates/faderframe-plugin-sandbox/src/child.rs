@@ -374,6 +374,7 @@ impl Helper {
             programs: inst.programs(),
             output_names: inst.output_bus_names(),
             output_channel_names: inst.output_channel_names(),
+            outputs_declared: inst.output_buses_declared(),
         };
         self.instance = Some(inst);
         (Response::Instantiated(Box::new(info)), Vec::new())

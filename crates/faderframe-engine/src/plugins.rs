@@ -29,12 +29,16 @@ pub struct OutputBus {
     /// Its channels' names where the plugin names them (one each), else
     /// empty.
     pub channel_names: Vec<String>,
+    /// The plugin grouped these channels into this bus itself (not the
+    /// host: LV2 ports without port groups).
+    pub declared: bool,
 }
 
 /// A plugin's output buses, main first, named by the plugin (or numbered).
 fn output_buses(instance: &mut dyn PluginInstance) -> Vec<OutputBus> {
     let names = instance.output_bus_names();
     let channel_names = instance.output_channel_names();
+    let declared = instance.output_buses_declared();
     let mut buses: Vec<OutputBus> = instance
         .descriptor()
         .audio_outputs
@@ -57,6 +61,7 @@ fn output_buses(instance: &mut dyn PluginInstance) -> Vec<OutputBus> {
                 ),
             channels: p.channels,
             channel_names: Vec::new(),
+            declared,
         })
         .collect();
     for (b, names) in buses.iter_mut().zip(channel_names) {

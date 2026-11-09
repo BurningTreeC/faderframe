@@ -627,8 +627,8 @@ impl faderframe_plugin_host::PluginEditor for ClapInstance {
         let h = self.instance.plugin_handle();
         gui.create(&h, gui_config(api, false))
             .map_err(|e| PluginError::Failed(format!("editor: {e:?}")))?;
-        // Cocoa sizes are in points (the system scales); X11 plugins take
-        // the scale from the system too, so it is only a hint there.
+        // Cocoa sizes are in points (the system scales). Elsewhere the
+        // host's scale (a plugin that asks the system itself ignores it).
         if api != WindowApi::Cocoa {
             let _ = gui.set_scale(&h, scale);
         }

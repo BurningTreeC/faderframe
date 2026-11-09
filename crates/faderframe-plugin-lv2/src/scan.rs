@@ -316,6 +316,14 @@ impl Lv2Plugin {
             .collect()
     }
 
+    /// Whether the plugin groups its outputs itself: port groups, or at
+    /// most a pair (a stereo plugin's two outputs). More ports without
+    /// groups are paired by the host ([`Self::output_buses`]).
+    pub fn output_buses_declared(&self) -> bool {
+        let outs: Vec<&Port> = self.audio(false).collect();
+        outs.len() <= 2 || outs.iter().all(|p| p.group.is_some())
+    }
+
     /// Each output bus's ports' names, main first (a multi-microphone
     /// instrument's microphones, for tracks taking one channel each).
     pub fn output_channel_names(&self) -> Vec<Vec<String>> {
@@ -940,6 +948,14 @@ mod bus_tests {
         assert_eq!(names[7], "Out 15/16");
         let channels = p.output_channel_names();
         assert_eq!(channels[2], vec!["Out5", "Out6"]);
+        // Paired by the host, not the plugin.
+        assert!(!p.output_buses_declared());
+    }
+
+    #[test]
+    fn a_stereo_plugins_two_outputs_are_its_own_pair() {
+        let p = with_outputs("two", &[("out_l", "Out L"), ("out_r", "Out R")]);
+        assert!(p.output_buses_declared());
     }
 
     #[test]

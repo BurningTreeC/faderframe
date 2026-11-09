@@ -171,6 +171,74 @@ fn monitors(app: &AppState) -> (Vec<Rect>, Option<Rect>) {
     (all, main.map(|m| rect(&m)))
 }
 
+/// The scale a plugin's GUI is told: how large the desktop shows a pixel
+/// of the window it draws in. Linux on Wayland: the X11 size of the
+/// monitor the editor opens on over its Wayland (logical) size — 1 where
+/// the compositor scales X11 windows itself, the monitor's scale where X11
+/// programs draw at full resolution (GNOME's native XWayland scaling,
+/// KDE's "applications scale themselves", Hyprland's
+/// `force_zero_scaling`; one scale for every monitor where the X11 screen
+/// has one). Elsewhere, and where monitors cannot be matched: the
+/// backend's (Windows' DPI, macOS points, the X11 desktop's DPI).
+fn editor_scale(app: &AppState, plugin: PluginInstanceId, x: &Parents) -> f64 {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if on_top::on_wayland()
+        && let Some(scale) = xwayland_scale(app, plugin, x)
+    {
+        return scale;
+    }
+    let _ = (app, plugin);
+    x.scale()
+}
+
+/// [`editor_scale`] on Wayland: the X11 monitor where the editor was last
+/// (frames keep X11 positions), else the main window's.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn xwayland_scale(app: &AppState, plugin: PluginInstanceId, x: &Parents) -> Option<f64> {
+    let named = x.named_monitors();
+    let display = gtk::gdk::Display::default()?;
+    let stored = app
+        .session
+        .try_borrow()
+        .ok()
+        .and_then(|s| s.workspace().plugin_windows.get(&plugin).copied());
+    let main = || {
+        let surface = app.window.borrow().as_ref()?.surface()?;
+        Some(
+            display
+                .monitor_at_surface(&surface)?
+                .connector()?
+                .to_string(),
+        )
+    };
+    let name = stored
+        .and_then(|(px, py)| {
+            named
+                .iter()
+                .find(|(_, (x, y, w, h))| px >= *x && px < x + w && py >= *y && py < y + h)
+                .map(|(n, _)| n.clone())
+        })
+        .or_else(main)?;
+    let (_, (_, _, x11_w, x11_h)) = named.iter().find(|(n, _)| *n == name)?;
+    let list = display.monitors();
+    let monitor = (0..list.n_items())
+        .filter_map(|i| list.item(i).and_downcast::<gtk::gdk::Monitor>())
+        .find(|m| m.connector().is_some_and(|c| c == name.as_str()))?;
+    let g = monitor.geometry();
+    x11_ratio((*x11_w, *x11_h), (g.width(), g.height()))
+}
+
+/// X11 pixels per logical pixel of a monitor (to the hundredth; at least
+/// 1); `None` for sizes that say nothing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_ratio(x11: (i32, i32), logical: (i32, i32)) -> Option<f64> {
+    if x11.0 <= 0 || logical.0 <= 0 {
+        return None;
+    }
+    let ratio = (f64::from(x11.0) / f64::from(logical.0) * 100.0).round() / 100.0;
+    (ratio > 0.0 && ratio <= 4.0).then_some(ratio.max(1.0))
+}
+
 /// Where an editor of `size` opens: its last position if that is still on a
 /// monitor, else centred on the monitor showing FaderFrame.
 fn placement(app: &AppState, plugin: PluginInstanceId, size: (u32, u32)) -> (i32, i32) {
@@ -598,7 +666,7 @@ fn outputs_button(app: &Rc<AppState>, plugin: PluginInstanceId) -> Option<gtk::M
                 Some(&target.to_variant()),
             );
             one.append_item(&item);
-            if o.channels > 1 && o.track.is_none() && !o.free_channels().is_empty() {
+            if o.channels > 1 && o.declared && o.track.is_none() && !o.free_channels().is_empty() {
                 let item = gtk::gio::MenuItem::new(
                     Some(&format!("{} as Mono Tracks", o.name).replace('_', "__")),
                     None,
@@ -967,8 +1035,9 @@ fn embed_native(
     failure: &mut Option<String>,
 ) -> Option<NativeEditor> {
     let api = WindowApi::NATIVE;
-    // Made before the plugin's editor is borrowed: the header reads the
-    // session.
+    // Made before the plugin's editor is borrowed: the header and the
+    // scale read the session.
+    let scale = with_parents(|x| editor_scale(app, plugin, x)).unwrap_or(1.0);
     let header = heading(app, plugin, true).map(|h| {
         let header = editor_header(app, plugin, &h);
         header.pack_end(&parameters_button(app, plugin));
@@ -983,7 +1052,7 @@ fn embed_native(
         let Some(Ok(x)) = parents.as_ref() else {
             return None;
         };
-        let size = match ed.open_embedded(api, x.scale()) {
+        let size = match ed.open_embedded(api, scale) {
             Ok(size) => size,
             Err(err) => {
                 *failure = Some(err.to_string());
@@ -1013,7 +1082,9 @@ fn embed_native(
                 });
                 glib::Propagation::Stop
             });
-            tracing::debug!("plugin editor {plugin}: {size:?} under the header, at {pos:?}");
+            tracing::debug!(
+                "plugin editor {plugin}: {size:?} at scale {scale} under the header, at {pos:?}"
+            );
             let top = frame.top();
             e.frames.borrow_mut().insert(plugin, frame);
             return Some(NativeEditor {
@@ -1863,6 +1934,25 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scale plugin GUIs are told on Wayland: X11 pixels per logical
+    /// pixel of the monitor (#54: a 4K monitor at 150 % next to HD ones
+    /// at 100 %).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn x11_pixels_per_logical_pixel_are_the_plugins_scale() {
+        // X11 programs at full resolution on a 4K monitor at 150 %.
+        assert_eq!(x11_ratio((3840, 2160), (2560, 1440)), Some(1.5));
+        // GNOME's native XWayland scaling: one scale (the largest) for
+        // the whole X11 screen, the HD monitors too.
+        assert_eq!(x11_ratio((2880, 1620), (1920, 1080)), Some(1.5));
+        // The compositor scales X11 windows itself: 1.
+        assert_eq!(x11_ratio((2560, 1440), (2560, 1440)), Some(1.0));
+        assert_eq!(x11_ratio((1920, 1080), (1920, 1080)), Some(1.0));
+        // Odd logical sizes still give the scale.
+        assert_eq!(x11_ratio((3840, 2160), (2954, 1662)), Some(1.3));
+        assert_eq!(x11_ratio((0, 0), (1920, 1080)), None);
+    }
     use faderframe_core::ParameterId;
 
     fn info(unit: ParameterUnit, stepped: bool) -> ParameterInfo {

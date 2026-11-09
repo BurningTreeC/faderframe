@@ -395,6 +395,13 @@ pub struct Instantiated {
     /// Its output buses' channels' names.
     #[serde(default)]
     pub output_channel_names: Vec<Vec<String>>,
+    /// Whether the plugin groups its outputs into those buses itself.
+    #[serde(default = "declared")]
+    pub outputs_declared: bool,
+}
+
+fn declared() -> bool {
+    true
 }
 
 /// What happened in the helper since the last poll.

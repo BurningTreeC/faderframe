@@ -2155,7 +2155,11 @@ impl MixerView {
                             }
                         };
                         entries.push(MenuItem::new(o.name.clone(), action).checked(o.taken()));
-                        if o.channels > 1 && o.track.is_none() && !o.free_channels().is_empty() {
+                        if o.channels > 1
+                            && o.declared
+                            && o.track.is_none()
+                            && !o.free_channels().is_empty()
+                        {
                             entries.push(MenuItem::new(
                                 format!("{} as Mono Tracks", o.name),
                                 Action::CreateOutputTracks {

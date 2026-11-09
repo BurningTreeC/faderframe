@@ -479,6 +479,13 @@ pub trait PluginInstance {
     fn output_channel_names(&mut self) -> Vec<Vec<String>> {
         Vec::new()
     }
+    /// Whether the plugin itself groups its output channels into these
+    /// buses (formats with buses do). `false`: the host grouped them (LV2
+    /// ports without port groups, paired by the host) — tracks for them
+    /// take one channel each, as nothing says which belong together.
+    fn output_buses_declared(&mut self) -> bool {
+        true
+    }
     fn descriptor(&self) -> &PluginDescriptor;
     fn parameters(&self) -> &[ParameterInfo];
     fn parameter(&mut self, id: ParameterId) -> Option<f64>;

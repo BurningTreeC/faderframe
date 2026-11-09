@@ -1170,9 +1170,10 @@ impl PluginEditor for Vst3Instance {
             if let Some(frame) = self.host.as_com_ref::<IPlugFrame>() {
                 view.setFrame(frame.as_ptr());
             }
-            // Windows editors scale themselves when told (optional
-            // interface; macOS and X11 take it from the system).
-            if cfg!(windows)
+            // Windows and Linux editors scale when told (optional
+            // interface, for systems where plug-ins cannot learn the
+            // scale themselves); macOS sizes are in points.
+            if cfg!(not(target_os = "macos"))
                 && let Some(s) = view.cast::<IPlugViewContentScaleSupport>()
             {
                 s.setContentScaleFactor(scale as f32);

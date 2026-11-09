@@ -274,6 +274,7 @@ pub struct RemoteInstance {
     program: Option<usize>,
     output_names: Vec<String>,
     output_channel_names: Vec<Vec<String>>,
+    outputs_declared: bool,
     /// Output buses the graph takes, and how many the active helper has.
     output_buses: usize,
     active_outputs: usize,
@@ -386,6 +387,7 @@ impl RemoteInstance {
             program: None,
             output_names: Vec::new(),
             output_channel_names: Vec::new(),
+            outputs_declared: true,
             output_buses: 1,
             active_outputs: 1,
             pending: false,
@@ -430,6 +432,7 @@ impl RemoteInstance {
                 inst.programs = i.programs;
                 inst.output_names = i.output_names;
                 inst.output_channel_names = i.output_channel_names;
+                inst.outputs_declared = i.outputs_declared;
                 tracing::info!(
                     "{} runs in a sandbox (process {})",
                     inst.descriptor.name,
@@ -733,6 +736,10 @@ impl PluginInstance for RemoteInstance {
 
     fn output_channel_names(&mut self) -> Vec<Vec<String>> {
         self.output_channel_names.clone()
+    }
+
+    fn output_buses_declared(&mut self) -> bool {
+        self.outputs_declared
     }
 
     fn current_program(&self) -> Option<usize> {

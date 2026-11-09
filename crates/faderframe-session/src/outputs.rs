@@ -11,7 +11,9 @@
 //! `channel`): "mono output tracks" make one per channel, whatever the
 //! plugin's format grouped its channels into — a multi-microphone drum
 //! instrument's microphones each on a track of their own, never two of
-//! them hard left and right on one (#52).
+//! them hard left and right on one (#52). Buses the plugin did not group
+//! itself (LV2 ports without port groups, paired by the host) always get a
+//! track per channel: nothing says which of them belong together.
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ChannelLayout, PluginInstanceId, TrackId};
@@ -29,6 +31,9 @@ pub struct PluginOutput {
     pub channel_names: Vec<String>,
     /// The plugin names its channels itself (LV2's ports).
     pub channels_named: bool,
+    /// The plugin grouped these channels into this bus itself (else the
+    /// host paired them: tracks take one channel each).
+    pub declared: bool,
     /// The tracks taking one channel of it, by channel.
     pub channel_tracks: Vec<Option<TrackId>>,
 }
@@ -37,6 +42,12 @@ impl PluginOutput {
     /// Does a track take it, all of it or a channel?
     pub fn taken(&self) -> bool {
         self.track.is_some() || self.channel_tracks.iter().any(Option::is_some)
+    }
+
+    /// Whether a track for it takes one channel each: asked to, or the
+    /// plugin did not group its channels itself.
+    pub fn by_channel(&self, mono: bool) -> bool {
+        self.channels > 1 && (mono || !self.declared)
     }
 
     /// Channels a mono track could still take (none while a track takes
@@ -129,6 +140,7 @@ impl Session {
                             .collect()
                     },
                     channels_named: named,
+                    declared: b.declared,
                     channel_tracks: if b.channels > 1 {
                         (0..b.channels)
                             .map(|c| {
@@ -185,12 +197,13 @@ impl Session {
         })
     }
 
-    /// Does any output bus of the plugin have more than one channel (mono
-    /// output tracks would differ from the buses' own)?
+    /// Does any output bus of the plugin keep several channels together on
+    /// one track (mono output tracks would differ from "Create Output
+    /// Tracks")?
     pub fn plugin_has_wide_outputs(&self, plugin: PluginInstanceId) -> bool {
         self.engine
             .plugin_outputs(plugin)
-            .is_some_and(|b| b.iter().any(|o| o.channels > 1))
+            .is_some_and(|b| b.iter().any(|o| o.channels > 1 && o.declared))
     }
 
     /// How many output tracks [`Action::CreateOutputTracks`] would make:
@@ -201,7 +214,7 @@ impl Session {
         self.plugin_output_buses(plugin)
             .iter()
             .map(|o| {
-                if mono {
+                if o.by_channel(mono) {
                     o.free_channels().len()
                 } else {
                     usize::from(!o.taken())
@@ -242,7 +255,7 @@ impl Session {
             .iter()
             .filter(|o| buses.is_none_or(|b| b.contains(&o.bus)))
         {
-            if !mono || o.channels <= 1 {
+            if !o.by_channel(mono) {
                 if !o.taken() {
                     let width = usize::from(o.channels.max(1));
                     wanted.push((

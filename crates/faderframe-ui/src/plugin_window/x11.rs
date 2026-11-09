@@ -479,9 +479,45 @@ impl Parents {
         }
     }
 
-    /// The display's scale (X11 editors take it from the system).
+    /// The X11 desktop's own scale where it says one (X11 sessions; a
+    /// fallback on Wayland): GTK's integer window scale times its font DPI
+    /// (`Xft/DPI` from XSETTINGS, unscaled where GTK scales windows itself)
+    /// over 96, else `Xft.dpi` from the X resources over 96; 1 where
+    /// nothing says.
     pub fn scale(&self) -> f64 {
-        1.0
+        let display = self.frame_display();
+        let gdk_scale = display
+            .as_ref()
+            .and_then(|d| d.monitors().item(0).and_downcast::<gdk::Monitor>())
+            .map_or(1, |m| m.scale_factor())
+            .max(1);
+        let gtk_dpi = display
+            .as_ref()
+            .map(|d| gtk::Settings::for_display(d).gtk_xft_dpi())
+            .filter(|d| *d > 0)
+            .map(|d| f64::from(d) / 1024.0);
+        let dpi = gtk_dpi.or_else(|| self.resource_dpi());
+        desktop_scale(dpi, gdk_scale)
+    }
+
+    /// `Xft.dpi` from the root window's X resources (`RESOURCE_MANAGER`).
+    fn resource_dpi(&self) -> Option<f64> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                xproto::AtomEnum::RESOURCE_MANAGER,
+                xproto::AtomEnum::STRING,
+                0,
+                1 << 16,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        resource_value(&String::from_utf8_lossy(&reply.value), "Xft.dpi")?
+            .parse()
+            .ok()
     }
 
     /// Map at `pos` (asked again after mapping: some window managers only
@@ -508,7 +544,8 @@ impl Parents {
         (all.into_iter().map(|(_, r)| r).collect(), main_rect)
     }
 
-    fn named_monitors(&self) -> Vec<(String, Rect)> {
+    /// The X server's monitors (RandR) by name, in X11 pixels.
+    pub fn named_monitors(&self) -> Vec<(String, Rect)> {
         use x11rb::protocol::randr::ConnectionExt as _;
         let Ok(Ok(reply)) = self
             .conn
@@ -661,6 +698,20 @@ impl Parents {
     }
 }
 
+/// Scale from a font DPI (96 = 1) and GTK's integer window scale.
+pub fn desktop_scale(dpi: Option<f64>, gdk_scale: i32) -> f64 {
+    let dpi = dpi.filter(|d| d.is_finite() && *d >= 48.0).unwrap_or(96.0);
+    (dpi / 96.0 * f64::from(gdk_scale.max(1))).clamp(1.0, 4.0)
+}
+
+/// A value from X resources text ("Xft.dpi:\t144").
+fn resource_value<'a>(resources: &'a str, key: &str) -> Option<&'a str> {
+    resources.lines().find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        (k.trim() == key).then(|| v.trim())
+    })
+}
+
 fn id(win: u64) -> xproto::Window {
     win as xproto::Window
 }
@@ -668,6 +719,20 @@ fn id(win: u64) -> xproto::Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_scale_comes_from_its_dpi_and_window_scale() {
+        assert_eq!(desktop_scale(None, 1), 1.0);
+        assert_eq!(desktop_scale(Some(144.0), 1), 1.5);
+        // GTK scales windows by 2 and gives the unscaled DPI.
+        assert_eq!(desktop_scale(Some(96.0), 2), 2.0);
+        // Nonsense is ignored, and a scale stays within reason.
+        assert_eq!(desktop_scale(Some(0.0), 1), 1.0);
+        assert_eq!(desktop_scale(Some(960.0), 1), 4.0);
+        let resources = "Xcursor.size:\t24\nXft.dpi:\t144\nXft.antialias:\t1\n";
+        assert_eq!(resource_value(resources, "Xft.dpi"), Some("144"));
+        assert_eq!(resource_value(resources, "Xft.hinting"), None);
+    }
 
     /// "Keep on Top" asks as EWMH says (a message to the root window:
     /// add/remove `_NET_WM_STATE_ABOVE`, source an application), seen
