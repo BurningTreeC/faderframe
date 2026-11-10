@@ -12,6 +12,15 @@ pub(crate) const RIGHT: f32 = 46.0;
 pub(crate) const AXIS_H: f32 = 18.0;
 pub(crate) const PIANO_H: f32 = 30.0;
 pub(crate) const NODE_R: f32 = 7.5;
+/// The band controls' first row (the second, of an expanded dynamic band,
+/// reaches up over the graph).
+pub(crate) const PANEL_ROW_H: f32 = 116.0;
+/// The room under the frequency scale kept for the band controls, so they
+/// cover none of the curves.
+const PANEL_STRIP_H: f32 = PANEL_ROW_H + 12.0;
+/// The least height the graph keeps: in less room the band controls lie
+/// over its foot instead.
+const MIN_GRAPH_H: f32 = 160.0;
 /// The whole frequency range the display can show.
 pub(crate) const F_MIN: f64 = 10.0;
 pub(crate) const F_MAX: f64 = 30_000.0;
@@ -25,6 +34,9 @@ pub(crate) struct Layout {
     /// The frequency scale (or the piano) under it.
     pub axis: Rect,
     pub bottom: Rect,
+    /// The band controls' room between the frequency scale and the bottom
+    /// bar (no height when the editor is too low to spare it).
+    pub panel: Rect,
     /// The output meter at the right.
     pub meter: Rect,
 }
@@ -34,19 +46,27 @@ impl Layout {
         let top = Rect::new(0.0, 0.0, size.w, TOP_H);
         let bottom = Rect::new(0.0, size.h - BOTTOM_H, size.w, BOTTOM_H);
         let axis_h = if piano { PIANO_H } else { AXIS_H };
+        let room = size.h - TOP_H - BOTTOM_H - axis_h - 6.0;
+        let strip = if room - PANEL_STRIP_H >= MIN_GRAPH_H {
+            PANEL_STRIP_H
+        } else {
+            0.0
+        };
         let graph = Rect::new(
             LEFT,
             TOP_H + 6.0,
             (size.w - LEFT - RIGHT).max(10.0),
-            (size.h - TOP_H - BOTTOM_H - axis_h - 6.0).max(10.0),
+            (room - strip).max(10.0),
         );
         let axis = Rect::new(graph.x, graph.bottom(), graph.w, axis_h);
+        let panel = Rect::new(0.0, axis.bottom(), size.w, strip);
         let meter = Rect::new(size.w - 12.0, graph.y, 7.0, graph.h);
         Self {
             top,
             graph,
             axis,
             bottom,
+            panel,
             meter,
         }
     }

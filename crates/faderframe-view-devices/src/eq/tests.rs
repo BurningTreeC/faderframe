@@ -1253,3 +1253,31 @@ fn a_reference_track_sent_to_eq_match_is_its_reference() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_band_controls_have_their_own_room_under_the_graph() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    click(
+        &mut view,
+        &mut s,
+        Point::new(590.0, 260.0),
+        2,
+        Modifiers::NONE,
+    );
+    paint(&mut view, &s);
+    let l = view.layout(SIZE, &s);
+    let tap = s.plugin_tap(plugin).unwrap();
+    // A deep cut: its node at the graph's foot, the controls under it.
+    set_param(&view, &mut s, 0, Field::Gain, -30.0);
+    let (r, _, _) = view.panel_rect(&l, &s, &tap).unwrap();
+    assert!(
+        r.y >= l.axis.bottom() && r.bottom() <= l.bottom.y,
+        "{r:?} {l:?}"
+    );
+    // Too low an editor to spare the room: they lie over the graph.
+    let low = view.layout(Size::new(SIZE.w, 300.0), &s);
+    assert_eq!(low.panel.h, 0.0);
+    let (r, _, _) = view.panel_rect(&low, &s, &tap).unwrap();
+    assert!(r.bottom() <= low.graph.bottom(), "{r:?} {low:?}");
+}

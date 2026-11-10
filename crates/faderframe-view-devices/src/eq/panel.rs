@@ -55,7 +55,7 @@ pub(crate) enum PanelItem {
 }
 
 pub(crate) const PANEL_W: f32 = 660.0;
-const ROW1_H: f32 = 116.0;
+const ROW1_H: f32 = super::geometry::PANEL_ROW_H;
 const ROW2_H: f32 = 98.0;
 
 /// A knob's range: low, high, logarithmic.
@@ -113,7 +113,14 @@ impl EqView {
         let h = ROW1_H + if expanded { ROW2_H } else { 0.0 };
         let x = self.axis(model).x(g, p.freq) - PANEL_W / 2.0;
         let x = x.clamp(g.x + 4.0, (g.right() - PANEL_W - 4.0).max(g.x + 4.0));
-        Some((Rect::new(x, g.bottom() - h - 6.0, PANEL_W, h), band, p))
+        // In its own room under the frequency scale, else over the graph's
+        // foot.
+        let bottom = if l.panel.h > 0.0 {
+            l.panel.bottom()
+        } else {
+            g.bottom()
+        };
+        Some((Rect::new(x, bottom - h - 6.0, PANEL_W, h), band, p))
     }
 
     pub(crate) fn panel_items(&self, r: &Rect, p: &BandParams) -> Vec<(PanelItem, Rect)> {
@@ -283,10 +290,17 @@ impl EqView {
         model: &Session,
         tap: &AnalysisTap,
     ) {
+        let th = &self.theme;
         let Some((r, band, bp)) = self.panel_rect(l, model, tap) else {
+            if l.panel.h > 0.0 && self.grab.is_none() {
+                p.text(
+                    "Click a band to edit it · double-click the curve to add one",
+                    l.panel,
+                    &TextStyle::new(th.fonts.small, th.ui.text_dim).center(),
+                );
+            }
             return;
         };
-        let th = &self.theme;
         let color = Self::band_color(band);
         p.shadow(r, 8.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 16.0);
         p.fill_rounded(r, 8.0, &Paint::Solid(th.device.panel.with_alpha(0.97)));
