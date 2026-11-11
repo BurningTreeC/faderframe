@@ -116,6 +116,14 @@ impl SignalTap {
         true
     }
 
+    /// Empty, nothing missed (while nothing processes).
+    fn reset(&self) {
+        if let Some(mut b) = self.buffer.try_lock() {
+            b.written = 0;
+        }
+        self.missed.store(0, Ordering::Relaxed);
+    }
+
     /// Audio side: append `n` frames of `input`.
     fn write(&self, input: &AudioBuffer, n: usize) {
         let Some(mut b) = self.buffer.try_lock() else {
@@ -241,6 +249,13 @@ impl DeviceProbe {
         }
     }
 
+    /// Nothing measured (while nothing processes).
+    fn reset(&self) {
+        for s in &self.stats {
+            s.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// What it measured so far.
     pub fn stats(&self) -> ProbeStats {
         let f = |i| f64::from_bits(self.get(i));
@@ -322,6 +337,28 @@ impl Capture {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Forget what was captured so far, while nothing processes (a
+    /// render's warm-up before its first frame): taps empty with nothing
+    /// missed, probes at zero.
+    pub(crate) fn reset(&self) {
+        for t in self
+            .taps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            t.reset();
+        }
+        for p in self
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            p.reset();
+        }
     }
 
     /// `track`'s tap for a graph being built (`None`: not planned). A
@@ -511,6 +548,40 @@ mod tests {
         assert_eq!(got[1][7], 2.0);
         // Emptied.
         assert!(tap.take(|c| assert!(c.iter().all(|x| x.is_empty()))));
+    }
+
+    #[test]
+    fn a_reset_forgets_what_was_captured_and_missed() {
+        let capture = Capture::new(CapturePlan {
+            tracks: vec![TrackId(1)],
+            devices: true,
+            block: 4,
+        });
+        let tap = capture.tap_for(TrackId(1), 1).unwrap();
+        tap.write(&buffer(&[&[0.5; 6]]), 6);
+        assert_eq!(tap.missed(), 2);
+        let info = ProbeInfo {
+            track: TrackId(1),
+            plugin: PluginInstanceId(7),
+            position: 0,
+            next: None,
+            bypassed: false,
+            in_channels: 1,
+            out_channels: 1,
+        };
+        let probe = capture.probe_for(info).unwrap();
+        probe.add(FRAMES, 6);
+        probe.add_f64(IN_ENERGY, 1.5);
+        capture.reset();
+        assert_eq!(tap.missed(), 0);
+        assert!(tap.take(|c| assert!(c[0].is_empty())));
+        assert_eq!(
+            probe.stats(),
+            ProbeStats {
+                diff_energy: Some(0.0),
+                ..ProbeStats::default()
+            }
+        );
     }
 
     #[test]

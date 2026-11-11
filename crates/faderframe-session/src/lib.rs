@@ -1073,6 +1073,12 @@ pub enum Action {
         track: TrackId,
         height: f32,
     },
+    /// Height of an automation lane in the arranger, or (`None`) of every
+    /// lane; not undoable, saved with the layout.
+    SetAutomationLaneHeight {
+        lane: Option<faderframe_core::AutomationLaneId>,
+        height: f32,
+    },
     /// Play take `take` of a take folder instead of its comp (`None`: the
     /// comp again); not undoable, not saved. Stopped, playback starts at
     /// the folder (unless the playhead is in it).
@@ -2460,6 +2466,15 @@ impl Session {
         if let Some(place) = self.arranger_place.get() {
             ws.arranger_place = Some(place);
         }
+        // Lanes removed keep their heights while an undo may bring them
+        // back; the file keeps those of the lanes there are.
+        let lanes = self
+            .project
+            .tracks
+            .iter()
+            .flat_map(|t| t.automation.lanes.iter().map(|l| l.id))
+            .collect();
+        ws.keep_automation_lane_heights(&lanes);
         ws
     }
 
@@ -2914,6 +2929,11 @@ impl Session {
     /// Height of a track's take lanes in the arranger.
     pub fn take_lane_height(&self, track: TrackId) -> f32 {
         self.workspace.take_lane_height(track)
+    }
+
+    /// Height of an automation lane in the arranger.
+    pub fn automation_lane_height(&self, lane: faderframe_core::AutomationLaneId) -> f32 {
+        self.workspace.automation_lane_height(lane)
     }
 
     /// A mixer strip's width, if not the theme's.
@@ -5331,6 +5351,10 @@ impl Session {
                 self.workspace.set_take_lane_height(track, height);
                 self.revision += 1;
             }
+            Action::SetAutomationLaneHeight { lane, height } => {
+                self.workspace.set_automation_lane_height(lane, height);
+                self.revision += 1;
+            }
             Action::AuditionTake { clip, take } => self.audition_take(clip, take)?,
             Action::SetStripWidth { track, width } => {
                 self.workspace.set_strip_width(track, width);
@@ -7385,6 +7409,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.sample_rate(), 48_000);
+    }
+
+    #[test]
+    fn a_saved_layout_keeps_the_heights_of_the_lanes_there_are() {
+        let mut s = Session::demo(config()).unwrap();
+        let t = s.project().tracks[0].id;
+        s.dispatch(Action::ToggleTrackAutomation(t)).unwrap();
+        let lane = s.shown_lanes(t)[0].id;
+        let gone = faderframe_core::AutomationLaneId(u64::MAX - 1);
+        for l in [lane, gone] {
+            s.dispatch(Action::SetAutomationLaneHeight {
+                lane: Some(l),
+                height: 120.0,
+            })
+            .unwrap();
+        }
+        let saved = s.workspace_to_save();
+        assert_eq!(saved.automation_lane_height(lane), 120.0);
+        assert!(!saved.automation_lane_heights.contains_key(&gone));
+        // Kept while the session runs: an undo may bring a lane back.
+        assert_eq!(s.automation_lane_height(gone), 120.0);
     }
 
     #[test]

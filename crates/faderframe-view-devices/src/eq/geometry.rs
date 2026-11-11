@@ -12,6 +12,11 @@ pub(crate) const RIGHT: f32 = 46.0;
 pub(crate) const AXIS_H: f32 = 18.0;
 pub(crate) const PIANO_H: f32 = 30.0;
 pub(crate) const NODE_R: f32 = 7.5;
+/// Space above and below the band controls in their room.
+pub(crate) const PANEL_MARGIN: f32 = 6.0;
+/// The least height the graph keeps: in less room the band controls lie
+/// over its foot.
+pub(crate) const MIN_GRAPH_H: f32 = 160.0;
 /// The whole frequency range the display can show.
 pub(crate) const F_MIN: f64 = 10.0;
 pub(crate) const F_MAX: f64 = 30_000.0;
@@ -24,28 +29,39 @@ pub(crate) struct Layout {
     pub graph: Rect,
     /// The frequency scale (or the piano) under it.
     pub axis: Rect,
+    /// The band controls' room, between the frequency scale and the bottom
+    /// bar: as tall as they are where the editor has the height, less (or
+    /// none) where the graph would keep under [`MIN_GRAPH_H`].
+    pub panel: Rect,
     pub bottom: Rect,
     /// The output meter at the right.
     pub meter: Rect,
 }
 
 impl Layout {
-    pub fn new(size: Size, piano: bool) -> Self {
+    /// The layout at `size`, keeping room for band controls `panel_h`
+    /// high under the frequency scale. The room gives way first where the
+    /// editor is low, so the graph's height never falls as it grows.
+    pub fn new(size: Size, piano: bool, panel_h: f32) -> Self {
         let top = Rect::new(0.0, 0.0, size.w, TOP_H);
         let bottom = Rect::new(0.0, size.h - BOTTOM_H, size.w, BOTTOM_H);
         let axis_h = if piano { PIANO_H } else { AXIS_H };
+        let room = size.h - TOP_H - BOTTOM_H - axis_h - 6.0;
+        let strip = (room - MIN_GRAPH_H).clamp(0.0, panel_h + 2.0 * PANEL_MARGIN);
         let graph = Rect::new(
             LEFT,
             TOP_H + 6.0,
             (size.w - LEFT - RIGHT).max(10.0),
-            (size.h - TOP_H - BOTTOM_H - axis_h - 6.0).max(10.0),
+            (room - strip).max(10.0),
         );
         let axis = Rect::new(graph.x, graph.bottom(), graph.w, axis_h);
+        let panel = Rect::new(0.0, axis.bottom(), size.w, strip);
         let meter = Rect::new(size.w - 12.0, graph.y, 7.0, graph.h);
         Self {
             top,
             graph,
             axis,
+            panel,
             bottom,
             meter,
         }

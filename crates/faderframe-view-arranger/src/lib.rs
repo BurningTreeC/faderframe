@@ -28,7 +28,7 @@ pub use header::HeaderLayout;
 
 use faderframe_core::gain::{SILENCE_DB, format_db};
 use faderframe_core::pan::format_pan;
-use faderframe_core::{ClipId, FaderLaw, TrackId, db_to_gain};
+use faderframe_core::{AutomationLaneId, ClipId, FaderLaw, TrackId, db_to_gain};
 use faderframe_project::{
     Clip, ClipContent, Command, MonitorMode, MusicalRange, OutputRouting, TakeFolder, Track,
     TrackColor, TrackKind,
@@ -212,6 +212,12 @@ pub enum Hit {
     },
     /// The bottom edge of a track's take lanes: drag to size them.
     TakeLanesEdge(TrackId),
+    /// An automation lane's bottom edge in the header column: drag to
+    /// size the lane.
+    AutomationEdge {
+        track: TrackId,
+        lane: AutomationLaneId,
+    },
     /// A word in a take lane (`word`: the folder's word, its column).
     TakeWord {
         clip: ClipId,
@@ -312,6 +318,15 @@ enum Drag {
         start_y: f32,
         start_h: f32,
         lanes: usize,
+    },
+    /// An automation lane sized by its bottom edge.
+    AutomationLane {
+        track: TrackId,
+        lane: AutomationLaneId,
+        start_y: f32,
+        start_h: f32,
+        /// Alt: every lane at once.
+        all: bool,
     },
 }
 
@@ -832,7 +847,7 @@ impl ArrangerView {
             y += self.base_h(model, t.id)
                 + Self::open_lanes(t, model) as f32 * model.take_lane_height(t.id)
                 + Self::lyric_row_h(t, model)
-                + model.shown_lanes(t.id).len() as f32 * AUTO_LANE_H;
+                + Self::automation_h(model, t);
             self.rows.push(y);
         }
     }
@@ -1072,6 +1087,9 @@ impl ArrangerView {
         }
         if let Some(track) = self.take_edge_hit(model, pos, size) {
             return Some(Hit::TakeLanesEdge(track));
+        }
+        if let Some((track, lane)) = self.automation_edge_hit(model, pos, size) {
+            return Some(Hit::AutomationEdge { track, lane });
         }
         let tracks = Self::lane_tracks(model);
         let Some(i) = self.row_at(pos.y).filter(|&i| i < tracks.len()) else {
@@ -3960,6 +3978,22 @@ impl ArrangerView {
                 });
                 cx.set_cursor(Cursor::ResizeVertical);
             }
+            Hit::AutomationEdge { lane, .. } if clicks >= 2 => {
+                cx.emit(Action::SetAutomationLaneHeight {
+                    lane: (!mods.alt).then_some(lane),
+                    height: AUTO_LANE_H,
+                });
+            }
+            Hit::AutomationEdge { track, lane } => {
+                self.drag = Some(Drag::AutomationLane {
+                    track,
+                    lane,
+                    start_y: pos.y,
+                    start_h: model.automation_lane_height(lane),
+                    all: mods.alt,
+                });
+                cx.set_cursor(Cursor::ResizeVertical);
+            }
             Hit::HeaderEdge if clicks >= 2 => {
                 cx.emit(Action::SetHeaderWidth(self.theme.arranger.header_width));
             }
@@ -4658,6 +4692,21 @@ impl ArrangerView {
                     cx.emit(Action::SetTakeLaneHeight { track, height: h });
                 }
             }
+            Some(Drag::AutomationLane {
+                lane,
+                start_y,
+                start_h,
+                all,
+                ..
+            }) => {
+                let h = (start_h + pos.y - start_y).round();
+                if (h - model.automation_lane_height(lane)).abs() >= 1.0 {
+                    cx.emit(Action::SetAutomationLaneHeight {
+                        lane: (!all).then_some(lane),
+                        height: h,
+                    });
+                }
+            }
             Some(Drag::Pan2D { origin, sx, sy }) => {
                 self.scroll_x = sx - (pos.x - origin.x) as f64;
                 self.scroll_y = sy - (pos.y - origin.y);
@@ -5015,6 +5064,21 @@ impl CanvasView<Session, Action> for ArrangerView {
                 theme.ui.accent.with_alpha(0.85),
             );
         }
+        // The bottom of an automation lane being sized, or under the
+        // pointer (in the header column, where it is grabbed).
+        let lane_sizing = match (self.drag, self.hover) {
+            (Some(Drag::AutomationLane { track, lane, .. }), _)
+            | (_, Some(Hit::AutomationEdge { track, lane })) => Some((track, lane)),
+            _ => None,
+        };
+        if let Some(y) =
+            lane_sizing.and_then(|(track, lane)| self.automation_edge_y(model, track, lane, size))
+        {
+            p.fill(
+                Rect::new(0.0, y - 1.0, self.header_w(), 2.0),
+                theme.ui.accent.with_alpha(0.85),
+            );
+        }
         // A dragged track: where it lands, and the rows scroll at the edges.
         if let Some(Drag::Row {
             track,
@@ -5295,6 +5359,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                                 Hit::AddTrack
                                     | Hit::Header(_, HeaderPart::Resize)
                                     | Hit::TakeLanesEdge(_)
+                                    | Hit::AutomationEdge { .. }
                             )
                         )
                     };
@@ -5309,7 +5374,9 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
                         Some(Hit::TakeAudition { .. }) => Cursor::Pointer,
                         Some(Hit::TakeWord { .. } | Hit::LyricWord { .. }) => Cursor::Pointer,
-                        Some(Hit::TakeLanesEdge(_)) => Cursor::ResizeVertical,
+                        Some(Hit::TakeLanesEdge(_) | Hit::AutomationEdge { .. }) => {
+                            Cursor::ResizeVertical
+                        }
                         Some(Hit::Automation { header: false, .. }) => Cursor::Crosshair,
                         Some(Hit::Automation { header: true, .. }) => Cursor::Pointer,
                         Some(Hit::Ruler(_) | Hit::LoopBand(_)) => Cursor::Pointer,
@@ -5626,6 +5693,11 @@ impl CanvasView<Session, Action> for ArrangerView {
             Hit::TakeLanesEdge(_) => {
                 Some("Drag to size the take lanes · Double-click: the default height".into())
             }
+            Hit::AutomationEdge { .. } => Some(
+                "Drag to change the lane height (Alt: every lane) · Double-click: the default \
+                 height (Alt: every lane's)"
+                    .into(),
+            ),
             hit @ (Hit::TakeWord { .. } | Hit::LyricWord { .. }) => {
                 Self::lyric_tooltip(model, &hit)
             }

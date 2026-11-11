@@ -21,8 +21,9 @@ use faderframe_ui_canvas::{
     Color, EventCx, HostRequest, MenuItem, Modifiers, Paint, Painter, Path, Point, Rect, TextStyle,
 };
 
-/// Height of one automation lane.
-pub const AUTO_LANE_H: f32 = 56.0;
+/// Height of an automation lane not sized (by its bottom edge in the
+/// header column: `Session::automation_lane_height`).
+pub const AUTO_LANE_H: f32 = faderframe_workspace::AUTOMATION_LANE_HEIGHT;
 /// Pointer distance that picks a point.
 const POINT_HIT: f32 = 6.0;
 const MODES: [AutomationMode; 5] = [
@@ -128,15 +129,61 @@ impl ArrangerView {
             .shown_lanes(t.id)
             .iter()
             .map(|l| {
+                let h = model.automation_lane_height(l.id);
                 let g = LaneGeom {
                     track: t.id,
                     lane: l.id,
-                    row: Rect::new(0.0, y, row.w, AUTO_LANE_H),
+                    row: Rect::new(0.0, y, row.w, h),
                 };
-                y += AUTO_LANE_H;
+                y += h;
                 g
             })
             .collect()
+    }
+
+    /// The height of `t`'s shown lanes together.
+    pub(crate) fn automation_h(model: &Session, t: &Track) -> f32 {
+        model
+            .shown_lanes(t.id)
+            .iter()
+            .map(|l| model.automation_lane_height(l.id))
+            .sum()
+    }
+
+    /// The lane whose bottom edge is under `pos` in the header column (a
+    /// few pixels either side of it): drag it to size the lane.
+    pub(crate) fn automation_edge_hit(
+        &self,
+        model: &Session,
+        pos: Point,
+        size: faderframe_ui_canvas::Size,
+    ) -> Option<(TrackId, AutomationLaneId)> {
+        if pos.x >= self.header_w() || pos.y < self.ruler_h() {
+            return None;
+        }
+        let tracks = Self::lane_tracks(model);
+        self.visible_rows(tracks.len(), size).find_map(|i| {
+            self.lane_geoms(model, tracks[i], self.row_rect(i, size))
+                .into_iter()
+                .find(|g| (pos.y - g.row.bottom()).abs() <= super::RESIZE_GRIP)
+                .map(|g| (g.track, g.lane))
+        })
+    }
+
+    /// Where `lane`'s bottom edge is (on screen), when it is shown.
+    pub(crate) fn automation_edge_y(
+        &self,
+        model: &Session,
+        track: TrackId,
+        lane: AutomationLaneId,
+        size: faderframe_ui_canvas::Size,
+    ) -> Option<f32> {
+        let tracks = Self::lane_tracks(model);
+        let i = tracks.iter().position(|t| t.id == track)?;
+        self.lane_geoms(model, tracks[i], self.row_rect(i, size))
+            .into_iter()
+            .find(|g| g.lane == lane)
+            .map(|g| g.row.bottom())
     }
 
     fn lane_of(model: &Session, track: TrackId, lane: AutomationLaneId) -> Option<&AutomationLane> {
@@ -720,7 +767,45 @@ impl ArrangerView {
             let item = MenuItem::new(label, action);
             items.push(if k == 0 { item.separated() } else { item });
         }
-        items.push(MenuItem::new("Hide Lane", Action::HideAutomationLane(lane.id)).separated());
+        items.push(Self::lane_height_menu(model, lane.id).separated());
+        items.push(MenuItem::new(
+            "Hide Lane",
+            Action::HideAutomationLane(lane.id),
+        ));
         HostRequest::ContextMenu { at: pos, items }
+    }
+
+    /// "Lane Height": sizes for this lane, and every lane at its height.
+    fn lane_height_menu(model: &Session, lane: AutomationLaneId) -> MenuItem<Action> {
+        let now = model.automation_lane_height(lane);
+        let mut heights: Vec<MenuItem<Action>> = [
+            ("Small", 32.0),
+            ("Normal", AUTO_LANE_H),
+            ("Large", 2.0 * AUTO_LANE_H),
+            ("Huge", 4.0 * AUTO_LANE_H),
+        ]
+        .into_iter()
+        .map(|(label, h)| {
+            MenuItem::new(
+                label,
+                Action::SetAutomationLaneHeight {
+                    lane: Some(lane),
+                    height: h,
+                },
+            )
+            .checked((now - h).abs() < 0.5)
+        })
+        .collect();
+        heights.push(
+            MenuItem::new(
+                "Every Lane at This Height",
+                Action::SetAutomationLaneHeight {
+                    lane: None,
+                    height: now,
+                },
+            )
+            .separated(),
+        );
+        MenuItem::submenu("Lane Height", heights)
     }
 }

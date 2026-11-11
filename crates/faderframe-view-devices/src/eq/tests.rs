@@ -1253,3 +1253,118 @@ fn a_reference_track_sent_to_eq_match_is_its_reference() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_band_controls_have_a_room_of_their_own_under_the_scale() {
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    // Nothing selected: the room says how to begin.
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts()
+            .iter()
+            .any(|t| t.starts_with("Click a band to edit it")),
+        "{:?}",
+        p.texts()
+    );
+    click(
+        &mut view,
+        &mut s,
+        Point::new(590.0, 260.0),
+        2,
+        Modifiers::NONE,
+    );
+    // A deep cut: its node at the graph's foot, the controls under the
+    // scale, clear of it.
+    set_param(&view, &mut s, 0, Field::Gain, -30.0);
+    let l = view.layout(SIZE, &s);
+    let tap = s.plugin_tap(plugin).unwrap();
+    let (r, _, _) = view.panel_rect(&l, &s, &tap).unwrap();
+    assert!(
+        r.y >= l.axis.bottom() && r.bottom() <= l.bottom.y,
+        "{r:?} {l:?}"
+    );
+    let at = node(&view, &s, plugin, 0);
+    assert!(
+        at.y + super::geometry::NODE_R < r.y,
+        "the node {at:?} clear of {r:?}"
+    );
+    let p = paint(&mut view, &s);
+    assert!(
+        !p.texts()
+            .iter()
+            .any(|t| t.starts_with("Click a band to edit it")),
+        "no hint under a band's controls"
+    );
+    // A low editor: the graph keeps its least height and the controls
+    // rise over its foot, above the bottom bar.
+    let low = view.layout(Size::new(SIZE.w, 300.0), &s);
+    assert_eq!(low.graph.h, super::geometry::MIN_GRAPH_H);
+    let (r, _, _) = view.panel_rect(&low, &s, &tap).unwrap();
+    assert!(
+        r.y < low.graph.bottom() && r.bottom() <= low.bottom.y,
+        "{r:?} {low:?}"
+    );
+}
+
+#[test]
+fn the_room_fits_the_dynamics_settings_and_holds_while_dragging() {
+    use super::geometry::PANEL_MARGIN;
+    use super::panel::panel_height;
+    let (mut s, plugin) = session();
+    let mut view = EqView::new(plugin, &Theme::default());
+    for x in [400.0, 800.0] {
+        click(&mut view, &mut s, Point::new(x, 200.0), 2, Modifiers::NONE);
+        run(&mut view, &mut s, key(Key::Escape, Modifiers::NONE));
+    }
+    assert!(band(&s, plugin, 0).used && band(&s, plugin, 1).used);
+    let plain = view.layout(SIZE, &s);
+    assert_eq!(plain.panel.h, panel_height(false) + 2.0 * PANEL_MARGIN);
+    // Band 0 shows its dynamics settings: the room is as tall as they
+    // need, whichever band is selected.
+    set_param(&view, &mut s, 0, Field::Range, -6.0);
+    set_param(&view, &mut s, 0, Field::Dynamics, 1.0);
+    let tall = view.layout(SIZE, &s);
+    assert_eq!(tall.panel.h, panel_height(true) + 2.0 * PANEL_MARGIN);
+    assert_eq!(tall.graph.h, plain.graph.h - (tall.panel.h - plain.panel.h));
+    let at0 = node(&view, &s, plugin, 0);
+    click(&mut view, &mut s, at0, 1, Modifiers::NONE);
+    let tap = s.plugin_tap(plugin).unwrap();
+    let (r, b, _) = view.panel_rect(&tall, &s, &tap).unwrap();
+    assert_eq!(b, 0);
+    assert!(r.bottom() <= tall.bottom.y, "{r:?} {tall:?}");
+    // The first row hangs under the scale whatever follows it.
+    assert_eq!(r.y, tall.panel.y + PANEL_MARGIN);
+    let at1 = node(&view, &s, plugin, 1);
+    click(&mut view, &mut s, at1, 1, Modifiers::NONE);
+    assert_eq!(view.layout(SIZE, &s).graph.h, tall.graph.h);
+    let (r1, b, _) = view.panel_rect(&tall, &s, &tap).unwrap();
+    assert_eq!((b, r1.y), (1, r.y));
+    // A drag holds the graph's size though band 0's range goes to zero
+    // meanwhile (its dynamics settings gone); let go, the room shrinks.
+    let at0 = node(&view, &s, plugin, 0);
+    run(&mut view, &mut s, down(at0, PointerButton::Primary, 1));
+    let moved = Point::new(at0.x + 3.0, at0.y);
+    run(&mut view, &mut s, drag(moved));
+    set_param(&view, &mut s, 0, Field::Range, 0.0);
+    assert_eq!(view.layout(SIZE, &s).graph.h, tall.graph.h);
+    run(&mut view, &mut s, up(moved));
+    assert_eq!(view.layout(SIZE, &s).graph.h, plain.graph.h);
+}
+
+#[test]
+fn the_graph_never_shrinks_as_the_editor_grows() {
+    let (s, plugin) = session();
+    let view = EqView::new(plugin, &Theme::default());
+    let mut last = view.layout(Size::new(SIZE.w, 120.0), &s);
+    for h in 121..900 {
+        let l = view.layout(Size::new(SIZE.w, h as f32), &s);
+        let grew = l.graph.h - last.graph.h;
+        assert!(
+            (0.0..=1.0001).contains(&grew),
+            "at {h} px the graph grew {grew}"
+        );
+        assert!(l.panel.y >= l.axis.bottom() && l.panel.bottom() <= l.bottom.y + 1e-3);
+        last = l;
+    }
+}

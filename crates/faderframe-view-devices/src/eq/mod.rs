@@ -290,6 +290,9 @@ pub struct EqView {
     /// The output meter's falling peaks.
     meter: [f32; 2],
     last_paint: Option<Instant>,
+    /// The band controls' height the layout keeps room for, as last
+    /// decided outside a drag.
+    panel_room: std::cell::Cell<f32>,
 }
 
 impl EqView {
@@ -317,6 +320,7 @@ impl EqView {
             ab_side: 0,
             meter: [-150.0; 2],
             last_paint: None,
+            panel_room: std::cell::Cell::new(panel::panel_height(false)),
         }
     }
 
@@ -386,7 +390,27 @@ impl EqView {
     }
 
     pub(crate) fn layout(&self, size: Size, model: &Session) -> Layout {
-        Layout::new(size, self.settings(model).piano)
+        Layout::new(size, self.settings(model).piano, self.panel_room(model))
+    }
+
+    /// The band controls' height the layout keeps room for: the tallest
+    /// any band shows (with its dynamics settings, when a band shows them),
+    /// so the graph keeps its size whichever band is selected. Held while a
+    /// drag goes on: the graph never resizes under the pointer (a range
+    /// dragged through zero shows and hides a band's dynamics settings).
+    fn panel_room(&self, model: &Session) -> f32 {
+        if self.drag.is_some() {
+            return self.panel_room.get();
+        }
+        let dynamics_row = self.device.tap(model).is_some_and(|tap| {
+            (0..faderframe_plugin_host::eq::BANDS).any(|b| {
+                let p = BandParams::read(&tap.params, b);
+                p.used && panel::shows_dynamics_row(&p)
+            })
+        });
+        let h = panel::panel_height(dynamics_row);
+        self.panel_room.set(h);
+        h
     }
 
     pub(crate) fn gain_axis(&self, model: &Session) -> GainAxis {

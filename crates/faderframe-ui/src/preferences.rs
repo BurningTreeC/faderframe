@@ -162,6 +162,27 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
     });
     sandbox_note.set_wrap(true);
     g.attach(&sandbox_note, 1, 6, 1, 1);
+    let warm_up = gtk::SpinButton::with_range(
+        0.0,
+        f64::from(faderframe_engine::offline::MAX_PLUGIN_WARM_UP_MS) / 1000.0,
+        0.5,
+    );
+    warm_up.set_digits(1);
+    warm_up.set_value(f64::from(app.session.borrow().plugin_warm_up_ms()) / 1000.0);
+    warm_up.set_hexpand(false);
+    let warm_up_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    warm_up_row.append(&warm_up);
+    warm_up_row.append(&gtk::Label::new(Some(
+        "seconds for plugins to get ready before a render starts",
+    )));
+    row(&g, 7, "Renders", &warm_up_row);
+    g.attach(
+        &note("Exports, bounces, freezes, self-freezing and analyses load plugins of their own and run faster than real time. Some plugins load what their settings name in the background (an amp model, samples, an impulse response) and play silence until it is ready — and no plugin format lets them say when that is. CLAP, VST3, LV2 and Audio Unit plugins get this much real time before the first frame; built-in devices never need it. 0: renders start at once."),
+        1,
+        8,
+        1,
+        1,
+    );
     let gpu = gtk::CheckButton::with_label("Draw analysers, meters and curves on the GPU");
     gpu.set_active(app.gpu_painter.get() && crate::gpu::available());
     gpu.set_sensitive(crate::gpu::available());
@@ -170,7 +191,7 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          the graphics card (vello on wgpu) instead of GTK's renderer, which rasterises \
          every changing curve on the CPU. Without a usable GPU they stay as they are.",
     ));
-    row(&g, 7, "Drawing", &gpu);
+    row(&g, 9, "Drawing", &gpu);
     // GTK's choice is software on a chip Mesa's crocus driver draws with.
     let automatic = crate::drawing::software_for_chip()
         .map(|family| format!("Automatic (software on {family} graphics)"));
@@ -195,7 +216,7 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          software on Intel graphics up to Haswell (Mesa's crocus driver crashes under \
          GTK's renderer); choose OpenGL to try the graphics chip anyway.",
     ));
-    row(&g, 8, "Renderer", &renderer);
+    row(&g, 10, "Renderer", &renderer);
     renderer.connect_selected_notify(|d| {
         let r = crate::drawing::RENDERERS[(d.selected() as usize).min(3)];
         let mut p = Preferences::load();
@@ -216,6 +237,20 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
             if let Some(app) = weak.upgrade() {
                 app.gpu_painter.set(crate::gpu::wanted(b.is_active()));
                 app.redraw_all();
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(app);
+        warm_up.connect_value_changed(move |b| {
+            let ms = (b.value() * 1000.0).round() as u32;
+            let mut p = Preferences::load();
+            p.plugin_warm_up_ms = ms;
+            if let Err(e) = p.save() {
+                tracing::warn!("cannot save preferences: {e}");
+            }
+            if let Some(app) = weak.upgrade() {
+                app.with_session(|s| s.set_plugin_warm_up(ms));
             }
         });
     }
@@ -280,7 +315,7 @@ fn general_page(app: &Rc<AppState>) -> gtk::Widget {
          its versions uses (deleted recordings and imports, replaced renders). The undo \
          history ends when the project closes, so nothing else needs them.",
     ));
-    row(&g, 9, "Unused media on closing", &unused);
+    row(&g, 11, "Unused media on closing", &unused);
     unused.connect_selected_notify(|d| {
         let mut p = Preferences::load();
         p.unused_media = UNUSED[(d.selected() as usize).min(UNUSED.len() - 1)]

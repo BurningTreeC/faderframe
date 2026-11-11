@@ -94,6 +94,9 @@ struct Hosted {
     /// A built-in's state as it was made: what a slot without a state of
     /// its own goes back to (the undo of its first preset or loaded file).
     initial: Option<Vec<u8>>,
+    /// When it was made, for a third-party plug-in (any format but the
+    /// built-ins): what an offline render's warm-up counts from.
+    third_party_since: Option<std::time::Instant>,
 }
 
 /// Owns one [`PluginInstance`] per project plugin slot.
@@ -180,6 +183,17 @@ impl PluginHost {
         self.instances.values().any(|h| h.instance.loading())
     }
 
+    /// When the newest instance of a third-party plug-in (CLAP, VST3, LV2,
+    /// Audio Unit, sandboxed or not) was made; `None`: built-ins only.
+    /// Nothing tells a host when such a plug-in has what its state names
+    /// ready (see [`crate::offline::OfflineRenderer`]).
+    pub fn third_party_since(&self) -> Option<std::time::Instant> {
+        self.instances
+            .values()
+            .filter_map(|h| h.third_party_since)
+            .max()
+    }
+
     /// Process plugins in 64-bit floating point where they can (applies
     /// with the next graph build); `true` when it changed.
     pub fn set_double_precision(&mut self, on: bool) -> bool {
@@ -223,7 +237,8 @@ impl PluginHost {
             if self.background_loading {
                 instance.configure_background_loading();
             }
-            let initial = if slot.plugin.format == ProjectFormat::Builtin {
+            let builtin = slot.plugin.format == ProjectFormat::Builtin;
+            let initial = if builtin {
                 instance.save_state().ok()
             } else {
                 None
@@ -255,6 +270,7 @@ impl PluginHost {
                     baseline,
                     state: slot.state.clone(),
                     initial,
+                    third_party_since: (!builtin).then(std::time::Instant::now),
                 },
             );
         }

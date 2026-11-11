@@ -1275,6 +1275,9 @@ fn keeps_audition(action: &Action) -> bool {
             | Action::SetGrid(_)
             | Action::ToggleSnap
             | Action::SetStripWidth { .. }
+            | Action::SetTrackHeight { .. }
+            | Action::SetTakeLaneHeight { .. }
+            | Action::SetAutomationLaneHeight { .. }
             | Action::AuditionOff
             | Action::ResetPerformance
             | Action::Codec(_)

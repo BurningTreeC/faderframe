@@ -12,9 +12,13 @@
 //! never their faders. Globally: the tempo map and signatures, the key
 //! and chord track (MIDI effects follow them), each track's tuning (the
 //! key table it plays and how its plugins are retuned), the project rate
-//! (clip positions are in its frames) and the engine rate (the cache is
-//! rendered at it). Nothing after the chain counts: fader, pan, sends,
-//! mute, solo and polarity of the track stay live.
+//! (clip positions are in its frames), the engine rate (the cache is
+//! rendered at it) and, where a third-party plug-in is among the chains,
+//! the real time renders give such plug-ins before their first frame
+//! (`faderframe_engine::offline::plugin_warm_up_ms`: what one preparing
+//! its state in the background plays first). Nothing after the chain
+//! counts: fader, pan, sends, mute, solo and polarity of the track stay
+//! live.
 //!
 //! Every comparison destructures [`Track`] and [`Clip`] field by field,
 //! so a field added later must be placed on one side or the other before
@@ -25,16 +29,18 @@ use faderframe_core::TrackId;
 use faderframe_mix_intelligence::Fnv;
 use faderframe_project::modulation::{FollowSource, ModSource};
 use faderframe_project::{
-    AudioSource, ChordEvent, Clip, KeyChange, OutputRouting, Project, SourceSpec, Track,
-    TrackColor, TrackKind,
+    AudioSource, ChordEvent, Clip, KeyChange, OutputRouting, PluginFormat, Project, SourceSpec,
+    Track, TrackColor, TrackKind,
 };
 use faderframe_timeline::Timeline;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 
 /// Changes when what a key covers (or how a cache is made) changes:
-/// older caches are not taken for newer ones.
-pub(crate) const KEY_VERSION: u64 = 1;
+/// older caches are not taken for newer ones. 2: third-party plug-ins
+/// get a warm-up before renders (caches made without one may start
+/// silent).
+pub(crate) const KEY_VERSION: u64 = 2;
 
 /// The tracks whose signal reaches `track`'s chain (itself included),
 /// sorted by id.
@@ -355,15 +361,35 @@ pub(crate) struct ChainView {
     keys: Vec<KeyChange>,
     chords: Vec<ChordEvent>,
     tracks: Vec<TrackPart>,
+    /// The plug-ins' warm-up a render of these chains takes, in
+    /// milliseconds (0 without third-party plug-ins: they never wait).
+    warm_up_ms: u32,
+}
+
+/// The warm-up a render of `tracks`' chains takes (see [`ChainView`]).
+fn warm_up_of<'a>(tracks: impl IntoIterator<Item = &'a Track>, ms: u32) -> u32 {
+    let third_party = tracks.into_iter().any(|t| {
+        t.slots()
+            .iter()
+            .any(|s| s.plugin.format != PluginFormat::Builtin)
+    });
+    if third_party { ms } else { 0 }
 }
 
 impl ChainView {
     /// `track`'s chain in `project`, rendered at `rate`.
     pub(crate) fn of(project: &Project, track: TrackId, rate: u32) -> Self {
         let solo = project.solo_audible();
-        let tracks = chain_closure(project, track)
+        let closure: Vec<&Track> = chain_closure(project, track)
             .into_iter()
             .filter_map(|id| project.track(id))
+            .collect();
+        let warm_up_ms = warm_up_of(
+            closure.iter().copied(),
+            faderframe_engine::offline::plugin_warm_up_ms(),
+        );
+        let tracks = closure
+            .into_iter()
             .map(|t| {
                 let midi = t.kind == TrackKind::Midi;
                 let clips: Vec<Clip> = t
@@ -401,6 +427,7 @@ impl ChainView {
             keys: project.keys.clone(),
             chords: project.chords.clone(),
             tracks,
+            warm_up_ms,
         }
     }
 
@@ -422,6 +449,13 @@ impl ChainView {
                 .zip(&self.tracks)
                 .any(|(id, p)| *id != p.track.id)
         {
+            return false;
+        }
+        let warm_up = warm_up_of(
+            closure.iter().filter_map(|id| project.track(*id)),
+            faderframe_engine::offline::plugin_warm_up_ms(),
+        );
+        if self.warm_up_ms != warm_up {
             return false;
         }
         let solo = project.solo_audible();
@@ -502,6 +536,32 @@ mod tests {
         // Another rate, another cache.
         assert!(!view.holds(&q, t, 44_100));
         assert_ne!(ChainView::of(&q, t, 44_100).key(), key);
+    }
+
+    #[test]
+    fn the_warm_up_counts_where_a_third_party_plug_in_plays() {
+        let p = demo_project(48_000);
+        let t = audio_track(&p);
+        let mut track = p.track(t).cloned().unwrap_or_else(|| panic!("the track"));
+        track
+            .inserts
+            .retain(|s| s.plugin.format == PluginFormat::Builtin);
+        assert_eq!(warm_up_of([&track], 2_000), 0, "built-ins never wait");
+        track.inserts.push(faderframe_project::PluginSlot {
+            id: faderframe_core::PluginInstanceId(9_999),
+            plugin: faderframe_project::PluginRef {
+                format: PluginFormat::Vst3,
+                id: "an.amp".into(),
+                name: "Amp".into(),
+            },
+            bypass: false,
+            parameters: Vec::new(),
+            state: None,
+            sidechain: None,
+            mono_to_stereo: false,
+        });
+        assert_eq!(warm_up_of([&track], 2_000), 2_000);
+        assert_eq!(warm_up_of([&track], 0), 0);
     }
 
     #[test]

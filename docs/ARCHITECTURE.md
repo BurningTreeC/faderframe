@@ -3170,6 +3170,35 @@ faster than real time outruns it. Tests: engine `tests/offline_mode.rs`,
 `an_offline_render_freewheels_and_does_its_work_in_the_block` (LV2),
 `an_offline_render_is_told_and_waits_for_every_block` (sandbox).
 
+**Renders give plugins time to get ready** (PR #56's report: a NAM amp
+plugin self-frozen silent for its first 2.3 s). A render hosts plugin
+instances of its own and starts at once, faster than real time; a plugin
+that prepares what its state names on threads of its own after
+`load_state` (an amp model, samples, an impulse response) plays silence
+or a stand-in until it is ready — and no format has a way to tell the
+host when that is. So an `OfflineRenderer` hosting any third-party
+instance (CLAP, VST3, LV2, AU, sandboxed or not;
+`PluginHost::third_party_since` = when the newest was made) gives them
+`offline::plugin_warm_up_ms` of real time before its first frame, as a
+device would: blocks of silence with the transport stopped, paced from
+the newest instance's making (the set-up's time counts), plugins polled
+between blocks — their main-thread callbacks served, and a restart (a
+latency known only once loaded) rebuilds the graph so the render
+compensates it. The block count follows from the time, rate and block
+alone, so renders of one project stay alike (a free-running plugin's
+state moves as far each time); the capture plan's taps and probes are
+reset afterwards (`Capture::reset`: Mix Intelligence would otherwise read
+the warm-up as lost frames and quieter devices). Process-wide
+(`set_plugin_warm_up`, 0 = none until a program sets it, at most
+`MAX_PLUGIN_WARM_UP_MS` 30 s); the shell sets it at start-up from
+`Preferences::plugin_warm_up_ms` (default `DEFAULT_PLUGIN_WARM_UP_MS`
+2 s; Preferences → General → Renders), `Session::set_plugin_warm_up`
+changes it (self-frozen chains with third-party plugins are made again:
+their `ChainView` holds the warm-up). Built-ins load synchronously in
+renders and never wait. Tests: engine `tests/offline_warm_up.rs`,
+`capture::tests::a_reset_forgets_what_was_captured_and_missed`, session
+`self_freeze::key::tests::the_warm_up_counts_where_a_third_party_plug_in_plays`.
+
 **Favorites** (issue #15) are the user's, not a project's:
 `faderframe_session::plugin_favorites` (pure; `PluginFavorites` with
 `Favorite`s keyed by `FavoriteKey` = format + the format's id — never the
@@ -3360,8 +3389,18 @@ bypass, automation, listening).
   output; collisions glow red), every
   band's curve (a dynamic band's reach shaded, spectral movement per
   frequency) and the overall response per part of the signal (stereo,
-  left, right, mid, side); floating band controls under the band in focus
-  (the gain knob carries the dynamic range ring; ">>" opens threshold,
+  left, right, mid, side); band controls under the band in focus, in a
+  room of their own between the frequency scale and the bottom bar (PR
+  #61's proposal: a band cut deep or a dynamic range pulled down is never
+  under them; `Layout::panel`, as tall as the tallest controls any band
+  shows — with a band's dynamics settings open, every band's room grows,
+  so the graph keeps its size whichever band is selected — and held while
+  a drag goes on; the controls hang under the scale, a band's dynamics
+  settings opening below their first row so ">>" stays under the pointer;
+  in an editor too low for it the room gives way first, the graph keeping
+  `MIN_GRAPH_H` 160 px, and the controls rise from the bottom bar over its
+  foot; with nothing selected the room says how to begin) (the gain knob
+  carries the dynamic range ring; ">>" opens threshold,
   sidechain, attack, release, trigger and spectral settings); values next
   to a band to drag, scroll or type ("1k", "A4", "C#2+13", "2x"); multi-
   selection, rectangle selection, copy and paste; EQ Sketch (a drawn curve
@@ -6226,7 +6265,8 @@ plugins stay loaded.
   project in place (clips, media, devices and their state blobs, the
   automation and modulators driving them, the MIDI tracks playing it with
   their effective mute, sidechain and follower sources recursively, tempo,
-  key and chords, project and engine rate) and a difference sends the
+  key and chords, project and engine rate, the plugins' warm-up where a
+  third-party plugin is among the chains) and a difference sends the
   track back in that very sync, before the edit is heard. The view's key
   (a hash) names the cache file, so undo, or reopening the project, finds
   the old file again without rendering. The comparisons destructure
@@ -7076,6 +7116,20 @@ Use (the whole take)/Delete Take and Flatten. Take lanes have a height per
 track (`WorkspaceSet::take_lane_heights`, `TAKE_LANE_HEIGHT` 30 px,
 20–240; drag their bottom edge — each lane grows by its share —,
 double-click it for the default, or the lane menu's Take Lane Height).
+Automation lanes have a height each (PR #57's request: a taller lane
+edits a curve more finely): `WorkspaceSet::automation_lane_heights` by
+lane, over `automation_lane_height` for every lane (both saved with the
+layout; `AUTOMATION_LANE_HEIGHT` 56 px, 32–400 — the lowest keeps the
+lane header's controls clear of its edge); drag a lane's bottom edge in
+the header column (`Hit::AutomationEdge`, `Drag::AutomationLane`; the
+track's own edge above its lanes still sizes the track; Alt: every
+lane), double-click it for the default (Alt: every lane's), or the lane
+menu's Lane Height (sizes, Every Lane at This Height) —
+`Action::SetAutomationLaneHeight { lane: Option, height }`, not
+undoable, kept by scenes, auditions and the macro recorder like the
+other heights. A saved layout keeps only the heights of lanes there are
+(`WorkspaceSet::keep_automation_lane_heights` in `workspace_to_save`);
+the session keeps the others while an undo may bring their lanes back.
 Each lane's ▶ auditions its take (`Action::AuditionTake`,
 `session::take_audition`): the folder plays that take whole instead of the
 comp (`EngineController::set_take_audition` → `TimelineSnapshot::build_with`

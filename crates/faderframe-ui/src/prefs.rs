@@ -113,6 +113,9 @@ pub struct Preferences {
     pub sandbox_plugins: bool,
     /// Process plugins in 64-bit floating point where they can.
     pub plugin_double_precision: bool,
+    /// Real time third-party plugins get before an offline render's first
+    /// frame, in milliseconds (`faderframe_engine::offline`; 0: none).
+    pub plugin_warm_up_ms: u32,
     /// Render tracks nobody plays live this many milliseconds ahead (0:
     /// off).
     pub render_ahead_ms: u32,
@@ -236,6 +239,7 @@ impl Default for Preferences {
             mtc_offset: "00:00:00:00".into(),
             sandbox_plugins: true,
             plugin_double_precision: false,
+            plugin_warm_up_ms: faderframe_engine::offline::DEFAULT_PLUGIN_WARM_UP_MS,
             render_ahead_ms: 200,
             render_ahead_buses: true,
             gpu_painter: true,

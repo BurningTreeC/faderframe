@@ -177,6 +177,29 @@ impl Session {
     pub fn plugin_double_precision(&self) -> bool {
         self.engine.plugin_double_precision()
     }
+
+    /// The real time third-party plug-ins get before an offline render's
+    /// first frame (exports, bounces, freezes, self-freezing, analyses),
+    /// for this process (`faderframe_engine::offline::set_plugin_warm_up`):
+    /// a plug-in preparing what its state names in the background is ready
+    /// by then. In milliseconds, up to
+    /// [`faderframe_engine::offline::MAX_PLUGIN_WARM_UP_MS`]; 0: renders
+    /// start at once. Self-frozen chains with such plug-ins are made again.
+    pub fn set_plugin_warm_up(&mut self, ms: u32) -> Result<()> {
+        use faderframe_engine::offline::{MAX_PLUGIN_WARM_UP_MS, plugin_warm_up_ms};
+        let ms = ms.min(MAX_PLUGIN_WARM_UP_MS);
+        if ms == plugin_warm_up_ms() {
+            return Ok(());
+        }
+        faderframe_engine::offline::set_plugin_warm_up(ms);
+        self.self_freeze_warm_up_changed();
+        self.revision += 1;
+        self.sync(Impact::None)
+    }
+
+    pub fn plugin_warm_up_ms(&self) -> u32 {
+        faderframe_engine::offline::plugin_warm_up_ms()
+    }
 }
 
 #[cfg(test)]

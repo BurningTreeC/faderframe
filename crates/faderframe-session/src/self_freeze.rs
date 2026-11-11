@@ -760,6 +760,19 @@ impl Session {
         self.self_freeze.idle = false;
     }
 
+    /// Renders give third-party plug-ins another warm-up: caches of
+    /// chains holding them were made with the old one (their views no
+    /// longer hold, the next sync plays those chains again) and a render
+    /// under way makes one.
+    pub(crate) fn self_freeze_warm_up_changed(&mut self) {
+        if let Some(job) = self.self_freeze.job.take() {
+            job.cancel();
+        }
+        self.self_freeze.keys.clear();
+        self.self_freeze.keys_at = None;
+        self.self_freeze.idle = false;
+    }
+
     /// The engine's rate changes: caches made at the old one are not
     /// played (the engine forgets them before its next graph).
     pub(crate) fn self_freeze_rate_changing(&mut self) {

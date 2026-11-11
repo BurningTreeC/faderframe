@@ -11,7 +11,7 @@
 //! hold Audition to hear it), and for spectral bands the density and the
 //! 3 dB/oct tilt.
 
-use super::geometry::Layout;
+use super::geometry::{Layout, PANEL_MARGIN};
 use super::paint::{cross_icon, headphones_icon, power_icon};
 use super::{EqView, Hit};
 use faderframe_plugin_host::eq::design::{self, BandType};
@@ -57,6 +57,17 @@ pub(crate) enum PanelItem {
 pub(crate) const PANEL_W: f32 = 660.0;
 const ROW1_H: f32 = 116.0;
 const ROW2_H: f32 = 98.0;
+
+/// How tall the band controls are: their first row, and the dynamics
+/// settings under it (a dynamic band's ">>").
+pub(crate) fn panel_height(dynamics_row: bool) -> f32 {
+    ROW1_H + if dynamics_row { ROW2_H } else { 0.0 }
+}
+
+/// Whether a band's controls show the dynamics settings.
+pub(crate) fn shows_dynamics_row(p: &BandParams) -> bool {
+    p.dynamic() && p.custom
+}
 
 /// A knob's range: low, high, logarithmic.
 pub(crate) fn knob_spec(field: Field) -> (f64, f64, bool) {
@@ -109,11 +120,20 @@ impl EqView {
             return None;
         }
         let g = &l.graph;
-        let expanded = p.dynamic() && p.custom;
-        let h = ROW1_H + if expanded { ROW2_H } else { 0.0 };
+        let h = panel_height(shows_dynamics_row(&p));
         let x = self.axis(model).x(g, p.freq) - PANEL_W / 2.0;
         let x = x.clamp(g.x + 4.0, (g.right() - PANEL_W - 4.0).max(g.x + 4.0));
-        Some((Rect::new(x, g.bottom() - h - 6.0, PANEL_W, h), band, p))
+        // Hanging under the frequency scale in their room: the dynamics
+        // settings open below the first row, so ">>" stays under the
+        // pointer. Where the room falls short they rise from the bottom
+        // bar over the scale and the graph's foot; without one, over the
+        // foot.
+        let y = if l.panel.h > 0.0 {
+            (l.panel.y + PANEL_MARGIN).min(l.panel.bottom() - h - PANEL_MARGIN)
+        } else {
+            g.bottom() - h - PANEL_MARGIN
+        };
+        Some((Rect::new(x, y, PANEL_W, h), band, p))
     }
 
     pub(crate) fn panel_items(&self, r: &Rect, p: &BandParams) -> Vec<(PanelItem, Rect)> {
@@ -197,7 +217,7 @@ impl EqView {
             PanelItem::Solo,
             Rect::new(r.x + 488.0, r.y + 40.0, 120.0, 22.0),
         ));
-        if p.dynamic() && p.custom {
+        if shows_dynamics_row(p) {
             let y = r.y + ROW1_H;
             out.push((
                 PanelItem::Threshold,
@@ -283,10 +303,17 @@ impl EqView {
         model: &Session,
         tap: &AnalysisTap,
     ) {
+        let th = &self.theme;
         let Some((r, band, bp)) = self.panel_rect(l, model, tap) else {
+            if l.panel.h >= 2.0 * th.fonts.small && self.grab.is_none() {
+                p.text(
+                    "Click a band to edit it · Double-click the display to add one",
+                    l.panel,
+                    &TextStyle::new(th.fonts.small, th.ui.text_dim).center(),
+                );
+            }
             return;
         };
-        let th = &self.theme;
         let color = Self::band_color(band);
         p.shadow(r, 8.0, Color::rgba(0.0, 0.0, 0.0, 0.45), 0.0, 3.0, 16.0);
         p.fill_rounded(r, 8.0, &Paint::Solid(th.device.panel.with_alpha(0.97)));
@@ -295,7 +322,7 @@ impl EqView {
             Rect::new(r.x + 12.0, r.y, r.w - 24.0, 2.0),
             color.with_alpha(0.9),
         );
-        if bp.dynamic() && bp.custom {
+        if shows_dynamics_row(&bp) {
             p.hline(
                 r.x + 10.0,
                 r.right() - 10.0,

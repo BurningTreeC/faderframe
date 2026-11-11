@@ -238,6 +238,13 @@ pub struct WorkspaceSet {
     /// [`TAKE_LANE_HEIGHT`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub take_lane_heights: std::collections::BTreeMap<faderframe_core::TrackId, f32>,
+    /// Height of every automation lane without one of its own (`None` =
+    /// [`AUTOMATION_LANE_HEIGHT`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_lane_height: Option<f32>,
+    /// Height of single automation lanes in the arranger.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub automation_lane_heights: std::collections::BTreeMap<faderframe_core::AutomationLaneId, f32>,
 }
 
 /// Where a timeline editor looks: its zoom and scroll.
@@ -328,6 +335,12 @@ pub const TRACK_HEIGHT_RANGE: (f32, f32) = (40.0, 480.0);
 pub const TAKE_LANE_HEIGHT: f32 = 30.0;
 pub const TAKE_LANE_HEIGHT_RANGE: (f32, f32) = (20.0, 240.0);
 
+/// An automation lane's height in the arranger unless set, and the range
+/// (the lowest keeps its header's controls clear of the edge that sizes
+/// it).
+pub const AUTOMATION_LANE_HEIGHT: f32 = 56.0;
+pub const AUTOMATION_LANE_HEIGHT_RANGE: (f32, f32) = (32.0, 400.0);
+
 impl Default for WorkspaceSet {
     fn default() -> Self {
         Self {
@@ -355,6 +368,8 @@ impl Default for WorkspaceSet {
             meter_bridge: false,
             arranger_place: None,
             take_lane_heights: Default::default(),
+            automation_lane_height: None,
+            automation_lane_heights: Default::default(),
         }
     }
 }
@@ -398,6 +413,54 @@ impl WorkspaceSet {
         } else {
             self.take_lane_heights.insert(track, h);
         }
+    }
+
+    /// Height of an automation lane in the arranger.
+    pub fn automation_lane_height(&self, lane: faderframe_core::AutomationLaneId) -> f32 {
+        self.automation_lane_heights
+            .get(&lane)
+            .copied()
+            .or(self.automation_lane_height)
+            .unwrap_or(AUTOMATION_LANE_HEIGHT)
+    }
+
+    /// Set one lane's height, or (with `None`) every lane's (clamped; a
+    /// lane at every lane's height, or every lane at the default, keeps
+    /// nothing of its own).
+    pub fn set_automation_lane_height(
+        &mut self,
+        lane: Option<faderframe_core::AutomationLaneId>,
+        height: f32,
+    ) {
+        let (lo, hi) = AUTOMATION_LANE_HEIGHT_RANGE;
+        let h = height.clamp(lo, hi);
+        match lane {
+            Some(l) => {
+                let all = self
+                    .automation_lane_height
+                    .unwrap_or(AUTOMATION_LANE_HEIGHT);
+                if (h - all).abs() < 0.5 {
+                    self.automation_lane_heights.remove(&l);
+                } else {
+                    self.automation_lane_heights.insert(l, h);
+                }
+            }
+            None => {
+                self.automation_lane_height =
+                    ((h - AUTOMATION_LANE_HEIGHT).abs() >= 0.5).then_some(h);
+                self.automation_lane_heights.clear();
+            }
+        }
+    }
+
+    /// Forget the heights of automation lanes not in `lanes` (those no
+    /// track holds: what a saved layout keeps).
+    pub fn keep_automation_lane_heights(
+        &mut self,
+        lanes: &std::collections::HashSet<faderframe_core::AutomationLaneId>,
+    ) {
+        self.automation_lane_heights
+            .retain(|l, _| lanes.contains(l));
     }
 
     /// Width of a track's mixer strip, if not the theme default.
@@ -571,5 +634,44 @@ mod track_height_tests {
         // Setting all heights clears overrides.
         ws.set_track_height(None, 10.0);
         assert_eq!(ws.track_height(TrackId(3)), Some(TRACK_HEIGHT_RANGE.0));
+    }
+}
+
+#[cfg(test)]
+mod automation_lane_height_tests {
+    use super::*;
+    use faderframe_core::AutomationLaneId;
+
+    #[test]
+    fn lanes_clamp_follow_every_lanes_height_and_round_trip() {
+        let (a, b) = (AutomationLaneId(1), AutomationLaneId(2));
+        let mut ws = WorkspaceSet::default();
+        assert_eq!(ws.automation_lane_height(a), AUTOMATION_LANE_HEIGHT);
+        ws.set_automation_lane_height(Some(a), 9999.0);
+        assert_eq!(ws.automation_lane_height(a), AUTOMATION_LANE_HEIGHT_RANGE.1);
+        assert_eq!(ws.automation_lane_height(b), AUTOMATION_LANE_HEIGHT);
+        let json = serde_json::to_string(&ws).unwrap();
+        assert_eq!(serde_json::from_str::<WorkspaceSet>(&json).unwrap(), ws);
+        // Every lane: the ones of their own go.
+        ws.set_automation_lane_height(None, 1.0);
+        assert_eq!(ws.automation_lane_height(a), AUTOMATION_LANE_HEIGHT_RANGE.0);
+        assert!(ws.automation_lane_heights.is_empty());
+        // A lane set to every lane's height keeps nothing of its own; every
+        // lane at the default keeps nothing at all.
+        ws.set_automation_lane_height(Some(b), AUTOMATION_LANE_HEIGHT_RANGE.0);
+        assert!(ws.automation_lane_heights.is_empty());
+        ws.set_automation_lane_height(None, AUTOMATION_LANE_HEIGHT);
+        assert_eq!(ws, WorkspaceSet::default());
+    }
+
+    #[test]
+    fn heights_of_lanes_no_track_holds_are_forgotten() {
+        let (a, b) = (AutomationLaneId(1), AutomationLaneId(2));
+        let mut ws = WorkspaceSet::default();
+        ws.set_automation_lane_height(Some(a), 80.0);
+        ws.set_automation_lane_height(Some(b), 120.0);
+        ws.keep_automation_lane_heights(&[b].into_iter().collect());
+        assert_eq!(ws.automation_lane_height(a), AUTOMATION_LANE_HEIGHT);
+        assert_eq!(ws.automation_lane_height(b), 120.0);
     }
 }

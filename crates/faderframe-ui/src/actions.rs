@@ -3546,6 +3546,41 @@ pub fn install(app: &Rc<AppState>) {
                 a.dispatch(Action::SetTakeLaneHeight { track, height });
             }
         }),
+        // Development aid: `automation-lane-height:<track>[@<n>]=<px>` (the
+        // track's n-th shown automation lane, from 1; the first without)
+        // or `automation-lane-height:all=<px>` (every lane).
+        named("automation-lane-height", |a, arg| {
+            let Some((which, height)) = arg.split_once('=') else {
+                tracing::warn!("automation-lane-height: '{arg}' is not <track>[@<n>]=<px>");
+                return;
+            };
+            let Ok(height) = height.trim().parse::<f32>() else {
+                tracing::warn!("automation-lane-height: '{height}' is not pixels");
+                return;
+            };
+            let lane = if which == "all" {
+                None
+            } else {
+                let (name, n) = match which.rsplit_once('@') {
+                    Some((name, n)) => (name, n.trim().parse::<usize>().unwrap_or(1)),
+                    None => (which, 1),
+                };
+                let s = a.session.borrow();
+                let lane = s
+                    .project()
+                    .tracks
+                    .iter()
+                    .find(|t| t.name == name)
+                    .and_then(|t| s.shown_lanes(t.id).get(n.saturating_sub(1)).map(|l| l.id));
+                drop(s);
+                let Some(lane) = lane else {
+                    tracing::warn!("automation-lane-height: '{which}' shows no such lane");
+                    return;
+                };
+                Some(lane)
+            };
+            a.dispatch(Action::SetAutomationLaneHeight { lane, height });
+        }),
         named("audition-take", |a, arg| {
             let Some((name, take)) = arg.split_once('=') else {
                 tracing::warn!("audition-take: '{arg}' is not <track>=<n|off>");
@@ -3983,6 +4018,14 @@ pub fn install(app: &Rc<AppState>) {
         named("plugin-precision", |a, arg| {
             let on = arg.trim() == "1";
             a.with_session(|s| s.set_plugin_double_precision(on));
+        }),
+        // Development aid: `plugin-warm-up:<ms>` (real time third-party
+        // plugins get before a render's first frame; not saved).
+        named("plugin-warm-up", |a, arg| match arg.trim().parse::<u32>() {
+            Ok(ms) => {
+                a.with_session(|s| s.set_plugin_warm_up(ms));
+            }
+            Err(_) => tracing::warn!("plugin-warm-up: {arg:?} is not milliseconds"),
         }),
         // Development aids: `import-midi-from:<path>` / `export-midi-to:<path>`.
         // Development aid: `import-audio-from:<path>` (a new track, at the

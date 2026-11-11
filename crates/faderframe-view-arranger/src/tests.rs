@@ -2863,3 +2863,162 @@ fn midi_clips_and_tracks_are_edited_as_notation_from_their_menus() {
         Some(Action::Score(ScoreOp::Show(ScoreOf::Tracks(vec![a, b]))))
     );
 }
+
+#[test]
+fn an_automation_lane_is_sized_by_its_bottom_edge() {
+    use faderframe_workspace::AUTOMATION_LANE_HEIGHT_RANGE;
+    let mut s = session();
+    let theme = Theme::default();
+    let mut view = ArrangerView::new(theme.clone());
+    let size = Size::new(1400.0, 900.0);
+    let tracks: Vec<TrackId> = ArrangerView::lane_tracks(&s)
+        .iter()
+        .take(2)
+        .map(|t| t.id)
+        .collect();
+    for t in &tracks {
+        s.dispatch(Action::ToggleTrackAutomation(*t)).unwrap();
+    }
+    let lane = s.shown_lanes(tracks[0])[0].id;
+    let other = s.shown_lanes(tracks[1])[0].id;
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let press = |pos: Point, alt: bool, clicks: u32| ViewEvent::PointerDown {
+        pos,
+        button: PointerButton::Primary,
+        modifiers: Modifiers {
+            alt,
+            ..Modifiers::NONE
+        },
+        clicks,
+    };
+    let row = view.row_rect(0, size);
+    let top = row.y + view.row_h();
+    let edge = Point::new(40.0, top + AUTO_LANE_H);
+    assert_eq!(
+        view.hit_test(edge, size, &s),
+        Some(Hit::AutomationEdge {
+            track: tracks[0],
+            lane
+        })
+    );
+    assert!(
+        view.tooltip(edge, size, &s)
+            .unwrap()
+            .contains("lane height")
+    );
+    // The track's own edge, above the lane, still sizes the track; in the
+    // lane area the edge is the lane's to edit.
+    assert_eq!(
+        view.hit_test(Point::new(40.0, top), size, &s),
+        Some(Hit::Header(tracks[0], HeaderPart::Resize))
+    );
+    assert!(!matches!(
+        view.hit_test(Point::new(600.0, edge.y), size, &s),
+        Some(Hit::AutomationEdge { .. })
+    ));
+
+    // Dragged 40 px down: this lane alone, one height a move.
+    let mut acts = run(&mut view, press(edge, false, 1), size, &s).0;
+    acts.extend(run(&mut view, mv(Point::new(40.0, edge.y + 40.0)), size, &s).0);
+    acts.extend(run(&mut view, up(Point::new(40.0, edge.y + 40.0)), size, &s).0);
+    assert_eq!(
+        acts,
+        vec![Action::SetAutomationLaneHeight {
+            lane: Some(lane),
+            height: AUTO_LANE_H + 40.0
+        }]
+    );
+    s.dispatch(acts[0].clone()).unwrap();
+    assert_eq!(s.automation_lane_height(lane), AUTO_LANE_H + 40.0);
+    assert_eq!(s.automation_lane_height(other), AUTO_LANE_H);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    assert_eq!(view.row_rect(0, size).h, view.row_h() + AUTO_LANE_H + 40.0);
+    let t0 = s.project().track(tracks[0]).unwrap().clone();
+    let g = view.lane_geoms(&s, &t0, view.row_rect(0, size))[0];
+    assert_eq!(g.row.h, AUTO_LANE_H + 40.0);
+    assert_eq!(
+        g.value_area(view.header_w(), size.w).h,
+        AUTO_LANE_H + 30.0,
+        "a taller lane is a finer one"
+    );
+    // The next track's rows moved down by as much.
+    let edge = Point::new(40.0, edge.y + 40.0);
+    assert!(matches!(
+        view.hit_test(edge, size, &s),
+        Some(Hit::AutomationEdge { lane: l, .. }) if l == lane
+    ));
+
+    // The lane's menu sizes it too.
+    let ev = ViewEvent::PointerDown {
+        pos: Point::new(600.0, top + 20.0),
+        button: PointerButton::Secondary,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    };
+    let (_, req) = run(&mut view, ev, size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("no lane menu");
+    };
+    let sizes = &items
+        .iter()
+        .find(|i| i.label == "Lane Height")
+        .unwrap_or_else(|| panic!("no Lane Height in the lane menu"))
+        .children;
+    let pick = |label: &str| {
+        sizes
+            .iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.action.clone())
+    };
+    assert_eq!(
+        pick("Large"),
+        Some(Action::SetAutomationLaneHeight {
+            lane: Some(lane),
+            height: 2.0 * AUTO_LANE_H
+        })
+    );
+    assert_eq!(
+        pick("Every Lane at This Height"),
+        Some(Action::SetAutomationLaneHeight {
+            lane: None,
+            height: AUTO_LANE_H + 40.0
+        })
+    );
+
+    // Double-click: the default height again.
+    let acts = run(&mut view, press(edge, false, 2), size, &s).0;
+    assert_eq!(
+        acts,
+        vec![Action::SetAutomationLaneHeight {
+            lane: Some(lane),
+            height: AUTO_LANE_H
+        }]
+    );
+    run(&mut view, up(edge), size, &s);
+
+    // Alt: every lane, as low as a lane goes; its header's controls stay
+    // clear of the edge.
+    let mut acts = run(&mut view, press(edge, true, 1), size, &s).0;
+    acts.extend(run(&mut view, mv(Point::new(40.0, edge.y - 500.0)), size, &s).0);
+    acts.extend(run(&mut view, up(Point::new(40.0, edge.y - 500.0)), size, &s).0);
+    let Some(Action::SetAutomationLaneHeight { lane: None, .. }) = acts.last() else {
+        panic!("{acts:?}");
+    };
+    for a in acts {
+        s.dispatch(a).unwrap();
+    }
+    let low = AUTOMATION_LANE_HEIGHT_RANGE.0;
+    assert_eq!(s.automation_lane_height(lane), low);
+    assert_eq!(s.automation_lane_height(other), low);
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let g = view.lane_geoms(&s, &t0, view.row_rect(0, size))[0];
+    for (r, part) in g.header_parts(view.header_w()) {
+        assert!(
+            matches!(
+                view.hit_test(r.center(), size, &s),
+                Some(Hit::Automation { header: true, .. })
+            ),
+            "{part:?} under the edge"
+        );
+    }
+}

@@ -112,7 +112,9 @@ pub fn install() {
             env: Vec::new(),
         });
     }
-    faderframe_plugin_sandbox::set_enabled(crate::prefs::Preferences::load().sandbox_plugins);
+    let prefs = crate::prefs::Preferences::load();
+    faderframe_plugin_sandbox::set_enabled(prefs.sandbox_plugins);
+    faderframe_engine::offline::set_plugin_warm_up(prefs.plugin_warm_up_ms);
     // Plugins hosted here (sandboxing off): an X error of their GUI must
     // not end FaderFrame (Xlib's default handler exits).
     faderframe_plugin_sandbox::xlib::tolerate_x_errors(
