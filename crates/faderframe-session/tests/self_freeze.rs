@@ -35,6 +35,7 @@ fn slot(p: &mut Project, id: &str) -> PluginSlot {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     }
 }
 

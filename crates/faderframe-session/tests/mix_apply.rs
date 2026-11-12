@@ -237,3 +237,162 @@ fn an_experiment_applied_before_other_edits_is_taken_back_alone() {
     assert!(s.dispatch(Action::Mix(MixOp::Undo(step))).is_err());
     s.wait_for_mix();
 }
+
+/// The EQ an experiment puts in says so (`PluginSlot::mix_origin`: the
+/// finding and the experiment), in the file too; Keep as My Own takes the
+/// mark off — one undo step, the device staying.
+#[test]
+fn an_applied_slot_says_where_it_came_from_until_kept_as_ones_own() {
+    let (mut s, _) = session();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let (f, i, masker) = eq_cut(&s);
+    s.dispatch(Action::Mix(MixOp::Apply {
+        finding: f.id,
+        recommendation: i,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let slot = |s: &Session| {
+        s.project()
+            .track(masker)
+            .unwrap()
+            .inserts
+            .iter()
+            .find(|x| x.plugin.id == faderframe_core::builtin::EQ)
+            .cloned()
+            .unwrap()
+    };
+    let eq = slot(&s);
+    let origin = eq.mix_origin.clone().expect("marked");
+    assert!(origin.contains("EQ cut on"), "{origin}");
+    // Kept in the file; an unmarked slot writes nothing new.
+    let json = serde_json::to_string(&eq).unwrap();
+    let back: faderframe_project::PluginSlot = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.mix_origin.as_deref(), Some(origin.as_str()));
+    let plain = faderframe_project::PluginSlot {
+        mix_origin: None,
+        ..eq.clone()
+    };
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("mix_origin")
+    );
+    // Keep as My Own: the mark goes, the EQ stays; undo brings it back.
+    s.dispatch(Action::Edit(Command::SetPluginMixOrigin {
+        track: masker,
+        plugin: eq.id,
+        origin: None,
+    }))
+    .unwrap();
+    assert_eq!(slot(&s).mix_origin, None);
+    assert_eq!(eq_count(&s, masker), 1);
+    let (done, _) = s.history_steps();
+    assert_eq!(done.last().map(String::as_str), Some("Keep as My Own"));
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(slot(&s).mix_origin.as_deref(), Some(origin.as_str()));
+    s.wait_for_mix();
+}
+
+/// An EQ experiment on a track whose devices end with a FaderFrame EQ can
+/// go into that EQ's next free band instead of a new EQ (Apply Into): one
+/// EQ still, the band as the experiment sets it, and its Undo frees the
+/// band again. Not offered when something follows the EQ or it is off.
+#[test]
+fn an_eq_cut_goes_into_the_eq_the_track_ends_with() {
+    use faderframe_plugin_host::eq::{Field, band_id};
+    let (mut s, tracks) = session();
+    // Each track ends with an EQ of its own whose first band is in use
+    // (shown, not heard: nothing analysed changes).
+    for t in tracks {
+        s.dispatch(Action::InsertPlugin {
+            track: t,
+            index: 0,
+            plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::EQ, "EQ"),
+        })
+        .unwrap();
+        let eq = s.project().track(t).unwrap().inserts[0].id;
+        s.dispatch(Action::Edit(Command::SetPluginParameter {
+            track: t,
+            plugin: eq,
+            parameter: band_id(0, Field::Enabled),
+            value: Some(2.0),
+        }))
+        .unwrap();
+    }
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let (f, i, masker) = eq_cut(&s);
+    let target = s.mix_merge_target(f.id, i).expect("offered");
+    let eq = s.project().track(masker).unwrap().inserts[0].id;
+    assert_eq!((target.plugin, target.band), (eq, 1));
+    let Experiment::EqCut {
+        freq_hz, gain_db, ..
+    } = f.recommendations[i].experiment
+    else {
+        panic!("an EQ cut")
+    };
+    s.dispatch(Action::Mix(MixOp::ApplyInto {
+        finding: f.id,
+        recommendation: i,
+    }))
+    .unwrap();
+    let saved = |s: &Session, field| {
+        let t = s.project().track(masker).unwrap();
+        t.inserts[0].saved(band_id(1, field))
+    };
+    assert_eq!(eq_count(&s, masker), 1, "no second EQ");
+    assert_eq!(saved(&s, Field::Enabled), Some(1.0));
+    assert_eq!(saved(&s, Field::Freq), Some(freq_hz));
+    assert_eq!(saved(&s, Field::Gain), Some(gain_db));
+    assert_eq!(
+        s.project().track(masker).unwrap().inserts[0].mix_origin,
+        None,
+        "the user's EQ"
+    );
+    s.wait_for_mix();
+    // Taken back: the band is free again.
+    let step = s.mix_applied_to(f.id)[0].step;
+    s.dispatch(Action::Mix(MixOp::Undo(step))).unwrap();
+    assert_eq!(saved(&s, Field::Enabled), None);
+    s.wait_for_mix();
+    // Auditioned first (its own EQ after the user's), then put into the
+    // user's EQ: the candidate's EQ goes, the band is in the user's.
+    let (f, i, masker) = eq_cut(&s);
+    s.dispatch(Action::Mix(MixOp::Audition {
+        finding: f.id,
+        recommendation: i,
+    }))
+    .unwrap();
+    assert_eq!(eq_count(&s, masker), 2, "the candidate's own EQ");
+    assert_eq!(s.mix_merge_target(f.id, i).map(|t| t.plugin), Some(eq));
+    s.dispatch(Action::Mix(MixOp::ApplyInto {
+        finding: f.id,
+        recommendation: i,
+    }))
+    .unwrap();
+    assert_eq!(eq_count(&s, masker), 1);
+    assert_eq!(saved(&s, Field::Enabled), Some(1.0));
+    s.wait_for_mix();
+    let step = s.mix_applied_to(f.id)[0].step;
+    s.dispatch(Action::Mix(MixOp::Undo(step))).unwrap();
+    s.wait_for_mix();
+    // Not offered with a device after the EQ, nor with the EQ off.
+    let (f, i, masker) = eq_cut(&s);
+    assert!(s.mix_merge_target(f.id, i).is_some());
+    s.dispatch(Action::Edit(Command::SetPluginBypass {
+        track: masker,
+        plugin: eq,
+        bypass: true,
+    }))
+    .unwrap();
+    assert_eq!(s.mix_merge_target(f.id, i), None, "bypassed");
+    s.dispatch(Action::Undo).unwrap();
+    s.dispatch(Action::InsertPlugin {
+        track: masker,
+        index: 1,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::GAIN, "Utility"),
+    })
+    .unwrap();
+    assert_eq!(s.mix_merge_target(f.id, i), None, "a device after it");
+    s.wait_for_mix();
+}

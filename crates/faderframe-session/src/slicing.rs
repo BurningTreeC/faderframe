@@ -830,6 +830,7 @@ impl Session {
                         state: Some(state),
                         sidechain: None,
                         mono_to_stereo: false,
+                        mix_origin: None,
                     },
                 });
                 track = id;

@@ -1182,6 +1182,7 @@ impl Session {
                     state: None,
                     sidechain: None,
                     mono_to_stereo: false,
+                    mix_origin: None,
                 });
                 self.edit(Command::SetSongInserts { song, inserts })?;
                 // Like an insert on a track: a hosted plugin shows its editor.

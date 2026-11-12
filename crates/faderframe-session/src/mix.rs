@@ -201,6 +201,13 @@ pub enum MixOp {
         finding: u64,
         recommendation: usize,
     },
+    /// [`MixOp::Apply`] for an EQ experiment, its band put into the
+    /// FaderFrame EQ the track's devices already end with instead of a new
+    /// one ([`Session::mix_merge_target`]).
+    ApplyInto {
+        finding: u64,
+        recommendation: usize,
+    },
     /// Take an applied experiment back ([`AppliedInfo::step`]): undone
     /// when it is the last step, else its inverse made a step of its own
     /// (what was done after it stays). Analysed again at once.
@@ -887,6 +894,7 @@ fn utility_slot(project: &mut Project, params: &[(u32, f64)]) -> PluginSlot {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     }
 }
 
@@ -907,7 +915,54 @@ fn eq_slot(
         state: None,
         sidechain,
         mono_to_stereo: false,
+        mix_origin: None,
     }
+}
+
+/// The EQ an experiment's band can go into ([`Session::mix_merge_target`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeTarget {
+    pub track: TrackId,
+    pub plugin: PluginInstanceId,
+    /// The free band it takes.
+    pub band: usize,
+    /// The key the EQ is given (it had none).
+    pub sidechain: Option<TrackId>,
+    /// As the mixer names it ("EQ (2)").
+    pub name: String,
+}
+
+/// An EQ experiment's new EQ turned into its band in `target`: every field
+/// of the new EQ's first band (unset ones at their defaults), and the key
+/// when the EQ needs one.
+fn merge_into(commands: Vec<Command>, target: &MergeTarget) -> Vec<Command> {
+    let mut out = Vec::new();
+    for c in commands {
+        let Command::InsertPlugin { slot, .. } = c else {
+            out.push(c);
+            continue;
+        };
+        if let Some(source) = target.sidechain {
+            out.push(Command::SetPluginSidechain {
+                track: target.track,
+                plugin: target.plugin,
+                source: Some(source),
+            });
+        }
+        // Written whole (a free band may hold what it was set to before).
+        let infos = faderframe_plugin_host::eq::parameters();
+        for f in Field::ALL {
+            let parameter = band_id(target.band, f);
+            let default = infos.iter().find(|i| i.id == parameter).map(|i| i.default);
+            out.push(Command::SetPluginParameter {
+                track: target.track,
+                plugin: target.plugin,
+                parameter,
+                value: slot.saved(band_id(0, f)).or(default),
+            });
+        }
+    }
+    out
 }
 
 fn job_worker(
@@ -1773,7 +1828,11 @@ impl Session {
             MixOp::Apply {
                 finding,
                 recommendation,
-            } => self.apply_mix_experiment(finding, recommendation)?,
+            } => self.apply_mix_experiment(finding, recommendation, false)?,
+            MixOp::ApplyInto {
+                finding,
+                recommendation,
+            } => self.apply_mix_experiment(finding, recommendation, true)?,
             MixOp::Undo(step) => self.undo_mix_experiment(step)?,
             MixOp::Open {
                 finding,
@@ -2995,9 +3054,79 @@ impl Session {
         }
     }
 
+    /// Where an EQ experiment's band could go instead of a new EQ: the
+    /// FaderFrame EQ the track's devices end with (where the new one would
+    /// stand, so the sound is the same), switched on, with a free band, and
+    /// keyed by the experiment's sidechain or by nothing yet (none of its
+    /// bands listening to a key). `None` for other experiments.
+    pub fn mix_merge_target(&self, finding: u64, recommendation: usize) -> Option<MergeTarget> {
+        let exp = self
+            .mix_finding(finding)?
+            .recommendations
+            .get(recommendation)?
+            .experiment
+            .clone();
+        let (track, key) = match exp {
+            Experiment::EqCut { track, .. } | Experiment::SideLowCut { track, .. } => (track, None),
+            Experiment::DynamicEqCut { track, key, .. } => (track, Some(key)),
+            _ => return None,
+        };
+        let t = self.project.track(track)?;
+        // Past an auditioned candidate's own EQ (it goes when applied).
+        let candidate = self
+            .mix
+            .audition
+            .as_ref()
+            .map(Audition::plugins)
+            .unwrap_or_default();
+        let eq = t
+            .inserts
+            .iter()
+            .rev()
+            .find(|s| !candidate.contains(&s.id))?;
+        if eq.plugin.format != faderframe_project::PluginFormat::Builtin
+            || eq.plugin.id != builtin::EQ
+            || eq.bypass
+        {
+            return None;
+        }
+        let state = |b: usize| eq.saved(band_id(b, Field::Enabled)).unwrap_or(0.0);
+        let band = (0..faderframe_plugin_host::eq::BANDS).find(|&b| state(b) == 0.0)?;
+        let keyed = (0..faderframe_plugin_host::eq::BANDS)
+            .any(|b| state(b) != 0.0 && eq.saved(band_id(b, Field::Key)).unwrap_or(0.0) != 0.0);
+        let sidechain = match (key, eq.sidechain) {
+            (None, _) => None,
+            (Some(k), Some(now)) if k == now => None,
+            (Some(k), None) if !keyed => Some(k),
+            _ => return None,
+        };
+        Some(MergeTarget {
+            track,
+            plugin: eq.id,
+            band,
+            sidechain,
+            name: t.name_of(eq).trim_start_matches("FaderFrame ").to_string(),
+        })
+    }
+
     /// Make an experiment one undo step (the auditioned candidate as it is
     /// now, the candidate's switch on).
-    fn apply_mix_experiment(&mut self, finding: u64, recommendation: usize) -> Result<()> {
+    fn apply_mix_experiment(
+        &mut self,
+        finding: u64,
+        recommendation: usize,
+        into: bool,
+    ) -> Result<()> {
+        let target = into.then(|| self.mix_merge_target(finding, recommendation));
+        let target = match target {
+            Some(None) => {
+                return Err(SessionError::Other(
+                    "no EQ at the end of the track to put it into".into(),
+                ));
+            }
+            Some(t) => t,
+            None => None,
+        };
         let auditioned = self
             .mix
             .audition
@@ -3027,7 +3156,7 @@ impl Session {
             .and_then(|f| f.recommendations.get(recommendation))
             .map(|r| r.experiment.clone())
             .ok_or_else(|| SessionError::Other("no such experiment".into()))?;
-        let commands = match kept {
+        let mut commands = match kept {
             Some((track, slot)) => {
                 let index = self
                     .project
@@ -3040,6 +3169,19 @@ impl Session {
         };
         let name = |id: TrackId| self.mix_track_name(id);
         let label = format!("Mix Intelligence: {}", exp.title(&name));
+        // The slots it adds say what they came for, in the mixer too.
+        let origin = match self.mix_finding(finding) {
+            Some(f) => format!("{} — {}", f.title(&name), exp.title(&name)),
+            None => exp.title(&name),
+        };
+        for c in &mut commands {
+            if let Command::InsertPlugin { slot, .. } = c {
+                slot.mix_origin = Some(origin.clone());
+            }
+        }
+        if let Some(target) = target {
+            commands = merge_into(commands, &target);
+        }
         self.edit(Command::Batch {
             label: label.clone(),
             commands,

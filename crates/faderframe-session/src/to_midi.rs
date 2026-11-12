@@ -354,6 +354,7 @@ impl Session {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let clip_id: ClipId = p.ids.allocate();
         let count = notes.len();

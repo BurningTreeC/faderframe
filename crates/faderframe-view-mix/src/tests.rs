@@ -614,3 +614,68 @@ fn an_applied_experiment_shows_its_undo() {
     assert!(view.rect_of(Hit::Undo(step)).is_none(), "taken back");
     assert!(view.rect_of(Hit::Apply(f.id, i)).is_some());
 }
+
+/// An EQ cut on a track that ends with an EQ offers Apply into it beside
+/// Apply; the button asks for exactly that.
+#[test]
+fn an_eq_cut_offers_to_go_into_the_eq_the_track_ends_with() {
+    let (mut s, a, b) = session();
+    for t in [a, b] {
+        s.dispatch(Action::InsertPlugin {
+            track: t,
+            index: 0,
+            plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::EQ, "EQ"),
+        })
+        .unwrap();
+    }
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| {
+            f.recommendations.iter().any(|r| {
+                matches!(
+                    r.experiment,
+                    faderframe_mix_intelligence::Experiment::EqCut { .. }
+                )
+            })
+        })
+        .expect("an EQ cut")
+        .clone();
+    let i = f
+        .recommendations
+        .iter()
+        .position(|r| {
+            matches!(
+                r.experiment,
+                faderframe_mix_intelligence::Experiment::EqCut { .. }
+            )
+        })
+        .unwrap();
+    s.dispatch(Action::Mix(MixOp::Select(Some(f.id)))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::ApplyInto(f.id, i)).is_some(),
+        "{:?}",
+        p.texts()
+    );
+    assert!(
+        p.texts().iter().any(|t| t.starts_with("Apply into EQ")),
+        "{:?}",
+        p.texts()
+    );
+    let (actions, _) = click(&mut view, &s, Hit::ApplyInto(f.id, i));
+    assert_eq!(
+        actions,
+        [Action::Mix(MixOp::ApplyInto {
+            finding: f.id,
+            recommendation: i
+        })]
+    );
+}

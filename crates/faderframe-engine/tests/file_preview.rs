@@ -226,6 +226,7 @@ fn a_midi_file_plays_the_auditioned_instrument_until_stopped() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.track_mut(t).unwrap().instrument = Some(slot);
     let config = EngineConfig {

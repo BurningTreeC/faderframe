@@ -36,6 +36,7 @@ fn project(muted: bool, sustain: bool) -> TestProject {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.track_mut(t).unwrap().instrument = Some(slot);
     let mut clip = MidiClip {

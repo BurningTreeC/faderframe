@@ -412,6 +412,7 @@ impl<'a> Importer<'a> {
             state: state.map(|s| faderframe_engine::encode_state(&s)),
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         })
     }
 
