@@ -10,12 +10,12 @@ main set is in the default Studio skin.
 ## Arranging, editing and recording
 
 The Editing workspace: markers, the Intro and Verse sections, the key and
-the chord track above the tracks, the arpeggios in a folder, and in the
-bottom dock the pad's modulators — an envelope follower that ducks it under
+the chord track above the tracks, and in the bottom dock the pad's
+modulators — an envelope follower that ducks it under
 the drums and a synced LFO that moves it across the stereo field. Beside
 the transport are the Q (input quantize) and the "i" (Inspector) buttons:
 
-![Editing workspace with the global lanes, a folder and the Modulators panel](screenshots/editing.png)
+![Editing workspace with the global lanes and the Modulators panel](screenshots/editing.png)
 
 Snap to Objects: the Bassline dragged in Slip mode (where nothing else
 attracts it) lands on the start of the Pad and Melody clips at bar 5; the

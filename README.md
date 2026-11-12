@@ -241,6 +241,8 @@ responsibilities and invariants.
 The [changelog](CHANGELOG.md) is generated from the commit history: after
 tagging a release, run `python3 scripts/changelog.py`. The release
 workflow puts the same notes on the GitHub release.
+`scripts/screenshots.sh` retakes the README's screenshots of the demo
+session (the workspaces and the skins), with settings of its own.
 
 ## License
 
