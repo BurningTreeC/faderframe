@@ -55,6 +55,8 @@ pub enum Hit {
     Event(u64, usize),
     Audition(u64, usize),
     Apply(u64, usize),
+    /// Apply an EQ experiment into the EQ the track ends with.
+    ApplyInto(u64, usize),
     /// Take an applied experiment back (its history step).
     Undo(u64),
     /// A hand-off experiment (a reference heard A/B, EQ Match).
@@ -1587,6 +1589,28 @@ impl MixView {
                         },
                     ),
                 };
+                // An EQ cut can go into the EQ the track already ends with.
+                let into = (!applied && enabled)
+                    .then(|| model.mix_merge_target(f.id, i))
+                    .flatten();
+                if let Some(t) = into {
+                    bx = self.button_at(
+                        p,
+                        bx,
+                        y,
+                        22.0,
+                        &format!("Apply into {}", t.name),
+                        Hit::ApplyInto(f.id, i),
+                        false,
+                        true,
+                        format!(
+                            "Put it into band {} of {}, the EQ the track's devices end with, \
+                             instead of a new EQ (one undo step; Undo frees the band)",
+                            t.band + 1,
+                            t.name
+                        ),
+                    );
+                }
                 if applied {
                     p.text(
                         "Applied",
@@ -2237,6 +2261,10 @@ impl MixView {
                 finding,
                 recommendation,
             })),
+            Hit::ApplyInto(finding, recommendation) => cx.emit(Action::Mix(MixOp::ApplyInto {
+                finding,
+                recommendation,
+            })),
             Hit::Undo(step) => cx.emit(Action::Mix(MixOp::Undo(step))),
             Hit::Open(finding, recommendation) => cx.emit(Action::Mix(MixOp::Open {
                 finding,
@@ -2402,6 +2430,10 @@ impl CanvasView<Session, Action> for MixView {
                     recommendation,
                 })),
                 Hit::Apply(finding, recommendation) => Some(Action::Mix(MixOp::Apply {
+                    finding,
+                    recommendation,
+                })),
+                Hit::ApplyInto(finding, recommendation) => Some(Action::Mix(MixOp::ApplyInto {
                     finding,
                     recommendation,
                 })),
