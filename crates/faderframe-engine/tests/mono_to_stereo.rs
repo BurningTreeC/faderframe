@@ -142,6 +142,7 @@ fn played(mono_to_stereo: bool) -> (ChannelLayout, f32, f32) {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     // Through the command, as the mixer's menu sets it.
     let inverse = Command::SetPluginMonoToStereo {

@@ -22,6 +22,7 @@ fn demo_renders_bit_identically_in_parallel() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     project
         .tracks

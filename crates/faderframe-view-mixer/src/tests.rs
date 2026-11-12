@@ -2680,6 +2680,7 @@ fn small_session(name: &str) -> (Session, TrackId, std::path::PathBuf) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     t.clips.push(clip);
     let at = p.tracks.len() - 1;
@@ -3038,4 +3039,75 @@ fn an_instrument_strip_chooses_its_tuning_and_retuning() {
         panic!("a menu")
     };
     assert!(items.iter().all(|i| i.label != "Tuning"));
+}
+
+/// A slot Mix Intelligence put there has a bar at its left, says why in
+/// its tooltip and offers Keep as My Own; taken as one's own, all three go.
+#[test]
+fn a_mix_intelligence_slot_is_marked_until_kept_as_ones_own() {
+    let mut s = session();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    s.dispatch(Action::InsertPlugin {
+        track: t,
+        index: 0,
+        plugin: faderframe_project::PluginRef::builtin(faderframe_core::builtin::EQ, "EQ"),
+    })
+    .unwrap();
+    let plugin = s.project().track(t).unwrap().inserts[0].id;
+    let why = "Masking: Bass × Kick — EQ cut on Bass";
+    s.dispatch(Action::Edit(Command::SetPluginMixOrigin {
+        track: t,
+        plugin,
+        origin: Some(why.into()),
+    }))
+    .unwrap();
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1600.0, 760.0);
+    let look = |view: &mut MixerView, s: &Session| {
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, s, &theme);
+        let at = view.layout_of(s, t, size).unwrap().inserts.unwrap()[0];
+        let bar = Rect::new(at.x + 2.0, at.y + 2.0, 3.0, at.h - 4.0);
+        let marked = p.ops.contains(&faderframe_ui_canvas::DrawOp::Rounded(bar));
+        let tip = view.tooltip(at.center(), size, s).unwrap_or_default();
+        let (_, req) = run(view, right(at.center()), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("the insert menu")
+        };
+        let keep = items.into_iter().find(|i| i.label == "Keep as My Own");
+        (marked, tip, keep)
+    };
+    let (marked, tip, keep) = look(&mut view, &s);
+    assert!(marked, "the bar");
+    assert!(
+        tip.contains(&format!("Added by Mix Intelligence: {why}")),
+        "{tip}"
+    );
+    let action = keep.and_then(|k| k.action).expect("Keep as My Own");
+    assert_eq!(
+        action,
+        Action::Edit(Command::SetPluginMixOrigin {
+            track: t,
+            plugin,
+            origin: None
+        })
+    );
+    s.dispatch(action).unwrap();
+    let (marked, tip, keep) = look(&mut view, &s);
+    assert!(!marked && !tip.contains("Mix Intelligence") && keep.is_none());
+    assert_eq!(
+        s.project().track(t).unwrap().inserts.len(),
+        1,
+        "the EQ stays"
+    );
 }

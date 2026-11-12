@@ -44,6 +44,7 @@ fn ramp_project() -> (TestProject, TrackId) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     (tp, t)
 }

@@ -171,6 +171,7 @@ fn rig() -> (
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     tp.project.track_mut(bus).unwrap().inserts.push(PluginSlot {
         id: PluginInstanceId(9_801),
@@ -180,6 +181,7 @@ fn rig() -> (
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let config = EngineConfig {
         sample_rate: SR,

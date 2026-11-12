@@ -365,6 +365,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         buses.push(id);
@@ -381,6 +382,7 @@ fn build(args: &Args) -> Project {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     p.tracks.insert(0, aux_track);
     for i in 0..args.tracks {
@@ -401,6 +403,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         t.pan = ((i as f32 * 0.37).sin()).clamp(-1.0, 1.0);
@@ -430,6 +433,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         if args.inserts {
@@ -441,6 +445,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         for _ in 0..args.fx {
@@ -452,6 +457,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         if let Some(plugin) = &args.plugin {
@@ -463,6 +469,7 @@ fn build(args: &Args) -> Project {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
         let clip = Clip {

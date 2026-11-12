@@ -559,6 +559,7 @@ mod tests {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         assert_eq!(warm_up_of([&track], 2_000), 2_000);
         assert_eq!(warm_up_of([&track], 0), 0);

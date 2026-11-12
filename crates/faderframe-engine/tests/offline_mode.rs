@@ -163,6 +163,7 @@ fn project(id: &str) -> (TestProject, faderframe_core::TrackId) {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     (tp, track)
 }

@@ -151,6 +151,7 @@ fn plugin_latency_is_compensated_at_the_summing_point() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         tp.project.track_mut(b).unwrap().inserts.push(slot);
         let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
@@ -362,6 +363,7 @@ fn sidechain_keys_a_compressor_from_a_muted_track_and_refuses_loops() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     // Keyed by itself: 0.25 (-12 dB) is compressed.
     let out = render_project(&tp.project, &tp.sources, config(), 64, 0, SR as usize).unwrap();

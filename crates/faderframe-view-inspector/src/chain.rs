@@ -64,6 +64,8 @@ pub struct Device {
     pub program: Option<String>,
     /// How many chains a container has.
     pub chains: usize,
+    /// What Mix Intelligence put it there for, if it did.
+    pub mix_origin: Option<String>,
 }
 
 fn format_name(f: PluginFormat) -> &'static str {
@@ -100,6 +102,7 @@ pub fn devices(model: &Session, t: &Track) -> Vec<Device> {
             format: format_name(s.plugin.format),
             program,
             chains: t.containers.get(&s.id).map_or(0, Vec::len),
+            mix_origin: s.mix_origin.clone(),
         }
     };
     let role_of = |s: &PluginSlot| {
