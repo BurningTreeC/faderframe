@@ -106,8 +106,8 @@ A/B listening against references or earlier steps of the undo history.
 
 ### ✂️ Editing that keeps up
 Takes and comping, elastic audio, pitch and polyphonic pitch editing,
-spectral editing, clip effects, scratch pads, song sections, snap to
-objects and an undo history you can listen back to.
+spectral editing, restoration and stem separation, clip envelopes and
+effects, song sections and an undo history you can listen back to.
 
 </td>
 <td valign="top">

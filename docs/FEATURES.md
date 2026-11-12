@@ -15,6 +15,7 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
 - [Mastering and delivery](#mastering-and-delivery)
 - [Picture and performance](#picture-and-performance)
 - [Sync, control surfaces and remote](#sync-control-surfaces-and-remote)
+- [Interchange and collaboration](#interchange-and-collaboration)
 - [Engine and audio](#engine-and-audio)
 
 ## Interface and workflow
@@ -79,7 +80,20 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   folder, beside the logs of the last runs, and the next start offers to show
   the report or open the folder (or says the system ended the run when
   there is none).
-
+* Undo tree and Audio Bisect: the history is a tree — an edit made after
+  undoing starts a branch and the old one stays. Edit → Audio Bisect
+  searches it for the edit that made the mix worse, as `git bisect`
+  searches commits: mark a state that sounded good and one that sounds
+  bad, and blind A/B rounds narrow it down to one edit.
+* Media browser (View → Browser, Ctrl+Shift+B): sounds, loops and MIDI
+  files indexed with their tempo and key, Find Similar, previews in the
+  song's tempo and key, placed by dragging.
+* Scripts and macros: Lua 5.4 scripts over a sandboxed `ff` API (see
+  [SCRIPTING.md](SCRIPTING.md)), recorded macros, run from the Scripts
+  menu or by MIDI and control-surface triggers.
+* Batch processing (File → Batch Processing…): a list of files through a
+  chain of steps, plugins among them, each written anew into an output
+  folder, outside any project.
 
 ## Arranging and editing
 
@@ -227,6 +241,22 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   picture) become hits the music lands on — a tempo map with a whole
   number of beats, eighths or bars between them, as steady as it can be
   within the tempo range asked for, previewed before it is applied.
+* Clip envelopes (Edit → Clip Envelopes, or the clip menu's Clip
+  Envelope): volume and pan drawn on an audio clip over its waveform.
+  They belong to the clip and move with it: a split gives each piece its
+  part, trims and time-stretch trims keep them on the audio. Volume from
+  −96 to +24 dB; pan as a balance on stereo tracks.
+* Strip Silence (Edit → Strip Silence…, or the audio clip menu): the sound
+  between silences kept as clips, by threshold, minimum length, padding
+  before and after, and a minimum gap.
+* Slicing (REX-style): a span of audio, or the sample a Sampler or Drum
+  Sampler pad plays, cut at its transients and played back from a sampler
+  in the original rhythm, the slices on pads or keys.
+* Aligning doubles (the clip menu's Align Timing to): a doubled vocal,
+  backing vocals or an ADR line warped onto a guide track's timing, as
+  tight as you choose.
+* Merging project versions: two versions of a project merged three-way
+  against the one they came from, for collaborators.
 
 ## Recording
 
@@ -284,6 +314,13 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   land where you played them (loop passes as the loop-record setting
   says); played while stopped, the phrase (back to an 8 s pause) starts on
   the bar at the playhead with its timing kept. One undo step.
+* Capture Audio (Transport → Capture Audio, Ctrl+Alt+C): the input of the
+  armed tracks (and, by default, those monitoring their input) is kept
+  while playing or stopped, and the newest phrase becomes takes
+  afterwards — the best take, played while not recording.
+* Comping by lyric: Whisper's word timings on every take; choose the best
+  take word by word, the syllable shown under each note in the pitch
+  editor.
 
 ## MIDI and instruments
 
@@ -405,6 +442,19 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   selected plays that one) and external instruments (track menu → MIDI
   Out) in time with the audio, and MIDI clock can sync
   external gear. Inputs, outputs, clock and mappings in Preferences → MIDI.
+* Wavetable, FM and Granular: three more instruments that play like the
+  Synth (its envelopes, filters, LFOs, voicing, an eight-slot matrix and
+  effects), each with an engine of its own (FM: six operators and a free
+  matrix).
+* Microtonal tuning (Audio → Tuning): a tuning and a reference pitch (A4,
+  200–1000 Hz) for the project; a track may play a tuning of its own.
+* Articulation and drum maps (View → Map Editor): articulation maps as in
+  Cubase — an instrument's articulations, set on notes or in the clip's
+  articulation lane, sending keyswitches, program changes, controllers or
+  a channel — and drum maps.
+* Score editor (View → Score): MIDI clips engraved and edited as
+  notation, two voices a staff; the score and the piano roll edit the
+  same notes.
 
 ## Mixing
 
@@ -552,6 +602,12 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   full width over the whole song — add, drag and delete points, curve
   shapes, Write Value at the playhead or over the edit selection, Thin,
   Clear, Delete.
+* Mix scenes (View → Mix Scenes): console snapshots recalled, compared,
+  crossfaded and morphed.
+* Self-freezing (Audio → Self-freeze): tracks nobody touches play from a
+  disk cache of their chain's output, so a heavy project plays on a small
+  machine. Nothing in the project changes, any edit sends the track back
+  to its chain, and the plugins stay loaded.
 
 ## Audio editing: pitch, spectrum, words
 
@@ -586,6 +642,8 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   Whisper running in FaderFrame; the model, 290 MB, is downloaded once
   from Audio → Download Speech Model). Lines are edited in place; the
   lane's menu writes them next to the project as LRC and SRT.
+* Stem separation: a stereo recording split into vocals, drums, bass and
+  the rest (X-UMXL, running in FaderFrame).
 
 ## Devices and plugins
 
@@ -733,6 +791,16 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   faults, time per block, resets — and the browser shows a verdict, the
   findings and advice per plugin version ("With findings" and "Not
   checked" list them).
+* A device's own A/B and undo: every editor window's header has the
+  device's Undo and Redo, A and B, Copy (A → B or B → A) and Match.
+* Restoration devices: De-noise, De-click, De-hum, De-clip and De-reverb;
+  the spectral editor's Learn Noise and Remove uses the same processing.
+* Convolution Reverb (without latency), Multiband Dynamics and a
+  Vocoder.
+* Pitch Correct: a live, monophonic pitch corrector, to a key or to the
+  notes played into it.
+* ARA hosting (Melodyne, SpectraLayers and the like), not yet tried with
+  a real ARA plug-in.
 
 ## Surround and immersive
 
@@ -763,6 +831,10 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   AOM's reference decoder and FFmpeg. Heads: two dummy heads and eighteen measured listeners
   to choose from by ear, or your own as a SOFA file; headphone correction
   from EqualizerAPO/AutoEq presets or an impulse response.
+* Ambisonics: tracks, buses and the master can carry an ambisonic sound
+  field, first to third order (AmbiX; File → Import Ambisonic Audio
+  (AmbiX)…), with head-tracked binaural listening (a phone's motion
+  sensors over OSC turn the scene).
 
 ## Mastering and delivery
 
@@ -808,6 +880,13 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   export asks before replacing a file, writes beside it and swaps the new
   file in only once it is complete, so a failed or stopped render leaves
   the old one as it was.
+* Codec monitor and platform previews (Audio → Listen → Codec Monitor,
+  the Tools view's Codec pane): the master as listeners get it, through a
+  lossy codec at a streaming platform's loudness — the decoded signal,
+  the original, or what the codec changed alone.
+* Delivery QC: null-tested stems and a QC report, every file of a render
+  read back once — silence at the head and the tail, gaps, peaks, DC
+  offset and overs.
 
 ## Picture and performance
 
@@ -874,6 +953,19 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   length and a count-in, MIDI clips take overdubs, and Record to
   Arrangement writes what plays (and the mixer's moves) as it plays.
   Pads, keys and buttons learn slots, scenes and stops.
+* A/V calibration by itself: a camera watches the video window flash and
+  a microphone hears the beeps, and the picture offset is set from them
+  (not yet tried with a real webcam); panning that follows an object
+  tracked on screen.
+* 360° video: the video window is a viewport into the sphere, the
+  listener's head on headphones turns with it, a click on the picture
+  pans a track to the direction it shows; spherical and ambisonic
+  metadata kept on export.
+* Adaptive music for games (View → Interactive Music): an interactive
+  score of states, layers, transition rules and stingers, previewed live
+  and exported as looped stems with imports for FMOD and Wwise.
+* Gear changes per song in show mode: program changes to external gear
+  as each song comes up.
 
 ## Sync, control surfaces and remote
 
@@ -909,6 +1001,18 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   to networks you trust. When the computer's firewall blocks the port,
   Preferences → Remote says so and gives the command that opens it to
   your network.
+
+## Interchange and collaboration
+
+* DAWproject (File → Export DAWproject… and Import DAWproject…):
+  projects to and from other programs in Bitwig's open format; MusicXML
+  scores imported as tracks.
+* AAF export and import for Pro Tools, Media Composer, Premiere and
+  Resolve (OMF is not read).
+* Live collaboration (File → Collaborate…): one project edited by several
+  people at once over an encrypted link, on a local network or the
+  internet; undo per person, media fetched by content hash, Listen
+  Along.
 
 ## Engine and audio
 
@@ -959,3 +1063,8 @@ Everything FaderFrame does today, by area. The [README](../README.md) has the ov
   engine work; load per track and per plugin instance (average and peak,
   sortable, latency and bypass shown); xruns, late callbacks and late disk
   reads.
+* Several audio interfaces joined: on PipeWire one FaderFrame node
+  linked to several devices, those with a clock of their own resampled
+  adaptively so they stay in step.
+* AES67 network audio: PTP-clocked RTP streams, as an audio system of its
+  own or beside another device (Dante in its AES67 mode, RAVENNA).
