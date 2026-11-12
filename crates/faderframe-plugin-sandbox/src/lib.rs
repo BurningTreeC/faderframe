@@ -68,9 +68,18 @@ use std::time::Duration;
 /// Sandboxing works on this platform.
 pub const AVAILABLE: bool = cfg!(any(target_os = "linux", target_os = "macos", windows));
 
-/// How long the host's audio thread waits for a helper's block before it
-/// gives the plugin up.
-pub const BLOCK_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long a helper may leave a block unanswered, while the host keeps
+/// asking, before the plugin is given up. Until then each late block plays
+/// silence (a call never waits longer than the engine's deadline), so a
+/// helper held up for a moment — the machine busy, the display driver
+/// stalling everything while a monitor wakes — plays on afterwards; one
+/// that stays stuck this long is hung.
+pub const BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A pause between two calls of the host's audio thread longer than this
+/// means the host was held up itself (and the helper with it, most
+/// likely): the helper's time to answer starts again.
+pub(crate) const HOST_STALL: Duration = Duration::from_millis(100);
 
 /// [`BLOCK_TIMEOUT`] in an offline render: no device waits, and a plugin
 /// told it renders offline may take its time (finish background work in
