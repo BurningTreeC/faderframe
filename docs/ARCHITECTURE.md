@@ -9951,7 +9951,7 @@ Platform specifics are isolated in backends and the GTK shell:
 
 The packages are not signed with paid certificates: the macOS app is
 signed ad hoc and not notarised (Gatekeeper asks once), the Windows
-installer and zip are unsigned (SmartScreen asks once) — see the README.
+installer and zip are unsigned (SmartScreen asks once) — see [BUILDING.md](BUILDING.md#packages).
 CoreAudio's IO workgroup is joined (see *Multicore*), by sandboxed
 plugins' audio threads too.
 
