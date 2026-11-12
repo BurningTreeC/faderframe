@@ -53,6 +53,7 @@ fn session() -> (Session, Ids) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     p.tracks.insert(0, v);
     p.tracks.insert(

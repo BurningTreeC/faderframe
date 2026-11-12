@@ -364,6 +364,13 @@ pub enum Command {
         plugin: PluginInstanceId,
         on: bool,
     },
+    /// What Mix Intelligence put a slot there for
+    /// ([`crate::PluginSlot::mix_origin`]); `None`: the user's own now.
+    SetPluginMixOrigin {
+        track: TrackId,
+        plugin: PluginInstanceId,
+        origin: Option<String>,
+    },
     /// Add a track group (members join with `SetTrackGroup`).
     AddGroup {
         group: Box<crate::TrackGroup>,
@@ -1068,6 +1075,8 @@ impl Command {
             SetPluginSidechain { .. } => "Set Sidechain".into(),
             SetPluginMonoToStereo { on: true, .. } => "Mono → Stereo".into(),
             SetPluginMonoToStereo { on: false, .. } => "Mono → Stereo Off".into(),
+            SetPluginMixOrigin { origin: None, .. } => "Keep as My Own".into(),
+            SetPluginMixOrigin { .. } => "Mix Intelligence".into(),
             AddGroup { .. } => "Add Group".into(),
             RemoveGroup { .. } => "Delete Group".into(),
             UpdateGroup { .. } => "Change Group".into(),
@@ -1260,7 +1269,9 @@ impl Command {
             | SetPluginParameter { .. }
             | SetPluginState { .. }
             | SetConsoleDrive { .. } => Impact::Params,
-            SetConsoleLook { .. } | SetSpeakerLayouts { .. } => Impact::None,
+            SetConsoleLook { .. } | SetSpeakerLayouts { .. } | SetPluginMixOrigin { .. } => {
+                Impact::None
+            }
             RenameTrack { .. }
             | SetTrackBinaural { .. }
             | SetTrackColor { .. }
@@ -1871,6 +1882,21 @@ impl Command {
                     track,
                     plugin,
                     on: old,
+                }
+            }
+            SetPluginMixOrigin {
+                track,
+                plugin,
+                origin,
+            } => {
+                let slot = track_mut(p, track)?
+                    .plugin_mut(plugin)
+                    .ok_or(EditError::UnknownPlugin(plugin))?;
+                let old = std::mem::replace(&mut slot.mix_origin, origin);
+                SetPluginMixOrigin {
+                    track,
+                    plugin,
+                    origin: old,
                 }
             }
             AddGroup { group } => {

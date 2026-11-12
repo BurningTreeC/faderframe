@@ -297,6 +297,7 @@ fn compressor(p: &mut Project, track: TrackId, params: &[(u32, f64)]) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     track_mut(p, track).inserts.push(slot);
 }

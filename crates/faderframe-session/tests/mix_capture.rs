@@ -139,6 +139,7 @@ fn device(p: &mut Project, track: TrackId, id: &str, params: &[(u32, f64)]) -> P
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     plugin
 }

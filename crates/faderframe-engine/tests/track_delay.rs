@@ -256,6 +256,7 @@ fn rendered_ahead_a_delayed_track_sounds_the_same() {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             });
         }
     }

@@ -286,6 +286,7 @@ fn behind_latency_the_compare_source_meets_the_mix_on_the_same_frame() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let config = EngineConfig {
         sample_rate: RATE,

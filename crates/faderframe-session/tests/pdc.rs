@@ -97,6 +97,7 @@ fn session(latency: u32, dir: &std::path::Path) -> (Session, TrackId) {
                 state: None,
                 sidechain: None,
                 mono_to_stereo: false,
+                mix_origin: None,
             },
         })
         .unwrap();
@@ -361,6 +362,7 @@ fn low_latency_monitoring_follows_the_tracks_heard_live() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         },
     })
     .unwrap();

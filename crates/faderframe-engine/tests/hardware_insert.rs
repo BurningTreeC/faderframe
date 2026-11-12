@@ -110,6 +110,7 @@ fn project(round_trip: Option<u32>) -> TestProject {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.track_mut(t).unwrap().inserts.push(slot);
     tp

@@ -887,6 +887,7 @@ fn utility_slot(project: &mut Project, params: &[(u32, f64)]) -> PluginSlot {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     }
 }
 
@@ -907,6 +908,7 @@ fn eq_slot(
         state: None,
         sidechain,
         mono_to_stereo: false,
+        mix_origin: None,
     }
 }
 
@@ -3027,7 +3029,7 @@ impl Session {
             .and_then(|f| f.recommendations.get(recommendation))
             .map(|r| r.experiment.clone())
             .ok_or_else(|| SessionError::Other("no such experiment".into()))?;
-        let commands = match kept {
+        let mut commands = match kept {
             Some((track, slot)) => {
                 let index = self
                     .project
@@ -3040,6 +3042,16 @@ impl Session {
         };
         let name = |id: TrackId| self.mix_track_name(id);
         let label = format!("Mix Intelligence: {}", exp.title(&name));
+        // The slots it adds say what they came for, in the mixer too.
+        let origin = match self.mix_finding(finding) {
+            Some(f) => format!("{} — {}", f.title(&name), exp.title(&name)),
+            None => exp.title(&name),
+        };
+        for c in &mut commands {
+            if let Command::InsertPlugin { slot, .. } = c {
+                slot.mix_origin = Some(origin.clone());
+            }
+        }
         self.edit(Command::Batch {
             label: label.clone(),
             commands,
