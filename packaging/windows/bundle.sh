@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Build dist/FaderFrame (a relocatable folder: bin/ with the program and
 # every DLL it needs, share/ with GTK's schemas and icons, lib/ with the
-# image loaders), the installer (when Inno Setup is installed) and
+# image loaders), the installer (when Inno Setup is installed),
 # dist/FaderFrame-<version>-windows-x64-portable.zip — the folder with a
-# "FaderFrame Data" folder, which makes it portable. Run in an MSYS2 UCRT64 shell:
+# "FaderFrame Data" folder, which makes it portable — and the program's
+# symbols (dist/FaderFrame-<version>-windows-x64-symbols.zip, for crash
+# reports). Run in an MSYS2 UCRT64 shell:
 #
 #   pacman -S mingw-w64-ucrt-x86_64-{gtk4,rust,pkgconf,gcc,librsvg,python,adwaita-icon-theme} zip \
 #       mingw-w64-ucrt-x86_64-{gstreamer,gst-plugins-base,gst-plugins-good,gst-plugins-bad} unzip
@@ -26,6 +28,16 @@ rm -rf "$out"
 mkdir -p "$out/bin" "$out/share/glib-2.0/schemas" "$out/share/icons" "$out/lib"
 cp "$exe" "$out/bin/"
 # Release builds carry debug info (for profiling): not for distribution.
+# It is kept apart as the release's symbols: crash reports name frames as
+# module + offset, and scripts/symbolize_crash.py looks the program's up in
+# dist/FaderFrame-<version>-windows-x64-symbols.zip (checked by build id).
+symbols=FaderFrame-$version-windows-x64-symbols
+rm -rf "dist/$symbols" "dist/$symbols.zip"
+mkdir -p "dist/$symbols"
+objcopy --only-keep-debug "$exe" "dist/$symbols/faderframe.exe.debug"
+(cd dist && zip -q -9 -r "$symbols.zip" "$symbols")
+rm -rf "dist/${symbols:?}"
+echo "dist/$symbols.zip"
 strip "$out/bin/faderframe.exe"
 
 # The DLLs a binary needs from the MSYS2 prefix (ldd lists them all).

@@ -10,8 +10,13 @@
 //!   `SIGILL`, `SIGFPE`, `SIGABRT` — written async-signal-safely: the
 //!   signal, the address, the thread and, where the stack has room, the
 //!   native backtrace as module + offset for `addr2line`), or an exception
-//!   nothing handled (Windows: code, address, thread, backtrace). Sandbox
-//!   and check helpers write theirs too (`…-plugin-sandbox-<pid>.log`).
+//!   nothing handled (Windows: the code, where it happened and what it
+//!   touched, the registers, the stack walked from the faulting
+//!   instruction and the loaded modules — `faderframe-crash` —, then the
+//!   end of the log). On Windows a panic's stack is module + offset too:
+//!   the program is stripped, and the release's symbols name the lines
+//!   (`scripts/symbolize_crash.py`). Sandbox and check helpers write
+//!   theirs too (`…-plugin-sandbox-<pid>.log`).
 //! * `session-<start>-<pid>.log` — this run's log (also where Windows'
 //!   GUI build, which has no console, keeps it).
 //! * `running-<pid>` — while the program runs. Left behind, it says that
@@ -383,7 +388,7 @@ fn install_panic_hook() {
                 .location()
                 .map_or_else(String::new, |l| format!(" at {l}"));
             let thread = std::thread::current();
-            let backtrace = std::backtrace::Backtrace::force_capture();
+            let stack = panic_stack();
             let tail = p
                 .log
                 .as_deref()
@@ -392,8 +397,8 @@ fn install_panic_hook() {
             let text = format!(
                 "{}\nPANIC (time {} UTC) on thread '{}'{place}:\n{message}\n\n\
                  (On a worker thread the program may have gone on without that \
-                 thread's work; anywhere else it ended here.)\n\nbacktrace:\n{backtrace}\n\
-                 \nthe end of the log:\n{tail}\n\n",
+                 thread's work; anywhere else it ended here.)\n\n{stack}\
+                 the end of the log:\n{tail}\n\n",
                 p.header,
                 utc_stamp(now_secs()),
                 thread.name().unwrap_or("<unnamed>"),
@@ -408,6 +413,25 @@ fn install_panic_hook() {
         }
         WRITING.with(|w| w.set(false));
     }));
+}
+
+/// Where a panic happened. On Windows the stack as module + offset and
+/// the modules (the program is stripped: Rust's backtrace would only say
+/// `<unknown>`), elsewhere Rust's backtrace (the symbol table is kept).
+fn panic_stack() -> String {
+    #[cfg(windows)]
+    {
+        let mut s = String::new();
+        faderframe_crash::report_stack(&mut |part| s.push_str(part));
+        s
+    }
+    #[cfg(not(windows))]
+    {
+        format!(
+            "backtrace:\n{}\n\n",
+            std::backtrace::Backtrace::force_capture()
+        )
+    }
 }
 
 /// The fatal-signal handlers (Linux, macOS).
@@ -870,20 +894,6 @@ mod fatal {
         unsafe { SetUnhandledExceptionFilter(Some(filter)) };
     }
 
-    fn name_of(code: u32) -> &'static str {
-        match code {
-            0xC000_0005 => "access violation",
-            0xC000_00FD => "stack overflow",
-            0xC000_001D => "illegal instruction",
-            0xC000_0094 => "integer division by zero",
-            0xC000_0096 => "privileged instruction",
-            0xC000_0006 => "in-page error",
-            0x8000_0003 => "breakpoint",
-            0xE06D_7363 => "C++ exception",
-            _ => "exception",
-        }
-    }
-
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
         if REPORTING.swap(true, Ordering::SeqCst) {
             return CONTINUE_SEARCH;
@@ -900,21 +910,32 @@ mod fatal {
                 })
         };
         let thread = std::thread::current();
-        let mut text = format!(
-            "{}\nCRASH: {} (0x{code:08x}) at {address:p}\nthread '{}', time {} UTC\n",
-            p.header,
-            name_of(code),
-            thread.name().unwrap_or("<unnamed>"),
-            super::utc_stamp(super::now_secs()),
+        super::append(
+            &p.report,
+            &format!(
+                "{}\nCRASH: {} (0x{code:08x}) at 0x{:016x}\nthread '{}' (id {}), time {} UTC\n",
+                p.header,
+                faderframe_crash::exception_name(code),
+                address as usize,
+                thread.name().unwrap_or("<unnamed>"),
+                faderframe_crash::os_thread_id(),
+                super::utc_stamp(super::now_secs()),
+            ),
         );
-        // A stack overflow leaves too little stack to walk it.
-        if code != 0xC000_00FD {
-            text.push_str(&format!(
-                "backtrace:\n{}\n",
-                std::backtrace::Backtrace::force_capture()
-            ));
+        // The rest a part at a time: a fault while walking a broken stack
+        // leaves what was written before it.
+        // SAFETY: what Windows passed this filter.
+        unsafe {
+            faderframe_crash::report_exception(info, &mut |part| {
+                super::append(&p.report, part);
+            })
+        };
+        if let Some(log) = p.log.as_deref() {
+            super::append(
+                &p.report,
+                &format!("the end of the log:\n{}\n\n", super::log_tail(log, 150)),
+            );
         }
-        super::append(&p.report, &text);
         CONTINUE_SEARCH
     }
 }

@@ -1569,8 +1569,10 @@ Please send:
 
 Report problems at <https://github.com/BurningTreeC/faderframe/issues>.
 
-> **Privacy:** logs contain file paths, including your user name, project
-> names and plugin names. Look through them before posting them publicly.
+> **Privacy:** logs and crash reports contain file paths, including your
+> user name, project names and plugin names (a Windows crash report lists
+> every library and plugin that was loaded). Look through them before
+> posting them publicly.
 
 > **Copy the files soon.** FaderFrame keeps the newest 20 crash reports and
 > only the newest **8 session logs**. Older ones are deleted at start-up,

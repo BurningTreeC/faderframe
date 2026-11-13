@@ -98,6 +98,7 @@ faderframe-view-score = { path = "crates/faderframe-view-score" }
 faderframe-collab = { path = "crates/faderframe-collab" }
 faderframe-view-adaptive = { path = "crates/faderframe-view-adaptive" }
 faderframe-view-maps = { path = "crates/faderframe-view-maps" }
+faderframe-crash = { path = "crates/faderframe-crash" }
 
 # --- external crates -------------------------------------------------------
 # GUI shell (Linux first; GTK 4.14+ for GSK path rendering).

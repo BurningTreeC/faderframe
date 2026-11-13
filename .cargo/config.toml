@@ -2,3 +2,9 @@
 # bundle rewrites them to (packaging/macos/bundle_dylibs.py).
 [target.'cfg(target_os = "macos")']
 rustflags = ["-C", "link-arg=-Wl,-headerpad_max_install_names"]
+
+# Windows (MinGW): a build id in the program (a CodeView record, which
+# stripping keeps). Crash reports list it with the modules, and
+# scripts/symbolize_crash.py checks a release's symbols against it.
+[target.'cfg(all(windows, target_env = "gnu"))']
+rustflags = ["-C", "link-arg=-Wl,--build-id"]

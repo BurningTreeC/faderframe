@@ -996,6 +996,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "faderframe-crash"
+version = "0.46.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "faderframe-disc"
 version = "0.46.0"
 dependencies = [
@@ -1458,6 +1465,7 @@ dependencies = [
  "faderframe-binaural",
  "faderframe-codec",
  "faderframe-core",
+ "faderframe-crash",
  "faderframe-engine",
  "faderframe-iamf",
  "faderframe-mix-intelligence",

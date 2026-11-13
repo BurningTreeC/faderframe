@@ -9317,8 +9317,35 @@ first in `main`; files in `<data>/Crash Reports`, the portable folder's
   `a_stack_overflow_is_reported_and_ends_as_rusts`); then the previous action, Rust's stack
   overflow report or the default, so core dumps and the system's crash
   collection go on); an **unhandled exception** (Windows,
-  `SetUnhandledExceptionFilter`: code, address, thread, backtrace; then
-  Windows Error Reporting). Sandbox and check helpers write theirs
+  `SetUnhandledExceptionFilter`, then Windows Error Reporting; the details
+  come from `faderframe-crash`, written a part at a time so that a fault
+  while walking a broken stack leaves the parts before it: the code, the
+  thread's name and id, where it happened as module + offset with the
+  nearest export of the module (GTK, GLib, plugins and the system export
+  names; the program none), what an access violation touched ("reading
+  0x10": a null pointer), the registers, the stack walked from the
+  faulting instruction's context with `RtlLookupFunctionEntry` +
+  `RtlVirtualUnwind` — a frame no unwind table covers (a leaf, or a call
+  through a bad pointer) pops its return address — within the thread's
+  stack limits, memory read only where `VirtualQuery` says it reads, runs
+  of one address written once, at most the top 96 and bottom 32 frames of
+  4096; then the loaded modules from a Toolhelp snapshot with their link
+  time stamps and CodeView ids, and the end of the log). A Windows panic's
+  stack is the same walk from `RtlCaptureContext` (Rust's backtrace says
+  only `<unknown>` in the stripped program). Nothing is symbolised in the
+  process: the program is linked with a build id (`.cargo/config.toml`:
+  `-Wl,--build-id`, a CodeView record stripping keeps), `bundle.sh` keeps
+  its debug info apart before stripping (`objcopy --only-keep-debug` →
+  `FaderFrame-<version>-windows-x64-symbols.zip`, a release asset), and
+  `scripts/symbolize_crash.py <report> <symbols>` adds the functions and
+  lines (inlined ones too) under each of the program's frames with
+  addr2line, refusing symbols whose build id differs from the report's.
+  The tests (`faderframe-crash/tests/windows.rs`) crash a child in a
+  `qsort` callback and read its report; they run under Wine too
+  (`CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test -p
+  faderframe-crash --target x86_64-pc-windows-gnu`). The graphics-driver
+  check reads a Windows report's stack (never its module list, which
+  names every driver loaded). Sandbox and check helpers write theirs
   (`crash-<start>-plugin-sandbox-<pid>.log`): a plugin crashing there
   leaves its report.
 * `session-<start>-<pid>.log`: the run's log (`tracing` writes it beside

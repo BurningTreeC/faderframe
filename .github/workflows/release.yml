@@ -2,7 +2,7 @@ name: Release
 
 # Packages FaderFrame: a Flatpak bundle and a portable tarball (Linux),
 # DMGs (macOS on Apple Silicon and Intel), an installer and a portable zip
-# (Windows). A tag
+# (Windows; with the program's symbols, for crash reports). A tag
 # `v*` publishes them as a GitHub release; a manual run keeps them as
 # workflow artifacts.
 

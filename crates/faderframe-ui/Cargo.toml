@@ -92,6 +92,8 @@ libc.workspace = true
 x11rb.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# Crash reports: the stack walked from the exception, the modules.
+faderframe-crash.workspace = true
 # Shared D3D12 textures to GTK's Vulkan renderer (GTK 4.20).
 gdk4-win32 = { version = "0.11", features = ["v4_20"] }
 # (Diagnostics/Kernel/Threading: the crash reporter's exception filter and

@@ -253,9 +253,11 @@ fn crash_in_the_graphics_driver(dir: &Path) -> bool {
     })
 }
 
-/// Whether a crash report's native backtrace runs through a graphics
-/// driver (Mesa's, NVIDIA's, AMD's or Intel's GL or Vulkan; the GL
-/// dispatch libraries).
+/// Whether a crash report's native stack runs through a graphics driver
+/// (Mesa's, NVIDIA's, AMD's or Intel's GL or Vulkan; the GL dispatch
+/// libraries): the Linux/macOS signal handler's backtrace, or the stack of
+/// a Windows report (not its module list, which names every driver
+/// loaded).
 fn in_the_graphics_driver(report: &str) -> bool {
     const DRIVERS: [&str; 14] = [
         "libgallium",
@@ -276,7 +278,11 @@ fn in_the_graphics_driver(report: &str) -> bool {
     report.contains("CRASH:")
         && report
             .lines()
-            .skip_while(|l| !l.starts_with("native backtrace"))
+            .skip_while(|l| {
+                !l.starts_with("native backtrace") && !l.starts_with("stack, from the crash")
+            })
+            .skip(1)
+            .take_while(|l| !l.trim().is_empty())
             .any(|l| DRIVERS.iter().any(|d| l.contains(d)))
 }
 
@@ -302,6 +308,37 @@ native backtrace (module(+offset) [address]):
         let ours = GALLIUM.replace("libgallium-26.1.6-1~bpo13+1.so", "libfoo.so");
         assert!(!in_the_graphics_driver(&ours));
         assert!(!in_the_graphics_driver("PANIC at libgallium"));
+    }
+
+    const NVIDIA_WINDOWS: &str = "FaderFrame 0.47.0
+CRASH: access violation (0xc0000005) at 0x00007ffb15f4d958
+thread 'main' (id 4242), time 20261111-120000 UTC
+in nvoglv64.dll+0x8bd958
+reading 0x0000000000000010 (an address near zero: a null pointer, or a field of one)
+
+stack, from the crash (module+offset; after the first, the addresses calls return to):
+     0  0x00007ffb15f4d958  nvoglv64.dll+0x8bd958
+     1  0x00007ffb2a6f1234  libgtk-4-1.dll+0x2c1234 (near gsk_renderer_render+0x142)
+     2  0x00007ff6a1234567  faderframe.exe+0x1234567
+
+modules (where, how long, link time stamp, PDB id, file):
+  0x00007ff6a0000000 0x05a3b000 faderframe.exe stamp 6730f1a2  C:\\FaderFrame\\bin\\faderframe.exe
+  0x00007ffb15690000 0x02a00000 nvoglv64.dll   stamp 6730f1a2  C:\\Windows\\System32\\nvoglv64.dll
+";
+
+    /// A Windows report names the driver in its stack; the module list
+    /// names it in every report, which says nothing.
+    #[test]
+    fn a_crash_in_a_windows_driver_is_told_by_its_stack_alone() {
+        assert!(in_the_graphics_driver(NVIDIA_WINDOWS));
+        let ours = NVIDIA_WINDOWS
+            .replace(
+                "nvoglv64.dll+0x8bd958\n     1",
+                "faderframe.exe+0x8bd958\n     1",
+            )
+            .replace("in nvoglv64.dll", "in faderframe.exe");
+        assert!(ours.contains(" nvoglv64.dll   stamp"), "still loaded");
+        assert!(!in_the_graphics_driver(&ours));
     }
 
     /// A fake `/sys/class/drm`: per card (vendor, device, driver,
