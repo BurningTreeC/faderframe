@@ -13,6 +13,23 @@ use gst::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Raw sound of more than two channels with no channel mask (QuickTime's
+/// PCM as `qtdemux` hands it out: our 360° movies' ambisonic fields and
+/// unplaced channels) said to be unplaced (`channel-mask` 0), as they were
+/// written. GStreamer 1.24's `audioconvert` refuses such caps ("invalid
+/// input caps": no sound at all) where later ones take them as unplaced.
+/// `None`: nothing to change.
+fn unplaced_when_unmarked(caps: &gst::CapsRef) -> Option<gst::Caps> {
+    let s = caps.structure(0)?;
+    let channels = s.get::<i32>("channels").ok()?;
+    if s.name() != "audio/x-raw" || channels <= 2 || s.has_field("channel-mask") {
+        return None;
+    }
+    let mut caps = caps.to_owned();
+    caps.make_mut().set("channel-mask", gst::Bitmask::new(0));
+    Some(caps)
+}
+
 /// Write audio stream `stream` (0: the first) of `src` into `dest_dir` at
 /// `rate`.
 pub fn extract_audio(
@@ -47,6 +64,15 @@ pub fn extract_audio(
     let next = elements[0]
         .static_pad("sink")
         .ok_or_else(|| VideoError::Gst("audioconvert without a sink".into()))?;
+    next.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+        if let Some(gst::PadProbeData::Event(ev)) = &mut info.data
+            && let gst::EventView::Caps(c) = ev.view()
+            && let Some(caps) = unplaced_when_unmarked(c.caps())
+        {
+            *ev = gst::event::Caps::new(&caps);
+        }
+        gst::PadProbeReturn::Ok
+    });
     p.parse(move |p, kind, n, pad| {
         (kind == Kind::Sound && n == stream)
             .then(|| p.decoder_into(pad, next.clone()).ok())

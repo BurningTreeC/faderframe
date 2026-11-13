@@ -1051,6 +1051,12 @@ fn an_mxf_clip_is_read() {
         eprintln!("skipped: no MXF elements here");
         return;
     }
+    if faderframe_video::mxf_may_crash() {
+        // GStreamer before 1.28.4 without gst-libav (Ubuntu 24.04's 1.24
+        // on CI): its demuxer would take the test process down.
+        eprintln!("skipped: this GStreamer's MXF demuxer crashes and FFmpeg's is not here");
+        return;
+    }
     let d = dir();
     let kinds = [("raw", "video/x-raw,format=UYVY")];
     for (name, encoder) in kinds {
