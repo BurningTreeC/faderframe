@@ -89,8 +89,10 @@ fn session_of(name: &str, samples: Vec<f32>) -> (Session, ClipId) {
 }
 
 fn detect(s: &mut Session, clip: ClipId) {
-    s.dispatch(Action::DetectPitch { clips: vec![clip] })
-        .unwrap();
+    s.dispatch(Action::DetectPitch {
+        audio: vec![clip.into()],
+    })
+    .unwrap();
     let start = Instant::now();
     while s.detecting_pitch() {
         assert!(start.elapsed() < Duration::from_secs(30), "detection hangs");
@@ -118,7 +120,11 @@ fn notes(s: &Session, clip: ClipId) -> Vec<(f32, f32, f32, f32)> {
 }
 
 fn edit(s: &mut Session, clip: ClipId, op: PitchOp) {
-    s.dispatch(Action::EditPitch { clip, op }).unwrap();
+    s.dispatch(Action::EditPitch {
+        audio: clip.into(),
+        op,
+    })
+    .unwrap();
 }
 
 #[test]
@@ -128,7 +134,7 @@ fn a_phrase_is_found_moved_and_corrected() {
     // Not analysed: nothing to edit.
     assert!(
         s.dispatch(Action::EditPitch {
-            clip,
+            audio: clip.into(),
             op: PitchOp::Reset { notes: Vec::new() },
         })
         .is_err()

@@ -493,6 +493,132 @@ fn file_format_errors_and_migration() {
     }
 }
 
+/// Version 2 kept a take as a source aligned with the folder's start and
+/// the range it covered; from version 3 a take is an audio clip placed in
+/// the folder. An old folder loads as the takes it played.
+#[test]
+fn old_take_folders_load_as_takes_that_are_clips() {
+    let mut p = demo_project(48_000);
+    let id = p
+        .clips
+        .values()
+        .find(|c| c.as_audio().is_some())
+        .map(|c| c.id)
+        .unwrap();
+    let source = p.clip(id).unwrap().as_audio().unwrap().source;
+    let mut f = faderframe_project::TakeFolder::new(48_000);
+    f.add_take(faderframe_project::Take::plain(
+        "One", source, 1_000, 0, 30_000,
+    ));
+    let mut late = faderframe_project::Take::plain("Two", source, 9_000, 12_000, 36_000);
+    late.audio.gain_db = -4.5;
+    late.rating = 3;
+    f.add_take(late);
+    f.use_take(0);
+    f.set_comp(20_000, 48_000, Some(1));
+    p.clips.get_mut(&id).unwrap().content = ClipContent::Takes(f.clone());
+
+    // As version 2 wrote it.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&file::to_string(&p, None).unwrap()).unwrap();
+    value["version"] = 2.into();
+    let clips = value["project"]["clips"].as_object_mut().unwrap();
+    let folder = clips
+        .values_mut()
+        .find(|c| c["id"] == serde_json::json!(id.raw()))
+        .unwrap();
+    folder["content"]
+        .as_object_mut()
+        .unwrap()
+        .remove("next_take");
+    for t in folder["content"]["takes"].as_array_mut().unwrap() {
+        let start = t["start"].as_i64().unwrap();
+        t.as_object_mut().unwrap().remove("id");
+        let audio = t.as_object_mut().unwrap().remove("audio").unwrap();
+        let length = audio["length"].as_i64().unwrap();
+        t["source"] = audio["source"].clone();
+        t["source_offset"] = (audio["source_offset"].as_i64().unwrap() - start).into();
+        t["end"] = (start + length).into();
+        t["gain_db"] = audio["gain_db"].clone();
+    }
+    let loaded = file::from_str(&value.to_string()).unwrap();
+    assert!(loaded.notes.iter().any(|n| n.contains("version 2")));
+    assert_eq!(
+        loaded.project.clip(id).unwrap().as_takes(),
+        Some(&f),
+        "the same takes (ids 1 and 2, the next 3), the same comp"
+    );
+
+    // A file whose folder gives two takes one id: loaded, each has its
+    // own.
+    let mut value: serde_json::Value =
+        serde_json::from_str(&file::to_string(&p, None).unwrap()).unwrap();
+    let clips = value["project"]["clips"].as_object_mut().unwrap();
+    let folder = clips
+        .values_mut()
+        .find(|c| c["id"] == serde_json::json!(id.raw()))
+        .unwrap();
+    folder["content"]["takes"][1]["id"] = 1.into();
+    let loaded = file::from_str(&value.to_string()).unwrap();
+    let g = loaded.project.clip(id).unwrap().as_takes().unwrap();
+    assert_eq!(g.takes[0].id, faderframe_project::TakeId(1));
+    assert_eq!(g.takes[1].id, faderframe_project::TakeId(3));
+}
+
+/// A take named by its folder and id is the same take while the folder
+/// changes: an earlier take removed, its audio given new edits, undone.
+#[test]
+fn a_take_is_named_across_edits_of_its_folder() {
+    let mut p = demo_project(48_000);
+    let id = p
+        .clips
+        .values()
+        .find(|c| c.as_audio().is_some())
+        .map(|c| c.id)
+        .unwrap();
+    let audio = p.clip(id).unwrap().as_audio().unwrap().clone();
+    let mut f = faderframe_project::TakeFolder::new(audio.length);
+    for name in ["One", "Two", "Three"] {
+        f.add_take(faderframe_project::Take::of_clip(name, 0, audio.clone()));
+    }
+    f.use_take(1);
+    let start = p.clip(id).unwrap().start;
+    let set = |p: &mut Project, f: faderframe_project::TakeFolder| {
+        Command::SetClipContent {
+            clip: id,
+            start,
+            content: Box::new(ClipContent::Takes(f)),
+        }
+        .apply(p)
+        .unwrap()
+    };
+    set(&mut p, f.clone());
+    let three = p.take_ref(id, 2).unwrap();
+    assert_eq!(p.take(three).unwrap().name, "Three");
+    f.remove_take(0);
+    set(&mut p, f);
+    assert_eq!(p.take(three).unwrap().name, "Three", "still, at index 1");
+    assert_eq!(p.take_in(three).map(|(_, i)| i), Some(1));
+
+    let mut down = audio.clone();
+    down.stretch = faderframe_project::StretchSettings::pitch(-12.0);
+    let undo = p
+        .set_take_audio(three, down.clone())
+        .unwrap()
+        .apply(&mut p)
+        .unwrap();
+    assert_eq!(p.take(three).unwrap().audio, down);
+    let f = p.clip(id).unwrap().as_takes().unwrap();
+    assert_eq!(f.takes[0].audio, audio, "the others as they were");
+    undo.apply(&mut p).unwrap();
+    assert_eq!(p.take(three).unwrap().audio, audio);
+    let gone = faderframe_project::TakeRef {
+        clip: id,
+        take: faderframe_project::TakeId(1),
+    };
+    assert!(p.take(gone).is_none() && p.set_take_audio(gone, down).is_none());
+}
+
 #[test]
 fn clip_content_replacement_is_undoable() {
     let mut p = demo_project(48_000);

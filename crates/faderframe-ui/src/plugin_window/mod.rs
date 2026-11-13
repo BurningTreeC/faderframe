@@ -419,10 +419,11 @@ fn title_of(app: &AppState, plugin: PluginInstanceId) -> Option<(TrackId, String
             ),
         ));
     }
-    if let Some((clip, _, _)) = s.clip_fx_slot(plugin) {
-        let c = s.project().clip(clip)?;
+    if let Some((audio, _, _)) = s.clip_fx_slot(plugin) {
+        let track = s.project().clip(audio.clip())?.track;
+        let what = s.project().audio_name(audio)?;
         let name = s.device_name(plugin)?;
-        return Some((c.track, format!("{name} — {} (clip effect)", c.name)));
+        return Some((track, format!("{name} — {what} (clip effect)")));
     }
     let (t, slot) = s.plugin_slot(plugin)?;
     Some((t.id, format!("{} — {}", t.name_of(slot), t.name)))

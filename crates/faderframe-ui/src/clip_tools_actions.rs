@@ -7,9 +7,10 @@
 //!   with that threshold and minimum length (the regions drawn on them),
 //!   `strip-silence:apply[=strip|separate|new-clips]` does it,
 //!   `strip-silence:close` closes it;
-//! * `clip-envelope:<track>=[pan:]<t>/<value>[|…]` — the track's first
-//!   audio clip's volume (dB) or pan (−1…1) envelope, seconds from the
-//!   clip's start, and that lane shown;
+//! * `clip-envelope:<track>[@<take n>]=[pan:]<t>/<value>[|…]` — the
+//!   track's first audio clip's (or take n's of its first take folder)
+//!   volume (dB) or pan (−1…1) envelope, seconds from its start, and that
+//!   lane shown;
 //! * Edit → Clip Envelopes (`show-clip-envelope:<hide|volume|pan>`, a
 //!   choice of `crate::toggles`).
 
@@ -126,10 +127,7 @@ fn strip_silence(a: &Rc<AppState>, arg: &str) {
 
 fn clip_envelope(a: &Rc<AppState>, arg: &str) {
     let Some((track, spec)) = arg.split_once('=') else {
-        return tracing::warn!("clip-envelope: '{arg}' is not <track>=<t>/<dB>[|…]");
-    };
-    let Some(track) = track_named(a, track) else {
-        return tracing::warn!("clip-envelope: no track '{track}'");
+        return tracing::warn!("clip-envelope: '{arg}' is not <track>[@<take n>]=<t>/<dB>[|…]");
     };
     let (lane, spec) = match spec.trim().strip_prefix("pan:") {
         Some(rest) => (EnvelopeLane::Pan, rest),
@@ -138,16 +136,23 @@ fn clip_envelope(a: &Rc<AppState>, arg: &str) {
             spec.trim().strip_prefix("volume:").unwrap_or(spec.trim()),
         ),
     };
-    let (clip, rate) = {
+    let (audio, rate) = {
         let s = a.session.borrow();
-        (s.first_audio_clip(track), s.project().sample_rate)
+        (
+            crate::actions::audio_target(&s, track),
+            s.project().sample_rate,
+        )
     };
-    let Some(clip) = clip else {
-        return tracing::warn!("clip-envelope: the track has no audio clip");
+    let Some(audio) = audio else {
+        return tracing::warn!("clip-envelope: no audio clip or take '{track}'");
     };
     let Some(points) = faderframe_session::clip_envelope::parse_points(spec, rate) else {
         return tracing::warn!("clip-envelope: '{spec}' is not <t>/<value>[|…]");
     };
     a.dispatch(Action::ShowClipEnvelope(Some(lane)));
-    a.dispatch(Action::SetClipEnvelope { clip, lane, points });
+    a.dispatch(Action::SetClipEnvelope {
+        audio,
+        lane,
+        points,
+    });
 }

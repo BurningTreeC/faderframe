@@ -544,7 +544,16 @@ pub(crate) fn export_plan(project: &Project, media: AafMedia) -> Result<ExportPl
                         .into_iter()
                         .map(|piece| {
                             let take = f.takes.get(piece.take)?;
-                            let s = project.sources.get(&take.source)?;
+                            // A take with edits of its own: the folder is
+                            // rendered.
+                            let a = &take.audio;
+                            if !take.plays_source_as_is()
+                                || a.envelope.is_some()
+                                || a.fades != Default::default()
+                            {
+                                return None;
+                            }
+                            let s = project.sources.get(&a.source)?;
                             match &s.spec {
                                 SourceSpec::File {
                                     path,
@@ -561,7 +570,7 @@ pub(crate) fn export_plan(project: &Project, media: AafMedia) -> Result<ExportPl
                     match plain {
                         Some(list) => {
                             for (piece, take, path, ch, frames) in list {
-                                let m = medium(&mut plan, take.source, path, ch, frames);
+                                let m = medium(&mut plan, take.audio.source, path, ch, frames);
                                 let fi = (piece.start == 0)
                                     .then(|| fade(f.fades.fade_in, f.fades.fade_in_shape))
                                     .flatten();
@@ -570,10 +579,10 @@ pub(crate) fn export_plan(project: &Project, media: AafMedia) -> Result<ExportPl
                                     .flatten();
                                 pieces.push(Piece {
                                     media: m,
-                                    offset: take.source_offset + piece.start,
+                                    offset: take.audio.source_offset + piece.start - take.start,
                                     position: start + piece.start,
                                     length: piece.end - piece.start,
-                                    gain: f64::from(f.gain_db + take.gain_db),
+                                    gain: f64::from(f.gain_db + take.audio.gain_db),
                                     fade_in: fi,
                                     fade_out: fo,
                                     envelope: None,

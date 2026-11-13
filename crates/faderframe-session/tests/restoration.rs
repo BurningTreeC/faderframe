@@ -94,7 +94,7 @@ fn snr(x: &[f32], from: usize) -> f64 {
 fn learn_noise_and_remove_cleans_the_whole_clip_in_one_step() {
     let (mut s, clip, input) = session();
     let original = s.project().clip(clip).unwrap().as_audio().unwrap().source;
-    s.dispatch(Action::OpenSpectralEditor(clip)).unwrap();
+    s.dispatch(Action::OpenSpectralEditor(clip.into())).unwrap();
     let steps = s.history_steps().0.len();
     // The noise alone: 0.1–0.5 s, every frequency.
     let edit = SpectralEdit::new(
@@ -107,7 +107,7 @@ fn learn_noise_and_remove_cleans_the_whole_clip_in_one_step() {
         SpectralOp::Denoise { reduction_db: 20.0 },
     );
     s.dispatch(Action::EditSpectral {
-        clip,
+        audio: clip.into(),
         change: SpectralChange::Add(edit),
     })
     .unwrap();

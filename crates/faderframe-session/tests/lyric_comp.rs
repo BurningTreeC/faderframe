@@ -202,15 +202,7 @@ fn session() -> (Session, ClipId, Arc<StandIn>) {
     let mut f = TakeFolder::new(len);
     for (i, c) in clips.iter().enumerate() {
         let a = c.as_audio().unwrap();
-        f.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: a.source,
-            source_offset: 0,
-            start: 0,
-            end: len,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(Take::plain(format!("Take {}", i + 1), a.source, 0, 0, len));
     }
     f.use_take(0);
     s.edit(Command::SetClipContent {
@@ -479,15 +471,17 @@ fn the_pitch_editor_shows_the_syllable_under_each_note() {
     .unwrap();
     let clip = *s.project().clips.keys().next().unwrap();
     hear(&mut s, clip);
-    s.dispatch(Action::DetectPitch { clips: vec![clip] })
-        .unwrap();
+    s.dispatch(Action::DetectPitch {
+        audio: vec![clip.into()],
+    })
+    .unwrap();
     let start = std::time::Instant::now();
     while s.detecting_pitch() {
         assert!(start.elapsed().as_secs() < 30, "detection hangs");
         std::thread::sleep(std::time::Duration::from_millis(5));
         s.tick(0.005);
     }
-    let syllables = s.pitch_syllables(clip);
+    let syllables = s.pitch_syllables(clip.into());
     let texts: Vec<String> = syllables
         .iter()
         .flatten()
@@ -534,15 +528,13 @@ fn whisper_hears_the_takes() {
         .unwrap();
     let mut f = TakeFolder::new(len);
     for (i, c) in clips.iter().enumerate() {
-        f.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: c.as_audio().unwrap().source,
-            source_offset: 0,
-            start: 0,
-            end: c.as_audio().unwrap().length,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(Take::plain(
+            format!("Take {}", i + 1),
+            c.as_audio().unwrap().source,
+            0,
+            0,
+            c.as_audio().unwrap().length,
+        ));
     }
     f.use_take(0);
     let clip = clips[0].id;

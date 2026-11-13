@@ -1,12 +1,14 @@
 //! Clip envelopes in the session ([`faderframe_project::clip_envelope`]):
-//! which lane the arranger shows and edits on audio clips, a lane's
-//! points replaced (drags inside a gesture coalesce into one step), lanes
-//! cleared, and the parser of the `clip-envelope:` dev action.
+//! which lane the arranger shows and edits on audio clips and on the takes
+//! in take lanes, a lane's points replaced (drags inside a gesture
+//! coalesce into one step), lanes cleared, and the parser of the
+//! `clip-envelope:` dev action. A take's envelope is its own (a take is a
+//! clip in its folder): it changes with the folder's content.
 
 use crate::{Result, Session, SessionError};
 use faderframe_core::{ClipId, TrackId};
 use faderframe_project::clip_envelope::{ClipEnvelope, EnvelopeLane, EnvelopePoint};
-use faderframe_project::{ClipContent, Command};
+use faderframe_project::{AudioClip, AudioRef, ClipContent, Command};
 
 impl Session {
     /// The envelope lane the arranger draws and edits on audio clips
@@ -15,58 +17,87 @@ impl Session {
         self.editor.clip_envelope
     }
 
-    /// An audio clip's envelopes (`None`: none, or no audio clip).
-    pub fn clip_envelope(&self, clip: ClipId) -> Option<&ClipEnvelope> {
-        match &self.project.clip(clip)?.content {
-            ClipContent::Audio(a) => a.envelope.as_deref(),
-            _ => None,
-        }
+    /// The envelopes of an audio clip or take (`None`: none, or no audio).
+    pub fn clip_envelope(&self, audio: AudioRef) -> Option<&ClipEnvelope> {
+        self.project.audio(audio)?.envelope.as_deref()
     }
 
-    /// Replace `lane` of `clip` by `points` (clip frames at the project
-    /// rate; sorted and clamped here). Inside a gesture successive calls
-    /// are one undo step.
+    /// Replace `lane` of `audio` (a clip or take) by `points` (its frames
+    /// at the project rate; sorted and clamped here). Inside a gesture
+    /// successive calls are one undo step.
     pub(crate) fn set_clip_envelope_lane(
         &mut self,
-        clip: ClipId,
+        audio: AudioRef,
         lane: EnvelopeLane,
         points: Vec<EnvelopePoint>,
     ) -> Result<()> {
-        let Some(c) = self.project.clip(clip) else {
-            return Err(SessionError::Other(format!("no clip {clip}")));
-        };
-        let ClipContent::Audio(a) = &c.content else {
-            return Err(SessionError::Other(format!(
-                "'{}' is no audio clip: only audio clips have envelopes",
-                c.name
-            )));
+        let Some(a) = self.project.audio(audio) else {
+            return Err(SessionError::Other(match self.project.clip(audio.clip()) {
+                Some(c) if c.as_takes().is_some() => format!(
+                    "'{}' is a take folder: each of its takes has an envelope of its own \
+                     (Show Takes)",
+                    c.name
+                ),
+                Some(c) => format!(
+                    "'{}' is no audio clip: only audio clips and takes have envelopes",
+                    c.name
+                ),
+                None => format!("no clip {}", audio.clip()),
+            }));
         };
         let envelope = ClipEnvelope::with_lane(a.envelope.as_deref(), lane, points);
         if envelope == a.envelope {
             return Ok(());
         }
-        self.edit(Command::SetClipEnvelope { clip, envelope })
+        match audio {
+            AudioRef::Clip(clip) => self.edit(Command::SetClipEnvelope { clip, envelope }),
+            AudioRef::Take(t) => {
+                let a = AudioClip {
+                    envelope,
+                    ..a.clone()
+                };
+                match self.project.set_take_audio(t, a) {
+                    Some(cmd) => self.edit(cmd),
+                    None => Ok(()),
+                }
+            }
+        }
     }
 
-    /// Clear `lane` (`None`: every lane) of the audio clips among `clips`
-    /// that have one, as one step.
+    /// Clear `lane` (`None`: every lane) of the clips and takes among
+    /// `audio` that have one, as one step.
     pub(crate) fn clear_clip_envelopes(
         &mut self,
-        clips: &[ClipId],
+        audio: &[AudioRef],
         lane: Option<EnvelopeLane>,
     ) -> Result<()> {
-        let commands: Vec<Command> = clips
-            .iter()
-            .filter_map(|&clip| {
-                let e = self.clip_envelope(clip)?;
-                let envelope = match lane {
-                    None => None,
-                    Some(lane) if e.lane(lane).is_empty() => return None,
-                    Some(lane) => ClipEnvelope::with_lane(Some(e), lane, Vec::new()),
-                };
-                Some(Command::SetClipEnvelope { clip, envelope })
-            })
-            .collect();
+        let mut takes = Vec::new();
+        let mut commands: Vec<Command> = Vec::new();
+        for &r in audio {
+            let Some(e) = self.clip_envelope(r) else {
+                continue;
+            };
+            let envelope = match lane {
+                None => None,
+                Some(lane) if e.lane(lane).is_empty() => continue,
+                Some(lane) => ClipEnvelope::with_lane(Some(e), lane, Vec::new()),
+            };
+            match r {
+                AudioRef::Clip(clip) => commands.push(Command::SetClipEnvelope { clip, envelope }),
+                AudioRef::Take(_) => {
+                    if let Some(a) = self.project.audio(r) {
+                        takes.push((
+                            r,
+                            AudioClip {
+                                envelope,
+                                ..a.clone()
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        commands.extend(self.project.set_audio(takes));
         if commands.is_empty() {
             return Ok(());
         }

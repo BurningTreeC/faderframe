@@ -723,8 +723,9 @@ impl ArrangerView {
         let zone = self.clip_zone(model, c, rect, pos);
         if zone == ClipZone::Envelope
             && let Some(lane) = Self::edits_envelope(model, c)
+            && let Some(place) = self.clip_envelope_place(c, rect)
         {
-            return self.press_envelope(c, rect, lane, pos, clicks, mods, model, cx);
+            return self.press_envelope(c, place, lane, pos, clicks, mods, model, cx);
         }
         let selected = model.selection.clips.contains(&clip);
         // Shift: everything from the clip last clicked to this one — the

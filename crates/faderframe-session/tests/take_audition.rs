@@ -24,15 +24,13 @@ fn session_with_takes() -> (Session, ClipId) {
     let a = c.as_audio().unwrap().clone();
     let mut f = TakeFolder::new(a.length);
     for i in 0..3 {
-        f.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: a.source,
-            source_offset: a.source_offset,
-            start: 0,
-            end: a.length,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(Take::plain(
+            format!("Take {}", i + 1),
+            a.source,
+            a.source_offset,
+            0,
+            a.length,
+        ));
     }
     f.use_take(2);
     s.edit(Command::SetClipContent {

@@ -944,6 +944,12 @@ impl Project {
                 ));
             }
         }
+        // Take folders: every take an id of its own, the comp in order.
+        for c in self.clips.values_mut() {
+            if let crate::ClipContent::Takes(f) = &mut c.content {
+                f.normalize();
+            }
+        }
         // Reserve IDs past everything in use.
         let mut max_id = 0;
         for t in &self.tracks {

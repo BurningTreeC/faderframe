@@ -1,11 +1,12 @@
 //! Audio to MIDI: a sung phrase, chords and a drum pattern become MIDI
-//! clips on new instrument tracks, in one undo step each.
+//! clips on new instrument tracks, in one undo step each; so does one take
+//! of a take folder.
 #![allow(clippy::unwrap_used)]
 
 use faderframe_audio_files::{WavFormat, write_wav};
 use faderframe_core::ClipId;
 use faderframe_engine::EngineConfig;
-use faderframe_project::{Project, TrackKind};
+use faderframe_project::{AudioRef, ClipContent, Command, Project, Take, TakeFolder, TrackKind};
 use faderframe_session::to_midi::ToMidi;
 use faderframe_session::{Action, Session};
 use faderframe_timeline::MusicalTime;
@@ -95,11 +96,28 @@ fn session(name: &str, samples: Vec<f32>) -> (Session, ClipId) {
     (s, clip)
 }
 
+/// Notes found: start and end (seconds from the MIDI clip's start), key,
+/// velocity.
+type Notes = Vec<(f64, f64, u8, u8)>;
+
 /// Convert and wait; the notes (seconds from the audio clip's start, key,
 /// velocity) and the new track's instrument.
-fn convert(s: &mut Session, clip: ClipId, how: ToMidi) -> (Vec<(f64, f64, u8, u8)>, String) {
+fn convert(s: &mut Session, clip: ClipId, how: ToMidi) -> (Notes, String) {
+    let (notes, instrument, start, _) = convert_audio(s, clip.into(), how);
+    assert_eq!(start, MusicalTime::from_quarters(4.0), "where the audio is");
+    (notes, instrument)
+}
+
+/// Convert a clip or take and wait; the notes (seconds from the MIDI
+/// clip's start, key, velocity), the new track's instrument, where the
+/// MIDI clip starts and what it is called.
+fn convert_audio(
+    s: &mut Session,
+    audio: AudioRef,
+    how: ToMidi,
+) -> (Notes, String, MusicalTime, String) {
     let tracks = s.project().tracks.len();
-    s.dispatch(Action::ConvertToMidi { clip, how }).unwrap();
+    s.dispatch(Action::ConvertToMidi { audio, how }).unwrap();
     let start = Instant::now();
     while s.converting_to_midi() {
         assert!(
@@ -117,11 +135,6 @@ fn convert(s: &mut Session, clip: ClipId, how: ToMidi) -> (Vec<(f64, f64, u8, u8
         .find(|t| t.kind == TrackKind::Instrument)
         .unwrap();
     let c = p.clip(t.clips[0]).unwrap();
-    assert_eq!(
-        c.start,
-        MusicalTime::from_quarters(4.0),
-        "where the audio is"
-    );
     let m = c.as_midi().unwrap();
     let rate = f64::from(SR);
     let base = p.timeline.to_samples(c.start, rate);
@@ -131,7 +144,12 @@ fn convert(s: &mut Session, clip: ClipId, how: ToMidi) -> (Vec<(f64, f64, u8, u8
         .iter()
         .map(|n| (secs(n.start), secs(n.start + n.length), n.key, n.velocity))
         .collect();
-    (notes, t.inserts[0].plugin.id.clone())
+    (
+        notes,
+        t.inserts[0].plugin.id.clone(),
+        c.start,
+        c.name.clone(),
+    )
 }
 
 #[test]
@@ -196,4 +214,48 @@ fn a_drum_pattern_becomes_hits_on_the_pads() {
         }
     }
     assert!(matched >= 14, "{matched} of 16 right: {notes:?}");
+}
+
+/// A take is a clip of its own: one take of a folder turns into MIDI on
+/// its own — its notes, from where it starts in the folder.
+#[test]
+fn one_take_of_a_folder_becomes_its_notes() {
+    let (mut s, clip) = session(
+        "Takes",
+        tones(&[(&[60], 0.4), (&[62], 0.4), (&[64], 0.6), (&[60], 0.4)]),
+    );
+    let c = s.project().clip(clip).unwrap().clone();
+    let a = c.as_audio().unwrap().clone();
+    // Take 2 is the phrase from its second note on, where it was sung.
+    let later = (0.46 * f64::from(SR)) as i64;
+    let mut f = TakeFolder::new(a.length);
+    f.add_take(Take::of_clip("Take 1", 0, a.clone()));
+    f.add_take(Take::of_clip(
+        "Take 2",
+        later,
+        a.cut(later, a.length).unwrap(),
+    ));
+    f.use_take(0);
+    s.edit(Command::SetClipContent {
+        clip,
+        start: c.start,
+        content: Box::new(ClipContent::Takes(f)),
+    })
+    .unwrap();
+    let two = s.project().take_ref(clip, 1).unwrap();
+    let (notes, instrument, start, name) = convert_audio(&mut s, two.into(), ToMidi::Melody);
+    assert_eq!(instrument, faderframe_core::builtin::SYNTH);
+    assert_eq!(name, format!("{} · Take 2 Melody", c.name));
+    let p = s.project();
+    let rate = f64::from(SR);
+    assert_eq!(
+        p.timeline.to_samples(start, rate),
+        p.timeline.to_samples(c.start, rate) + later,
+        "where the take starts"
+    );
+    let keys: Vec<u8> = notes.iter().map(|n| n.2).collect();
+    assert_eq!(keys, [62, 64, 60], "{notes:?}");
+    for (n, at) in notes.iter().zip([0.0, 0.46, 1.12]) {
+        assert!((n.0 - at).abs() < 0.04, "{n:?} vs {at}");
+    }
 }

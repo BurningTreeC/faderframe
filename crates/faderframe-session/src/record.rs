@@ -449,7 +449,7 @@ pub(crate) fn carve_midi(
     b: MusicalTime,
 ) -> Vec<Command> {
     carve_where(p, track, a, b, |c| {
-        matches!(c.content, faderframe_project::ClipContent::Midi(_))
+        matches!(c.content, ClipContent::Midi(_))
     })
 }
 
@@ -471,63 +471,104 @@ fn carve_where(
     b: MusicalTime,
     kind: impl Fn(&faderframe_project::Clip) -> bool,
 ) -> Vec<Command> {
-    let mut out = Vec::new();
-    let clips: Vec<(ClipId, MusicalTime, MusicalTime)> = p
+    let clips: Vec<ClipId> = p
         .clips_of(track)
         .into_iter()
         .filter(|c| !c.muted && kind(c))
-        .map(|c| (c.id, c.start, c.end(&p.timeline, p.sample_rate)))
-        .filter(|&(_, s, e)| s < b && e > a)
+        .filter(|c| c.start < b && c.end(&p.timeline, p.sample_rate) > a)
+        .map(|c| c.id)
         .collect();
-    for (id, start, end) in clips {
-        match (start < a, end > b) {
-            // Spans the range: keep both outer parts.
-            (true, true) => {
-                let mid: ClipId = p.ids.allocate();
-                let right: ClipId = p.ids.allocate();
-                out.push(Command::SplitClip {
-                    clip: id,
-                    at: a,
-                    new_clip: mid,
-                });
-                out.push(Command::SplitClip {
-                    clip: mid,
-                    at: b,
-                    new_clip: right,
-                });
-                out.push(Command::RemoveClip { clip: mid });
-            }
-            // Overlaps the range start: keep the head.
-            (true, false) => {
-                let tail: ClipId = p.ids.allocate();
-                out.push(Command::SplitClip {
-                    clip: id,
-                    at: a,
-                    new_clip: tail,
-                });
-                out.push(Command::RemoveClip { clip: tail });
-            }
-            // Overlaps the range end: keep the tail.
-            (false, true) => {
-                let tail: ClipId = p.ids.allocate();
-                out.push(Command::SplitClip {
-                    clip: id,
-                    at: b,
-                    new_clip: tail,
-                });
-                out.push(Command::RemoveClip { clip: id });
-            }
-            (false, false) => out.push(Command::RemoveClip { clip: id }),
-        }
+    let mut out = Vec::new();
+    for id in clips {
+        out.extend(cut_out(p, id, a, b, |clip| Command::RemoveClip { clip }));
     }
     out
+}
+
+/// Commands cutting clip `id` (which overlaps `[a, b)`) where `a` and `b`
+/// fall inside it and doing `then` to the part between them; the parts
+/// outside keep playing as they were (a cut keeps every edit of the
+/// clip: `Clip::split_at`).
+fn cut_out(
+    p: &mut Project,
+    id: ClipId,
+    a: MusicalTime,
+    b: MusicalTime,
+    then: impl Fn(ClipId) -> Command,
+) -> Vec<Command> {
+    let Some(c) = p.clip(id) else {
+        return Vec::new();
+    };
+    let rate = p.sample_rate as f64;
+    let (x, y) = (
+        p.timeline.to_samples(a, rate),
+        p.timeline.to_samples(b, rate),
+    );
+    let (at_a, at_b) = (splits_at(p, c, a), splits_at(p, c, b) && y > x);
+    let mut out = Vec::new();
+    match (at_a, at_b) {
+        // Spans the range: keep both outer parts.
+        (true, true) => {
+            let mid: ClipId = p.ids.allocate();
+            let right: ClipId = p.ids.allocate();
+            out.push(Command::SplitClip {
+                clip: id,
+                at: a,
+                new_clip: mid,
+            });
+            out.push(Command::SplitClip {
+                clip: mid,
+                at: b,
+                new_clip: right,
+            });
+            out.push(then(mid));
+        }
+        // Overlaps the range start: keep the head.
+        (true, false) => {
+            let tail: ClipId = p.ids.allocate();
+            out.push(Command::SplitClip {
+                clip: id,
+                at: a,
+                new_clip: tail,
+            });
+            out.push(then(tail));
+        }
+        // Overlaps the range end: keep the tail.
+        (false, true) => {
+            let tail: ClipId = p.ids.allocate();
+            out.push(Command::SplitClip {
+                clip: id,
+                at: b,
+                new_clip: tail,
+            });
+            out.push(then(id));
+        }
+        (false, false) => out.push(then(id)),
+    }
+    out
+}
+
+/// `Command::SplitClip` would cut `c` at `at`: inside it by at least a
+/// sample (a cut a rounding away from an edge would fail the batch).
+fn splits_at(p: &Project, c: &Clip, at: MusicalTime) -> bool {
+    if at <= c.start || at >= c.end(&p.timeline, p.sample_rate) {
+        return false;
+    }
+    let rate = p.sample_rate as f64;
+    let offset = p.timeline.to_samples(at, rate) - p.timeline.to_samples(c.start, rate);
+    match &c.content {
+        ClipContent::Audio(a) => offset > 0 && offset < a.length,
+        ClipContent::Takes(f) => offset > 0 && offset < f.length,
+        ClipContent::Midi(_) => true,
+    }
 }
 
 /// What recording over existing clips does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RecordMode {
     /// Existing material becomes takes of a take folder; the new take is
-    /// comped in over the recorded range (nothing is lost).
+    /// comped in over the recorded range (nothing is lost: a take keeps
+    /// every edit of the clip it was).
     #[default]
     Takes,
     /// Existing clips are cut back underneath the new take (tape style).
@@ -610,7 +651,10 @@ pub(crate) struct NewTake {
 }
 
 /// Commands placing `new` takes (in recording order) on `track`; returns
-/// them and the clip that plays the result.
+/// them and the clip that plays the result. In [`RecordMode::Takes`] the
+/// clips and folders in the way become takes of one folder, every edit of
+/// theirs kept (a take is an audio clip of its own), each playing at the
+/// level it had.
 pub(crate) fn place_takes(
     p: &mut Project,
     track: TrackId,
@@ -626,28 +670,8 @@ pub(crate) fn place_takes(
     let u0 = first.abs_start;
     let u1 = new.iter().map(|t| t.abs_end).max().unwrap_or(u0);
     let (ua, ub) = (first.start, p.timeline.to_musical(u1, rate));
-    let plain = |t: &NewTake, p: &mut Project| Clip {
-        id: p.ids.allocate(),
-        track,
-        name: t.name.clone(),
-        color: None,
-        start: t.start,
-        muted: false,
-        content: ClipContent::Audio(AudioClip {
-            source: t.source,
-            source_offset: t.source_offset,
-            length: t.abs_end - t.abs_start,
-            gain_db: 0.0,
-            fades: Default::default(),
-            stretch: Default::default(),
-            reversed: false,
-            warp: None,
-            pitch: None,
-            effects: None,
-            spectral: None,
-            envelope: None,
-        }),
-    };
+    let recorded =
+        |t: &NewTake| AudioClip::plain(t.source, t.source_offset, t.abs_end - t.abs_start);
     // Existing material in the way.
     let items: Vec<Clip> = if overlap == RecordMode::Takes {
         let mut v: Vec<Clip> = p
@@ -667,10 +691,18 @@ pub(crate) fn place_takes(
         commands.extend(carve(p, track, ua, ub));
     }
     if items.is_empty() && new.len() == 1 {
-        let clip = plain(&new[0], p);
-        let id = clip.id;
+        let t = &new[0];
+        let id = p.ids.allocate();
         commands.push(Command::AddClip {
-            clip: Box::new(clip),
+            clip: Box::new(Clip {
+                id,
+                track,
+                name: t.name.clone(),
+                color: None,
+                start: t.start,
+                muted: false,
+                content: ClipContent::Audio(recorded(t)),
+            }),
         });
         return (commands, Some(id));
     }
@@ -699,29 +731,31 @@ pub(crate) fn place_takes(
         }
         None => TakeFolder::new(r1 - r0),
     };
+    // Every take plays through the folder's gain: what comes in plays at
+    // the level it had.
+    let level = folder.gain_db;
     for c in items.iter().filter(|c| Some(c.id) != base) {
         let rel = abs(p, c.start) - r0;
         match &c.content {
             ClipContent::Audio(a) => {
-                let i = folder.add_take(Take {
-                    name: c.name.clone(),
-                    source: a.source,
-                    source_offset: a.source_offset - rel,
-                    start: rel,
-                    end: rel + a.length,
-                    gain_db: a.gain_db,
-                    rating: 0,
-                });
+                let audio = AudioClip {
+                    gain_db: a.gain_db - level,
+                    ..a.clone()
+                };
+                let i = folder.add_take(Take::of_clip(c.name.clone(), rel, audio));
                 folder.set_comp(rel, rel + a.length, Some(i));
             }
             ClipContent::Takes(other) => {
                 let first_new = folder.takes.len();
-                for t in &other.takes {
+                // Its gain and edge fades go into its takes.
+                for t in other.takes_as_played() {
                     folder.add_take(Take {
-                        source_offset: t.source_offset - rel,
                         start: t.start + rel,
-                        end: t.end + rel,
-                        ..t.clone()
+                        audio: AudioClip {
+                            gain_db: t.audio.gain_db - level,
+                            ..t.audio
+                        },
+                        ..t
                     });
                 }
                 for piece in other.pieces() {
@@ -738,17 +772,8 @@ pub(crate) fn place_takes(
     }
     for t in new {
         let rel = t.abs_start - r0;
-        let len = t.abs_end - t.abs_start;
-        let i = folder.add_take(Take {
-            name: t.name.clone(),
-            source: t.source,
-            source_offset: t.source_offset - rel,
-            start: rel,
-            end: rel + len,
-            gain_db: 0.0,
-            rating: 0,
-        });
-        folder.set_comp(rel, rel + len, Some(i));
+        let i = folder.add_take(Take::of_clip(t.name.clone(), rel, recorded(t)));
+        folder.set_comp(rel, rel + (t.abs_end - t.abs_start), Some(i));
     }
     let id = match base {
         Some(id) => {
@@ -1748,8 +1773,9 @@ impl Session {
 }
 
 impl Session {
-    /// Replace a take folder by plain audio clips of what its comp plays
-    /// (keeping the comp crossfades as clip fades).
+    /// Replace a take folder by the clips its comp plays: each piece its
+    /// take's clip cut there, edits and all, with the comp's crossfades as
+    /// clip fades ([`TakeFolder::played`], what the engine plays).
     pub(crate) fn flatten_takes(&mut self, clip: ClipId) -> Result<()> {
         let Some(c) = self.project.clip(clip).cloned() else {
             return Ok(());
@@ -1760,97 +1786,19 @@ impl Session {
         let p = &mut self.project;
         let rate = p.sample_rate as f64;
         let base = p.timeline.to_samples(c.start, rate);
-        let half = f.crossfade.max(0) / 2;
-        let pieces = f.pieces();
         let mut commands = vec![Command::RemoveClip { clip }];
         let mut created = Vec::new();
-        for (i, piece) in pieces.iter().enumerate() {
-            let take = &f.takes[piece.take];
-            let touches_prev = i > 0 && pieces[i - 1].end == piece.start;
-            let touches_next = pieces.get(i + 1).is_some_and(|n| n.start == piece.end);
-            let a = if touches_prev {
-                (piece.start - half).max(take.start)
-            } else {
-                piece.start
-            };
-            let b = if touches_next {
-                (piece.end + half).min(take.end)
-            } else {
-                piece.end
-            };
-            let fade = |touch: bool, len: i64, edge: i64| if touch { len } else { edge };
-            // As the engine plays the comp: an edge inside the folder that
-            // touches no other piece gets a short declick.
-            let declick = faderframe_project::COMP_DECLICK.min(b - a);
-            let (inner_in, inner_out) = (!touches_prev && a > 0, !touches_next && b < f.length);
+        for piece in f.played() {
             let id: ClipId = p.ids.allocate();
-            let start = p.timeline.to_musical(base + a, rate);
-            let fades = faderframe_project::ClipFades {
-                fade_in: fade(
-                    touches_prev,
-                    piece.start + half - a,
-                    if a == 0 { f.fades.fade_in } else { declick },
-                ),
-                fade_out: fade(
-                    touches_next,
-                    b - (piece.end - half),
-                    if b == f.length {
-                        f.fades.fade_out
-                    } else {
-                        declick
-                    },
-                ),
-                fade_in_shape: if touches_prev {
-                    faderframe_project::FadeShape::EqualPower
-                } else if inner_in {
-                    faderframe_project::FadeShape::Linear
-                } else {
-                    f.fades.fade_in_shape
-                },
-                fade_out_shape: if touches_next {
-                    faderframe_project::FadeShape::EqualPower
-                } else if inner_out {
-                    faderframe_project::FadeShape::Linear
-                } else {
-                    f.fades.fade_out_shape
-                },
-                fade_in_bend: if touches_prev || inner_in {
-                    0
-                } else {
-                    f.fades.fade_in_bend
-                },
-                fade_out_bend: if touches_next || inner_out {
-                    0
-                } else {
-                    f.fades.fade_out_bend
-                },
-            };
-            // Both fades fit the piece.
-            let mut fades = fades;
-            fades.fade_in = fades.fade_in.clamp(0, b - a);
-            fades.fade_out = fades.fade_out.clamp(0, b - a - fades.fade_in);
             commands.push(Command::AddClip {
                 clip: Box::new(Clip {
                     id,
                     track: c.track,
-                    name: take.name.clone(),
+                    name: f.takes[piece.take].name.clone(),
                     color: c.color,
-                    start,
+                    start: p.timeline.to_musical(base + piece.start, rate),
                     muted: c.muted,
-                    content: ClipContent::Audio(AudioClip {
-                        source: take.source,
-                        source_offset: take.source_offset + a,
-                        length: b - a,
-                        gain_db: f.gain_db + take.gain_db,
-                        fades,
-                        stretch: Default::default(),
-                        reversed: false,
-                        warp: None,
-                        pitch: None,
-                        effects: None,
-                        spectral: None,
-                        envelope: None,
-                    }),
+                    content: ClipContent::Audio(piece.audio),
                 }),
             });
             created.push(id);
@@ -1861,5 +1809,270 @@ impl Session {
         })?;
         self.selection.select_clips(&created, SelectMode::Replace);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod take_placement_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use faderframe_project::pitch::{PitchEdit, Polyphonic};
+    use faderframe_project::{Track, TrackColor};
+
+    const SR: u32 = 48_000;
+
+    fn frames(seconds: f64) -> i64 {
+        (seconds * SR as f64) as i64
+    }
+
+    fn at(p: &Project, seconds: f64) -> MusicalTime {
+        p.timeline.to_musical(frames(seconds), SR as f64)
+    }
+
+    fn project() -> (Project, TrackId) {
+        let mut p = Project::new("Takes", SR);
+        let id: TrackId = p.ids.allocate();
+        let index = p.tracks.len();
+        Command::AddTrack {
+            track: Box::new(Track::new(
+                id,
+                TrackKind::Audio,
+                "Guitar",
+                TrackColor::PALETTE[0],
+            )),
+            index,
+        }
+        .apply(&mut p)
+        .unwrap();
+        (p, id)
+    }
+
+    fn source(p: &mut Project, name: &str) -> AudioSourceId {
+        let id = p.ids.allocate();
+        Command::AddSource {
+            source: Box::new(AudioSource {
+                id,
+                name: name.into(),
+                spec: SourceSpec::File {
+                    path: format!("/media/{name}.wav").into(),
+                    channels: 1,
+                    frames: frames(20.0),
+                    sample_rate: SR,
+                },
+            }),
+        }
+        .apply(p)
+        .unwrap();
+        id
+    }
+
+    fn audio(source: AudioSourceId, seconds: f64) -> AudioClip {
+        AudioClip::plain(source, 0, frames(seconds))
+    }
+
+    fn folder(source: AudioSourceId, seconds: f64, gain_db: f32) -> TakeFolder {
+        let mut f = TakeFolder::new(frames(seconds));
+        f.add_take(Take::plain("Take", source, 0, 0, frames(seconds)));
+        f.use_take(0);
+        f.gain_db = gain_db;
+        f
+    }
+
+    fn add(
+        p: &mut Project,
+        track: TrackId,
+        name: &str,
+        seconds: f64,
+        content: ClipContent,
+    ) -> ClipId {
+        let id = p.ids.allocate();
+        let start = at(p, seconds);
+        Command::AddClip {
+            clip: Box::new(Clip {
+                id,
+                track,
+                name: name.into(),
+                color: None,
+                start,
+                muted: false,
+                content,
+            }),
+        }
+        .apply(p)
+        .unwrap();
+        id
+    }
+
+    fn new_take(p: &Project, source: AudioSourceId, from: f64, to: f64) -> NewTake {
+        NewTake {
+            name: "Guitar 2".into(),
+            source,
+            abs_start: frames(from),
+            abs_end: frames(to),
+            start: at(p, from),
+            source_offset: 0,
+        }
+    }
+
+    /// Takes mode over `new`, applied as the recording's one step.
+    fn place(p: &mut Project, track: TrackId, new: &[NewTake]) -> ClipId {
+        let (commands, clip) = place_takes(p, track, new, RecordMode::Takes, "Guitar Takes");
+        Command::Batch {
+            label: "Record".into(),
+            commands,
+        }
+        .apply(p)
+        .unwrap();
+        clip.unwrap()
+    }
+
+    /// The clips of `track` as (start in seconds, length in seconds,
+    /// muted, clip).
+    fn laid_out(p: &Project, track: TrackId) -> Vec<(f64, f64, bool, Clip)> {
+        let rate = SR as f64;
+        p.clips_of(track)
+            .into_iter()
+            .map(|c| {
+                let a = p.timeline.to_samples(c.start, rate);
+                let b = p.timeline.to_samples(c.end(&p.timeline, SR), rate);
+                (a as f64 / rate, (b - a) as f64 / rate, c.muted, c.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_edited_clip_goes_into_the_folder_with_its_edits() {
+        let (mut p, track) = project();
+        let original = source(&mut p, "Guitar");
+        let rendered = source(&mut p, "Guitar (moved)");
+        let new = source(&mut p, "Guitar 2");
+        // A polyphonic pitch edit plays its render; the recording is kept
+        // to go back to. An octave down, a fade-out of its own.
+        let edit = PitchEdit {
+            hop: 256,
+            notes: Vec::new(),
+            keep_formants: true,
+            polyphonic: Some(Polyphonic {
+                original,
+                rendered: 7,
+            }),
+            removed: Vec::new(),
+        };
+        let mut edited = audio(rendered, 4.0);
+        edited.pitch = Some(edit);
+        edited.stretch = faderframe_project::StretchSettings::pitch(-12.0);
+        edited.fades.fade_out = frames(0.5);
+        add(
+            &mut p,
+            track,
+            "Guitar",
+            0.0,
+            ClipContent::Audio(edited.clone()),
+        );
+
+        let take = new_take(&p, new, 1.0, 2.0);
+        let placed = place(&mut p, track, &[take]);
+        let clips = laid_out(&p, track);
+        assert_eq!(clips.len(), 1, "{clips:#?}");
+        assert_eq!(clips[0].3.id, placed);
+        let f = clips[0].3.as_takes().unwrap();
+        assert_eq!(f.takes.len(), 2);
+        assert_eq!(f.takes[0].name, "Guitar");
+        assert_eq!(f.takes[0].audio, edited, "every edit of it");
+        let comped: Vec<_> = f.segments().map(|(_, _, t)| t).collect();
+        assert_eq!(comped, vec![Some(0), Some(1), Some(0)]);
+        // Where the comp plays it, it plays as it did.
+        let played = f.played();
+        assert!(
+            played
+                .iter()
+                .filter(|q| q.take == 0)
+                .all(|q| q.audio.stretch.semitones() == -12.0 && q.audio.pitch.is_some())
+        );
+        assert_eq!(
+            played.last().map(|q| q.audio.fades.fade_out),
+            Some(frames(0.5)),
+            "its own fade-out where it ends"
+        );
+        // Still used: the unused-media cleanup leaves the recording alone.
+        assert!(p.used_sources().contains(&original));
+    }
+
+    #[test]
+    fn clips_and_folders_folded_in_keep_their_levels() {
+        let (mut p, track) = project();
+        let (a, b, c, new) = (
+            source(&mut p, "A"),
+            source(&mut p, "B"),
+            source(&mut p, "C"),
+            source(&mut p, "New"),
+        );
+        let base = add(
+            &mut p,
+            track,
+            "Guitar Takes",
+            0.0,
+            ClipContent::Takes(folder(a, 2.0, -3.0)),
+        );
+        // Another folder and a plain clip, each with a gain of its own.
+        let mut other = folder(b, 1.0, -2.0);
+        other.takes[0].audio.gain_db = -1.0;
+        add(&mut p, track, "More Takes", 3.0, ClipContent::Takes(other));
+        let mut plain = audio(c, 1.0);
+        plain.gain_db = -6.0;
+        add(&mut p, track, "Guitar 1", 5.0, ClipContent::Audio(plain));
+
+        let take = new_take(&p, new, 1.0, 5.5);
+        let placed = place(&mut p, track, &[take]);
+        assert_eq!(placed, base, "the folder that was there takes them in");
+        let clips = laid_out(&p, track);
+        assert_eq!(clips.len(), 1, "{clips:#?}");
+        let f = clips[0].3.as_takes().unwrap();
+        assert_eq!(f.gain_db, -3.0);
+        let level = |s: AudioSourceId| {
+            let t = f.takes.iter().find(|t| t.audio.source == s).unwrap();
+            f.gain_db + t.audio.gain_db
+        };
+        assert_eq!(level(a), -3.0);
+        assert_eq!(level(b), -3.0, "its own −1 dB under its folder's −2 dB");
+        assert_eq!(level(c), -6.0);
+        assert_eq!(level(new), -3.0, "a new take plays at the folder's level");
+    }
+
+    /// A folder taken into another keeps the fades at its edges: they go
+    /// into its takes there.
+    #[test]
+    fn a_folder_taken_into_another_keeps_its_edge_fades() {
+        let (mut p, track) = project();
+        let (a, b, new) = (
+            source(&mut p, "A"),
+            source(&mut p, "B"),
+            source(&mut p, "New"),
+        );
+        add(
+            &mut p,
+            track,
+            "Guitar Takes",
+            0.0,
+            ClipContent::Takes(folder(a, 2.0, 0.0)),
+        );
+        let mut faded = folder(b, 1.0, 0.0);
+        faded.fades.fade_out = frames(0.25);
+        add(&mut p, track, "Faded Takes", 3.0, ClipContent::Takes(faded));
+
+        let take = new_take(&p, new, 1.0, 3.5);
+        place(&mut p, track, &[take]);
+        let clips = laid_out(&p, track);
+        assert_eq!(clips.len(), 1, "{clips:#?}");
+        let f = clips[0].3.as_takes().unwrap();
+        let t = f.takes.iter().find(|t| t.audio.source == b).unwrap();
+        assert_eq!(t.audio.fades.fade_out, frames(0.25));
+        let last = f.played().into_iter().last().unwrap();
+        assert_eq!(last.audio.source, b);
+        assert_eq!(
+            last.audio.fades.fade_out,
+            frames(0.25),
+            "it still fades out"
+        );
     }
 }

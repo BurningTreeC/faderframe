@@ -145,7 +145,7 @@ pub fn take_words(
         .takes
         .iter()
         .map(|t| {
-            let Some(sw) = words.get(&t.source) else {
+            let Some(sw) = words.get(&t.audio.source) else {
                 return Vec::new();
             };
             let k = if sw.rate == 0 || sw.rate == rate {
@@ -153,16 +153,17 @@ pub fn take_words(
             } else {
                 f64::from(rate) / f64::from(sw.rate)
             };
-            let to_folder = |f: i64| (f as f64 * k).round() as i64 - t.source_offset;
+            let to_folder = |f: i64| t.folder_of((f as f64 * k).round() as i64);
             sw.words
                 .iter()
                 .enumerate()
                 .filter_map(|(index, w)| {
                     let (a, b) = (to_folder(w.start), to_folder(w.end));
                     let mid = (a + b) / 2;
-                    (mid >= t.start && mid < t.end).then(|| FolderWord {
+                    let (a, b) = (a.min(b), a.max(b));
+                    (mid >= t.start && mid < t.end()).then(|| FolderWord {
                         start: a.max(t.start),
-                        end: b.min(t.end).max(a.max(t.start)),
+                        end: b.min(t.end()).max(a.max(t.start)),
                         text: w.text.trim().to_string(),
                         line: w.line,
                         confidence: w.confidence,
@@ -682,7 +683,7 @@ pub fn plan_comp(
     let end = (b < len && folder.take_at(b) != Some(take)).then(|| {
         let other = folder.take_at(b);
         let mut lo = b;
-        let mut hi = (b + reach).min(t.end);
+        let mut hi = (b + reach).min(t.end());
         if let Some(s) = after(take) {
             hi = hi.min(s);
         }

@@ -155,15 +155,13 @@ fn takes_are_rated() {
             }),
         }))
         .unwrap();
-        folder.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: AudioSourceId(500 + i),
-            source_offset: 0,
-            start: 0,
-            end: 2 * S,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        folder.add_take(Take::plain(
+            format!("Take {}", i + 1),
+            AudioSourceId(500 + i),
+            0,
+            0,
+            2 * S,
+        ));
     }
     let clip = ClipId(9_000);
     s.dispatch(Action::Edit(Command::AddClip {

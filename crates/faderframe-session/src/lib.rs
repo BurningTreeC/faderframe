@@ -457,9 +457,9 @@ pub enum Action {
     /// Turn what the live tracks were played last into clips (recording
     /// or not).
     CaptureMidi,
-    /// Show an audio clip in the pitch editor (finding its notes first if
-    /// it has none).
-    OpenPitchEditor(ClipId),
+    /// Show an audio clip or one take of a folder in the pitch editor
+    /// (finding its notes first if it has none).
+    OpenPitchEditor(faderframe_project::AudioRef),
     /// Select the track and show the surround panner.
     ShowSurroundPanner(TrackId),
     /// Read an object-based master (ADM BWF) into the project.
@@ -504,31 +504,33 @@ pub enum Action {
         index: usize,
         text: Option<String>,
     },
-    /// Show an audio clip's effects in their editor.
-    OpenClipEffects(ClipId),
-    /// Show an audio clip in the spectral editor.
-    OpenSpectralEditor(ClipId),
-    /// Change an audio clip's spectral edits.
+    /// Show the effects of an audio clip or of one take in their editor.
+    OpenClipEffects(faderframe_project::AudioRef),
+    /// Show an audio clip or one take in the spectral editor.
+    OpenSpectralEditor(faderframe_project::AudioRef),
+    /// Change the spectral edits of an audio clip or take.
     EditSpectral {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         change: spectral::SpectralChange,
     },
-    /// Edit an audio clip's effects (rendered once the chain rests).
+    /// Edit the effects of an audio clip or take (rendered once the chain
+    /// rests).
     ClipEffects {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         op: clip_fx::ClipFxOp,
     },
-    /// Show one of a clip's effects in its own editor window: the
-    /// device's GUI, or (`generic`, or when it has none) the generic one.
+    /// Show one of the effects of a clip or take in its own editor window:
+    /// the device's GUI, or (`generic`, or when it has none) the generic
+    /// one.
     OpenClipEffectEditor {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         index: usize,
         generic: bool,
     },
-    /// An audio clip's notes on a new instrument track (melody, harmony
-    /// or drums; after listening to it).
+    /// The notes of an audio clip or take on a new instrument track
+    /// (melody, harmony or drums; after listening to it).
     ConvertToMidi {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         how: to_midi::ToMidi,
     },
     /// A lead sheet of a clip's melody, of several clips' or of a track's
@@ -579,13 +581,13 @@ pub enum Action {
         clip: ClipId,
         what: detect::FromClip,
     },
-    /// Find the notes of audio clips for pitch editing.
+    /// Find the notes of audio clips (or takes) for pitch editing.
     DetectPitch {
-        clips: Vec<ClipId>,
+        audio: Vec<faderframe_project::AudioRef>,
     },
-    /// Edit the notes of a clip's pitch edit.
+    /// Edit the notes of a clip's (or take's) pitch edit.
     EditPitch {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         op: pitch::PitchOp,
     },
     /// Launch clips and scenes, edit the clip launcher.
@@ -1454,16 +1456,18 @@ pub enum Action {
     /// Show (and edit) a clip envelope lane on the arranger's audio clips
     /// (`None`: hide them).
     ShowClipEnvelope(Option<faderframe_project::clip_envelope::EnvelopeLane>),
-    /// Replace one lane of an audio clip's envelope (clip frames at the
-    /// project rate). Drags send it inside a gesture: one undo step.
+    /// Replace one lane of the envelope of an audio clip or take (its
+    /// frames at the project rate). Drags send it inside a gesture: one
+    /// undo step.
     SetClipEnvelope {
-        clip: ClipId,
+        audio: faderframe_project::AudioRef,
         lane: faderframe_project::clip_envelope::EnvelopeLane,
         points: Vec<faderframe_project::clip_envelope::EnvelopePoint>,
     },
-    /// Clear a lane (`None`: every lane) of the clips' envelopes.
+    /// Clear a lane (`None`: every lane) of the envelopes of these clips
+    /// and takes.
     ClearClipEnvelope {
-        clips: Vec<ClipId>,
+        audio: Vec<faderframe_project::AudioRef>,
         lane: Option<faderframe_project::clip_envelope::EnvelopeLane>,
     },
     /// Strip Silence: open its dialog, change settings, apply, close.
@@ -1966,7 +1970,7 @@ pub struct Session {
     /// The listener's head: a tracker over OSC or set by hand.
     head: headtrack::HeadState,
     /// The audio clip the pitch editor shows.
-    pitch_clip: Option<ClipId>,
+    pitch_target: Option<faderframe_project::AudioRef>,
     /// Track renders for freezing and bouncing.
     bounces: Vec<freeze::PendingBounce>,
     /// The mono check is on (listening only).
@@ -2363,7 +2367,7 @@ impl Session {
             launcher: launcher::LauncherState::default(),
             control: control::ControlState::default(),
             head: headtrack::HeadState::default(),
-            pitch_clip: None,
+            pitch_target: None,
             gesture_base: HashMap::new(),
             grouped_targets: None,
             ripple_gesture: ripple::RippleGesture::default(),
@@ -2738,13 +2742,10 @@ impl Session {
         self.editor_clip.filter(|c| self.project.clip(*c).is_some())
     }
 
-    /// The audio clip the pitch editor shows.
-    pub fn pitch_clip(&self) -> Option<ClipId> {
-        self.pitch_clip.filter(|c| {
-            self.project
-                .clip(*c)
-                .is_some_and(|c| c.as_audio().is_some())
-        })
+    /// The audio clip, or the take of a folder, the pitch editor shows.
+    pub fn pitch_target(&self) -> Option<faderframe_project::AudioRef> {
+        self.pitch_target
+            .filter(|r| self.project.audio(*r).is_some())
     }
 
     /// Bumped on every model change (views may cache against it).
@@ -4414,8 +4415,8 @@ impl Session {
         // A clip effect in an editor window of its own: an edit of its
         // chain, whatever the window sent.
         if let Some(edits) = self.clip_fx_commands(&cmd) {
-            for (clip, op) in edits {
-                self.edit_clip_fx(clip, op)?;
+            for (audio, op) in edits {
+                self.edit_clip_fx(audio, op)?;
             }
             return Ok(());
         }
@@ -4858,7 +4859,7 @@ impl Session {
                 target,
             } => self.make_sample(track, start, end, target)?,
             Action::CaptureMidi => self.capture_midi()?,
-            Action::DetectPitch { clips } => self.detect_pitch(&clips)?,
+            Action::DetectPitch { audio } => self.detect_pitch(&audio)?,
             Action::FromClip { clip, what } => self.from_clip(clip, what)?,
             Action::SongStructure { clips } => self.song_structure(&clips)?,
             Action::Mix(op) => self.mix_op(op)?,
@@ -4868,7 +4869,7 @@ impl Session {
             Action::Talkback(op) => self.talk(op)?,
             Action::Show(op) => self.show_op(op)?,
             Action::Maps(op) => self.map_op(op)?,
-            Action::ConvertToMidi { clip, how } => self.convert_to_midi(clip, how)?,
+            Action::ConvertToMidi { audio, how } => self.convert_to_midi(audio, how)?,
             Action::MakeLeadSheet { of, grid } => self.make_lead_sheet(of, grid)?,
             Action::MakeTab { of } => self.make_tab(of)?,
             Action::SetSheetStyle(style) => self.set_sheet_style(style)?,
@@ -4877,9 +4878,9 @@ impl Session {
             Action::ExportLeadSheet(path) => {
                 self.export_lead_sheet(&path)?;
             }
-            Action::OpenClipEffects(clip) => self.open_clip_fx(clip)?,
-            Action::OpenSpectralEditor(clip) => self.open_spectral(clip)?,
-            Action::EditSpectral { clip, change } => self.edit_spectral(clip, change)?,
+            Action::OpenClipEffects(audio) => self.open_clip_fx(audio)?,
+            Action::OpenSpectralEditor(audio) => self.open_spectral(audio)?,
+            Action::EditSpectral { audio, change } => self.edit_spectral(audio, change)?,
             Action::DownloadSpeechModel => self.download_speech_model()?,
             Action::Transcribe(clip) => self.transcribe(clip)?,
             Action::ExportLyrics => {
@@ -4890,12 +4891,12 @@ impl Session {
             }
             a @ (Action::SaveQcReport { .. } | Action::NullTestStems) => self.qc_action(a)?,
             Action::EditLyric { index, text } => self.edit_lyric(index, text)?,
-            Action::ClipEffects { clip, op } => self.edit_clip_fx(clip, op)?,
+            Action::ClipEffects { audio, op } => self.edit_clip_fx(audio, op)?,
             Action::OpenClipEffectEditor {
-                clip,
+                audio,
                 index,
                 generic,
-            } => self.open_clip_fx_editor(clip, index, generic)?,
+            } => self.open_clip_fx_editor(audio, index, generic)?,
             Action::ImportAdm(path) => self.start_adm_import(path),
             Action::SetMonoCheck(on) => self.set_mono_check(on)?,
             Action::SetBassManagement(b) => self.set_bass_management(b)?,
@@ -4921,19 +4922,19 @@ impl Session {
                 })?;
                 self.workspace_action(WorkspaceAction::ShowView(ViewId::surround()))?;
             }
-            Action::OpenPitchEditor(clip) => {
-                let Some(a) = self.project.clip(clip).and_then(|c| c.as_audio()) else {
+            Action::OpenPitchEditor(target) => {
+                let Some(a) = self.project.audio(target) else {
                     return Ok(());
                 };
                 let analysed = a.pitch.is_some();
-                self.pitch_clip = Some(clip);
+                self.pitch_target = Some(target);
                 self.workspace_action(WorkspaceAction::ShowView(ViewId::pitch()))?;
                 if !analysed {
-                    self.detect_pitch(&[clip])?;
+                    self.detect_pitch(&[target])?;
                 }
                 self.revision += 1;
             }
-            Action::EditPitch { clip, op } => self.edit_pitch(clip, op)?,
+            Action::EditPitch { audio, op } => self.edit_pitch(audio, op)?,
             Action::Launcher(op) => self.launcher_op(op)?,
             Action::SaveVersion { name } => {
                 self.save_version(&name)?;
@@ -5686,11 +5687,15 @@ impl Session {
                 self.editor.clip_envelope = lane;
                 self.revision += 1;
             }
-            Action::SetClipEnvelope { clip, lane, points } => {
-                self.set_clip_envelope_lane(clip, lane, points)?;
+            Action::SetClipEnvelope {
+                audio,
+                lane,
+                points,
+            } => {
+                self.set_clip_envelope_lane(audio, lane, points)?;
             }
-            Action::ClearClipEnvelope { clips, lane } => {
-                self.clear_clip_envelopes(&clips, lane)?;
+            Action::ClearClipEnvelope { audio, lane } => {
+                self.clear_clip_envelopes(&audio, lane)?;
             }
             Action::StripSilence(op) => self.strip_silence(op)?,
             Action::CaptureAudio => self.capture_audio()?,
@@ -6201,10 +6206,11 @@ impl Session {
         if let Some((t, s)) = self.plugin_slot(plugin) {
             return Some((t.id, s));
         }
-        // A clip effect in its own editor window: the clip's track (its
-        // commands become edits of the clip's chain).
-        if let Some((clip, _, s)) = self.clip_fx_slot(plugin) {
-            return Some((self.project.clip(clip)?.track, s));
+        // A clip effect in its own editor window: the track of the clip
+        // (or of the take's folder; its commands become edits of the
+        // chain).
+        if let Some((audio, _, s)) = self.clip_fx_slot(plugin) {
+            return Some((self.project.clip(audio.clip())?.track, s));
         }
         let (_, s) = self.project.album.insert(plugin)?;
         Some((self.project.master_id()?, s))

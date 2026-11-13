@@ -717,15 +717,13 @@ fn a_take_folders_comp_is_taken_whole() {
     let a = base.clip(pad).unwrap().as_audio().unwrap().clone();
     let mut folder = crate::TakeFolder::new(a.length);
     for i in 0..3 {
-        folder.add_take(crate::Take {
-            name: format!("Take {}", i + 1),
-            source: a.source,
-            source_offset: 0,
-            start: 0,
-            end: a.length,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        folder.add_take(crate::Take::plain(
+            format!("Take {}", i + 1),
+            a.source,
+            0,
+            0,
+            a.length,
+        ));
     }
     base.clips.get_mut(&pad).unwrap().content = ClipContent::Takes(folder);
     let (mut ours, mut theirs) = (base.clone(), base.clone());

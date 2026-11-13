@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const FORMAT_ID: &str = "faderframe-project";
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 pub const FILE_EXTENSION: &str = "ffproj";
 
 #[derive(Debug, thiserror::Error)]
@@ -105,7 +105,7 @@ type Migration = fn(Value) -> Result<Value, FileError>;
 
 /// `MIGRATIONS[i]` upgrades a document from version `i` to `i + 1`.
 /// Version 0 never existed publicly; the entry documents the pattern.
-const MIGRATIONS: &[Migration] = &[migrate_v0_to_v1, migrate_v1_to_v2];
+const MIGRATIONS: &[Migration] = &[migrate_v0_to_v1, migrate_v1_to_v2, migrate_v2_to_v3];
 
 fn migrate_v0_to_v1(mut doc: Value) -> Result<Value, FileError> {
     // Pre-release drafts stored the track list as "channels".
@@ -141,6 +141,80 @@ fn migrate_v1_to_v2(mut doc: Value) -> Result<Value, FileError> {
                 t.insert("monitor".into(), Value::String("auto".into()));
             }
         }
+    }
+    Ok(doc)
+}
+
+/// Version 3 made every take of a take folder an audio clip of its own
+/// (so it can carry a clip's edits): `{ name, source, source_offset (the
+/// source frame at the folder's start), start, end, gain_db, rating }`
+/// becomes `{ name, start, audio: { source, source_offset (at the take's
+/// start), length, gain_db }, rating }`, each with an id of its own in
+/// its folder (1, 2, …; the folder's `next_take` after them). Folders are
+/// found wherever they are (clips, scratch pads put aside, launcher
+/// slots).
+fn migrate_v2_to_v3(mut doc: Value) -> Result<Value, FileError> {
+    fn take(t: &mut Value, id: usize) -> Result<(), FileError> {
+        let Some(t) = t.as_object_mut() else {
+            return Ok(());
+        };
+        if t.contains_key("audio") {
+            return Ok(());
+        }
+        t.insert("id".into(), Value::from(id));
+        let int = |t: &serde_json::Map<String, Value>, k: &str| {
+            t.get(k)
+                .and_then(Value::as_i64)
+                .ok_or_else(|| FileError::Corrupt(format!("a take without {k}")))
+        };
+        let (offset, start, end) = (int(t, "source_offset")?, int(t, "start")?, int(t, "end")?);
+        let source = t
+            .remove("source")
+            .ok_or_else(|| FileError::Corrupt("a take without source".into()))?;
+        let gain = t.remove("gain_db").unwrap_or(Value::from(0.0));
+        t.remove("source_offset");
+        t.remove("end");
+        t.insert(
+            "audio".into(),
+            serde_json::json!({
+                "source": source,
+                "source_offset": offset + start,
+                "length": (end - start).max(0),
+                "gain_db": gain,
+            }),
+        );
+        Ok(())
+    }
+    fn walk(v: &mut Value) -> Result<(), FileError> {
+        match v {
+            Value::Object(o) => {
+                let folder = o.contains_key("comp");
+                let mut count = 0;
+                for (k, child) in o.iter_mut() {
+                    if folder && k == "takes" {
+                        for (i, t) in child.as_array_mut().into_iter().flatten().enumerate() {
+                            take(t, i + 1)?;
+                            count = i + 1;
+                        }
+                    } else {
+                        walk(child)?;
+                    }
+                }
+                if folder && !o.contains_key("next_take") {
+                    o.insert("next_take".into(), Value::from(count + 1));
+                }
+            }
+            Value::Array(a) => {
+                for child in a {
+                    walk(child)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    if let Some(project) = doc.get_mut("project") {
+        walk(project)?;
     }
     Ok(doc)
 }

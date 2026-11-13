@@ -169,6 +169,53 @@ fn recording_again_makes_a_take_folder_and_comps_the_new_take() {
     assert!(clips(&s, t)[0].as_takes().is_some());
 }
 
+/// #67: recording over an edited clip makes it a take with every edit of
+/// its own; the comp plays it so, and Flatten Comp gives back clips that
+/// still carry them. One undo step takes the recording back.
+#[test]
+fn recording_over_an_edited_clip_keeps_its_edits_in_the_take() {
+    let (mut s, t) = session();
+    record(&mut s, 0.5);
+    let first = clips(&s, t)[0].clone();
+    let mut down = first.as_audio().unwrap().clone();
+    down.stretch = faderframe_project::StretchSettings::pitch(-12.0);
+    s.edit(Command::SetClipContent {
+        clip: first.id,
+        start: first.start,
+        content: Box::new(ClipContent::Audio(down.clone())),
+    })
+    .unwrap();
+    let before = s.project().clone();
+    locate(&mut s, 0.1);
+    record(&mut s, 0.3);
+
+    let c = clips(&s, t);
+    assert_eq!(c.len(), 1, "one folder: {c:?}");
+    let f = c[0].as_takes().expect("take folder");
+    assert_eq!(f.takes.len(), 2);
+    assert_eq!(f.takes[0].audio, down, "the edited clip, edits and all");
+    assert_eq!(
+        f.takes[1].audio.stretch.semitones(),
+        0.0,
+        "the new take as played"
+    );
+
+    // Flattened: the transposed pieces stay transposed.
+    s.dispatch(Action::FlattenTakes(c[0].id)).unwrap();
+    let flat = clips(&s, t);
+    assert_eq!(flat.len(), 3, "{flat:?}");
+    let semitones: Vec<f32> = flat
+        .iter()
+        .map(|c| c.as_audio().unwrap().stretch.semitones())
+        .collect();
+    assert_eq!(semitones, vec![-12.0, 0.0, -12.0]);
+    s.dispatch(Action::Undo).unwrap();
+
+    s.dispatch(Action::Undo).unwrap();
+    let back: Vec<_> = before.clips_of(t).into_iter().cloned().collect();
+    assert_eq!(clips(&s, t), back, "one step");
+}
+
 #[test]
 fn replace_mode_cuts_existing_clips_back() {
     let (mut s, t) = session();

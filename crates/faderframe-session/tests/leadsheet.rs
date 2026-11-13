@@ -512,15 +512,7 @@ fn a_take_folder_is_heard_as_its_comp_plays() {
     let len = (4.0 * 60.0 / bpm * f64::from(SR)) as i64;
     let mut folder = TakeFolder::new(len);
     for (i, (_, _, source)) in sources.iter().enumerate() {
-        folder.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: *source,
-            source_offset: 0,
-            start: 0,
-            end: len,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        folder.add_take(Take::plain(format!("Take {}", i + 1), *source, 0, 0, len));
     }
     folder.set_comp(0, len / 2, Some(0));
     folder.set_comp(len / 2, len, Some(1));

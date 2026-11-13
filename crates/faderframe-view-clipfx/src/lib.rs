@@ -1,5 +1,6 @@
-//! Clip effects: the devices on one audio clip (rendered offline into the
-//! audio it plays, see `faderframe_session::clip_fx`), a card each with
+//! Clip effects: the devices on one audio clip or on one take of a take
+//! folder (rendered offline into the audio it plays, see
+//! `faderframe_session::clip_fx`), a card each with
 //! its parameters as bars — drag across one to set it (Shift: finely),
 //! double-click to reset it. "+ Add Effect" offers the audio effects the
 //! session knows (built-ins first); a card's header bypasses, moves or
@@ -10,9 +11,8 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_core::ClipId;
 use faderframe_plugin_host::{ParameterInfo, ParameterUnit};
-use faderframe_project::PluginSlot;
+use faderframe_project::{AudioRef, PluginSlot};
 use faderframe_session::clip_fx::ClipFxOp;
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::{
@@ -123,9 +123,10 @@ impl ClipFxView {
         }
     }
 
-    fn clip(model: &Session) -> Option<(ClipId, String, Vec<PluginSlot>)> {
-        let id = model.clip_fx_clip()?;
-        let name = model.project().clip(id)?.name.clone();
+    /// The clip or take shown: what it is, its name and its chain.
+    fn clip(model: &Session) -> Option<(AudioRef, String, Vec<PluginSlot>)> {
+        let id = model.clip_fx_target()?;
+        let name = model.project().audio_name(id)?;
         Some((id, name, model.clip_fx_chain(id)))
     }
 
@@ -244,7 +245,7 @@ impl ClipFxView {
         })
     }
 
-    fn add_menu(model: &Session, clip: ClipId, at: Point) -> HostRequest<Action> {
+    fn add_menu(model: &Session, clip: AudioRef, at: Point) -> HostRequest<Action> {
         let mut plugins: Vec<_> = model
             .available_plugins()
             .into_iter()
@@ -274,7 +275,7 @@ impl ClipFxView {
             let item = MenuItem::new(
                 label,
                 Action::ClipEffects {
-                    clip,
+                    audio: clip,
                     op: ClipFxOp::Add(p.plugin),
                 },
             );
@@ -406,7 +407,7 @@ impl ClipFxView {
     fn set(
         &self,
         model: &Session,
-        clip: ClipId,
+        clip: AudioRef,
         card: usize,
         parameter: usize,
         value: f64,
@@ -421,7 +422,7 @@ impl ClipFxView {
             return;
         };
         cx.emit(Action::ClipEffects {
-            clip,
+            audio: clip,
             op: ClipFxOp::SetParameter {
                 index: card,
                 parameter: info.id,
@@ -446,7 +447,7 @@ impl ClipFxView {
         let Some(hit) = self.hit(pos, size, model) else {
             return false;
         };
-        let op = |op| Action::ClipEffects { clip, op };
+        let op = |op| Action::ClipEffects { audio: clip, op };
         match hit {
             Hit::Add => cx.request(Self::add_menu(model, clip, pos)),
             Hit::Clear => cx.emit(op(ClipFxOp::Clear)),
@@ -460,7 +461,7 @@ impl ClipFxView {
             }
             Hit::Remove(i) => cx.emit(op(ClipFxOp::Remove(i))),
             Hit::Window(index) => cx.emit(Action::OpenClipEffectEditor {
-                clip,
+                audio: clip,
                 index,
                 generic: false,
             }),
@@ -505,7 +506,7 @@ impl CanvasView<Session, Action> for ClipFxView {
         p.hline(0.0, size.w, HEADER_H - 0.5, th.ui.border);
         let Some((clip, name, chain)) = Self::clip(model) else {
             p.text(
-                "Right-click an audio clip and choose Clip Effects",
+                "Right-click an audio clip (or a take lane) and choose Clip Effects",
                 Rect::new(0.0, HEADER_H, size.w, size.h - HEADER_H),
                 &TextStyle::new(th.fonts.normal, th.ui.text_dim).center(),
             );
@@ -629,7 +630,9 @@ impl CanvasView<Session, Action> for ClipFxView {
     }
 
     fn wants_frames(&self, model: &Session) -> bool {
-        model.clip_fx_clip().is_some_and(|c| model.clip_fx_busy(c))
+        model
+            .clip_fx_target()
+            .is_some_and(|c| model.clip_fx_busy(c))
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
@@ -691,15 +694,16 @@ mod tests {
     use faderframe_project::{PluginFormat, PluginRef};
     use faderframe_ui_canvas::RecordingPainter;
 
-    fn session() -> (Session, ClipId) {
+    fn session() -> (Session, AudioRef) {
         let mut s = Session::demo(EngineConfig::default()).unwrap();
-        let pad = s
+        let pad: AudioRef = s
             .project()
             .tracks
             .iter()
             .find(|t| t.name == "Pad")
             .unwrap()
-            .clips[0];
+            .clips[0]
+            .into();
         s.dispatch(Action::OpenClipEffects(pad)).unwrap();
         (s, pad)
     }
@@ -751,7 +755,7 @@ mod tests {
         assert!(!labels.iter().any(|l| l.contains("Synth")), "{labels:?}");
         // A utility on the clip.
         s.dispatch(Action::ClipEffects {
-            clip,
+            audio: clip,
             op: ClipFxOp::Add(PluginRef {
                 format: PluginFormat::Builtin,
                 id: faderframe_core::builtin::GAIN.into(),
@@ -826,7 +830,7 @@ mod tests {
         let size = Size::new(900.0, 420.0);
         let mut view = ClipFxView::new(Theme::default());
         s.dispatch(Action::ClipEffects {
-            clip,
+            audio: clip,
             op: ClipFxOp::Add(PluginRef {
                 format: PluginFormat::Builtin,
                 id: faderframe_core::builtin::GAIN.into(),

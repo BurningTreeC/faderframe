@@ -9,6 +9,8 @@
 //! once — the arranger paints them on the clips while the dialog is open
 //! ([`Session::strip_silence_preview`]). Warped and reversed clips are
 //! looked at as they play: a clip's levels are read through its time map.
+//! Take folders are left out with a word why: a take is one clip in its
+//! folder and cannot be cut into pieces there (Flatten Comp first).
 
 use crate::{Result, Session, SessionError, UiRequest};
 use faderframe_analysis::silence::{self, HOP, Levels};
@@ -228,6 +230,14 @@ impl Session {
                     None if clips.is_empty() => self.selected_arranger_clips(),
                     None => clips,
                 };
+                // A take is one clip in its folder: it cannot be cut into
+                // pieces there, so folders are left out (and said so).
+                let folders: Vec<String> = clips
+                    .iter()
+                    .filter_map(|c| self.project.clip(*c))
+                    .filter(|c| c.as_takes().is_some())
+                    .map(|c| format!("‘{}’", c.name))
+                    .collect();
                 let clips: Vec<ClipId> = clips
                     .into_iter()
                     .filter(|c| {
@@ -236,10 +246,20 @@ impl Session {
                             .is_some_and(|c| matches!(c.content, ClipContent::Audio(_)))
                     })
                     .collect();
+                let flatten = (!folders.is_empty()).then(|| {
+                    format!(
+                        "Strip Silence cuts clips, not the takes in a take folder: \
+                         flatten the comp of {} first",
+                        folders.join(", ")
+                    )
+                });
                 if clips.is_empty() {
-                    return Err(SessionError::Other(
-                        "Strip Silence works on audio clips: select some".into(),
-                    ));
+                    return Err(SessionError::Other(flatten.unwrap_or_else(|| {
+                        "Strip Silence works on audio clips: select some".into()
+                    })));
+                }
+                if let Some(text) = flatten {
+                    self.notify(crate::NoticeLevel::Info, text);
                 }
                 self.strip_silence.open = true;
                 self.strip_silence.preview.clips = clips;

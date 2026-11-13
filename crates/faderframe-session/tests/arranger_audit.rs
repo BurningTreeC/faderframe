@@ -357,15 +357,13 @@ fn a_nudge_trim_passes_over_take_folders() {
     let plain = add(&mut s, audio(t[0], source, bar(0.0), 2.0, 100));
     let mut folder = audio(t[1], source, bar(0.0), 2.0, 101);
     let mut takes = faderframe_project::TakeFolder::new(2 * BAR);
-    let first = takes.add_take(faderframe_project::Take {
-        name: "Take 1".into(),
+    let first = takes.add_take(faderframe_project::Take::plain(
+        "Take 1",
         source,
-        source_offset: 0,
-        start: 0,
-        end: 2 * BAR,
-        gain_db: 0.0,
-        rating: 0,
-    });
+        0,
+        0,
+        2 * BAR,
+    ));
     takes.use_take(first);
     folder.content = ClipContent::Takes(takes);
     let folder = add(&mut s, folder);

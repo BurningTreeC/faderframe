@@ -239,10 +239,11 @@ fn source_spans(content: &ClipContent) -> BTreeMap<AudioSourceId, Vec<(i64, i64)
     match content {
         ClipContent::Takes(f) => {
             for t in &f.takes {
-                if t.end > t.start {
-                    out.entry(t.source)
+                let a = &t.audio;
+                if a.length > 0 {
+                    out.entry(a.source)
                         .or_default()
-                        .push((t.source_offset + t.start, t.source_offset + t.end));
+                        .push((a.source_offset, a.source_offset + a.source_span()));
                 }
             }
         }
@@ -784,16 +785,16 @@ impl Session {
                 let take = f.takes.get(t);
                 let fresh = self.lyric_comp.serial == self.project_serial;
                 let sound = w.zip(take).filter(|_| fresh).and_then(|(w, take)| {
-                    let src = p.source_words.get(&take.source)?;
+                    let src = p.source_words.get(&take.audio.source)?;
                     let sw = src.words.get(w.index)?;
                     let mut s = *self
                         .lyric_comp
                         .sounds
-                        .get(&take.source)?
+                        .get(&take.audio.source)?
                         .get(&(sw.start, sw.end))?;
                     // The take's gain counts in its level.
-                    s.level_db += take.gain_db;
-                    s.floor_db += take.gain_db;
+                    s.level_db += take.audio.gain_db;
+                    s.floor_db += take.audio.gain_db;
                     Some(s)
                 });
                 times.push(sound.and(w.map(|w| timing(w.start))));
@@ -824,9 +825,18 @@ impl Session {
             if let Some(f) = c.as_takes() {
                 f.length.hash(&mut h);
                 for t in &f.takes {
-                    (t.source.raw(), t.source_offset, t.start, t.end).hash(&mut h);
-                    t.gain_db.to_bits().hash(&mut h);
-                    if let Some(w) = p.source_words.get(&t.source) {
+                    // Where its words land: its place and how it plays
+                    // its source.
+                    let a = &t.audio;
+                    (a.source.raw(), a.source_offset, a.length, t.start).hash(&mut h);
+                    (a.gain_db.to_bits(), a.reversed).hash(&mut h);
+                    if let Some(w) = &a.warp {
+                        w.source_length.hash(&mut h);
+                        for m in &w.markers {
+                            (m.at, m.source).hash(&mut h);
+                        }
+                    }
+                    if let Some(w) = p.source_words.get(&a.source) {
                         w.rate.hash(&mut h);
                         for x in &w.words {
                             (x.start, x.end, &x.text, x.line).hash(&mut h);
@@ -915,9 +925,9 @@ impl Session {
         let len = (e.hi - e.lo) as usize + 2 * pad;
         let window = |t: usize| -> Option<Vec<f32>> {
             let tk = f.takes.get(t)?;
-            let frames =
-                self.source_frames(tk.source, tk.source_offset + e.lo - pad as i64, len)?;
-            let g = faderframe_core::gain::db_to_gain(tk.gain_db);
+            let from = tk.source_at(e.lo - pad as i64).round() as i64;
+            let frames = self.source_frames(tk.audio.source, from, len)?;
+            let g = faderframe_core::gain::db_to_gain(tk.audio.gain_db);
             Some(
                 (0..len)
                     .map(|i| frames.iter().map(|ch| ch[i]).sum::<f32>() * g)
@@ -1003,9 +1013,12 @@ impl Session {
 
     /// The syllable under each note of an audio clip's pitch edit (empty
     /// without words heard in its source).
-    pub fn pitch_syllables(&self, clip: ClipId) -> Vec<Option<NoteSyllable>> {
+    pub fn pitch_syllables(
+        &self,
+        audio: faderframe_project::AudioRef,
+    ) -> Vec<Option<NoteSyllable>> {
         let p = &self.project;
-        let Some(a) = p.clip(clip).and_then(|c| c.as_audio()) else {
+        let Some(a) = p.audio(audio) else {
             return Vec::new();
         };
         let (Some(edit), Some(words)) = (a.pitch.as_ref(), p.source_words.get(&a.source)) else {

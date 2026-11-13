@@ -288,15 +288,7 @@ fn flatten_keeps_the_declicks_of_a_comp_with_gaps() {
     let len = 3 * SR as i64;
     let mut f = TakeFolder::new(len);
     for name in ["A", "B"] {
-        f.add_take(Take {
-            name: name.into(),
-            source,
-            source_offset: 0,
-            start: 0,
-            end: len,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(Take::plain(name, source, 0, 0, len));
     }
     // A for a second, silence, B from two seconds on.
     f.comp = vec![
@@ -482,7 +474,7 @@ fn passes_inside_a_punch_range_end_with_their_own_audio() {
     assert!(f.takes.len() >= 3, "{} passes", f.takes.len());
     let window = (0.2 * SR as f64) as i64;
     for take in &f.takes {
-        assert_eq!(take.end - take.start, window - 480, "{}", take.name);
+        assert_eq!(take.audio.length, window - 480, "{}", take.name);
     }
 }
 

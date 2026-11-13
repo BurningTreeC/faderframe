@@ -20,8 +20,7 @@ use faderframe_midi::{Fine, MidiEvent};
 use faderframe_project::articulation::{ArticulationMap, Directions};
 use faderframe_project::drum_map::DrumMap;
 use faderframe_project::{
-    ClipContent, ExpressionKind, FadeShape, MidiClip, MpeConfig, Project, SourceSpec, TakeFolder,
-    WarpAlgorithm,
+    ClipContent, ExpressionKind, FadeShape, MidiClip, MpeConfig, Project, SourceSpec, WarpAlgorithm,
 };
 use faderframe_realtime::{Epoch, Reclaimer};
 use faderframe_timeline::Timeline;
@@ -1087,65 +1086,31 @@ impl TimelineSnapshot {
             let start = tl.to_samples(clip.start, sr);
             match &clip.content {
                 ClipContent::Audio(a) => {
-                    let region = AudioPiece {
-                        source: a.source,
-                        source_offset: a.source_offset,
-                        rel_start: 0,
-                        length: a.length,
-                        gain_db: a.gain_db,
-                        fade_in: (a.fades.fade_in, a.fades.fade_in_shape, a.fades.fade_in_bend),
-                        fade_out: (
-                            a.fades.fade_out,
-                            a.fades.fade_out_shape,
-                            a.fades.fade_out_bend,
-                        ),
-                        reversed: a.reversed,
-                    }
-                    .region(start, sources, sr, project_rate);
-                    let Some(mut r) = region else { continue };
-                    if let Some(e) = &a.envelope {
-                        r.envelope = RegionEnvelope::new(e, r.start, sr / project_rate);
-                    }
                     let lane = lane_for(&mut lanes, &mut launch_lanes, clip.track, slot);
-                    let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
-                    match a.warp.as_ref() {
-                        Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
-                            lane.warped.push(warped_region(
-                                clip.id.raw(),
-                                r,
-                                a,
-                                w,
-                                sr,
-                                project_rate,
-                            ));
-                        }
-                        // Pitch edited or transposed: through a stretcher,
-                        // 1:1 in time.
-                        _ if (pitched || a.stretch.semitones() != 0.0) && !a.reversed => {
-                            let w = faderframe_project::Warp::uniform(a.length);
-                            lane.warped.push(warped_region(
-                                clip.id.raw(),
-                                r,
-                                a,
-                                &w,
-                                sr,
-                                project_rate,
-                            ));
-                        }
-                        _ => lane.audio.push(r),
-                    }
+                    place_audio(lane, clip.id.raw(), start, 0, a, sources, sr, project_rate);
                 }
                 ClipContent::Takes(f) => {
+                    // Its takes' clips cut at the comp's boundaries, each
+                    // played as any clip is (the same pieces Flatten Comp
+                    // places).
                     let pieces = match audition {
-                        Some((c, take)) if c == clip.id => take_pieces(f, take),
-                        _ => comp_pieces(f),
+                        Some((c, take)) if c == clip.id => f.played_take(take),
+                        _ => f.played(),
                     };
-                    for piece in pieces {
-                        if let Some(r) = piece.region(start, sources, sr, project_rate) {
-                            lane_for(&mut lanes, &mut launch_lanes, clip.track, slot)
-                                .audio
-                                .push(r);
-                        }
+                    let lane = lane_for(&mut lanes, &mut launch_lanes, clip.track, slot);
+                    for piece in &pieces {
+                        let take = f.takes.get(piece.take).map_or(0, |t| t.id.0);
+                        let key = piece_key(clip.id.raw(), take, piece.start);
+                        place_audio(
+                            lane,
+                            key,
+                            start,
+                            piece.start,
+                            &piece.audio,
+                            sources,
+                            sr,
+                            project_rate,
+                        );
                     }
                 }
                 ClipContent::Midi(m) => {
@@ -1610,95 +1575,67 @@ impl AudioPiece {
     }
 }
 
-/// Frames of fade at comp edges that do not crossfade (declick).
-const DECLICK: i64 = faderframe_project::COMP_DECLICK;
-
-/// The pieces a take folder's comp plays, with centred equal-power
-/// crossfades where two pieces touch.
-fn comp_pieces(f: &TakeFolder) -> Vec<AudioPiece> {
-    let pieces = f.pieces();
-    let half = f.crossfade.max(0) / 2;
-    let mut out = Vec::with_capacity(pieces.len());
-    for (i, p) in pieces.iter().enumerate() {
-        let take = &f.takes[p.take];
-        let touches_prev = i > 0 && pieces[i - 1].end == p.start;
-        let touches_next = pieces.get(i + 1).is_some_and(|n| n.start == p.end);
-        let a = if touches_prev {
-            (p.start - half).max(take.start)
-        } else {
-            p.start
-        };
-        let b = if touches_next {
-            (p.end + half).min(take.end)
-        } else {
-            p.end
-        };
-        let fade_in = if touches_prev {
-            (p.start + half - a, FadeShape::EqualPower, 0)
-        } else if p.start == 0 {
-            (f.fades.fade_in, f.fades.fade_in_shape, f.fades.fade_in_bend)
-        } else {
-            (DECLICK, FadeShape::Linear, 0)
-        };
-        let fade_out = if touches_next {
-            (b - (p.end - half), FadeShape::EqualPower, 0)
-        } else if p.end == f.length {
-            (
-                f.fades.fade_out,
-                f.fades.fade_out_shape,
-                f.fades.fade_out_bend,
-            )
-        } else {
-            (DECLICK, FadeShape::Linear, 0)
-        };
-        out.push(AudioPiece {
-            source: take.source,
-            source_offset: take.source_offset + a,
-            rel_start: a,
-            length: b - a,
-            gain_db: f.gain_db + take.gain_db,
-            fade_in,
-            fade_out,
-            reversed: false,
-        });
+/// Place audio clip `a` (at `rel_start` project frames after `start`, in
+/// engine frames) on `lane`: a plain region, or through a stretcher where
+/// it is warped, transposed or pitch edited (`key`: its stretcher voices
+/// follow it across blocks).
+#[allow(clippy::too_many_arguments)]
+fn place_audio(
+    lane: &mut Lane,
+    key: u64,
+    start: i64,
+    rel_start: i64,
+    a: &faderframe_project::AudioClip,
+    sources: &SourceMap,
+    sr: f64,
+    project_rate: f64,
+) {
+    let region = AudioPiece {
+        source: a.source,
+        source_offset: a.source_offset,
+        rel_start,
+        length: a.length,
+        gain_db: a.gain_db,
+        fade_in: (a.fades.fade_in, a.fades.fade_in_shape, a.fades.fade_in_bend),
+        fade_out: (
+            a.fades.fade_out,
+            a.fades.fade_out_shape,
+            a.fades.fade_out_bend,
+        ),
+        reversed: a.reversed,
     }
-    out
+    .region(start, sources, sr, project_rate);
+    let Some(mut r) = region else { return };
+    if let Some(e) = &a.envelope {
+        r.envelope = RegionEnvelope::new(e, r.start, sr / project_rate);
+    }
+    let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
+    match a.warp.as_ref() {
+        Some(w) if !a.reversed && !w.is_identity(a.source_offset, a.length) => {
+            lane.warped
+                .push(warped_region(key, r, a, w, sr, project_rate));
+        }
+        // Pitch edited or transposed: through a stretcher, 1:1 in time.
+        _ if (pitched || a.stretch.semitones() != 0.0) && !a.reversed => {
+            let w = faderframe_project::Warp::uniform(a.length);
+            lane.warped
+                .push(warped_region(key, r, a, &w, sr, project_rate));
+        }
+        _ => lane.audio.push(r),
+    }
 }
 
-/// A take of a folder played whole (auditioned): where it has material,
-/// with the folder's fades at the folder's edges.
-fn take_pieces(f: &TakeFolder, k: usize) -> Vec<AudioPiece> {
-    let Some(take) = f.takes.get(k) else {
-        return Vec::new();
-    };
-    let (a, b) = (take.start.max(0), take.end.min(f.length));
-    if b <= a {
-        return Vec::new();
+/// The stretcher key of a comp piece: its folder's clip, its take's id
+/// and where it starts (pieces overlapping in a crossfade get voices of
+/// their own; a piece keeps its voice while the comp changes elsewhere,
+/// takes come or go).
+fn piece_key(clip: u64, take: u32, start: i64) -> u64 {
+    let mut h = clip ^ 0x9e37_79b9_7f4a_7c15;
+    for v in [u64::from(take), start as u64] {
+        h = (h ^ v).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 31;
     }
-    let fade_in = if a == 0 {
-        (f.fades.fade_in, f.fades.fade_in_shape, f.fades.fade_in_bend)
-    } else {
-        (DECLICK, FadeShape::Linear, 0)
-    };
-    let fade_out = if b == f.length {
-        (
-            f.fades.fade_out,
-            f.fades.fade_out_shape,
-            f.fades.fade_out_bend,
-        )
-    } else {
-        (DECLICK, FadeShape::Linear, 0)
-    };
-    vec![AudioPiece {
-        source: take.source,
-        source_offset: take.source_offset + a,
-        rel_start: a,
-        length: b - a,
-        gain_db: f.gain_db + take.gain_db,
-        fade_in,
-        fade_out,
-        reversed: false,
-    }]
+    h
 }
 
 /// A streamed region as seen by the disk loader.

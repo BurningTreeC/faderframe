@@ -292,15 +292,13 @@ fn session_with_takes() -> (Session, ClipId, usize) {
     let a = c.as_audio().unwrap().clone();
     let mut f = TakeFolder::new(a.length);
     for i in 0..3 {
-        f.add_take(faderframe_project::Take {
-            name: format!("Take {}", i + 1),
-            source: a.source,
-            source_offset: a.source_offset,
-            start: 0,
-            end: a.length,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(faderframe_project::Take::plain(
+            format!("Take {}", i + 1),
+            a.source,
+            a.source_offset,
+            0,
+            a.length,
+        ));
     }
     f.use_take(2);
     s.edit(Command::SetClipContent {
@@ -310,6 +308,136 @@ fn session_with_takes() -> (Session, ClipId, usize) {
     })
     .unwrap();
     (s, clip, row)
+}
+
+/// A take lane's menu opens the pitch editor on that take (a take is a
+/// clip of its own).
+#[test]
+fn a_take_lanes_menu_edits_the_pitch_of_that_take() {
+    let (mut s, clip, _) = session_with_takes();
+    let c = s.project().clip(clip).unwrap().clone();
+    let HostRequest::ContextMenu { items, .. } =
+        ArrangerView::take_menu(&s, &c, 1, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let item = items
+        .iter()
+        .find(|i| i.label == "Edit Pitch of “Take 2” (find its notes)")
+        .expect("Edit Pitch for take 2");
+    let two = s.project().take_ref(clip, 1).unwrap();
+    assert_eq!(item.action, Some(Action::OpenPitchEditor(two.into())));
+    s.dispatch(item.action.clone().unwrap()).unwrap();
+    assert_eq!(s.pitch_target(), Some(two.into()));
+}
+
+/// A take lane's menu opens the other clip editors on that take too:
+/// the spectral editor, clip effects, Audio to MIDI and its envelope.
+#[test]
+fn a_take_lanes_menu_opens_the_clip_editors_on_that_take() {
+    let (mut s, clip, _) = session_with_takes();
+    let c = s.project().clip(clip).unwrap().clone();
+    let two: faderframe_project::AudioRef = s.project().take_ref(clip, 1).unwrap().into();
+    let HostRequest::ContextMenu { items, .. } =
+        ArrangerView::take_menu(&s, &c, 1, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let find = |label: &str| {
+        items
+            .iter()
+            .find(|i| i.label == label)
+            .unwrap_or_else(|| panic!("{label}"))
+    };
+    let spectral = find("Spectral Editor for “Take 2” (Remove Noises, Heal)…");
+    assert_eq!(spectral.action, Some(Action::OpenSpectralEditor(two)));
+    let effects = find("Clip Effects on “Take 2”…");
+    assert_eq!(effects.action, Some(Action::OpenClipEffects(two)));
+    let midi = find("Convert “Take 2” to MIDI");
+    let hows: Vec<_> = midi.children.iter().map(|i| i.action.clone()).collect();
+    use faderframe_session::to_midi::ToMidi;
+    assert_eq!(
+        hows,
+        [ToMidi::Melody, ToMidi::Harmony, ToMidi::Drums]
+            .map(|how| Some(Action::ConvertToMidi { audio: two, how }))
+    );
+    let envelope = find("Clip Envelope");
+    assert!(envelope.children.iter().any(|i| i.label == "Show Volume"));
+    s.dispatch(spectral.action.clone().unwrap()).unwrap();
+    assert_eq!(s.spectral_target(), Some(two));
+    s.dispatch(effects.action.clone().unwrap()).unwrap();
+    assert_eq!(s.clip_fx_target(), Some(two));
+}
+
+/// While a clip envelope is shown, a take's lane draws and edits that
+/// take's envelope (a click adds a point and drags it, one undo step; a
+/// right-click on it is its menu) instead of comping; the comp is left as
+/// it was, and the folder's main lane draws what the comp plays.
+#[test]
+fn a_take_lane_edits_its_takes_envelope_while_one_is_shown() {
+    use faderframe_project::clip_envelope::EnvelopeLane;
+    use faderframe_ui_canvas::DrawOp;
+    let (mut s, clip, row_i) = session_with_takes();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 900.0);
+    let theme = Theme::default();
+    s.dispatch(Action::ToggleTakeLanes(clip)).unwrap();
+    s.dispatch(Action::ShowClipEnvelope(Some(EnvelopeLane::Volume)))
+        .unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &theme);
+    let comp = s.project().clip(clip).unwrap().as_takes().unwrap().pieces();
+    let start = s.project().clip(clip).unwrap().start;
+    let row = view.row_rect(row_i, size);
+    let base_h = view.row_h();
+    let lane_y = |k: usize| row.y + base_h + TAKE_LANE_HEIGHT * (k as f32 + 0.5);
+    let two = s.project().take_ref(clip, 1).unwrap();
+    let steps = s.history_steps().0.len();
+    let x0 = view.x_of(start + MusicalTime::from_quarters_i(1));
+    let mut actions = run(&mut view, down(Point::new(x0, lane_y(1))), size, &s).0;
+    actions.extend(run(&mut view, mv(Point::new(x0, lane_y(1) + 6.0)), size, &s).0);
+    actions.extend(run(&mut view, up(Point::new(x0, lane_y(1) + 6.0)), size, &s).0);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::SetClipEnvelope { audio, .. } if *audio == two.into())),
+        "{actions:?}"
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+    let e = s.clip_envelope(two.into()).expect("take 2 has an envelope");
+    assert_eq!(e.volume.len(), 1);
+    assert!(e.volume[0].value < 0.0, "dragged down: {:?}", e.volume);
+    let one = s.project().take_ref(clip, 0).unwrap();
+    assert!(s.clip_envelope(one.into()).is_none());
+    let f = s.project().clip(clip).unwrap().as_takes().unwrap().clone();
+    assert_eq!(f.pieces(), comp, "no comping meanwhile");
+    // Painted: take 2's point in its lane.
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let c = s.project().clip(clip).unwrap().clone();
+    let px = view.x_of_frame(&s, &c, f.takes[1].start + e.volume[0].at);
+    let lane = (row.y + base_h + TAKE_LANE_HEIGHT, TAKE_LANE_HEIGHT);
+    assert!(p.ops.iter().any(|op| matches!(op,
+        DrawOp::Rect(r) if (r.center().x - px).abs() < 0.5
+            && (r.w - 6.0).abs() < 0.01
+            && r.center().y > lane.0 && r.center().y < lane.0 + lane.1)));
+    assert!(p.balanced_clips());
+    // A right-click on it: the point's menu.
+    let point = Point::new(px, lane_y(1) + 6.0);
+    let ev = ViewEvent::PointerDown {
+        pos: point,
+        button: PointerButton::Secondary,
+        modifiers: Modifiers::NONE,
+        clicks: 1,
+    };
+    let (_, req) = run(&mut view, ev, size, &s);
+    let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+        panic!("no menu");
+    };
+    let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"Remove Point"), "{labels:?}");
 }
 
 #[test]

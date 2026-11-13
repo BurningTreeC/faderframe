@@ -79,7 +79,10 @@ pub use midimap::{
 };
 pub use preset::{PresetError, TrackPreset};
 pub use project::{AudioSource, Marker, MusicalRange, PlayStart, Project, Section, SourceSpec};
-pub use takes::{COMP_DECLICK, CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, Take, TakeFolder};
+pub use takes::{
+    AudioRef, COMP_DECLICK, CompPiece, CompSegment, DEFAULT_COMP_CROSSFADE, PlayedPiece, Take,
+    TakeFolder, TakeId, TakeRef,
+};
 pub use track::{
     AuxSend, BinauralRender, Freeze, GroupLink, InputRouting, MAX_TRACK_DELAY_MS,
     MidiOutputRouting, MonitorMode, OutputRouting, PluginFormat, PluginRef, PluginSlot,

@@ -138,7 +138,7 @@ fn strip_takes_out_the_silence_in_one_step_and_keeps_the_envelope() {
     let (mut s, track, clip, dir) = setup("strip");
     // An envelope rides along into the pieces.
     s.dispatch(Action::SetClipEnvelope {
-        clip,
+        audio: clip.into(),
         lane: EnvelopeLane::Volume,
         points: vec![
             EnvelopePoint::new(0, 0.0),
@@ -165,7 +165,7 @@ fn strip_takes_out_the_silence_in_one_step_and_keeps_the_envelope() {
         .min_by_key(|c| (c.start.ticks() - MusicalTime::from_quarters(3.0).ticks()).abs())
         .map(|c| c.id)
         .unwrap();
-    let e = s.clip_envelope(second).unwrap();
+    let e = s.clip_envelope(second.into()).unwrap();
     let start = e.value_at(EnvelopeLane::Volume, 0.0).unwrap();
     assert!((start - (-30.0 * 1.49 / 3.0)).abs() < 0.1, "{start}");
     // The pieces are selected and the dialog looks at them.
@@ -241,6 +241,56 @@ fn strip_silence_needs_audio_clips() {
         }))
         .is_err()
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A take is one clip in its folder and cannot be cut into pieces there:
+/// a take folder is left out, and Strip Silence says to flatten its comp
+/// (alone, it refuses with that word; with clips, it works on those).
+#[test]
+fn take_folders_are_left_out_with_a_word_why() {
+    let (mut s, track, clip, dir) = setup("folders");
+    let c = s.project().clip(clip).unwrap().clone();
+    let a = c.as_audio().unwrap().clone();
+    let mut f = faderframe_project::TakeFolder::new(a.length);
+    f.add_take(faderframe_project::Take::of_clip("Take 1", 0, a.clone()));
+    f.use_take(0);
+    s.edit(faderframe_project::Command::SetClipContent {
+        clip,
+        start: c.start,
+        content: Box::new(ClipContent::Takes(f)),
+    })
+    .unwrap();
+    let refused = s.dispatch(Action::StripSilence(StripSilenceOp::Open {
+        clips: vec![clip],
+    }));
+    let e = format!("{:?}", refused.unwrap_err());
+    assert!(e.contains("flatten the comp"), "{e}");
+    assert!(s.strip_silence_preview().is_none());
+    // Beside an audio clip: that one is worked on, the folder is named.
+    s.dispatch(Action::Edit(faderframe_project::Command::AddClip {
+        clip: Box::new(faderframe_project::Clip {
+            id: faderframe_core::ClipId(77_000),
+            track,
+            name: "Hits 2".into(),
+            color: None,
+            start: MusicalTime::from_quarters(16.0),
+            muted: false,
+            content: ClipContent::Audio(a),
+        }),
+    }))
+    .unwrap();
+    let other = faderframe_core::ClipId(77_000);
+    s.dispatch(Action::StripSilence(StripSilenceOp::Open {
+        clips: vec![clip, other],
+    }))
+    .unwrap();
+    assert_eq!(s.strip_silence_preview().unwrap().clips, vec![other]);
+    let said = s
+        .latest_notice()
+        .map(|n| n.text.clone())
+        .unwrap_or_default();
+    assert!(said.contains(&format!("‘{}’", c.name)), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

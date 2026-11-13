@@ -26,15 +26,13 @@ fn session() -> (Session, ClipId, usize) {
     let a = c.as_audio().unwrap().clone();
     let mut f = TakeFolder::new(a.length);
     for i in 0..3 {
-        f.add_take(faderframe_project::Take {
-            name: format!("Take {}", i + 1),
-            source: a.source,
-            source_offset: a.source_offset,
-            start: 0,
-            end: a.length,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(faderframe_project::Take::plain(
+            format!("Take {}", i + 1),
+            a.source,
+            a.source_offset,
+            0,
+            a.length,
+        ));
     }
     f.use_take(2);
     s.edit(Command::SetClipContent {
@@ -289,7 +287,9 @@ fn the_lyrics_comp_row_takes_suggestions_and_lists_the_takes() {
 #[test]
 fn comp_by_lyrics_is_offered_until_the_words_are_heard() {
     let (mut s, clip, row) = session();
-    let source = s.project().clip(clip).unwrap().as_takes().unwrap().takes[0].source;
+    let source = s.project().clip(clip).unwrap().as_takes().unwrap().takes[0]
+        .audio
+        .source;
     s.edit(Command::SetSourceWords {
         source,
         words: None,

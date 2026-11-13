@@ -1733,23 +1733,17 @@ pub fn install(app: &Rc<AppState>) {
             });
         }),
         // Development aid: `alias-clip:<clip name>` (an alias right after it).
-        // Development aids: `edit-pitch:<track>` (its first audio clip in
-        // the pitch editor), `pitch:<correct|straighten|reset|move=<n>@<by>|
-        // formant=<n>@<st>|keep|move-formants>` on the clip shown.
+        // Development aids: `edit-pitch:<track>[@<take n>]` (its first
+        // audio clip, or take n of its first take folder, in the pitch
+        // editor), `pitch:<correct|straighten|reset|move=<n>@<by>|
+        // formant=<n>@<st>|keep|move-formants>` on the clip or take shown.
         named("edit-pitch", |a, arg| {
-            let clip = {
-                let s = a.session.borrow();
-                let p = s.project();
-                p.tracks.iter().find(|t| t.name == arg).and_then(|t| {
-                    t.clips
-                        .iter()
-                        .copied()
-                        .find(|c| p.clip(*c).is_some_and(|c| c.as_audio().is_some()))
-                })
-            };
-            match clip {
-                Some(c) => a.dispatch(Action::OpenPitchEditor(c)),
-                None => tracing::warn!("edit-pitch: no audio clip on {arg}"),
+            // `<track>`: its first audio clip; `<track>@<n>`: take n (from
+            // 1) of its first take folder.
+            let target = audio_target(&a.session.borrow(), arg);
+            match target {
+                Some(r) => a.dispatch(Action::OpenPitchEditor(r)),
+                None => tracing::warn!("edit-pitch: no audio clip or take {arg}"),
             }
         }),
         // `add-surface:<mackie|xt|hui|osc[@<listen port>]>`: a control
@@ -1981,20 +1975,16 @@ pub fn install(app: &Rc<AppState>) {
             };
             a.dispatch(Action::Launcher(op));
         }),
-        // Development aids: `clip-fx:<track>` (its first clip in the clip
+        // Development aids: `spectral:<track>[@<take n>]` (its first audio
+        // clip, or take n of its first take folder, in the spectral
+        // editor), `clip-fx:<track>[@<take n>]` (likewise in the clip
         // effects editor), `clip-fx-add:<plugin id>`,
-        // `clip-fx-set:<n>:<parameter>=<value>` (on that clip).
+        // `clip-fx-set:<n>:<parameter>=<value>` (on the one shown).
         named("spectral", |a, arg| {
-            let clip = a
-                .session
-                .borrow()
-                .project()
-                .tracks
-                .iter()
-                .find(|t| t.name == arg)
-                .and_then(|t| t.clips.first().copied());
-            if let Some(clip) = clip {
-                a.dispatch(Action::OpenSpectralEditor(clip));
+            let target = audio_target(&a.session.borrow(), arg);
+            match target {
+                Some(r) => a.dispatch(Action::OpenSpectralEditor(r)),
+                None => tracing::warn!("spectral: no audio clip or take {arg}"),
             }
         }),
         named("spectral-add", |a, arg| {
@@ -2035,17 +2025,17 @@ pub fn install(app: &Rc<AppState>) {
             };
             let found = {
                 let s = a.session.borrow();
-                s.spectral_clip().and_then(|clip| {
-                    let au = s.project().clip(clip)?.as_audio()?;
-                    let (now, _) = s.spectral_sources(clip)?;
+                s.spectral_target().and_then(|r| {
+                    let au = s.project().audio(r)?;
+                    let (now, _) = s.spectral_sources(r)?;
                     let (rate, _, _) = s.source_format(now)?;
-                    Some((clip, au.source_offset, f64::from(rate)))
+                    Some((r, au.source_offset, f64::from(rate)))
                 })
             };
-            if let Some((clip, offset, rate)) = found {
+            if let Some((audio, offset, rate)) = found {
                 let at = |t: f64| offset + (t * rate) as i64;
                 a.dispatch(Action::EditSpectral {
-                    clip,
+                    audio,
                     change: faderframe_session::spectral::SpectralChange::Add(SpectralEdit::new(
                         SpectralShape::Rect {
                             start: at(t0),
@@ -2059,37 +2049,31 @@ pub fn install(app: &Rc<AppState>) {
             }
         }),
         named("clip-fx", |a, arg| {
-            let clip = a
-                .session
-                .borrow()
-                .project()
-                .tracks
-                .iter()
-                .find(|t| t.name == arg)
-                .and_then(|t| t.clips.first().copied());
-            if let Some(clip) = clip {
-                a.dispatch(Action::OpenClipEffects(clip));
+            let target = audio_target(&a.session.borrow(), arg);
+            match target {
+                Some(r) => a.dispatch(Action::OpenClipEffects(r)),
+                None => tracing::warn!("clip-fx: no audio clip or take {arg}"),
             }
         }),
         named("clip-fx-add", |a, arg| {
             let found = {
                 let s = a.session.borrow();
-                s.clip_fx_clip().and_then(|clip| {
+                s.clip_fx_target().and_then(|r| {
                     s.available_plugins()
                         .into_iter()
                         .find(|p| p.plugin.id == arg)
-                        .map(|p| (clip, p.plugin))
+                        .map(|p| (r, p.plugin))
                 })
             };
-            if let Some((clip, plugin)) = found {
+            if let Some((audio, plugin)) = found {
                 a.dispatch(Action::ClipEffects {
-                    clip,
+                    audio,
                     op: faderframe_session::clip_fx::ClipFxOp::Add(plugin),
                 });
             }
         }),
         named("clip-fx-set", |a, arg| {
-            let Some(clip) = a.session.borrow().clip_fx_clip() else {
+            let Some(audio) = a.session.borrow().clip_fx_target() else {
                 return;
             };
             let parsed = (|| {
@@ -2099,7 +2083,7 @@ pub fn install(app: &Rc<AppState>) {
             })();
             if let Some((index, parameter, value)) = parsed {
                 a.dispatch(Action::ClipEffects {
-                    clip,
+                    audio,
                     op: faderframe_session::clip_fx::ClipFxOp::SetParameter {
                         index,
                         parameter: faderframe_core::ParameterId(parameter),
@@ -2111,7 +2095,7 @@ pub fn install(app: &Rc<AppState>) {
         // `clip-fx-open:<n>[/generic]`: effect n of the shown clip in its
         // own window (its "Open Window").
         named("clip-fx-open", |a, arg| {
-            let Some(clip) = a.session.borrow().clip_fx_clip() else {
+            let Some(audio) = a.session.borrow().clip_fx_target() else {
                 return;
             };
             let (n, generic) = match arg.split_once('/') {
@@ -2120,7 +2104,7 @@ pub fn install(app: &Rc<AppState>) {
             };
             if let Ok(index) = n.parse() {
                 a.dispatch(Action::OpenClipEffectEditor {
-                    clip,
+                    audio,
                     index,
                     generic,
                 });
@@ -2187,8 +2171,8 @@ pub fn install(app: &Rc<AppState>) {
                 a.dispatch(Action::AraNotesToMidi(clip));
             }
         }),
-        // Development aid: `to-midi:<melody|harmony|drums>=<track>` (its
-        // first clip).
+        // Development aid: `to-midi:<melody|harmony|drums>=<track>[@<take
+        // n>]` (its first audio clip, or take n of its first take folder).
         named("to-midi", |a, arg| {
             use faderframe_session::to_midi::ToMidi;
             let Some((how, name)) = arg.split_once('=') else {
@@ -2200,16 +2184,10 @@ pub fn install(app: &Rc<AppState>) {
                 "drums" => ToMidi::Drums,
                 _ => return,
             };
-            let clip = a
-                .session
-                .borrow()
-                .project()
-                .tracks
-                .iter()
-                .find(|t| t.name == name)
-                .and_then(|t| t.clips.first().copied());
-            if let Some(clip) = clip {
-                a.dispatch(Action::ConvertToMidi { clip, how });
+            let target = audio_target(&a.session.borrow(), name);
+            match target {
+                Some(audio) => a.dispatch(Action::ConvertToMidi { audio, how }),
+                None => tracing::warn!("to-midi: no audio clip or take {name}"),
             }
         }),
         // Development aid: `tempo-from-hits:<markers|cuts|range>[@beats|
@@ -2445,7 +2423,7 @@ pub fn install(app: &Rc<AppState>) {
         }),
         named("pitch", |a, arg| {
             use faderframe_session::pitch::PitchOp;
-            let Some(clip) = a.session.borrow().pitch_clip() else {
+            let Some(audio) = a.session.borrow().pitch_target() else {
                 tracing::warn!("pitch: no clip in the pitch editor");
                 return;
             };
@@ -2514,7 +2492,7 @@ pub fn install(app: &Rc<AppState>) {
                     return;
                 }
             };
-            a.dispatch(Action::EditPitch { clip, op });
+            a.dispatch(Action::EditPitch { audio, op });
         }),
         named("alias-clip", |a, arg| {
             let id = a
@@ -3492,15 +3470,16 @@ pub fn install(app: &Rc<AppState>) {
             let Some(audio) = c.as_audio() else { return };
             let mut f = faderframe_project::TakeFolder::new(audio.length);
             for i in 0..3 {
-                f.add_take(faderframe_project::Take {
-                    name: format!("Take {}", i + 1),
-                    source: audio.source,
-                    source_offset: audio.source_offset,
-                    start: 0,
-                    end: audio.length,
-                    gain_db: -2.0 * i as f32,
-                    rating: 0,
-                });
+                // The clip, edits and all, a little quieter each time.
+                let take = faderframe_project::AudioClip {
+                    gain_db: audio.gain_db - 2.0 * i as f32,
+                    ..audio.clone()
+                };
+                f.add_take(faderframe_project::Take::of_clip(
+                    format!("Take {}", i + 1),
+                    0,
+                    take,
+                ));
             }
             f.use_take(0);
             f.set_comp(audio.length / 3, audio.length * 2 / 3, Some(1));
@@ -4946,6 +4925,36 @@ pub fn install(app: &Rc<AppState>) {
 
 /// Insert `n` (0-based; unparsable: 0) of the first selected track that
 /// has it, else of the first audio track that has it (dev actions).
+/// The audio a dev action names: `<track>` = its first audio clip,
+/// `<track>@<n>` = take n (from 1) of its first take folder.
+pub(crate) fn audio_target(
+    s: &faderframe_session::Session,
+    arg: &str,
+) -> Option<faderframe_project::AudioRef> {
+    let (track, take) = match arg
+        .rsplit_once('@')
+        .and_then(|(t, n)| Some((t, n.parse::<usize>().ok()?)))
+    {
+        Some((t, n)) => (t, Some(n)),
+        None => (arg, None),
+    };
+    let p = s.project();
+    let t = p.tracks.iter().find(|t| t.name == track)?;
+    let first = |want: &dyn Fn(&faderframe_project::Clip) -> bool| {
+        t.clips
+            .iter()
+            .copied()
+            .find(|c| p.clip(*c).is_some_and(want))
+    };
+    match take {
+        Some(n) => {
+            let folder = first(&|c| c.as_takes().is_some())?;
+            Some(p.take_ref(folder, n.checked_sub(1)?)?.into())
+        }
+        None => first(&|c| c.as_audio().is_some()).map(Into::into),
+    }
+}
+
 fn insert_at(
     a: &AppState,
     n: &str,

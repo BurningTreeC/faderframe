@@ -59,6 +59,38 @@ impl Session {
         Ok(self.gesture_base.entry(clip).or_insert(current).clone())
     }
 
+    /// The audio of `r` as the running gesture first saw its clip (or
+    /// folder), and that clip; the current ones outside gestures.
+    pub(crate) fn gesture_audio(
+        &mut self,
+        r: faderframe_project::AudioRef,
+    ) -> Result<(Clip, AudioClip)> {
+        let c = self.gesture_clip(r.clip())?;
+        let a = match r {
+            faderframe_project::AudioRef::Clip(_) => c.as_audio().cloned(),
+            faderframe_project::AudioRef::Take(t) => c
+                .as_takes()
+                .and_then(|f| f.take(t.take))
+                .map(|t| t.audio.clone()),
+        };
+        let a = a.ok_or_else(|| SessionError::Other("no such audio clip or take".into()))?;
+        Ok((c, a))
+    }
+
+    /// Give `r` (a clip or a take) the audio `a`, one undo step `label`.
+    pub(crate) fn set_audio_of(
+        &mut self,
+        label: &str,
+        r: faderframe_project::AudioRef,
+        a: AudioClip,
+    ) -> Result<()> {
+        let commands = self.project.set_audio(vec![(r, a)]);
+        if commands.is_empty() {
+            return Ok(());
+        }
+        self.batch(label, commands)
+    }
+
     pub(crate) fn set_audio(
         &mut self,
         label: &str,

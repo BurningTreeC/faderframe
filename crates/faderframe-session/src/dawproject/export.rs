@@ -290,20 +290,21 @@ impl Exporter<'_> {
         let r = self.rate;
         let mut inner = Vec::new();
         for piece in f.pieces() {
+            // The take's clip cut to the piece, as a clip's content (its
+            // warp and gain with it), the folder's gain in it.
             let take = &f.takes[piece.take];
-            let Some(media) = self.media(take.source) else {
+            let Some(cut) = take
+                .audio
+                .cut(piece.start - take.start, piece.end - take.start)
+            else {
                 continue;
             };
-            let start = (take.source_offset + piece.start) as f64 / r;
-            let gain = take.gain_db + f.gain_db;
-            let content = if gain.abs() > 1e-4 {
-                let points = self.gain_points(f64::from(db_to_gain(gain)), start);
-                dp::Timeline::Lanes(dp::Lanes {
-                    common: self.timeline_meta(),
-                    lanes: vec![dp::Timeline::Audio(media), points],
-                })
-            } else {
-                dp::Timeline::Audio(media)
+            let a = AudioClip {
+                gain_db: cut.gain_db + f.gain_db,
+                ..cut
+            };
+            let Some((content, start, _)) = self.audio_content(&a) else {
+                continue;
             };
             let fade = f.crossfade as f64 / r;
             inner.push(dp::Clip {

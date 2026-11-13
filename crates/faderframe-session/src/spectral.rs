@@ -1,11 +1,12 @@
 //! Spectral editing in the session (see [`faderframe_project::spectral`]):
-//! a clip's edits changed at once (what the editor shows), rendered when
+//! the edits of an audio clip or of one take of a take folder (an
+//! [`AudioRef`]) changed at once (what the editor shows), rendered when
 //! they have rested for a moment, in a worker, into a processed copy of
-//! the clip's source ([`faderframe_spectral::apply`]); the copy then
-//! becomes a source and the clip plays it, edits and all, in one
+//! its source ([`faderframe_spectral::apply`]); the copy then becomes a
+//! source and the clip or take plays it, edits and all, in one
 //! "Spectral Edit" step (a render a newer change overtook is dropped).
 //! With clip effects the copy is what the effects process (they render
-//! again). No edits left: the clip's audio back.
+//! again). No edits left: the audio as it was back.
 //!
 //! The editor's picture comes from [`Session::spectrogram`]: asked for
 //! while painting, computed by a worker (the newest request first), the
@@ -14,10 +15,10 @@
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_audio_files::WavFormat;
 use faderframe_audio_files::wavstream::{WavFile, WavWriter};
-use faderframe_core::{AudioSourceId, ClipId};
+use faderframe_core::AudioSourceId;
 use faderframe_engine::Source;
 use faderframe_project::spectral::{SpectralEdit, SpectralEdits};
-use faderframe_project::{AudioClip, AudioSource, ClipContent, Command, SourceSpec};
+use faderframe_project::{AudioClip, AudioRef, AudioSource, Command, SourceSpec};
 use faderframe_spectral::Spectrogram;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -128,7 +129,7 @@ struct Pending {
 }
 
 struct Job {
-    clip: ClipId,
+    audio: AudioRef,
     generation: u64,
     edits: Vec<SpectralEdit>,
     original: AudioSourceId,
@@ -230,9 +231,9 @@ impl Drop for PictureService {
 
 #[derive(Default)]
 pub(crate) struct SpectralState {
-    /// The clip the editor shows.
-    pub(crate) shown: Option<ClipId>,
-    pending: HashMap<ClipId, Pending>,
+    /// The clip or take the editor shows.
+    pub(crate) shown: Option<AudioRef>,
+    pending: HashMap<AudioRef, Pending>,
     jobs: Vec<Job>,
     generation: u64,
     pictures: Option<PictureService>,
@@ -244,41 +245,39 @@ fn edited_source(a: &AudioClip) -> AudioSourceId {
 }
 
 impl Session {
-    /// The clip the spectral editor shows.
-    pub fn spectral_clip(&self) -> Option<ClipId> {
-        self.spectral.shown.filter(|c| {
-            self.project
-                .clip(*c)
-                .is_some_and(|c| c.as_audio().is_some())
-        })
+    /// The clip or take the spectral editor shows (while it is there).
+    pub fn spectral_target(&self) -> Option<AudioRef> {
+        self.spectral
+            .shown
+            .filter(|r| self.project.audio(*r).is_some())
     }
 
-    /// A clip's spectral edits as they are being changed (or as rendered).
-    pub fn spectral_edits(&self, clip: ClipId) -> Vec<SpectralEdit> {
-        if let Some(p) = self.spectral.pending.get(&clip) {
+    /// The spectral edits of a clip or take as they are being changed (or
+    /// as rendered).
+    pub fn spectral_edits(&self, audio: AudioRef) -> Vec<SpectralEdit> {
+        if let Some(p) = self.spectral.pending.get(&audio) {
             return p.edits.clone();
         }
         self.project
-            .clip(clip)
-            .and_then(|c| c.as_audio())
+            .audio(audio)
             .and_then(|a| a.spectral.as_ref())
             .map(|s| s.edits.clone())
             .unwrap_or_default()
     }
 
-    /// Are a clip's edits waiting to render or rendering? With how far a
-    /// render is (0…1).
-    pub fn spectral_busy(&self, clip: ClipId) -> Option<f32> {
-        if let Some(j) = self.spectral.jobs.iter().find(|j| j.clip == clip) {
+    /// Are the edits of a clip or take waiting to render or rendering?
+    /// With how far a render is (0…1).
+    pub fn spectral_busy(&self, audio: AudioRef) -> Option<f32> {
+        if let Some(j) = self.spectral.jobs.iter().find(|j| j.audio == audio) {
             return Some(f32::from_bits(j.progress.load(Ordering::Relaxed)));
         }
-        self.spectral.pending.contains_key(&clip).then_some(0.0)
+        self.spectral.pending.contains_key(&audio).then_some(0.0)
     }
 
-    /// The sources of a clip's spectral picture: the one it plays (its
-    /// edits applied) and its unedited one.
-    pub fn spectral_sources(&self, clip: ClipId) -> Option<(AudioSourceId, AudioSourceId)> {
-        let a = self.project.clip(clip)?.as_audio()?;
+    /// The sources of the spectral picture of a clip or take: the one it
+    /// plays (its edits applied) and its unedited one.
+    pub fn spectral_sources(&self, audio: AudioRef) -> Option<(AudioSourceId, AudioSourceId)> {
+        let a = self.project.audio(audio)?;
         let now = edited_source(a);
         Some((now, a.spectral.as_ref().map_or(now, |s| s.original)))
     }
@@ -334,14 +333,14 @@ impl Session {
         })
     }
 
-    /// Show a clip in the spectral editor.
-    pub(crate) fn open_spectral(&mut self, clip: ClipId) -> Result<()> {
-        if self.project.clip(clip).and_then(|c| c.as_audio()).is_none() {
+    /// Show a clip or take in the spectral editor.
+    pub(crate) fn open_spectral(&mut self, audio: AudioRef) -> Result<()> {
+        if self.project.audio(audio).is_none() {
             return Err(SessionError::Other(
-                "spectral editing is for audio clips".into(),
+                "spectral editing is for audio clips and takes".into(),
             ));
         }
-        self.spectral.shown = Some(clip);
+        self.spectral.shown = Some(audio);
         if self.spectral.pictures.is_none() {
             self.spectral.pictures = Some(PictureService::start());
         }
@@ -352,17 +351,14 @@ impl Session {
         Ok(())
     }
 
-    /// Change a clip's spectral edits (see the module docs).
-    pub(crate) fn edit_spectral(&mut self, clip: ClipId, change: SpectralChange) -> Result<()> {
-        let Some(c) = self.project.clip(clip).cloned() else {
-            return Err(SessionError::Other(format!("no clip {clip}")));
-        };
-        let Some(a) = c.as_audio().cloned() else {
+    /// Change the spectral edits of a clip or take (see the module docs).
+    pub(crate) fn edit_spectral(&mut self, audio: AudioRef, change: SpectralChange) -> Result<()> {
+        let Some(a) = self.project.audio(audio).cloned() else {
             return Err(SessionError::Other(
-                "spectral editing is for audio clips".into(),
+                "spectral editing is for audio clips and takes".into(),
             ));
         };
-        let mut edits = self.spectral_edits(clip);
+        let mut edits = self.spectral_edits(audio);
         match change {
             SpectralChange::Add(e) => edits.push(e),
             SpectralChange::Set(i, e) if i < edits.len() => edits[i] = e,
@@ -374,7 +370,7 @@ impl Session {
         }
         if edits.is_empty() {
             // Nothing left: the unedited audio back (an undo step).
-            self.spectral.pending.remove(&clip);
+            self.spectral.pending.remove(&audio);
             if let Some(s) = a.spectral.as_deref() {
                 let mut back = a.clone();
                 match back.effects.as_mut() {
@@ -382,16 +378,9 @@ impl Session {
                     None => back.source = s.original,
                 }
                 back.spectral = None;
-                self.batch(
-                    "Remove Spectral Edits",
-                    vec![Command::SetClipContent {
-                        clip,
-                        start: c.start,
-                        content: Box::new(ClipContent::Audio(back)),
-                    }],
-                )?;
+                self.set_audio_of("Remove Spectral Edits", audio, back)?;
                 if a.effects.is_some() {
-                    self.rerender_clip_fx(clip);
+                    self.rerender_clip_fx(audio);
                 }
             }
             self.revision += 1;
@@ -400,7 +389,7 @@ impl Session {
         self.spectral.generation += 1;
         let generation = self.spectral.generation;
         self.spectral.pending.insert(
-            clip,
+            audio,
             Pending {
                 edits,
                 changed: Instant::now(),
@@ -414,23 +403,23 @@ impl Session {
     /// Start renders of edits that have rested; place the finished ones
     /// (from the session tick).
     pub(crate) fn poll_spectral(&mut self) {
-        let ready: Vec<ClipId> = self
+        let ready: Vec<AudioRef> = self
             .spectral
             .pending
             .iter()
-            .filter(|(c, p)| {
+            .filter(|(r, p)| {
                 p.changed.elapsed() >= SETTLE
                     && !self
                         .spectral
                         .jobs
                         .iter()
-                        .any(|j| j.clip == **c && j.generation == p.generation)
+                        .any(|j| j.audio == **r && j.generation == p.generation)
             })
-            .map(|(c, _)| *c)
+            .map(|(r, _)| *r)
             .collect();
-        for clip in ready {
-            if let Err(e) = self.start_spectral_render(clip) {
-                self.spectral.pending.remove(&clip);
+        for audio in ready {
+            if let Err(e) = self.start_spectral_render(audio) {
+                self.spectral.pending.remove(&audio);
                 self.notify(NoticeLevel::Error, format!("spectral edit: {e}"));
             }
         }
@@ -444,7 +433,7 @@ impl Session {
             let latest = self
                 .spectral
                 .pending
-                .get(&j.clip)
+                .get(&j.audio)
                 .is_none_or(|p| p.generation == j.generation);
             let result = j
                 .handle
@@ -455,10 +444,10 @@ impl Session {
                 let _ = std::fs::remove_file(&j.path);
                 continue;
             }
-            self.spectral.pending.remove(&j.clip);
+            self.spectral.pending.remove(&j.audio);
             let placed = result
                 .map_err(SessionError::Other)
-                .and_then(|()| self.place_spectral(j.clip, j.edits, j.original, &j.path));
+                .and_then(|()| self.place_spectral(j.audio, j.edits, j.original, &j.path));
             if let Err(e) = placed {
                 self.notify(NoticeLevel::Error, format!("spectral edit: {e}"));
             }
@@ -494,19 +483,15 @@ impl Session {
         None
     }
 
-    fn start_spectral_render(&mut self, clip: ClipId) -> Result<()> {
-        let Some(p) = self.spectral.pending.get(&clip) else {
+    fn start_spectral_render(&mut self, audio: AudioRef) -> Result<()> {
+        let Some(p) = self.spectral.pending.get(&audio) else {
             return Ok(());
         };
         let (edits, generation) = (p.edits.clone(), p.generation);
-        let c = self
+        let a = self
             .project
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other("the clip is gone".into()))?;
-        let a = c
-            .as_audio()
-            .ok_or_else(|| SessionError::Other("not an audio clip".into()))?;
+            .audio(audio)
+            .ok_or_else(|| SessionError::Other("the clip or take is gone".into()))?;
         let original = a
             .spectral
             .as_ref()
@@ -514,11 +499,10 @@ impl Session {
         let data = self
             .source_data(original)
             .ok_or_else(|| SessionError::Other("the clip's audio is not loaded".into()))?;
-        let name = self
-            .project
-            .sources
-            .get(&original)
-            .map_or_else(|| c.name.clone(), |s| s.name.clone());
+        let name = match self.project.sources.get(&original) {
+            Some(s) => s.name.clone(),
+            None => self.project.audio_name(audio).unwrap_or_default(),
+        };
         std::fs::create_dir_all(&self.media_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.media_dir.display())))?;
         let path = crate::media::unique_path(&self.media_dir, &format!("{name} Spectral"));
@@ -530,7 +514,7 @@ impl Session {
             .spawn(move || render(&job_edits, &data, &job_path, &job_progress))
             .map_err(|e| SessionError::Other(e.to_string()))?;
         self.spectral.jobs.push(Job {
-            clip,
+            audio,
             generation,
             edits,
             original,
@@ -543,7 +527,7 @@ impl Session {
 
     fn place_spectral(
         &mut self,
-        clip: ClipId,
+        audio: AudioRef,
         edits: Vec<SpectralEdit>,
         original: AudioSourceId,
         path: &std::path::Path,
@@ -551,17 +535,15 @@ impl Session {
         let wav = WavFile::open(path)
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
         let (frames, channels, rate) = (wav.frames() as i64, wav.channels(), wav.sample_rate());
-        let Some(c) = self.project.clip(clip).cloned() else {
+        let Some(mut a) = self.project.audio(audio).cloned() else {
             return Ok(()); // deleted meanwhile
-        };
-        let Some(mut a) = c.as_audio().cloned() else {
-            return Ok(());
         };
         let source = AudioSource {
             id: self.project.ids.allocate(),
-            name: path
-                .file_stem()
-                .map_or_else(|| c.name.clone(), |s| s.to_string_lossy().to_string()),
+            name: path.file_stem().map_or_else(
+                || self.project.audio_name(audio).unwrap_or_default(),
+                |s| s.to_string_lossy().to_string(),
+            ),
             spec: SourceSpec::File {
                 path: path.to_path_buf(),
                 channels: channels as u16,
@@ -575,21 +557,13 @@ impl Session {
         }
         let fx = a.effects.is_some();
         a.spectral = Some(Box::new(SpectralEdits { original, edits }));
-        self.batch(
-            "Spectral Edit",
-            vec![
-                Command::AddSource {
-                    source: Box::new(source),
-                },
-                Command::SetClipContent {
-                    clip,
-                    start: c.start,
-                    content: Box::new(ClipContent::Audio(a)),
-                },
-            ],
-        )?;
+        let mut commands = vec![Command::AddSource {
+            source: Box::new(source),
+        }];
+        commands.extend(self.project.set_audio(vec![(audio, a)]));
+        self.batch("Spectral Edit", commands)?;
         if fx {
-            self.rerender_clip_fx(clip);
+            self.rerender_clip_fx(audio);
         }
         Ok(())
     }

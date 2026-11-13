@@ -270,15 +270,13 @@ fn take_folders_do_not_slip() {
     let (mut s, t, _, src) = setup();
     let mut folder = TakeFolder::new(2 * BAR);
     for n in 0..2 {
-        folder.add_take(faderframe_project::Take {
-            name: format!("Take {n}"),
-            source: src,
-            source_offset: n * BAR,
-            start: 0,
-            end: 2 * BAR,
-            gain_db: 0.0,
-            rating: 0,
-        });
+        folder.add_take(faderframe_project::Take::plain(
+            format!("Take {n}"),
+            src,
+            n * BAR,
+            0,
+            2 * BAR,
+        ));
     }
     folder.use_take(1);
     let f = add(&mut s, t, 0.0, ClipContent::Takes(folder));

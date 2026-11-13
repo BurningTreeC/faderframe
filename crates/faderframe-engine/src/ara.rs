@@ -333,9 +333,17 @@ impl AraHost {
                     .pieces()
                     .into_iter()
                     .filter_map(|p| {
+                        // The take's clip cut to the piece (its warp
+                        // stretches it as a clip's does).
                         let take = f.takes.get(p.take)?;
-                        let len = p.end - p.start;
-                        Some((take.source, take.source_offset + p.start, p.start, len, len))
+                        let cut = take.audio.cut(p.start - take.start, p.end - take.start)?;
+                        Some((
+                            cut.source,
+                            cut.source_offset,
+                            p.start,
+                            cut.length,
+                            cut.source_span(),
+                        ))
                     })
                     .collect(),
                 ClipContent::Midi(_) => Vec::new(),

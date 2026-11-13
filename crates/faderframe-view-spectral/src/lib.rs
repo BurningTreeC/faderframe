@@ -1,5 +1,6 @@
-//! The spectral editor: an audio clip's spectrogram (its source over the
-//! clip's region, a logarithmic frequency axis), regions drawn on it — a
+//! The spectral editor: the spectrogram of an audio clip or of one take of
+//! a take folder (its source over the clip's region, a logarithmic
+//! frequency axis), regions drawn on it — a
 //! rectangle, a time range, a frequency band, a lasso, a brush stroke —
 //! and turned into edits with Attenuate (down to the sound around it),
 //! Heal (replaced by it), Remove, Gain or De-noise (learn the noise in the
@@ -15,7 +16,8 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_core::{AudioSourceId, ClipId};
+use faderframe_core::AudioSourceId;
+use faderframe_project::AudioRef;
 use faderframe_project::spectral::{SpectralEdit, SpectralOp, SpectralShape};
 use faderframe_session::spectral::{PictureKey, SpectralChange};
 use faderframe_session::{Action, Session, TransportAction};
@@ -128,7 +130,7 @@ struct Picture {
 /// The clip as the editor maps it.
 #[derive(Clone, Copy, Debug)]
 struct Shown {
-    clip: ClipId,
+    audio: AudioRef,
     /// The source drawn (edited or the original).
     source: AudioSourceId,
     rate: f64,
@@ -157,7 +159,7 @@ pub struct SpectralView {
     theme: Theme,
     /// Visible source frames.
     view: Option<(f64, f64)>,
-    clip: Option<ClipId>,
+    audio: Option<AudioRef>,
     pub tool: Tool,
     pub gain_db: f32,
     pub feather_ms: f32,
@@ -190,7 +192,7 @@ impl SpectralView {
         Self {
             theme,
             view: None,
-            clip: None,
+            audio: None,
             tool: Tool::Rect,
             gain_db: -6.0,
             feather_ms: 10.0,
@@ -260,17 +262,17 @@ impl SpectralView {
         }
     }
 
-    /// The clip shown: the session's spectral clip.
+    /// The clip or take shown: the session's spectral target.
     fn shown(&self, model: &Session) -> Option<Shown> {
-        let clip = model.spectral_clip()?;
-        let (now, original) = model.spectral_sources(clip)?;
+        let audio = model.spectral_target()?;
+        let (now, original) = model.spectral_sources(audio)?;
         let source = if self.original { original } else { now };
         let (rate, _, _) = model.source_format(source)?;
-        let a = model.project().clip(clip)?.as_audio()?;
+        let a = model.project().audio(audio)?;
         let from = a.source_offset as f64;
         let to = from + a.source_span().max(1) as f64;
         Some(Shown {
-            clip,
+            audio,
             source,
             rate: f64::from(rate.max(1)),
             region: (from, to),
@@ -505,13 +507,13 @@ impl SpectralView {
     /// Apply operation `op`: the region drawn becomes an edit, else the
     /// selected edit takes the operation.
     fn apply(&mut self, op: SpectralOp, model: &Session, cx: &mut EventCx<'_, Action>) {
-        let Some(clip) = model.spectral_clip() else {
+        let Some(audio) = model.spectral_target() else {
             return;
         };
-        let edits = model.spectral_edits(clip);
+        let edits = model.spectral_edits(audio);
         if let Some(shape) = self.selection.take() {
             cx.emit(Action::EditSpectral {
-                clip,
+                audio,
                 change: SpectralChange::Add(self.edit_of(shape, op)),
             });
             self.selected = Some(edits.len());
@@ -519,7 +521,7 @@ impl SpectralView {
             let mut e = edits[i].clone();
             e.op = op;
             cx.emit(Action::EditSpectral {
-                clip,
+                audio,
                 change: SpectralChange::Set(i, e),
             });
         }
@@ -567,32 +569,31 @@ impl SpectralView {
         }
     }
 
-    /// The project position of source frame `frame` of the clip (as played
-    /// without warping).
+    /// The project position of source frame `frame` of the clip or take
+    /// (as played without warping).
     fn position_of(
         model: &Session,
-        clip: ClipId,
+        audio: AudioRef,
         frame: f64,
     ) -> Option<faderframe_timeline::MusicalTime> {
         let p = model.project();
-        let c = p.clip(clip)?;
-        let a = c.as_audio()?;
+        let a = p.audio(audio)?;
         let rate = f64::from(p.sample_rate.max(1));
-        let start = p.timeline.to_samples(c.start, rate);
+        let start = p.audio_start(audio)?;
         Some(p.timeline.to_musical(
             start + (frame - a.source_offset as f64).max(0.0) as i64,
             rate,
         ))
     }
 
-    /// The source frame the playhead is at, when it is inside the clip.
-    fn playhead_frame(model: &Session, clip: ClipId) -> Option<f64> {
+    /// The source frame the playhead is at, when it is inside the clip or
+    /// take.
+    fn playhead_frame(model: &Session, audio: AudioRef) -> Option<f64> {
         let p = model.project();
-        let c = p.clip(clip)?;
-        let a = c.as_audio()?;
+        let a = p.audio(audio)?;
         let rate = f64::from(p.sample_rate.max(1));
         let at = p.timeline.to_samples(model.playhead(), rate);
-        let start = p.timeline.to_samples(c.start, rate);
+        let start = p.audio_start(audio)?;
         let rel = at - start;
         (rel >= 0 && rel < a.length).then(|| a.source_at(rel as f64))
     }
@@ -759,8 +760,8 @@ impl CanvasView<Session, Action> for SpectralView {
             &TextStyle::new(th.fonts.normal, th.ui.text).bold(),
         );
         let shown = self.shown(model);
-        if shown.map(|s| s.clip) != self.clip {
-            self.clip = shown.map(|s| s.clip);
+        if shown.map(|s| s.audio) != self.audio {
+            self.audio = shown.map(|s| s.audio);
             self.view = None;
             self.selection = None;
             self.selected = None;
@@ -798,14 +799,14 @@ impl CanvasView<Session, Action> for SpectralView {
         self.button(p, l.original, "Original", self.original, shown.is_some());
         let Some(s) = shown else {
             p.text(
-                "No audio clip: an audio clip's menu → Spectral Editor",
+                "No audio clip: an audio clip's (or a take lane's) menu → Spectral Editor",
                 Rect::new(0.0, BAR_H, size.w, size.h - BAR_H),
                 &TextStyle::new(th.fonts.small, th.ui.text_dim).center(),
             );
             return;
         };
         // Busy: the render's progress.
-        if let Some(f) = model.spectral_busy(s.clip) {
+        if let Some(f) = model.spectral_busy(s.audio) {
             let text = if f > 0.0 {
                 format!("Rendering {:.0} %", f * 100.0)
             } else {
@@ -874,7 +875,7 @@ impl CanvasView<Session, Action> for SpectralView {
             p.fill(Rect::new(r1, area.y, area.x + area.w - r1, area.h), shade);
         }
         // The edits.
-        let edits = model.spectral_edits(s.clip);
+        let edits = model.spectral_edits(s.audio);
         for (i, e) in edits.iter().enumerate() {
             let shape = match &self.drag {
                 Some(Drag::Move {
@@ -940,7 +941,7 @@ impl CanvasView<Session, Action> for SpectralView {
             }
         }
         // The playhead.
-        if let Some(f) = Self::playhead_frame(model, s.clip) {
+        if let Some(f) = Self::playhead_frame(model, s.audio) {
             let x = self.x_of(&s, area, f);
             p.vline(x, area.y, area.y + area.h, th.ui.accent);
         }
@@ -1050,6 +1051,14 @@ impl CanvasView<Session, Action> for SpectralView {
             l.edits.inset_xy(12.0, 0.0),
             &TextStyle::new(th.fonts.small, th.ui.text_dim),
         );
+        // What is shown: the clip, or "<folder> · <take>".
+        if let Some(name) = model.project().audio_name(s.audio) {
+            p.text(
+                &name,
+                l.edits.inset_xy(12.0, 0.0),
+                &TextStyle::new(th.fonts.small, th.ui.text).right(),
+            );
+        }
     }
 
     fn event(
@@ -1107,13 +1116,13 @@ impl CanvasView<Session, Action> for SpectralView {
                         .as_ref()
                         .map(|sh| sh.frames().0)
                         .or_else(|| {
-                            let edits = model.spectral_edits(s.clip);
+                            let edits = model.spectral_edits(s.audio);
                             self.selected
                                 .and_then(|i| edits.get(i))
                                 .map(|e| e.shape.frames().0)
                         })
                         .map_or(s.region.0, |f| f as f64);
-                    if let Some(at) = Self::position_of(model, s.clip, from) {
+                    if let Some(at) = Self::position_of(model, s.audio, from) {
                         cx.emit(Action::Transport(TransportAction::Locate(at)));
                         cx.emit(Action::Transport(TransportAction::Play));
                     }
@@ -1123,7 +1132,7 @@ impl CanvasView<Session, Action> for SpectralView {
                     return false;
                 }
                 // On a selected edit: move it; else draw.
-                let edits = model.spectral_edits(s.clip);
+                let edits = model.spectral_edits(s.audio);
                 if let Some(i) = self
                     .edit_at(&s, l.area, &edits, pos)
                     .filter(|i| self.selected == Some(*i))
@@ -1199,7 +1208,7 @@ impl CanvasView<Session, Action> for SpectralView {
                     }
                     _ => {
                         if l.area.contains(pos) {
-                            let edits = model.spectral_edits(s.clip);
+                            let edits = model.spectral_edits(s.audio);
                             let over = self.edit_at(&s, l.area, &edits, pos);
                             cx.set_cursor(if over.is_some() && over == self.selected {
                                 Cursor::Grab
@@ -1229,7 +1238,7 @@ impl CanvasView<Session, Action> for SpectralView {
                 let Some(s) = shown else {
                     return true;
                 };
-                let edits = model.spectral_edits(s.clip);
+                let edits = model.spectral_edits(s.audio);
                 match &drag {
                     Drag::Shape { start, last, .. }
                         if (last.x - start.x).hypot(last.y - start.y) < CLICK_PX =>
@@ -1251,7 +1260,7 @@ impl CanvasView<Session, Action> for SpectralView {
                         if (now.x - from.x).hypot(now.y - from.y) >= CLICK_PX {
                             let moved = self.moved(&s, l.area, edit, *from, *now);
                             cx.emit(Action::EditSpectral {
-                                clip: s.clip,
+                                audio: s.audio,
                                 change: SpectralChange::Set(*index, moved),
                             });
                         }
@@ -1272,7 +1281,7 @@ impl CanvasView<Session, Action> for SpectralView {
                             }
                             if e != edits[i] {
                                 cx.emit(Action::EditSpectral {
-                                    clip: s.clip,
+                                    audio: s.audio,
                                     change: SpectralChange::Set(i, e),
                                 });
                             }
@@ -1293,7 +1302,7 @@ impl CanvasView<Session, Action> for SpectralView {
                 if !l.area.contains(pos) {
                     return false;
                 }
-                let edits = model.spectral_edits(s.clip);
+                let edits = model.spectral_edits(s.audio);
                 let mut items: Vec<MenuItem<Action>> = Vec::new();
                 if let Some(i) = self.edit_at(&s, l.area, &edits, pos) {
                     self.selected = Some(i);
@@ -1313,7 +1322,7 @@ impl CanvasView<Session, Action> for SpectralView {
                             MenuItem::new(
                                 label,
                                 Action::EditSpectral {
-                                    clip: s.clip,
+                                    audio: s.audio,
                                     change: SpectralChange::Set(i, e),
                                 },
                             )
@@ -1324,14 +1333,15 @@ impl CanvasView<Session, Action> for SpectralView {
                         MenuItem::new(
                             format!("Delete Edit {}", i + 1),
                             Action::EditSpectral {
-                                clip: s.clip,
+                                audio: s.audio,
                                 change: SpectralChange::Remove(i),
                             },
                         )
                         .separated(),
                     );
                 }
-                if let Some(at) = Self::position_of(model, s.clip, self.frame_at(&s, l.area, pos.x))
+                if let Some(at) =
+                    Self::position_of(model, s.audio, self.frame_at(&s, l.area, pos.x))
                 {
                     items.push(
                         MenuItem::new(
@@ -1346,7 +1356,7 @@ impl CanvasView<Session, Action> for SpectralView {
                         MenuItem::new(
                             "Remove Every Edit",
                             Action::EditSpectral {
-                                clip: s.clip,
+                                audio: s.audio,
                                 change: SpectralChange::Clear,
                             },
                         )
@@ -1396,10 +1406,10 @@ impl CanvasView<Session, Action> for SpectralView {
                 };
                 match key {
                     Key::Delete | Key::Backspace => {
-                        let edits = model.spectral_edits(s.clip);
+                        let edits = model.spectral_edits(s.audio);
                         if let Some(i) = self.selected.take().filter(|i| *i < edits.len()) {
                             cx.emit(Action::EditSpectral {
-                                clip: s.clip,
+                                audio: s.audio,
                                 change: SpectralChange::Remove(i),
                             });
                         } else if self.selection.take().is_none() {
@@ -1469,7 +1479,7 @@ impl CanvasView<Session, Action> for SpectralView {
             || self.waiting.is_some_and(|t| t.elapsed() < WAIT)
             || model.spectrogram_pending()
             || model
-                .spectral_clip()
+                .spectral_target()
                 .is_some_and(|c| model.spectral_busy(c).is_some())
             || model.transport().playing
     }

@@ -1,5 +1,6 @@
-//! Clip effects in the session: a clip's chain edited, rendered offline
-//! and played (see [`faderframe_project::clip_fx`]).
+//! Clip effects in the session: the chain of an audio clip or of one take
+//! of a take folder (an [`AudioRef`]) edited, rendered offline and played
+//! (see [`faderframe_project::clip_fx`]).
 //!
 //! Edits ([`ClipFxOp`]) change a pending chain at once (what the editor
 //! shows); a render starts when the chain has rested for a moment (a drag
@@ -7,8 +8,8 @@
 //! project holding the clip's original audio with the chain as inserts.
 //! When it is done, the new file becomes a source and the clip plays it,
 //! chain and all, in one "Clip Effects" step; a render that a newer edit
-//! has overtaken is dropped. Removing every effect gives the clip its
-//! audio back.
+//! has overtaken is dropped. Removing every effect gives the clip (or
+//! take) its audio back.
 //!
 //! A device can be shown in its own editor window
 //! ([`Session::open_clip_fx_editor`]): the engine hosts an instance of
@@ -24,6 +25,7 @@ use crate::render::{self, RenderChannels, RenderJob, RenderRange, RenderSettings
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_audio_files::WavFormat;
 use faderframe_core::{ChannelLayout, ClipId, ParameterId, PluginInstanceId, TrackId};
+use faderframe_project::AudioRef;
 use faderframe_project::clip_fx::{ClipEffects, OriginalAudio};
 use faderframe_project::{
     AudioClip, AudioSource, Clip, ClipContent, ClipFades, Command, PluginRef, PluginSlot, Project,
@@ -71,10 +73,10 @@ pub enum ClipFxOp {
     Clear,
 }
 
-/// A device shown in its own editor window: its clip, and when its GUI
-/// last changed something not yet taken into the chain.
+/// A device shown in its own editor window: its clip or take, and when
+/// its GUI last changed something not yet taken into the chain.
 struct Editor {
-    clip: ClipId,
+    audio: AudioRef,
     touched: Option<Instant>,
     /// Its state was asked for (a sandboxed plugin answers later).
     asked: bool,
@@ -87,7 +89,7 @@ struct Pending {
 }
 
 struct Job {
-    clip: ClipId,
+    audio: AudioRef,
     generation: u64,
     chain: Vec<PluginSlot>,
     original: OriginalAudio,
@@ -97,7 +99,7 @@ struct Job {
 
 #[derive(Default)]
 pub(crate) struct ClipFxState {
-    pending: HashMap<ClipId, Pending>,
+    pending: HashMap<AudioRef, Pending>,
     jobs: Vec<Job>,
     generation: u64,
     /// Parameters by plugin (format and id).
@@ -105,8 +107,8 @@ pub(crate) struct ClipFxState {
     /// The ones a card shows (not what a device measured, as De-noise's
     /// profile: `devices::hidden`).
     shown_infos: HashMap<String, Vec<faderframe_plugin_host::ParameterInfo>>,
-    /// The clip the editor shows.
-    pub(crate) shown: Option<ClipId>,
+    /// The clip or take the editor shows.
+    pub(crate) shown: Option<AudioRef>,
     /// Devices in editor windows of their own, by slot.
     editors: HashMap<PluginInstanceId, Editor>,
     /// The session revision the editors' instances were last synced at.
@@ -118,31 +120,29 @@ fn key(p: &PluginRef) -> String {
 }
 
 impl Session {
-    /// The clip the clip-effects editor shows.
-    pub fn clip_fx_clip(&self) -> Option<ClipId> {
-        self.clip_fx.shown.filter(|c| {
-            self.project
-                .clip(*c)
-                .is_some_and(|c| c.as_audio().is_some())
-        })
+    /// The clip or take the clip-effects editor shows (while it is there).
+    pub fn clip_fx_target(&self) -> Option<AudioRef> {
+        self.clip_fx
+            .shown
+            .filter(|r| self.project.audio(*r).is_some())
     }
 
-    /// A clip's chain as it is being edited (or as rendered).
-    pub fn clip_fx_chain(&self, clip: ClipId) -> Vec<PluginSlot> {
-        if let Some(p) = self.clip_fx.pending.get(&clip) {
+    /// The chain of a clip or take as it is being edited (or as rendered).
+    pub fn clip_fx_chain(&self, audio: AudioRef) -> Vec<PluginSlot> {
+        if let Some(p) = self.clip_fx.pending.get(&audio) {
             return p.chain.clone();
         }
         self.project
-            .clip(clip)
-            .and_then(|c| c.as_audio())
+            .audio(audio)
             .and_then(|a| a.effects.as_ref())
             .map(|e| e.chain.clone())
             .unwrap_or_default()
     }
 
-    /// Is a clip's chain waiting to render or rendering?
-    pub fn clip_fx_busy(&self, clip: ClipId) -> bool {
-        self.clip_fx.pending.contains_key(&clip) || self.clip_fx.jobs.iter().any(|j| j.clip == clip)
+    /// Is the chain of a clip or take waiting to render or rendering?
+    pub fn clip_fx_busy(&self, audio: AudioRef) -> bool {
+        self.clip_fx.pending.contains_key(&audio)
+            || self.clip_fx.jobs.iter().any(|j| j.audio == audio)
     }
 
     /// A device's parameters (made once per plugin and kept).
@@ -181,13 +181,15 @@ impl Session {
             .map(Vec::as_slice)
     }
 
-    /// Show a clip in the clip-effects editor.
-    pub(crate) fn open_clip_fx(&mut self, clip: ClipId) -> Result<()> {
-        if self.project.clip(clip).and_then(|c| c.as_audio()).is_none() {
-            return Err(SessionError::Other("clip effects go on audio clips".into()));
+    /// Show a clip or take in the clip-effects editor.
+    pub(crate) fn open_clip_fx(&mut self, audio: AudioRef) -> Result<()> {
+        if self.project.audio(audio).is_none() {
+            return Err(SessionError::Other(
+                "clip effects go on audio clips and takes".into(),
+            ));
         }
-        self.clip_fx.shown = Some(clip);
-        for slot in self.clip_fx_chain(clip) {
+        self.clip_fx.shown = Some(audio);
+        for slot in self.clip_fx_chain(audio) {
             self.clip_fx_parameters(&slot.plugin);
         }
         self.workspace_action(crate::WorkspaceAction::ShowView(
@@ -197,15 +199,14 @@ impl Session {
         Ok(())
     }
 
-    /// Edit a clip's effects (see the module docs).
-    pub fn edit_clip_fx(&mut self, clip: ClipId, op: ClipFxOp) -> Result<()> {
-        let Some(c) = self.project.clip(clip).cloned() else {
-            return Err(SessionError::Other(format!("no clip {clip}")));
+    /// Edit the effects of a clip or take (see the module docs).
+    pub fn edit_clip_fx(&mut self, audio: AudioRef, op: ClipFxOp) -> Result<()> {
+        let Some(a) = self.project.audio(audio).cloned() else {
+            return Err(SessionError::Other(
+                "clip effects go on audio clips and takes".into(),
+            ));
         };
-        let Some(a) = c.as_audio().cloned() else {
-            return Err(SessionError::Other("clip effects go on audio clips".into()));
-        };
-        let mut chain = self.clip_fx_chain(clip);
+        let mut chain = self.clip_fx_chain(audio);
         match op {
             ClipFxOp::Add(plugin) => {
                 self.clip_fx_parameters(&plugin);
@@ -260,11 +261,11 @@ impl Session {
         if chain.is_empty() {
             // Nothing left: the original back (an undo step), nothing
             // pending.
-            self.clip_fx.pending.remove(&clip);
+            self.clip_fx.pending.remove(&audio);
             if let Some(fx) = a.effects.as_deref() {
                 let mut restored = a.clone();
                 fx.original.restore(&mut restored, fx.trim(&a));
-                self.set_audio("Remove Clip Effects", &c, c.start, restored)?;
+                self.set_audio_of("Remove Clip Effects", audio, restored)?;
             }
             self.revision += 1;
             return Ok(());
@@ -272,7 +273,7 @@ impl Session {
         self.clip_fx.generation += 1;
         let generation = self.clip_fx.generation;
         self.clip_fx.pending.insert(
-            clip,
+            audio,
             Pending {
                 chain,
                 changed: Instant::now(),
@@ -283,22 +284,23 @@ impl Session {
         Ok(())
     }
 
-    /// Show device `index` of `clip`'s chain in its own editor window
-    /// (its GUI, or the generic one when `generic` or it has none).
+    /// Show device `index` of the chain of `audio` (a clip or take) in its
+    /// own editor window (its GUI, or the generic one when `generic` or it
+    /// has none).
     pub(crate) fn open_clip_fx_editor(
         &mut self,
-        clip: ClipId,
+        audio: AudioRef,
         index: usize,
         generic: bool,
     ) -> Result<()> {
-        let Some(slot) = self.clip_fx_chain(clip).get(index).cloned() else {
+        let Some(slot) = self.clip_fx_chain(audio).get(index).cloned() else {
             return Err(SessionError::Other("no such clip effect".into()));
         };
         let track = self
             .project
-            .clip(clip)
+            .clip(audio.clip())
             .map(|c| c.track)
-            .ok_or_else(|| SessionError::Other(format!("no clip {clip}")))?;
+            .ok_or_else(|| SessionError::Other(format!("no clip {}", audio.clip())))?;
         if !self.engine.host_plugin(&slot) {
             return Err(SessionError::Other(format!(
                 "{} could not be loaded",
@@ -308,7 +310,7 @@ impl Session {
         // Hosted before (its window closed since): what the chain says now.
         self.engine.sync_plugin_slot(&slot);
         self.clip_fx.editors.entry(slot.id).or_insert(Editor {
-            clip,
+            audio,
             touched: None,
             asked: false,
         });
@@ -323,27 +325,28 @@ impl Session {
         Ok(())
     }
 
-    /// A device in an editor window of its own: its clip, its place in the
-    /// chain and its slot (as being edited).
-    pub fn clip_fx_slot(&self, plugin: PluginInstanceId) -> Option<(ClipId, usize, &PluginSlot)> {
-        let clip = self.clip_fx.editors.get(&plugin)?.clip;
-        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&clip) {
+    /// A device in an editor window of its own: its clip or take, its
+    /// place in the chain and its slot (as being edited).
+    pub fn clip_fx_slot(&self, plugin: PluginInstanceId) -> Option<(AudioRef, usize, &PluginSlot)> {
+        let audio = self.clip_fx.editors.get(&plugin)?.audio;
+        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&audio) {
             Some(p) => &p.chain,
-            None => &self.project.clip(clip)?.as_audio()?.effects.as_ref()?.chain,
+            None => &self.project.audio(audio)?.effects.as_ref()?.chain,
         };
         chain
             .iter()
             .enumerate()
             .find(|(_, s)| s.id == plugin)
-            .map(|(i, s)| (clip, i, s))
+            .map(|(i, s)| (audio, i, s))
     }
 
-    /// A device's name as the views show it, for one in a clip's chain.
+    /// A device's name as the views show it, for one in a clip's or a
+    /// take's chain.
     pub(crate) fn clip_fx_device_name(&self, plugin: PluginInstanceId) -> Option<String> {
-        let (clip, _, slot) = self.clip_fx_slot(plugin)?;
-        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&clip) {
+        let (audio, _, slot) = self.clip_fx_slot(plugin)?;
+        let chain: &[PluginSlot] = match self.clip_fx.pending.get(&audio) {
             Some(p) => &p.chain,
-            None => &self.project.clip(clip)?.as_audio()?.effects.as_ref()?.chain,
+            None => &self.project.audio(audio)?.effects.as_ref()?.chain,
         };
         Some(faderframe_project::device_name(chain, slot))
     }
@@ -351,7 +354,7 @@ impl Session {
     /// The chain edits a command about devices in editor windows of their
     /// own stands for (editor windows send track commands; device editors
     /// batch several values). `None` when it names anything else.
-    pub(crate) fn clip_fx_commands(&self, cmd: &Command) -> Option<Vec<(ClipId, ClipFxOp)>> {
+    pub(crate) fn clip_fx_commands(&self, cmd: &Command) -> Option<Vec<(AudioRef, ClipFxOp)>> {
         if self.clip_fx.editors.is_empty() {
             return None;
         }
@@ -367,7 +370,7 @@ impl Session {
 
     /// The chain edit one command about a device in an editor window of
     /// its own stands for.
-    fn clip_fx_command(&self, cmd: &Command) -> Option<(ClipId, ClipFxOp)> {
+    fn clip_fx_command(&self, cmd: &Command) -> Option<(AudioRef, ClipFxOp)> {
         let (plugin, op): (_, Box<dyn Fn(usize) -> ClipFxOp>) = match cmd {
             Command::SetPluginParameter {
                 plugin,
@@ -413,8 +416,8 @@ impl Session {
             }
             _ => return None,
         };
-        let (clip, index, _) = self.clip_fx_slot(plugin)?;
-        Some((clip, op(index)))
+        let (audio, index, _) = self.clip_fx_slot(plugin)?;
+        Some((audio, op(index)))
     }
 
     /// Moves made in a device's own GUI: those of devices in editor
@@ -524,10 +527,10 @@ impl Session {
     /// every value it moved (explicit values are applied after the state,
     /// so they must follow; the view shows them), then render.
     fn take_clip_fx_state(&mut self, plugin: PluginInstanceId, state: Option<String>) {
-        let Some((clip, index, _)) = self.clip_fx_slot(plugin) else {
+        let Some((audio, index, _)) = self.clip_fx_slot(plugin) else {
             return;
         };
-        let mut chain = self.clip_fx_chain(clip);
+        let mut chain = self.clip_fx_chain(audio);
         let Some(slot) = chain.get_mut(index) else {
             return;
         };
@@ -561,7 +564,7 @@ impl Session {
             .checked_sub(SETTLE)
             .unwrap_or_else(Instant::now);
         self.clip_fx.pending.insert(
-            clip,
+            audio,
             Pending {
                 chain,
                 changed,
@@ -571,16 +574,17 @@ impl Session {
         self.revision += 1;
     }
 
-    /// Render a clip's chain again (its original audio changed).
-    pub(crate) fn rerender_clip_fx(&mut self, clip: ClipId) {
-        let chain = self.clip_fx_chain(clip);
+    /// Render the chain of a clip or take again (its original audio
+    /// changed).
+    pub(crate) fn rerender_clip_fx(&mut self, audio: AudioRef) {
+        let chain = self.clip_fx_chain(audio);
         if chain.is_empty() {
             return;
         }
         self.clip_fx.generation += 1;
         let generation = self.clip_fx.generation;
         self.clip_fx.pending.insert(
-            clip,
+            audio,
             Pending {
                 chain,
                 changed: Instant::now(),
@@ -593,23 +597,23 @@ impl Session {
     /// (from the session tick).
     pub(crate) fn poll_clip_fx(&mut self) {
         self.tick_clip_fx_editors();
-        let ready: Vec<ClipId> = self
+        let ready: Vec<AudioRef> = self
             .clip_fx
             .pending
             .iter()
-            .filter(|(c, p)| {
+            .filter(|(r, p)| {
                 p.changed.elapsed() >= SETTLE
                     && !self
                         .clip_fx
                         .jobs
                         .iter()
-                        .any(|j| j.clip == **c && j.generation == p.generation)
+                        .any(|j| j.audio == **r && j.generation == p.generation)
             })
-            .map(|(c, _)| *c)
+            .map(|(r, _)| *r)
             .collect();
-        for clip in ready {
-            if let Err(e) = self.start_clip_fx_render(clip) {
-                self.clip_fx.pending.remove(&clip);
+        for audio in ready {
+            if let Err(e) = self.start_clip_fx_render(audio) {
+                self.clip_fx.pending.remove(&audio);
                 self.notify(NoticeLevel::Error, format!("clip effects: {e}"));
             }
         }
@@ -623,7 +627,7 @@ impl Session {
             let latest = self
                 .clip_fx
                 .pending
-                .get(&j.clip)
+                .get(&j.audio)
                 .is_none_or(|p| p.generation == j.generation);
             let result = j.job.join();
             if !latest {
@@ -631,10 +635,10 @@ impl Session {
                 let _ = std::fs::remove_file(&j.path);
                 continue;
             }
-            self.clip_fx.pending.remove(&j.clip);
+            self.clip_fx.pending.remove(&j.audio);
             let placed = result
                 .map_err(|e| SessionError::Other(e.to_string()))
-                .and_then(|_| self.place_clip_fx(j.clip, j.chain, j.original, &j.path));
+                .and_then(|_| self.place_clip_fx(j.audio, j.chain, j.original, &j.path));
             if let Err(e) = placed {
                 self.notify(NoticeLevel::Error, format!("clip effects: {e}"));
             }
@@ -642,19 +646,16 @@ impl Session {
         }
     }
 
-    fn start_clip_fx_render(&mut self, clip: ClipId) -> Result<()> {
-        let Some(p) = self.clip_fx.pending.get(&clip) else {
+    fn start_clip_fx_render(&mut self, audio: AudioRef) -> Result<()> {
+        let Some(p) = self.clip_fx.pending.get(&audio) else {
             return Ok(());
         };
         let (chain, generation) = (p.chain.clone(), p.generation);
-        let c = self
+        let a = self
             .project
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other("the clip is gone".into()))?;
-        let a = c
-            .as_audio()
-            .ok_or_else(|| SessionError::Other("not an audio clip".into()))?;
+            .audio(audio)
+            .ok_or_else(|| SessionError::Other("the clip or take is gone".into()))?;
+        let name = self.project.audio_name(audio).unwrap_or_default();
         let original = a
             .effects
             .as_ref()
@@ -692,7 +693,7 @@ impl Session {
             Clip {
                 id: clip_id,
                 track,
-                name: c.name.clone(),
+                name: name.clone(),
                 color: None,
                 start: MusicalTime::ZERO,
                 muted: false,
@@ -716,7 +717,7 @@ impl Session {
             .ok_or_else(|| SessionError::Other("nothing to render".into()))?;
         std::fs::create_dir_all(&self.media_dir)
             .map_err(|e| SessionError::Other(format!("{}: {e}", self.media_dir.display())))?;
-        let path = crate::media::unique_path(&self.media_dir, &format!("{} FX", c.name));
+        let path = crate::media::unique_path(&self.media_dir, &format!("{name} FX"));
         let settings = RenderSettings {
             range: RenderRange::Span { start, end },
             channels: if channels == 1 {
@@ -736,7 +737,7 @@ impl Session {
         };
         let job = render::start(copy, settings).map_err(|e| SessionError::Other(e.to_string()))?;
         self.clip_fx.jobs.push(Job {
-            clip,
+            audio,
             generation,
             chain,
             original,
@@ -748,7 +749,7 @@ impl Session {
 
     fn place_clip_fx(
         &mut self,
-        clip: ClipId,
+        audio: AudioRef,
         chain: Vec<PluginSlot>,
         original: OriginalAudio,
         path: &std::path::Path,
@@ -756,18 +757,16 @@ impl Session {
         let wav = faderframe_audio_files::wavstream::WavFile::open(path)
             .map_err(|e| SessionError::Other(format!("{}: {e}", path.display())))?;
         let (frames, channels, rate) = (wav.frames() as i64, wav.channels(), wav.sample_rate());
-        let Some(c) = self.project.clip(clip).cloned() else {
+        let Some(mut a) = self.project.audio(audio).cloned() else {
             return Ok(()); // deleted meanwhile
-        };
-        let Some(mut a) = c.as_audio().cloned() else {
-            return Ok(());
         };
         let trim = a.effects.as_ref().map_or(0, |e| e.trim(&a));
         let source = AudioSource {
             id: self.project.ids.allocate(),
-            name: path
-                .file_stem()
-                .map_or_else(|| c.name.clone(), |s| s.to_string_lossy().to_string()),
+            name: path.file_stem().map_or_else(
+                || self.project.audio_name(audio).unwrap_or_default(),
+                |s| s.to_string_lossy().to_string(),
+            ),
             spec: SourceSpec::File {
                 path: path.to_path_buf(),
                 channels: channels as u16,
@@ -788,16 +787,10 @@ impl Session {
             original,
             rendered_offset: offset,
         }));
-        let cmds = vec![
-            Command::AddSource {
-                source: Box::new(source),
-            },
-            Command::SetClipContent {
-                clip,
-                start: c.start,
-                content: Box::new(ClipContent::Audio(a)),
-            },
-        ];
+        let mut cmds = vec![Command::AddSource {
+            source: Box::new(source),
+        }];
+        cmds.extend(self.project.set_audio(vec![(audio, a)]));
         self.batch("Clip Effects", cmds)
     }
 }
@@ -816,13 +809,14 @@ mod tests {
     #[test]
     fn what_a_devices_own_gui_changes_reaches_the_chain() {
         let mut s = Session::demo(EngineConfig::default()).unwrap();
-        let clip = s
+        let clip: AudioRef = s
             .project()
             .tracks
             .iter()
             .find(|t| t.name == "Pad")
             .unwrap()
-            .clips[0];
+            .clips[0]
+            .into();
         let utility = PluginRef {
             format: PluginFormat::Builtin,
             id: faderframe_core::builtin::GAIN.into(),

@@ -1,5 +1,6 @@
 //! Polyphonic pitch editing in the session (the Pitch editor's
-//! Polyphonic option, on by default).
+//! Polyphonic option, on by default), of audio clips and of single takes
+//! of take folders alike ([`AudioRef`]).
 //!
 //! Detection ([`hear_notes`], which lead sheets hear their audio with
 //! too): the clip's audio (its original source: a render is never
@@ -18,10 +19,10 @@
 
 use crate::to_midi::{Found, harmony};
 use crate::{NoticeLevel, Result, Session, SessionError};
-use faderframe_core::{AudioSourceId, ClipId};
+use faderframe_core::AudioSourceId;
 use faderframe_polypitch::{Heard, Moved, follow};
 use faderframe_project::pitch::{PitchEdit, PitchNote, Polyphonic, UNVOICED};
-use faderframe_project::{AudioSource, ClipContent, Command, SourceSpec};
+use faderframe_project::{AudioRef, AudioSource, Command, SourceSpec};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ const HOP_SECONDS: f64 = 0.005;
 const SHORTEST: f64 = 0.06;
 
 struct Render {
-    clip: ClipId,
+    clip: AudioRef,
     key: u64,
     path: PathBuf,
     progress: Arc<AtomicU32>,
@@ -47,10 +48,11 @@ struct Render {
 
 #[derive(Default)]
 pub(crate) struct PolyState {
-    detect: Vec<(ClipId, JoinHandle<Option<PitchEdit>>)>,
+    detect: Vec<(AudioRef, JoinHandle<Option<PitchEdit>>)>,
     renders: Vec<Render>,
-    /// Each polyphonic clip's notes' key as last seen and since when.
-    seen: HashMap<ClipId, (u64, Instant)>,
+    /// Each polyphonic clip's (or take's) notes' key as last seen and
+    /// since when.
+    seen: HashMap<AudioRef, (u64, Instant)>,
     looked: Option<Instant>,
 }
 
@@ -197,12 +199,12 @@ pub(crate) fn hear_notes(mono: &[f32], rate: f64, lo: usize, hi: usize) -> Optio
 }
 
 impl Session {
-    /// Find every note of `clips` (polyphonic; on workers, placed when
-    /// done).
-    pub(crate) fn detect_polyphonic(&mut self, clips: &[ClipId]) -> Result<()> {
+    /// Find every note of `audio` (clips or takes; polyphonic; on
+    /// workers, placed when done).
+    pub(crate) fn detect_polyphonic(&mut self, audio: &[AudioRef]) -> Result<()> {
         let project_rate = f64::from(self.project.sample_rate.max(1));
-        for &id in clips {
-            let Some(ClipContent::Audio(a)) = self.project.clip(id).map(|c| &c.content) else {
+        for &id in audio {
+            let Some(a) = self.project.audio(id) else {
                 continue;
             };
             if a.spectral.is_some() || a.effects.is_some() {
@@ -288,16 +290,16 @@ impl Session {
         !self.poly.detect.is_empty()
     }
 
-    /// Drop a clip's polyphonic detection (its thread runs on, its notes
-    /// are not placed); whether one was running.
-    pub(crate) fn cancel_polyphonic(&mut self, clip: ClipId) -> bool {
+    /// Drop a clip's (or take's) polyphonic detection (its thread runs
+    /// on, its notes are not placed); whether one was running.
+    pub(crate) fn cancel_polyphonic(&mut self, clip: AudioRef) -> bool {
         let before = self.poly.detect.len();
         self.poly.detect.retain(|(c, _)| *c != clip);
         self.poly.detect.len() != before
     }
 
-    /// How far a clip's render is (0…1), while one runs.
-    pub fn pitch_rendering(&self, clip: ClipId) -> Option<f32> {
+    /// How far a clip's (or take's) render is (0…1), while one runs.
+    pub fn pitch_rendering(&self, clip: AudioRef) -> Option<f32> {
         self.poly
             .renders
             .iter()
@@ -324,10 +326,12 @@ impl Session {
         }
     }
 
-    /// A polyphonic clip whose audio does not match its notes yet.
+    /// A polyphonic clip (or take) whose audio does not match its notes
+    /// yet.
     fn poly_pending(&self) -> bool {
-        self.project.clips.values().any(|c| {
-            c.as_audio()
+        let p = &self.project;
+        p.audio_refs().into_iter().any(|r| {
+            p.audio(r)
                 .and_then(|a| a.pitch.as_ref())
                 .is_some_and(|e| e.polyphonic.is_some_and(|p| p.rendered != e.sound_key()))
         })
@@ -381,14 +385,14 @@ impl Session {
             return;
         }
         self.poly.looked = Some(Instant::now());
-        let wanted: Vec<(ClipId, u64, Polyphonic)> = self
-            .project
-            .clips
-            .values()
-            .filter_map(|c| {
-                let e = c.as_audio()?.pitch.as_ref()?;
+        let project = &self.project;
+        let wanted: Vec<(AudioRef, u64, Polyphonic)> = project
+            .audio_refs()
+            .into_iter()
+            .filter_map(|r| {
+                let e = project.audio(r)?.pitch.as_ref()?;
                 let p = e.polyphonic?;
-                Some((c.id, e.sound_key(), p))
+                Some((r, e.sound_key(), p))
             })
             .collect();
         self.poly
@@ -428,15 +432,13 @@ impl Session {
         }
     }
 
-    /// Give a clip the notes found (a melodic edit's corrections carried
-    /// over to them).
-    fn place_detection(&mut self, clip: ClipId, mut edit: PitchEdit) -> Result<()> {
-        let Some(c) = self.project.clip(clip).cloned() else {
+    /// Give a clip (or take) the notes found (a melodic edit's
+    /// corrections carried over to them).
+    fn place_detection(&mut self, clip: AudioRef, mut edit: PitchEdit) -> Result<()> {
+        let Some(mut a) = self.project.audio(clip).cloned() else {
             return Ok(());
         };
-        let Some(mut a) = c.as_audio().cloned() else {
-            return Ok(());
-        };
+        let name = self.project.audio_name(clip).unwrap_or_default();
         if let Some(old) = a.pitch.as_ref().filter(|e| e.polyphonic.is_none()) {
             faderframe_project::pitch::carry(old, &mut edit);
         }
@@ -444,33 +446,24 @@ impl Session {
         let count = edit.notes.len();
         a.source = original;
         a.pitch = Some(edit);
-        self.batch(
-            "Detect Pitch",
-            vec![Command::SetClipContent {
-                clip,
-                start: c.start,
-                content: Box::new(ClipContent::Audio(a)),
-            }],
-        )?;
+        self.set_audio_of("Detect Pitch", clip, a)?;
         self.notify(
             NoticeLevel::Info,
-            format!("Found {count} notes in ‘{}’ (polyphonic)", c.name),
+            format!("Found {count} notes in ‘{name}’ (polyphonic)"),
         );
         Ok(())
     }
 
-    fn start_render(&mut self, clip: ClipId, key: u64, original: AudioSourceId) -> Result<()> {
-        let Some(c) = self.project.clip(clip) else {
+    fn start_render(&mut self, clip: AudioRef, key: u64, original: AudioSourceId) -> Result<()> {
+        let Some(e) = self.project.audio(clip).and_then(|a| a.pitch.clone()) else {
             return Ok(());
         };
-        let Some(e) = c.as_audio().and_then(|a| a.pitch.clone()) else {
-            return Ok(());
-        };
+        let name = self.project.audio_name(clip).unwrap_or_default();
         let Some(data) = self.source_data(original) else {
             return Err(SessionError::Other("the clip's audio is not loaded".into()));
         };
         std::fs::create_dir_all(&self.media_dir).map_err(|e| SessionError::Other(e.to_string()))?;
-        let path = crate::media::unique_path(&self.media_dir, &format!("{} Pitch", c.name));
+        let path = crate::media::unique_path(&self.media_dir, &format!("{name} Pitch"));
         let project_rate = f64::from(self.project.sample_rate.max(1));
         let progress = Arc::new(AtomicU32::new(0));
         let (job_path, job_progress) = (path.clone(), Arc::clone(&progress));
@@ -530,32 +523,29 @@ impl Session {
 
     fn place_render(
         &mut self,
-        clip: ClipId,
+        clip: AudioRef,
         key: u64,
         path: &std::path::Path,
         (channels, frames, rate): (u16, i64, u32),
     ) -> Result<()> {
-        let current = self.project.clip(clip).cloned();
+        let current = self.project.audio(clip).cloned();
         let fits = current
             .as_ref()
-            .and_then(|c| c.as_audio())
             .and_then(|a| a.pitch.as_ref())
             .is_some_and(|e| {
                 e.sound_key() == key && e.polyphonic.is_some_and(|p| p.rendered != key)
             });
-        let Some(c) = current.filter(|_| fits) else {
-            // The notes moved on meanwhile (or the clip went).
+        let Some(mut a) = current.filter(|_| fits) else {
+            // The notes moved on meanwhile (or the clip or take went).
             let _ = std::fs::remove_file(path);
             return Ok(());
         };
-        let Some(mut a) = c.as_audio().cloned() else {
-            return Ok(());
-        };
+        let name = self.project.audio_name(clip).unwrap_or_default();
         let source = AudioSource {
             id: self.project.ids.allocate(),
             name: path
                 .file_stem()
-                .map_or_else(|| c.name.clone(), |s| s.to_string_lossy().to_string()),
+                .map_or(name, |s| s.to_string_lossy().to_string()),
             spec: SourceSpec::File {
                 path: path.to_path_buf(),
                 channels,
@@ -567,24 +557,17 @@ impl Session {
         if let Some(p) = a.pitch.as_mut().and_then(|e| e.polyphonic.as_mut()) {
             p.rendered = key;
         }
-        self.apply_unrecorded(vec![
-            Command::AddSource {
-                source: Box::new(source),
-            },
-            Command::SetClipContent {
-                clip,
-                start: c.start,
-                content: Box::new(ClipContent::Audio(a)),
-            },
-        ])
+        let mut commands = vec![Command::AddSource {
+            source: Box::new(source),
+        }];
+        commands.extend(self.project.set_audio(vec![(clip, a)]));
+        self.apply_unrecorded(commands)
     }
 
-    /// Nothing moved any more: the clip plays its original again.
-    fn place_original(&mut self, clip: ClipId) -> Result<()> {
-        let Some(c) = self.project.clip(clip).cloned() else {
-            return Ok(());
-        };
-        let Some(mut a) = c.as_audio().cloned() else {
+    /// Nothing moved any more: the clip (or take) plays its original
+    /// again.
+    fn place_original(&mut self, clip: AudioRef) -> Result<()> {
+        let Some(mut a) = self.project.audio(clip).cloned() else {
             return Ok(());
         };
         let Some(p) = a.pitch.as_mut().and_then(|e| e.polyphonic.as_mut()) else {
@@ -592,10 +575,7 @@ impl Session {
         };
         p.rendered = 0;
         a.source = p.original;
-        self.apply_unrecorded(vec![Command::SetClipContent {
-            clip,
-            start: c.start,
-            content: Box::new(ClipContent::Audio(a)),
-        }])
+        let commands = self.project.set_audio(vec![(clip, a)]);
+        self.apply_unrecorded(commands)
     }
 }

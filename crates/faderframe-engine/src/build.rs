@@ -431,56 +431,79 @@ enum Role {
 }
 
 /// Stretcher voices a track's clip player needs: one per pitch-preserving
-/// warp preset its clips use, two when such clips overlap.
+/// warp preset its clips (and the pieces its folders' comps play) use, two
+/// when such clips overlap.
 pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> StretchVoices {
-    use faderframe_project::{ClipContent, WarpAlgorithm};
+    use faderframe_project::ClipContent;
     let mut spans: [Vec<(i64, i64)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     // A launched clip plays alone (but may start while the arrangement's
     // clip still has its voice): one more of its kind.
     let mut launched = [0usize; 3];
+    // A folder's take auditioned whole plays alone in its place: one of
+    // each kind its takes use.
+    let mut one = [false; 3];
     let slot_clips = project
         .launcher
         .slots
         .iter()
         .filter(|(k, _)| k.track == track.id)
         .filter_map(|(_, c)| project.clips.get(c));
+    let rate = f64::from(project.sample_rate);
+    let tl = &project.timeline;
     for (c, in_slot) in project
         .clips_of(track.id)
         .into_iter()
         .map(|c| (c, false))
         .chain(slot_clips.map(|c| (c, true)))
     {
-        let ClipContent::Audio(a) = &c.content else {
-            continue;
-        };
-        let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
-        let warped = a
-            .warp
-            .as_ref()
-            .filter(|w| !w.is_identity(a.source_offset, a.length));
-        let transposed = a.stretch.semitones() != 0.0;
-        if c.muted
-            || a.reversed
-            || track.freeze.is_some()
-            || (warped.is_none() && !pitched && !transposed)
-        {
+        if c.muted || track.freeze.is_some() {
             continue;
         }
-        // Pitch edits play through PSOLA voices, warped or not; a clip
-        // only transposed through a polyphonic stretcher.
-        let i = match warped.map(|w| w.algorithm) {
-            _ if pitched => 2,
-            Some(WarpAlgorithm::Polyphonic) => 0,
-            Some(WarpAlgorithm::Rhythmic) => 1,
-            None if transposed => 0,
-            _ => continue,
+        // What plays, from where to where (ticks): a clip, or the pieces
+        // of a folder's comp (its takes' clips cut there, overlapping in
+        // the crossfades).
+        let parts: Vec<(
+            std::borrow::Cow<'_, faderframe_project::AudioClip>,
+            i64,
+            i64,
+        )> = match &c.content {
+            ClipContent::Audio(a) => vec![(
+                std::borrow::Cow::Borrowed(a),
+                c.start.ticks(),
+                c.end(tl, project.sample_rate).ticks(),
+            )],
+            ClipContent::Takes(f) => {
+                for t in &f.takes {
+                    if let Some(i) = stretch_kind(&t.audio) {
+                        one[i] = true;
+                    }
+                }
+                let base = tl.to_samples(c.start, rate);
+                f.played()
+                    .into_iter()
+                    .map(|p| {
+                        let a = base + p.start;
+                        let b = a + p.audio.length;
+                        (
+                            std::borrow::Cow::Owned(p.audio),
+                            tl.to_musical(a, rate).ticks(),
+                            tl.to_musical(b, rate).ticks(),
+                        )
+                    })
+                    .collect()
+            }
+            ClipContent::Midi(_) => continue,
         };
-        if in_slot {
-            launched[i] = 1;
-            continue;
+        for (a, start, end) in parts {
+            let Some(i) = stretch_kind(&a) else {
+                continue;
+            };
+            if in_slot {
+                launched[i] = 1;
+                continue;
+            }
+            spans[i].push((start, end));
         }
-        let start = c.start.ticks();
-        spans[i].push((start, c.end(&project.timeline, project.sample_rate).ticks()));
     }
     let need = |v: &mut Vec<(i64, i64)>| -> usize {
         if v.is_empty() {
@@ -491,11 +514,36 @@ pub fn stretch_voices(project: &Project, track: &faderframe_project::Track) -> S
         if overlap { 2 } else { 1 }
     };
     let [mut poly, mut rhythmic, mut psola] = spans;
+    let at_least = |n: usize, i: usize| n.max(usize::from(one[i]));
     StretchVoices {
-        polyphonic: need(&mut poly) + launched[0],
-        rhythmic: need(&mut rhythmic) + launched[1],
-        psola: need(&mut psola) + launched[2],
+        polyphonic: at_least(need(&mut poly), 0) + launched[0],
+        rhythmic: at_least(need(&mut rhythmic), 1) + launched[1],
+        psola: at_least(need(&mut psola), 2) + launched[2],
         channels: track.layout.channel_count().max(2),
+    }
+}
+
+/// The stretcher voice an audio clip plays through: 0 polyphonic, 1
+/// rhythmic, 2 PSOLA (`None`: played as it is — reversed clips too).
+fn stretch_kind(a: &faderframe_project::AudioClip) -> Option<usize> {
+    use faderframe_project::WarpAlgorithm;
+    let pitched = a.pitch.as_ref().is_some_and(|e| e.plays_live());
+    let warped = a
+        .warp
+        .as_ref()
+        .filter(|w| !w.is_identity(a.source_offset, a.length));
+    let transposed = a.stretch.semitones() != 0.0;
+    if a.reversed {
+        return None;
+    }
+    // Pitch edits play through PSOLA voices, warped or not; a clip only
+    // transposed through a polyphonic stretcher.
+    match warped.map(|w| w.algorithm) {
+        _ if pitched => Some(2),
+        Some(WarpAlgorithm::Polyphonic) => Some(0),
+        Some(WarpAlgorithm::Rhythmic) => Some(1),
+        None if transposed => Some(0),
+        _ => None,
     }
 }
 

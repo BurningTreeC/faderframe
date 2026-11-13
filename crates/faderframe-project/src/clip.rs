@@ -48,25 +48,14 @@ impl ClipContent {
     /// under clip effects, the unedited audio of spectral edits and of a
     /// polyphonic pitch edit.
     pub fn referenced_sources(&self) -> Vec<AudioSourceId> {
-        fn pitch(p: Option<&crate::pitch::PitchEdit>, out: &mut Vec<AudioSourceId>) {
-            if let Some(poly) = p.and_then(|p| p.polyphonic.as_ref()) {
-                out.push(poly.original);
-            }
-        }
         let mut out = Vec::new();
         match self {
-            ClipContent::Audio(a) => {
-                out.push(a.source);
-                pitch(a.pitch.as_ref(), &mut out);
-                if let Some(e) = &a.effects {
-                    out.push(e.original.source);
-                    pitch(e.original.pitch.as_ref(), &mut out);
-                }
-                if let Some(s) = &a.spectral {
-                    out.push(s.original);
+            ClipContent::Audio(a) => a.referenced_sources(&mut out),
+            ClipContent::Takes(f) => {
+                for t in &f.takes {
+                    t.audio.referenced_sources(&mut out);
                 }
             }
-            ClipContent::Takes(f) => out.extend(f.sources()),
             ClipContent::Midi(_) => {}
         }
         out.sort();
@@ -117,6 +106,25 @@ pub struct AudioClip {
 }
 
 impl AudioClip {
+    /// `length` frames of `source` from source frame `source_offset`, as
+    /// recorded: no gain, fades or edits.
+    pub fn plain(source: AudioSourceId, source_offset: i64, length: i64) -> Self {
+        Self {
+            source,
+            source_offset,
+            length: length.max(0),
+            gain_db: 0.0,
+            fades: ClipFades::default(),
+            stretch: StretchSettings::Off,
+            reversed: false,
+            warp: None,
+            pitch: None,
+            effects: None,
+            spectral: None,
+            envelope: None,
+        }
+    }
+
     /// The source frame played at clip-relative output frame `out`.
     pub fn source_at(&self, out: f64) -> f64 {
         match &self.warp {
@@ -128,6 +136,91 @@ impl AudioClip {
     /// Source frames the clip covers.
     pub fn source_span(&self) -> i64 {
         self.warp.as_ref().map_or(self.length, |w| w.source_length)
+    }
+
+    /// The clip cut `offset` frames from its start into the part before
+    /// and the part after (`None` unless `0 < offset < length`). Every edit
+    /// goes with the material it belongs to: a warp's map is cut where the
+    /// output is, an envelope is sliced, a reversed clip's later output is
+    /// its earlier source; the fades at the cut are gone, pitch edits
+    /// (source frames), clip effects and spectral edits go with both.
+    pub fn split_frames(&self, offset: i64) -> Option<(AudioClip, AudioClip)> {
+        if offset <= 0 || offset >= self.length {
+            return None;
+        }
+        let mut l = self.clone();
+        let mut r = self.clone();
+        let rest = self.length - offset;
+        match &self.warp {
+            Some(w) => {
+                let (src, right_warp) = w.after(self.source_offset, self.length, offset);
+                r.source_offset = src;
+                r.warp = Some(right_warp);
+                l.warp = Some(w.before(self.source_offset, self.length, offset));
+            }
+            // Played backwards: the first output frames are the source's
+            // last ones.
+            None if self.reversed => l.source_offset = self.source_offset + rest,
+            None => r.source_offset = self.source_offset + offset,
+        }
+        l.length = offset;
+        r.length = rest;
+        if let Some(e) = &self.envelope {
+            l.envelope = e.slice(0, offset).boxed();
+            r.envelope = e.slice(offset, self.length).boxed();
+        }
+        l.fades.fade_out = 0;
+        r.fades.fade_in = 0;
+        Some((l, r))
+    }
+
+    /// The part of the clip from `from` to `to` frames after its start
+    /// (clamped to the clip; `None` when nothing is left), cut as
+    /// [`Self::split_frames`] cuts.
+    pub fn cut(&self, from: i64, to: i64) -> Option<AudioClip> {
+        let (from, to) = (from.max(0), to.min(self.length));
+        if to <= from {
+            return None;
+        }
+        let mut part = self.clone();
+        if to < part.length {
+            part = part.split_frames(to)?.0;
+        }
+        if from > 0 {
+            part = part.split_frames(from)?.1;
+        }
+        Some(part)
+    }
+
+    /// The clip with nothing left to play (a take's lane in a part of a
+    /// split folder it has no material in): its source and edits, no
+    /// length.
+    pub fn emptied(&self) -> AudioClip {
+        AudioClip {
+            length: 0,
+            fades: ClipFades::default(),
+            warp: None,
+            envelope: None,
+            ..self.clone()
+        }
+    }
+
+    /// Every source it plays or keeps to go back to.
+    pub fn referenced_sources(&self, out: &mut Vec<AudioSourceId>) {
+        fn pitch(p: Option<&crate::pitch::PitchEdit>, out: &mut Vec<AudioSourceId>) {
+            if let Some(poly) = p.and_then(|p| p.polyphonic.as_ref()) {
+                out.push(poly.original);
+            }
+        }
+        out.push(self.source);
+        pitch(self.pitch.as_ref(), out);
+        if let Some(e) = &self.effects {
+            out.push(e.original.source);
+            pitch(e.original.pitch.as_ref(), out);
+        }
+        if let Some(s) = &self.spectral {
+            out.push(s.original);
+        }
     }
 }
 

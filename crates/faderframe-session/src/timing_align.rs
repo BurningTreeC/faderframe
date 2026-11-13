@@ -81,10 +81,9 @@ struct GuidePiece {
 /// How a piece finds its source frame (project rate) for a frame of it.
 #[derive(Clone)]
 enum Reads {
-    /// An audio clip (through its warp; reversed or not).
+    /// An audio clip (through its warp; reversed or not) — a take folder's
+    /// piece is its take's clip cut there.
     Clip(AudioClip),
-    /// A take folder's take: the frame from the folder's start plus this.
-    Take { offset: i64, folder_start: i64 },
 }
 
 impl GuidePiece {
@@ -92,10 +91,6 @@ impl GuidePiece {
     fn source_at(&self, t: f64) -> f64 {
         match &self.reads {
             Reads::Clip(a) => clip_source_at(a, t - self.start as f64),
-            Reads::Take {
-                offset,
-                folder_start,
-            } => *offset as f64 + t - *folder_start as f64,
         }
     }
 }
@@ -424,15 +419,18 @@ impl Session {
                         let Some(take) = f.takes.get(piece.take) else {
                             continue;
                         };
+                        let Some(cut) = take
+                            .audio
+                            .cut(piece.start - take.start, piece.end - take.start)
+                        else {
+                            continue;
+                        };
                         pieces.push(GuidePiece {
                             start: start + piece.start,
                             end: start + piece.end,
-                            source: take.source,
-                            reads: Reads::Take {
-                                offset: take.source_offset,
-                                folder_start: start,
-                            },
-                            gain: 10f32.powf((take.gain_db + f.gain_db) / 20.0),
+                            source: cut.source,
+                            gain: 10f32.powf((cut.gain_db + f.gain_db) / 20.0),
+                            reads: Reads::Clip(cut),
                         });
                     }
                 }

@@ -7,9 +7,9 @@
 //! re-synchronised (parameter values, timeline content, or the whole graph).
 
 use crate::{
-    AudioSource, AuxSend, Clip, ClipContent, ClipFades, CueMix, CueSend, InputRouting, Marker,
-    MidiNote, MonitorMode, MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track,
-    TrackColor, TrackKind,
+    AudioSource, AuxSend, Clip, ClipContent, CueMix, CueSend, InputRouting, Marker, MidiNote,
+    MonitorMode, MusicalRange, OutputRouting, PluginSlot, Project, SendTap, Track, TrackColor,
+    TrackKind,
 };
 use faderframe_automation::AutomationLane;
 use faderframe_core::ChannelLayout;
@@ -3256,32 +3256,11 @@ impl Clip {
             (ClipContent::Audio(l), ClipContent::Audio(r)) => {
                 let sr = rate as f64;
                 let offset = timeline.to_samples(at, sr) - timeline.to_samples(original.start, sr);
-                if offset <= 0 || offset >= l.length {
-                    return Err(EditError::Invalid("split point is outside the clip".into()));
-                }
-                match l.warp.take() {
-                    Some(w) => {
-                        let (src, right_warp) = w.after(l.source_offset, l.length, offset);
-                        r.source_offset = src;
-                        r.warp = Some(right_warp);
-                        l.warp = Some(w.before(l.source_offset, l.length, offset));
-                    }
-                    None => r.source_offset = l.source_offset + offset,
-                }
-                r.length = l.length - offset;
-                if let Some(e) = l.envelope.take() {
-                    r.envelope = e.slice(offset, offset + r.length).boxed();
-                    l.envelope = e.slice(0, offset).boxed();
-                }
-                l.length = offset;
-                l.fades = ClipFades {
-                    fade_out: 0,
-                    ..l.fades
-                };
-                r.fades = ClipFades {
-                    fade_in: 0,
-                    ..r.fades
-                };
+                let (a, b) = l
+                    .split_frames(offset)
+                    .ok_or_else(|| EditError::Invalid("split point is outside the clip".into()))?;
+                *l = a;
+                *r = b;
             }
             (ClipContent::Takes(l), ClipContent::Takes(r)) => {
                 let sr = rate as f64;

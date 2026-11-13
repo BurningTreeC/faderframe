@@ -2,14 +2,16 @@
 //! source that the clip plays, in one undo step; the unedited source is
 //! kept; clearing the edits gives it back; with clip effects the effects
 //! render again from the edited audio; the editor's picture shows the
-//! source.
+//! source; one take of a take folder is edited on its own.
 #![allow(clippy::unwrap_used)]
 
 use faderframe_audio_files::{WavFormat, read_wav, write_wav};
 use faderframe_core::{ClipId, ParameterId};
 use faderframe_engine::EngineConfig;
 use faderframe_project::spectral::{SpectralEdit, SpectralOp, SpectralShape};
-use faderframe_project::{PluginFormat, PluginRef, Project, SourceSpec};
+use faderframe_project::{
+    ClipContent, Command, PluginFormat, PluginRef, Project, SourceSpec, Take, TakeFolder, TakeRef,
+};
 use faderframe_session::clip_fx::ClipFxOp;
 use faderframe_session::spectral::{PictureKey, SpectralChange};
 use faderframe_session::{Action, Session};
@@ -81,23 +83,23 @@ fn remove_5k() -> SpectralEdit {
 fn an_edit_renders_onto_the_clip_in_one_step_and_comes_off() {
     let (mut s, clip) = session();
     let original = s.project().clip(clip).unwrap().as_audio().unwrap().source;
-    s.dispatch(Action::OpenSpectralEditor(clip)).unwrap();
-    assert_eq!(s.spectral_clip(), Some(clip));
+    s.dispatch(Action::OpenSpectralEditor(clip.into())).unwrap();
+    assert_eq!(s.spectral_target(), Some(clip.into()));
     let steps = s.history_steps().0.len();
     s.dispatch(Action::EditSpectral {
-        clip,
+        audio: clip.into(),
         change: SpectralChange::Add(remove_5k()),
     })
     .unwrap();
-    assert_eq!(s.spectral_edits(clip).len(), 1, "shown at once");
-    assert!(s.spectral_busy(clip).is_some());
+    assert_eq!(s.spectral_edits(clip.into()).len(), 1, "shown at once");
+    assert!(s.spectral_busy(clip.into()).is_some());
     s.wait_for_spectral();
-    assert!(s.spectral_busy(clip).is_none());
+    assert!(s.spectral_busy(clip.into()).is_none());
     assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
     let a = s.project().clip(clip).unwrap().as_audio().unwrap().clone();
     assert_ne!(a.source, original, "plays the processed copy");
     assert_eq!(a.spectral.as_ref().unwrap().original, original);
-    assert_eq!(s.spectral_sources(clip), Some((a.source, original)));
+    assert_eq!(s.spectral_sources(clip.into()), Some((a.source, original)));
     let out = audio(&s, a.source);
     assert_eq!(out.len(), 2 * SR as usize, "same frames");
     assert!(20.0 * (amplitude(&out, 30_000, 66_000, 5000.0) / 0.25).log10() < -40.0);
@@ -111,13 +113,13 @@ fn an_edit_renders_onto_the_clip_in_one_step_and_comes_off() {
         s.project().clip(clip).unwrap().as_audio().unwrap().source,
         original
     );
-    assert!(s.spectral_edits(clip).is_empty());
+    assert!(s.spectral_edits(clip.into()).is_empty());
     s.dispatch(Action::Redo).unwrap();
-    assert_eq!(s.spectral_edits(clip).len(), 1);
+    assert_eq!(s.spectral_edits(clip.into()).len(), 1);
 
     // A second edit renders from the unedited source, both applied.
     s.dispatch(Action::EditSpectral {
-        clip,
+        audio: clip.into(),
         change: SpectralChange::Add(SpectralEdit::new(
             SpectralShape::Rect {
                 start: 24_000,
@@ -140,7 +142,7 @@ fn an_edit_renders_onto_the_clip_in_one_step_and_comes_off() {
     // Clear: the unedited audio, one step.
     let steps = s.history_steps().0.len();
     s.dispatch(Action::EditSpectral {
-        clip,
+        audio: clip.into(),
         change: SpectralChange::Clear,
     })
     .unwrap();
@@ -159,12 +161,12 @@ fn with_clip_effects_the_edits_go_before_them() {
         name: "Utility".into(),
     };
     s.dispatch(Action::ClipEffects {
-        clip,
+        audio: clip.into(),
         op: ClipFxOp::Add(utility),
     })
     .unwrap();
     s.dispatch(Action::ClipEffects {
-        clip,
+        audio: clip.into(),
         op: ClipFxOp::SetParameter {
             index: 0,
             parameter: ParameterId(0),
@@ -174,7 +176,7 @@ fn with_clip_effects_the_edits_go_before_them() {
     .unwrap();
     let settle = |s: &mut Session| {
         let start = Instant::now();
-        while s.clip_fx_busy(clip) || s.spectral_busy(clip).is_some() {
+        while s.clip_fx_busy(clip.into()) || s.spectral_busy(clip.into()).is_some() {
             assert!(start.elapsed() < Duration::from_secs(60), "render hangs");
             std::thread::sleep(Duration::from_millis(10));
             s.tick(0.01);
@@ -194,7 +196,7 @@ fn with_clip_effects_the_edits_go_before_them() {
         .original
         .source;
     s.dispatch(Action::EditSpectral {
-        clip,
+        audio: clip.into(),
         change: SpectralChange::Add(remove_5k()),
     })
     .unwrap();
@@ -216,8 +218,8 @@ fn with_clip_effects_the_edits_go_before_them() {
 #[test]
 fn the_picture_shows_the_tones() {
     let (mut s, clip) = session();
-    s.dispatch(Action::OpenSpectralEditor(clip)).unwrap();
-    let (now, _) = s.spectral_sources(clip).unwrap();
+    s.dispatch(Action::OpenSpectralEditor(clip.into())).unwrap();
+    let (now, _) = s.spectral_sources(clip.into()).unwrap();
     assert_eq!(s.source_format(now), Some((SR, 1, 2 * i64::from(SR))));
     let key = PictureKey {
         source: now,
@@ -230,4 +232,76 @@ fn the_picture_shows_the_tones() {
     let at = |hz: f32| picture.db(picture.row_at(hz) as usize, 50);
     assert!(at(1000.0) > -15.0 && at(5000.0) > -15.0);
     assert!(at(300.0) < -60.0);
+}
+
+/// The clip folded into a take folder of two takes of its audio: take 1
+/// comped on the first second, take 2 on the second.
+fn two_takes(s: &mut Session, clip: ClipId) -> (TakeRef, TakeRef) {
+    let c = s.project().clip(clip).unwrap().clone();
+    let a = c.as_audio().unwrap().clone();
+    let mut f = TakeFolder::new(a.length);
+    f.add_take(Take::of_clip("Take 1", 0, a.clone()));
+    f.add_take(Take::of_clip("Take 2", 0, a.clone()));
+    f.use_take(0);
+    f.set_comp(a.length / 2, a.length, Some(1));
+    s.edit(Command::SetClipContent {
+        clip,
+        start: c.start,
+        content: Box::new(ClipContent::Takes(f)),
+    })
+    .unwrap();
+    let p = s.project();
+    (p.take_ref(clip, 0).unwrap(), p.take_ref(clip, 1).unwrap())
+}
+
+/// A take is a clip of its own: the spectral editor opens on one take of a
+/// folder; its edit renders onto that take in one step, the other take
+/// keeps the recording, and the comp plays the edited take where it plays
+/// it; undo gives the take its audio back.
+#[test]
+fn one_take_of_a_folder_has_its_spectrum_edited_on_its_own() {
+    let (mut s, clip) = session();
+    let original = s.project().clip(clip).unwrap().as_audio().unwrap().source;
+    let (one, two) = two_takes(&mut s, clip);
+    let take = |s: &Session, r: TakeRef| s.project().take(r).unwrap().audio.clone();
+    s.dispatch(Action::OpenSpectralEditor(two.into())).unwrap();
+    assert_eq!(s.spectral_target(), Some(two.into()));
+    let steps = s.history_steps().0.len();
+    // The 5 kHz tone out over the second second (where take 2 plays).
+    let mut edit = remove_5k();
+    edit.shape = SpectralShape::Rect {
+        start: 54_000,
+        end: 90_000,
+        low: 4_000.0,
+        high: 6_000.0,
+    };
+    s.dispatch(Action::EditSpectral {
+        audio: two.into(),
+        change: SpectralChange::Add(edit),
+    })
+    .unwrap();
+    assert_eq!(s.spectral_edits(two.into()).len(), 1, "shown at once");
+    assert!(s.spectral_edits(one.into()).is_empty());
+    s.wait_for_spectral();
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+    let edited = take(&s, two);
+    assert_ne!(edited.source, original, "take 2 plays the processed copy");
+    assert_eq!(edited.spectral.as_ref().unwrap().original, original);
+    assert_eq!(take(&s, one).source, original, "take 1 the recording");
+    assert_eq!(
+        s.spectral_sources(two.into()),
+        Some((edited.source, original))
+    );
+    let out = audio(&s, edited.source);
+    assert!(20.0 * (amplitude(&out, 60_000, 84_000, 5000.0) / 0.25).log10() < -40.0);
+    // The comp: take 1's recording, then take 2's copy.
+    let f = s.project().clip(clip).unwrap().as_takes().unwrap().clone();
+    let sources: Vec<_> = f.played().iter().map(|p| p.audio.source).collect();
+    assert_eq!(sources, vec![original, edited.source]);
+    assert!(s.project().used_sources().contains(&original));
+    // The folder itself is no clip of audio to edit.
+    assert!(s.dispatch(Action::OpenSpectralEditor(clip.into())).is_err());
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(take(&s, two).source, original);
+    assert!(s.spectral_edits(two.into()).is_empty());
 }

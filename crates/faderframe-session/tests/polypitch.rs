@@ -103,13 +103,13 @@ fn a_note_of_a_chord_is_removed_and_another_made_longer() {
         "short-chord",
         &[(60.0, 0.3, 1.5), (64.0, 0.3, 1.5), (67.0, 0.3, 1.5)],
     );
-    s.dispatch(Action::OpenPitchEditor(clip)).unwrap();
+    s.dispatch(Action::OpenPitchEditor(clip.into())).unwrap();
     s.wait_for_polyphonic();
     let e = edit_of(&s, clip);
     let (g, count) = (note_at(&e, 67.0), e.notes.len());
     // The G removed: gone from the editor and from the sound.
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::RemoveNotes { notes: vec![g] },
     })
     .unwrap();
@@ -128,7 +128,7 @@ fn a_note_of_a_chord_is_removed_and_another_made_longer() {
     let e4 = note_at(&e, 64.0);
     let end = e.notes[e4].end;
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::Length {
             notes: vec![e4],
             edge: Edge::End,
@@ -166,7 +166,7 @@ fn switching_between_polyphonic_and_melodic_finds_the_notes_again() {
             .unwrap();
     };
     // Switched while the notes are being found: found the new way only.
-    s.dispatch(Action::OpenPitchEditor(clip)).unwrap();
+    s.dispatch(Action::OpenPitchEditor(clip.into())).unwrap();
     assert!(s.detecting_polyphonic());
     flag(&mut s, false);
     assert!(!s.detecting_polyphonic(), "the polyphonic search dropped");
@@ -178,7 +178,7 @@ fn switching_between_polyphonic_and_melodic_finds_the_notes_again() {
     // Back to polyphonic: found again, with the E moved down first.
     let e4 = note_at(&e, 64.0);
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::Move {
             notes: vec![e4],
             by: -1.0,
@@ -222,7 +222,7 @@ fn a_note_of_a_recorded_chord_moves_and_undo_brings_it_back() {
         &[(60.0, 0.3, 2.5), (64.0, 0.3, 2.5), (67.0, 0.3, 2.5)],
     );
     assert!(s.editor.pitch_polyphonic, "polyphonic by default");
-    s.dispatch(Action::OpenPitchEditor(clip)).unwrap();
+    s.dispatch(Action::OpenPitchEditor(clip.into())).unwrap();
     s.wait_for_polyphonic();
     let audio = |s: &Session| s.project().clip(clip).unwrap().as_audio().unwrap().clone();
     let a = audio(&s);
@@ -246,7 +246,7 @@ fn a_note_of_a_recorded_chord_moves_and_undo_brings_it_back() {
         .unwrap();
     // E down a semitone: the clip plays a render with E♭.
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::Move {
             notes: vec![e4],
             by: -1.0,
@@ -283,7 +283,7 @@ fn a_note_of_a_recorded_chord_moves_and_undo_brings_it_back() {
     assert_eq!(audio(&s).source, moved.source);
     // Muting a note re-renders; removing the edit plays the recording.
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::Mute {
             notes: vec![e4],
             on: true,
@@ -301,7 +301,7 @@ fn a_note_of_a_recorded_chord_moves_and_undo_brings_it_back() {
         "not moved any more"
     );
     s.dispatch(Action::EditPitch {
-        clip,
+        audio: clip.into(),
         op: PitchOp::Remove,
     })
     .unwrap();
@@ -311,5 +311,141 @@ fn a_note_of_a_recorded_chord_moves_and_undo_brings_it_back() {
     let _ = matches!(
         s.project().clip(clip).unwrap().content,
         ClipContent::Audio(_)
+    );
+}
+
+/// The clip of `clip` made a folder of two takes of it (take 1 comped in
+/// the first half, take 2 in the second); the folder's id is the clip's.
+fn two_takes(s: &mut Session, clip: ClipId) {
+    let c = s.project().clip(clip).unwrap().clone();
+    let a = c.as_audio().unwrap().clone();
+    let mut f = faderframe_project::TakeFolder::new(a.length);
+    f.add_take(faderframe_project::Take::of_clip("Take 1", 0, a.clone()));
+    f.add_take(faderframe_project::Take::of_clip("Take 2", 0, a.clone()));
+    f.use_take(0);
+    f.set_comp(a.length / 2, a.length, Some(1));
+    s.edit(faderframe_project::Command::SetClipContent {
+        clip,
+        start: c.start,
+        content: Box::new(ClipContent::Takes(f)),
+    })
+    .unwrap();
+}
+
+/// A take is a clip of its own: the pitch editor opens on one take of a
+/// folder, finds its notes and moves one; that take plays a render of it
+/// where the comp plays it, the other takes stay as they were; the editor
+/// keeps to the take while takes before it go; undo takes the move back.
+#[test]
+fn one_take_of_a_folder_has_its_pitch_edited_on_its_own() {
+    let (mut s, clip, x) = recorded(
+        "take-chord",
+        &[(60.0, 0.3, 2.5), (64.0, 0.3, 2.5), (67.0, 0.3, 2.5)],
+    );
+    let original = s.project().clip(clip).unwrap().as_audio().unwrap().source;
+    two_takes(&mut s, clip);
+    let two = s.project().take_ref(clip, 1).unwrap();
+    let take =
+        |s: &Session, r: faderframe_project::TakeRef| s.project().take(r).unwrap().audio.clone();
+    let one = s.project().take_ref(clip, 0).unwrap();
+
+    s.dispatch(Action::OpenPitchEditor(two.into())).unwrap();
+    assert_eq!(s.pitch_target(), Some(two.into()));
+    s.wait_for_polyphonic();
+    let e = take(&s, two).pitch.expect("its notes found");
+    assert!(e.polyphonic.is_some());
+    assert!(take(&s, one).pitch.is_none(), "the other take untouched");
+    let e4 = note_at(&e, 64.0);
+    s.dispatch(Action::EditPitch {
+        audio: two.into(),
+        op: PitchOp::Move {
+            notes: vec![e4],
+            by: -1.0,
+        },
+    })
+    .unwrap();
+    s.wait_for_polyphonic();
+    let moved = take(&s, two);
+    assert_ne!(moved.source, original, "the take plays a render");
+    let ed = moved.pitch.clone().unwrap();
+    assert_eq!(ed.polyphonic.unwrap().rendered, ed.sound_key());
+    assert_eq!(take(&s, one).source, original, "take 1 plays the recording");
+    let out = s.source_frames(moved.source, 0, 3 * SR as usize).unwrap();
+    let (gone, came) = (
+        level(&x, 1.4, hz(64.0)) - level(&out[0], 1.4, hz(64.0)),
+        level(&out[0], 1.4, hz(63.0)) - level(&x, 1.4, hz(63.0)),
+    );
+    assert!(
+        gone > 15.0 && came > 15.0,
+        "E down {gone:.1}, E♭ up {came:.1}"
+    );
+    // Where the comp plays take 2, the render plays.
+    let f = s.project().clip(clip).unwrap().as_takes().unwrap().clone();
+    let sources: Vec<_> = f.played().iter().map(|p| p.audio.source).collect();
+    assert_eq!(sources, vec![original, moved.source]);
+    assert!(s.project().used_sources().contains(&original));
+
+    // Take 1 deleted: the editor still shows take 2, which still edits.
+    let mut fewer = f.clone();
+    fewer.remove_take(0);
+    s.edit(faderframe_project::Command::SetClipContent {
+        clip,
+        start: s.project().clip(clip).unwrap().start,
+        content: Box::new(ClipContent::Takes(fewer)),
+    })
+    .unwrap();
+    assert_eq!(s.pitch_target(), Some(two.into()));
+    assert_eq!(s.project().take_in(two).map(|(_, i)| i), Some(0));
+    s.dispatch(Action::EditPitch {
+        audio: two.into(),
+        op: PitchOp::Mute {
+            notes: vec![e4],
+            on: true,
+        },
+    })
+    .unwrap();
+    assert!(take(&s, two).pitch.unwrap().notes[e4].muted);
+    // Undo both: take 1 back, take 2 with the E moved and its render.
+    s.dispatch(Action::Undo).unwrap();
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(take(&s, two).source, moved.source);
+    assert_eq!(take(&s, one).source, original);
+    // And the move: take 2 as played.
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(take(&s, two).source, original);
+    assert!(!take(&s, two).pitch.unwrap().edited());
+}
+
+/// Melodic detection of several takes of one folder is one step.
+#[test]
+fn takes_of_a_folder_are_found_melodically_in_one_step() {
+    let (mut s, clip, _) = recorded("take-line", &[(64.0, 0.3, 1.4), (67.0, 1.4, 2.5)]);
+    two_takes(&mut s, clip);
+    s.dispatch(Action::SetEditFlag(EditFlag::PolyphonicPitch, false))
+        .unwrap();
+    let takes: Vec<_> = (0..2)
+        .map(|k| s.project().take_ref(clip, k).unwrap())
+        .collect();
+    let steps = s.history_steps().0.len();
+    s.dispatch(Action::DetectPitch {
+        audio: takes.iter().map(|&t| t.into()).collect(),
+    })
+    .unwrap();
+    let start = std::time::Instant::now();
+    while s.detecting_pitch() {
+        assert!(start.elapsed().as_secs() < 30, "detection hangs");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.tick(0.005);
+    }
+    for t in &takes {
+        let e = s.project().take(*t).unwrap().audio.pitch.clone().unwrap();
+        assert!(e.polyphonic.is_none(), "melodic");
+        note_at(&e, 64.0);
+        note_at(&e, 67.0);
+    }
+    assert_eq!(
+        s.history_steps().0.len(),
+        steps + 1,
+        "one Detect Pitch step"
     );
 }

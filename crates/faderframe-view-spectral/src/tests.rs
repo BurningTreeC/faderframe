@@ -10,7 +10,7 @@ use faderframe_ui_canvas::{Modifiers, RecordingPainter};
 const SR: u32 = 48_000;
 const SIZE: Size = Size::new(1200.0, 520.0);
 
-fn session() -> (Session, ClipId) {
+fn session() -> (Session, AudioRef) {
     let dir = std::env::temp_dir().join(format!("ff-view-spectral-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("Tone.wav");
@@ -26,7 +26,7 @@ fn session() -> (Session, ClipId) {
     })
     .unwrap();
     s.wait_for_imports();
-    let clip = *s.project().clips.keys().next().unwrap();
+    let clip: AudioRef = (*s.project().clips.keys().next().unwrap()).into();
     s.dispatch(Action::OpenSpectralEditor(clip)).unwrap();
     (s, clip)
 }
@@ -124,7 +124,7 @@ fn a_region_drawn_becomes_an_edit_and_can_be_selected_moved_and_removed() {
     let (actions, _) = run(&mut view, press(l.ops[2].center()), &s);
     let [
         Action::EditSpectral {
-            clip: c,
+            audio: c,
             change: SpectralChange::Add(edit),
         },
     ] = actions.as_slice()
@@ -322,4 +322,74 @@ fn the_picture_arrives_and_zoom_keeps_the_pointer() {
     let (a, b) = view.visible(&shown);
     assert!(b - a < 96_000.0 * 0.7, "zoomed in: {}", b - a);
     assert!((view.frame_at(&shown, l.area, at.x) - before).abs() < 10.0);
+}
+
+/// A take of a take folder is shown over its own part of the source (a
+/// take is a clip of its own), and what is drawn becomes an edit of that
+/// take.
+#[test]
+fn a_take_is_shown_over_its_part_of_the_source_and_edited_on_its_own() {
+    use faderframe_project::{ClipContent, Command, Take, TakeFolder};
+    let (mut s, clip) = session();
+    let AudioRef::Clip(id) = clip else {
+        panic!("a clip");
+    };
+    let c = s.project().clip(id).unwrap().clone();
+    let a = c.as_audio().unwrap().clone();
+    // Take 2: the second second of the tone, where it was.
+    let half = i64::from(SR);
+    let mut f = TakeFolder::new(a.length);
+    f.add_take(Take::of_clip("Take 1", 0, a.clone()));
+    f.add_take(Take::of_clip(
+        "Take 2",
+        half,
+        a.cut(half, a.length).unwrap(),
+    ));
+    f.use_take(0);
+    s.edit(Command::SetClipContent {
+        clip: id,
+        start: c.start,
+        content: Box::new(ClipContent::Takes(f)),
+    })
+    .unwrap();
+    let two: AudioRef = s.project().take_ref(id, 1).unwrap().into();
+    s.dispatch(Action::OpenSpectralEditor(two)).unwrap();
+    let mut view = SpectralView::new(Theme::default());
+    view.paint(&mut RecordingPainter::new(), SIZE, &s, &Theme::default());
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, SIZE, &s, &Theme::default());
+    assert!(
+        p.texts().iter().any(|t| t.ends_with("· Take 2")),
+        "named in the bar"
+    );
+    let shown = view.shown(&s).unwrap();
+    assert_eq!(shown.audio, two);
+    assert_eq!(shown.region, (half as f64, 2.0 * half as f64), "its part");
+    let l = SpectralView::layout(SIZE);
+    let area = l.area;
+    let (y1, y2) = (
+        SpectralView::y_of(&shown, area, 3000.0),
+        SpectralView::y_of(&shown, area, 1400.0),
+    );
+    let (x1, x2) = (area.x + area.w * 0.25, area.x + area.w * 0.75);
+    drag(&mut view, &s, Point::new(x1, y1), Point::new(x2, y2));
+    let (actions, _) = run(&mut view, press(l.ops[2].center()), &s);
+    let [
+        Action::EditSpectral {
+            audio,
+            change: SpectralChange::Add(edit),
+        },
+    ] = actions.as_slice()
+    else {
+        panic!("{actions:?}");
+    };
+    assert_eq!(*audio, two);
+    let SpectralShape::Rect { start, end, .. } = edit.shape else {
+        panic!("{:?}", edit.shape);
+    };
+    let (want_a, want_b) = (half + half / 4, half + 3 * half / 4);
+    assert!(
+        (start - want_a).abs() < 200 && (end - want_b).abs() < 200,
+        "{start}–{end}: in take 2's part of the source"
+    );
 }

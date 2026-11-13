@@ -22,15 +22,13 @@ fn w(a: f64, b: f64, text: &str) -> FolderWord {
 fn folder(takes: usize, len_ms: f64) -> TakeFolder {
     let mut f = TakeFolder::new(ms(len_ms));
     for i in 0..takes {
-        f.add_take(Take {
-            name: format!("Take {}", i + 1),
-            source: AudioSourceId(i as u64 + 1),
-            source_offset: 0,
-            start: 0,
-            end: ms(len_ms),
-            gain_db: 0.0,
-            rating: 0,
-        });
+        f.add_take(Take::plain(
+            format!("Take {}", i + 1),
+            AudioSourceId(i as u64 + 1),
+            0,
+            0,
+            ms(len_ms),
+        ));
     }
     f
 }
@@ -87,8 +85,15 @@ fn heard_spans_merge_and_say_what_is_missing() {
 #[test]
 fn a_takes_words_land_in_its_folder() {
     let mut f = folder(2, 3000.0);
-    f.takes[1].source_offset = ms(500.0);
-    f.takes[1].start = ms(1000.0);
+    // From 1 s on, source 2 from 1.5 s (its frame 500 ms before the
+    // folder's).
+    f.takes[1] = Take::plain(
+        "Take 2",
+        AudioSourceId(2),
+        ms(1500.0),
+        ms(1000.0),
+        ms(2000.0),
+    );
     let mut words = BTreeMap::new();
     for (id, list) in [
         (1, vec![(100.0, 400.0, "one"), (2900.0, 3200.0, "late")]),

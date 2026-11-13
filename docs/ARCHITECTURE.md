@@ -6998,21 +6998,64 @@ later than its capture position, so what was played lines up with what
 was heard.
 
 **Take folders.** `ClipContent::Takes(TakeFolder)` holds several `Take`s
-(each a source, its alignment and the folder range it has material for) and
-a *comp*: sorted `CompSegment`s, each playing one take (or nothing) until
+and a *comp*: sorted `CompSegment`s, each playing one take (or nothing) until
 the next one starts — the comp can never overlap or leave holes. Comp edits
 (`set_comp`, `use_take`, `remove_take`) are ordinary `SetClipContent`
 commands, so a swipe coalesces into one undo step; folders move, delete and
-split like any clip. The engine expands the comp into regions with centred
-equal-power crossfades (`crossfade`, 10 ms by default) at touching segment
-boundaries and short declicks elsewhere. *Flatten Comp* replaces a folder by
-plain clips with the same fades.
+split like any clip.
+
+A take is an audio clip of its own placed in the folder (`Take { name,
+start, audio: AudioClip, rating }`, file format version 3; `MIGRATIONS`
+turns version 2's folder-aligned source offsets into it): it carries every
+edit a clip can — pitch, warp, transposition, reversal, clip effects,
+spectral edits, envelope, fades, gain. What a comp plays is its takes' clips
+cut at the comp's boundaries, `TakeFolder::played` (and `played_take` for a
+take auditioned whole): centred equal-power crossfades (`crossfade`, 10 ms
+by default) where pieces touch, short declicks elsewhere, the folder's fades
+at its edges, a take's own fade where the take itself begins or ends (the
+longer of it and the comp's plays), the folder's gain in every piece. Cutting
+is `AudioClip::cut`/`split_frames`, the same cut Separate makes
+(`Clip::split_at`): a warp's map is cut where the output is, an envelope is
+sliced, a reversed clip's earlier output is its later source. The engine
+plays each piece exactly as it plays a clip (`snapshot::place_audio`, its
+stretcher key from `piece_key`; `build::stretch_voices` counts the pieces,
+and one voice of each kind a folder's takes need for an audition), and
+*Flatten Comp* places the same pieces as clips, so a flattened comp plays
+what the comp played sample for sample. Readers that need a source position
+go through the take: `Take::source_at` / `folder_of`, or the cut clip.
+
+Every take has an id of its own in its folder (`TakeId`, from the
+folder's `next_take`; `add_take` gives it, `normalize` — run by the clip
+commands and on loading — gives one to a take without one or with one
+another take has). It is kept through comp edits, splits, undo and
+saving and never given to another take of the folder, so an editor
+working on one take names it by `TakeRef { clip, take }` (`Project::{
+take, take_in, take_ref}`) and changes it with `Project::set_take_audio`
+(the folder's content with that take's clip changed: one undo step, as a
+comp edit is) while takes before it come and go. The comp still names
+takes by index (they are only looked up at once); the engine keys a
+piece's stretcher by the take's id.
+
+Recording in *Takes* mode folds the clips in the way with all their edits,
+each at the level it had (a take's gain under the folder's own), and a
+folder taken into another brings its gain and edge fades in its takes
+(`TakeFolder::takes_as_played`), so nothing is lost and a pitch edit's or
+clip effect's original recording stays in use (#67). A take is edited
+like a clip, on its own: every clip editor takes an `AudioRef` (a clip or
+one take; see *Pitch editing*), and a take lane's menu (Show Takes) opens
+the pitch editor ("Edit Pitch of “Take 2”"), the spectral editor and clip
+effects on it, converts it to MIDI and holds its "Clip Envelope" submenu.
+While a clip envelope is shown the take lanes draw and edit their takes'
+envelopes instead of comping, and the folder's main lane draws what the
+comp plays (each piece its take's envelope there; edited in the lanes).
+Strip Silence cannot cut a take into pieces inside its folder: it leaves
+folders out and says to Flatten Comp first.
 
 **Record modes** (`RecordSettings`, Transport menu / Preferences → Recording):
 
 | Setting | Options |
 |---|---|
-| Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged · *Replace* — overlapped clips are cut back (tape style) |
+| Record mode (over existing clips) | *Takes* — overlapped clips and folders become takes of one folder, the new take is comped in over its range, playback elsewhere is unchanged (a take keeps every edit of the clip it was — see *Take folders*) · *Replace* — overlapped clips are cut back (tape style) |
 | Loop recording | *Passes as takes* · *Keep last pass* · *New track per pass* (earlier passes on new, muted tracks) |
 | Metronome | Off · While recording · Always (`click.rs`: decaying sine per beat, accented downbeats, follows tempo and meter, live output only) |
 | Pre-roll | `Roll` (amount + `RollUnit` bars/beats/seconds; menu presets, any amount in Preferences) before the record start when starting from stop; from that bar's line or exactly (`preroll_on_bar`, `Session::pre_roll`); what lies before the project's start is counted in before playback (§6, *Counting in before playback*) |
@@ -7441,6 +7484,21 @@ much of the wandering around the pitch is straightened) and `formant`,
 plus `keep_formants`. The project holds everything playback needs; the
 analysis is not saved.
 
+What the editor works on is an `AudioRef`: an audio clip, or one take of a
+take folder (`AudioRef::Take(TakeRef)`; a take is an audio clip of its
+own) — as do spectral editing, clip effects, clip envelopes and Audio to
+MIDI. `Project::{audio, audio_start, audio_name, audio_refs}` read it and
+`Project::set_audio` writes it back — a clip's content, or its folder's
+with that take changed, one command a clip however many of its takes
+change (several takes detected together are one step).
+`Action::{OpenPitchEditor, DetectPitch, EditPitch}` and
+`Session::{pitch_target, pitch_rendering, pitch_syllables}` take it, drags
+recompute from `Session::gesture_audio` (the folder as the gesture found
+it), and the polyphonic renderer keeps its detections, renders and settle
+times by it, looking over every clip and take for renders due. The editor
+names a take "<folder> · <take>" and keeps to it while takes before it
+come and go (it holds the take's id).
+
 Playback: an edited clip becomes a `WarpedRegion` (an identity map when
 unwarped) with a `PitchCurve` (corrections every hop, gliding over 30 ms
 between notes and across gaps up to 200 ms, and the sung pitch for the
@@ -7534,11 +7592,13 @@ confidence 0.1 are refused with a notice.
 
 ### Audio to MIDI
 
-`session::to_midi` (`Action::ConvertToMidi { clip, how }`, the arranger's
-clip menu "Convert Melody/Harmony/Drums to MIDI") listens to an audio
-clip's part of its source in a thread and puts the notes on a new
-instrument track below it (the built-in synth, or the Drum Sampler for
-drums) as a MIDI clip in the same place, in one "Convert to MIDI" step.
+`session::to_midi` (`Action::ConvertToMidi { audio, how }`, the arranger's
+clip menu "Convert Melody/Harmony/Drums to MIDI", a take lane's "Convert
+“Take n” to MIDI") listens to an audio clip's or take's part of its
+source in a thread and puts the notes on a new instrument track below it
+(the built-in synth, or the Drum Sampler for drums) as a MIDI clip in the
+same place (a take's from where it starts in its folder; named
+"<folder> · <take> Melody"), in one "Convert to MIDI" step.
 **Melody** uses the pitch-editing analysis (`melody::notes`, velocity
 from the level). **Harmony** runs Spotify's basic-pitch
 (`faderframe-transcribe`, Apache-2.0, `model/NOTICE`): its ONNX graph
@@ -7563,8 +7623,9 @@ audio it plays (`faderframe_project::clip_fx`: `AudioClip::effects`, a
 region, warp, pitch edit, reversal — and `rendered_offset`, the frame in
 the render where the original region starts, so trims carry over).
 `session::clip_fx` (`Action::OpenClipEffects`, `Action::ClipEffects {
-clip, op: ClipFxOp }`): an edit changes a pending chain at once (what the
-editor shows); after 300 ms of rest the chain renders in a worker on a
+audio, op: ClipFxOp }`, on an `AudioRef`: a clip, or one take of a folder,
+whose chain is its own; `Session::clip_fx_target`): an edit changes a
+pending chain at once (what the editor shows); after 300 ms of rest the chain renders in a worker on a
 one-track copy of the project (the original audio, the chain as inserts,
 `render::track_render_project`, 2 s of tail), and the result becomes a
 source the clip plays, chain and all, in one "Clip Effects" step; a
@@ -7574,15 +7635,16 @@ come from an instance made for the asking (`EngineController::
 describe_parameters`, cached per plugin). Editor `faderframe-view-clipfx`
 (`ViewKind::ClipFx`, a card per device with parameter bars).
 
-A card's "Open Window" (`Action::OpenClipEffectEditor { clip, index,
+A card's "Open Window" (`Action::OpenClipEffectEditor { audio, index,
 generic }`) shows the device in the window an insert gets — its own GUI,
 a built-in's editor, or the generic one. The engine hosts an instance of
 the slot outside the graph, as it does an album song's inserts
 (`EngineController::host_plugin`, kept through rebuilds by
 `keep_plugins`, pushed to by `sync_plugin_slot`, dropped by
 `release_plugin` once the slot leaves its chain). The session answers for
-the slot as a plugin's owner (`Session::clip_fx_slot`: `plugin_owner`
-gives the clip's track, `device_name` the chain's name), so the editor
+the slot as a plugin's owner (`Session::clip_fx_slot`, the clip or take
+and the place in its chain: `plugin_owner` gives the clip's (folder's)
+track, `device_name` the chain's name), so the editor
 windows work unchanged; the track commands they send about it
 (`SetPluginParameter`, `SetPluginBypass`, `SetPluginState`, batches of
 them) become chain edits in `Session::edit` (`clip_fx_commands`;
@@ -7614,7 +7676,12 @@ stays at unity — on stereo outputs only (mono and surround tracks leave
 pan out). `Command::SetClipEnvelope { clip, envelope }` replaces it
 (sorted and clamped on apply; refused on MIDI clips and take folders;
 label "Clip Envelope", `CoalesceKey::ClipEnvelope`, Impact Timeline);
-aliases mirror it and frozen tracks refuse it like any content edit.
+aliases mirror it and frozen tracks refuse it like any content edit. A
+take's envelope is its clip's (`Take::audio.envelope`): it changes with
+its folder's content (`Project::{set_take_audio, set_audio}`), comp
+pieces get their part of it (`AudioClip::cut`), and the session's
+`clip_envelope`, `Action::SetClipEnvelope { audio, lane, points }` and
+`Action::ClearClipEnvelope { audio, lane }` take an `AudioRef`.
 
 The engine applies it as the clip plays, sample by sample: the snapshot
 places the points at engine frames (`snapshot::RegionEnvelope` on the
@@ -7646,14 +7713,20 @@ still trim, the name strip still moves): a click adds a point on the
 grid (Alt: free) and drags it, a drag moves a point between its
 neighbours (Shift keeps its time, Ctrl fine), a double-click removes it,
 a right-click sets its segment's shape or removes it — each one
-`Action::SetClipEnvelope { clip, lane, points }` inside a gesture, one
-undo step (`view-arranger/src/clip_envelope.rs`). The clip menu also
+`Action::SetClipEnvelope { audio, lane, points }` inside a gesture, one
+undo step (`view-arranger/src/clip_envelope.rs`; `EnvelopePlace` = the
+clip or take, its offset in the clip and the area drawn). In an open take
+folder each take's lane does the same for its take (comping by click and
+swipe, and the words of comping by lyric, wait until the envelopes are
+hidden), and the main lane draws the comp's envelope as played. The clip menu also
 clears a lane or all of the selected clips' envelopes
 (`Action::ClearClipEnvelope`). Clip-effect parameters are not enveloped
 (they are rendered into the audio; an envelope there would mean a render
-per point). Dev action `clip-envelope:<track>=[pan:]<t>/<value>[|…]`
-(seconds from the first audio clip's start). Test arranger
-`clip_envelope_tests.rs`.
+per point). Dev action `clip-envelope:<track>[@<take n>]=[pan:]<t>/<value>[|…]`
+(seconds from the first audio clip's start, or take n's of the first take
+folder). Tests arranger `clip_envelope_tests.rs`,
+`a_take_lane_edits_its_takes_envelope_while_one_is_shown`, session
+`one_take_of_a_folder_has_an_envelope_of_its_own`.
 
 ### Strip Silence
 
@@ -7671,7 +7744,9 @@ the dialog's clips once on a helper thread (kept for the session,
 it plays (`clip_levels`: the warp map, backwards when reversed), so a
 turn of a setting previews at once: `Session::strip_silence_preview()`
 (regions per clip in clip frames) is what the arranger shades and
-outlines (`paint_strip_preview`). Opened with an edit range (no clips named),
+outlines (`paint_strip_preview`). Take folders are left out with a
+notice (or, alone, refused) saying to Flatten Comp first: a take is one
+clip in its folder and cannot be cut into pieces there. Opened with an edit range (no clips named),
 it takes the selected tracks' audio clips in the range, and only silence
 inside the range goes (`within_range`: what lies outside is sound). Apply is one undo step: `Strip` takes
 the silence out (each region a clip of its own, sliced with
@@ -10591,8 +10666,10 @@ run-in for the gains and every other edit's reach and surroundings — and
 every edit run over it in order; only the chunk is written, so a long clip
 never sits in memory whole and the joins do not show.
 
-`session::spectral`: changes (`Action::EditSpectral { clip, change:
-SpectralChange::{Add, Set, Remove, Clear} }`) are pending at once
+`session::spectral`: changes (`Action::EditSpectral { audio, change:
+SpectralChange::{Add, Set, Remove, Clear} }`, on an `AudioRef` — a clip,
+or one take of a folder; `Session::spectral_target` is the one shown) are
+pending at once
 (`spectral_edits`), render after `SETTLE` in a worker from the unedited
 source into a float WAV beside the media, then `AddSource` + `SetClipContent`
 as one "Spectral Edit" step (overtaken renders dropped); with clip effects

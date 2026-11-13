@@ -12,12 +12,13 @@
 
 #![forbid(unsafe_code)]
 
-use faderframe_core::ClipId;
+use faderframe_core::TrackId;
 use faderframe_project::pitch::{Edge, PitchEdit, PitchNote};
-use faderframe_project::{AudioClip, Clip};
+use faderframe_project::{AudioClip, AudioRef};
 use faderframe_session::lyric_comp::LyricCompOp;
 use faderframe_session::pitch::PitchOp;
 use faderframe_session::{Action, Session, TransportAction};
+use faderframe_timeline::MusicalTime;
 use faderframe_ui_canvas::{
     CanvasView, Color, Cursor, EventCx, HostRequest, Key, MenuItem, Modifiers, Paint, Painter,
     Path, Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
@@ -95,7 +96,7 @@ pub struct PitchView {
     selected: Vec<usize>,
     /// The clip and its note count when last painted (a new clip or new
     /// notes reset the selection and the view).
-    seen: Option<(ClipId, usize)>,
+    seen: Option<(AudioRef, usize)>,
     drag: Option<Drag>,
     hover: Option<usize>,
     /// The note edge under the pointer.
@@ -109,15 +110,20 @@ pub struct PitchView {
     bar_held: bool,
 }
 
-/// The clip shown and what places it.
+/// The clip (or take of a folder) shown and what places it.
 struct Shown<'a> {
-    id: ClipId,
-    clip: &'a Clip,
+    id: AudioRef,
+    /// The clip's name, or "<folder> · <take>".
+    name: String,
+    /// The track it plays on.
+    track: TrackId,
     audio: &'a AudioClip,
     /// Project rate.
     rate: f64,
-    /// The clip's start on the timeline (samples).
+    /// Where its first frame plays on the timeline (samples, and as a
+    /// musical time).
     start: i64,
+    at: MusicalTime,
 }
 
 impl Shown<'_> {
@@ -146,17 +152,19 @@ impl Shown<'_> {
 }
 
 fn shown(model: &Session) -> Option<Shown<'_>> {
-    let id = model.pitch_clip()?;
+    let id = model.pitch_target()?;
     let p = model.project();
-    let clip = p.clip(id)?;
-    let audio = clip.as_audio()?;
+    let audio = p.audio(id)?;
     let rate = p.sample_rate as f64;
+    let start = p.audio_start(id)?;
     Some(Shown {
         id,
-        clip,
+        name: p.audio_name(id)?,
+        track: p.clip(id.clip())?.track,
         audio,
         rate,
-        start: p.timeline.to_samples(clip.start, rate),
+        start,
+        at: p.timeline.to_musical(start, rate),
     })
 }
 
@@ -379,7 +387,7 @@ impl PitchView {
             let heard = words_heard(model, sh);
             items.push((
                 Item::Words,
-                if model.hearing_words(sh.id).is_some() {
+                if model.hearing_words(sh.id.clip()).is_some() {
                     "Hearing Words…".to_string()
                 } else if heard {
                     "Words Heard".into()
@@ -456,7 +464,7 @@ impl PitchView {
         if model.detecting_pitch() || model.detecting_polyphonic() {
             return format!(
                 "{} · finding the notes ({})…",
-                s.clip.name,
+                s.name,
                 if model.editor.pitch_polyphonic {
                     "polyphonic"
                 } else {
@@ -465,10 +473,10 @@ impl PitchView {
             );
         }
         let Some(e) = s.edit() else {
-            return s.clip.name.clone();
+            return s.name.clone();
         };
         if let Some(done) = model.pitch_rendering(s.id) {
-            return format!("{} · rendering {:.0}%", s.clip.name, done * 100.0);
+            return format!("{} · rendering {:.0}%", s.name, done * 100.0);
         }
         let picked: Vec<&PitchNote> = self
             .selected
@@ -489,7 +497,7 @@ impl PitchView {
         match picked.as_slice() {
             [] => format!(
                 "{} · {} notes{}",
-                s.clip.name,
+                s.name,
                 e.notes.len(),
                 if e.polyphonic.is_some() {
                     " (polyphonic)"
@@ -557,7 +565,7 @@ impl PitchView {
             }
             Item::Detect => {
                 if !model.detecting_pitch() && !model.detecting_polyphonic() {
-                    cx.emit(Action::DetectPitch { clips: vec![s.id] });
+                    cx.emit(Action::DetectPitch { audio: vec![s.id] });
                 }
                 return;
             }
@@ -575,8 +583,9 @@ impl PitchView {
                 PitchOp::Remove
             }
             Item::Words => {
-                if model.hearing_words(s.id).is_none() {
-                    let clip = s.id;
+                // A take's words are heard with its folder's.
+                if model.hearing_words(s.id.clip()).is_none() {
+                    let clip = s.id.clip();
                     cx.emit(Action::LyricComp(if words_heard(model, &s) {
                         LyricCompOp::HearAgain { clip }
                     } else {
@@ -587,7 +596,7 @@ impl PitchView {
             }
             Item::Amount | Item::Drift | Item::Info => return,
         };
-        cx.emit(Action::EditPitch { clip: s.id, op });
+        cx.emit(Action::EditPitch { audio: s.id, op });
     }
 
     fn note_menu(&self, at: Point, s: &Shown<'_>, note: usize) -> HostRequest<Action> {
@@ -596,7 +605,7 @@ impl PitchView {
         } else {
             vec![note]
         };
-        let op = |op: PitchOp| Action::EditPitch { clip: s.id, op };
+        let op = |op: PitchOp| Action::EditPitch { audio: s.id, op };
         let formant = s
             .edit()
             .and_then(|e| e.notes.get(note))
@@ -773,7 +782,7 @@ impl PitchView {
         // Bar lines where the clip plays.
         let proj = model.project();
         let tl = &proj.timeline;
-        let first = tl.meter.bar_at(s.clip.start);
+        let first = tl.meter.bar_at(s.at);
         for bar in (first..).take(10_000) {
             let at = tl.to_samples(tl.meter.bar_start(bar), s.rate);
             let x = self.x_of((at - s.start) as f64 / s.rate, g);
@@ -796,12 +805,9 @@ impl PitchView {
         let Some(e) = s.edit() else {
             return;
         };
-        let color = model
-            .project()
-            .track(s.clip.track)
-            .map_or(th.ui.accent, |t| {
-                Color::rgb8(t.color.r, t.color.g, t.color.b)
-            });
+        let color = model.project().track(s.track).map_or(th.ui.accent, |t| {
+            Color::rgb8(t.color.r, t.color.g, t.color.b)
+        });
         p.push_clip(g);
         let syllables = model.pitch_syllables(s.id);
         let words = TextStyle::new(th.fonts.small, th.ui.text);
@@ -1051,7 +1057,7 @@ impl PitchView {
         };
         let g = self.grid(size);
         let tl = &model.project().timeline;
-        let first = tl.meter.bar_at(s.clip.start);
+        let first = tl.meter.bar_at(s.at);
         p.push_clip(Rect::new(g.x, r.y, g.w, r.h));
         for bar in (first..).take(10_000) {
             let at = tl.to_samples(tl.meter.bar_start(bar), s.rate);
@@ -1228,7 +1234,7 @@ impl PitchView {
                 };
                 let at = n.source_of(placed as f64).round() as i64;
                 cx.emit(Action::EditPitch {
-                    clip: s.id,
+                    audio: s.id,
                     op: PitchOp::Split { note: i, at },
                 });
                 self.selected.clear();
@@ -1300,7 +1306,7 @@ impl PitchView {
                         *begun = true;
                     }
                     cx.emit(Action::EditPitch {
-                        clip: s.id,
+                        audio: s.id,
                         op: PitchOp::Length {
                             notes: notes.clone(),
                             edge: *edge,
@@ -1333,7 +1339,7 @@ impl PitchView {
                         *begun = true;
                     }
                     cx.emit(Action::EditPitch {
-                        clip: s.id,
+                        audio: s.id,
                         op: PitchOp::Move {
                             notes: notes.clone(),
                             by,
@@ -1464,7 +1470,7 @@ impl PitchView {
             }
             _ => return false,
         };
-        cx.emit(Action::EditPitch { clip: s.id, op });
+        cx.emit(Action::EditPitch { audio: s.id, op });
         true
     }
 }
@@ -1715,6 +1721,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use faderframe_core::ClipId;
     use faderframe_engine::EngineConfig;
     use faderframe_project::pitch::PitchNote;
     use faderframe_project::{ClipContent, Command};
@@ -1758,7 +1765,7 @@ mod tests {
             content: Box::new(ClipContent::Audio(a)),
         }))
         .unwrap();
-        s.dispatch(Action::OpenPitchEditor(pad)).unwrap();
+        s.dispatch(Action::OpenPitchEditor(pad.into())).unwrap();
         (s, pad)
     }
 
@@ -1997,6 +2004,80 @@ mod tests {
         send(&mut view, down(correct.center(), 1), size, &mut s);
         // C# is as near C as D: a tie goes down.
         assert_eq!(shifts(&s, clip), [0.0, 0.0, 0.0]);
+    }
+
+    /// A take of a folder in the editor: shown by its name and edited on
+    /// its own (the other take keeps no notes).
+    #[test]
+    fn a_take_is_shown_and_edited_on_its_own() {
+        let (mut s, pad) = session();
+        let c = s.project().clip(pad).unwrap().clone();
+        let with_notes = c.as_audio().unwrap().clone();
+        let plain = faderframe_project::AudioClip {
+            pitch: None,
+            ..with_notes.clone()
+        };
+        let mut f = faderframe_project::TakeFolder::new(with_notes.length);
+        f.add_take(faderframe_project::Take::of_clip("Take 1", 0, plain));
+        f.add_take(faderframe_project::Take::of_clip("Take 2", 0, with_notes));
+        f.use_take(1);
+        s.dispatch(Action::Edit(Command::SetClipContent {
+            clip: pad,
+            start: c.start,
+            content: Box::new(ClipContent::Takes(f)),
+        }))
+        .unwrap();
+        let two = s.project().take_ref(pad, 1).unwrap();
+        s.dispatch(Action::OpenPitchEditor(two.into())).unwrap();
+
+        let size = Size::new(1000.0, 600.0);
+        let mut view = PitchView::new(Theme::default());
+        let mut p = RecordingPainter::new();
+        view.paint(&mut p, size, &s, &Theme::default());
+        let texts = p.texts();
+        assert!(texts.contains(&"C4"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains(" · Take 2 · 3 notes")),
+            "named as the folder's take: {texts:?}"
+        );
+        // Drag its C4 up two rows.
+        let shown = shown(&s).unwrap();
+        let g = view.grid(size);
+        let e = shown.edit().unwrap().clone();
+        let r = view.note_rect(&shown, &e.notes[1], g);
+        let up = 2.0 * view.row_h + 1.0;
+        send(&mut view, down(r.center(), 1), size, &mut s);
+        send(
+            &mut view,
+            ViewEvent::PointerMove {
+                pos: Point::new(r.center().x, r.center().y - up),
+                modifiers: Modifiers::NONE,
+                dragging: true,
+            },
+            size,
+            &mut s,
+        );
+        send(
+            &mut view,
+            ViewEvent::PointerUp {
+                pos: r.center(),
+                button: PointerButton::Primary,
+                modifiers: Modifiers::NONE,
+            },
+            size,
+            &mut s,
+        );
+        let take = |k: usize| s.project().clip(pad).unwrap().as_takes().unwrap().takes[k].clone();
+        let shifts: Vec<f32> = take(1)
+            .audio
+            .pitch
+            .unwrap()
+            .notes
+            .iter()
+            .map(|n| n.shift)
+            .collect();
+        assert_eq!(shifts, [0.0, 2.0, 0.0]);
+        assert!(take(0).audio.pitch.is_none(), "take 1 as it was");
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! Pitch editing in the session: finding the notes of audio clips and
-//! editing them.
+//! Pitch editing in the session: finding the notes of audio clips — or of
+//! one take of a take folder ([`AudioRef`]: a take is an audio clip of its
+//! own) — and editing them.
 //!
 //! Detection ([`faderframe_analysis::melody`]) runs in a thread per source
 //! (its mono mix, read from the media file or the in-memory data) and is
@@ -7,7 +8,7 @@
 //! [`PitchEdit`] of the notes inside it, in one undo step, once its
 //! source is analysed. Edits ([`PitchOp`]) change the edit's notes;
 //! drags send the total move inside one gesture and recompute from the
-//! clip as the gesture found it ([`Session::gesture_clip`]).
+//! clip (or take) as the gesture found it ([`Session::gesture_audio`]).
 //!
 //! Switching the editor between Polyphonic and Melodic detects the clip
 //! it shows again the new way ([`Session::pitch_mode_changed`]), its
@@ -17,12 +18,12 @@
 use crate::{Result, Session, SessionError};
 use faderframe_analysis::melody::{self, PitchTrack};
 use faderframe_audio_files::onsets;
-use faderframe_core::{AudioSourceId, ClipId};
+use faderframe_core::AudioSourceId;
 use faderframe_engine::Source;
 use faderframe_project::pitch::{
     self, Edge, MAX_FORMANT, MAX_SHIFT, PitchEdit, PitchNote, UNVOICED,
 };
-use faderframe_project::{AudioClip, Clip, ClipContent};
+use faderframe_project::{AudioClip, AudioRef};
 use faderframe_timeline::MusicalTime;
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,8 +91,8 @@ pub(crate) struct PitchCache {
     /// A source's pitch track and its sample rate.
     tracks: HashMap<AudioSourceId, (Arc<PitchTrack>, f64)>,
     jobs: Vec<(AudioSourceId, JoinHandle<Analysis>)>,
-    /// Clips waiting for their source's analysis.
-    waiting: Vec<ClipId>,
+    /// Clips and takes waiting for their source's analysis.
+    waiting: Vec<AudioRef>,
 }
 
 /// A media file's mono mix and rate.
@@ -217,15 +218,6 @@ fn analysed_source(a: &AudioClip) -> AudioSourceId {
         .map_or(a.source, |p| p.original)
 }
 
-fn audio_of(c: &Clip) -> Result<AudioClip> {
-    match &c.content {
-        ClipContent::Audio(a) => Ok(a.clone()),
-        _ => Err(SessionError::Other(
-            "pitch editing works on audio clips".into(),
-        )),
-    }
-}
-
 /// `notes` (all of `count` when empty), in range, sorted, once each.
 fn chosen(notes: &[usize], count: usize) -> Vec<usize> {
     let mut v: Vec<usize> = if notes.is_empty() {
@@ -239,16 +231,17 @@ fn chosen(notes: &[usize], count: usize) -> Vec<usize> {
 }
 
 impl Session {
-    /// Find the notes of `clips` (audio clips; at once when their sources
-    /// are analysed, else when the analyses finish): every note, chords
-    /// too, with the editor's Polyphonic option (the default).
-    pub fn detect_pitch(&mut self, clips: &[ClipId]) -> Result<()> {
+    /// Find the notes of `audio` (audio clips or takes; at once when
+    /// their sources are analysed, else when the analyses finish): every
+    /// note, chords too, with the editor's Polyphonic option (the
+    /// default).
+    pub fn detect_pitch(&mut self, audio: &[AudioRef]) -> Result<()> {
         if self.editor.pitch_polyphonic {
-            return self.detect_polyphonic(clips);
+            return self.detect_polyphonic(audio);
         }
         let mut ready = Vec::new();
-        for &id in clips {
-            let Some(ClipContent::Audio(a)) = self.project.clip(id).map(|c| &c.content) else {
+        for &id in audio {
+            let Some(a) = self.project.audio(id) else {
                 continue;
             };
             let source = analysed_source(a);
@@ -280,35 +273,35 @@ impl Session {
         !self.pitch.jobs.is_empty()
     }
 
-    /// The editor's Polyphonic option changed: the clip the pitch editor
-    /// shows is detected again the new way when its notes were found (or
-    /// are being found) the other way. Its corrections carry over to the
-    /// notes found again (`pitch::carry`), in one "Detect Pitch" step.
+    /// The editor's Polyphonic option changed: the clip (or take) the
+    /// pitch editor shows is detected again the new way when its notes
+    /// were found (or are being found) the other way. Its corrections
+    /// carry over to the notes found again (`pitch::carry`), in one
+    /// "Detect Pitch" step.
     pub(crate) fn pitch_mode_changed(&mut self) -> Result<()> {
-        let Some(clip) = self.pitch_clip() else {
+        let Some(target) = self.pitch_target() else {
             return Ok(());
         };
         let polyphonic = self.editor.pitch_polyphonic;
         let other_way = self
             .project
-            .clip(clip)
-            .and_then(|c| c.as_audio())
+            .audio(target)
             .and_then(|a| a.pitch.as_ref())
             .is_some_and(|e| e.polyphonic.is_some() != polyphonic);
-        let pending = self.cancel_detection(clip);
+        let pending = self.cancel_detection(target);
         if other_way || pending {
-            self.detect_pitch(&[clip])?;
+            self.detect_pitch(&[target])?;
         }
         Ok(())
     }
 
-    /// Stop waiting for a clip's notes (either way); whether it was.
-    /// (A polyphonic detection runs on and is dropped; a source's melodic
-    /// analysis is kept for the session.)
-    fn cancel_detection(&mut self, clip: ClipId) -> bool {
-        let waiting = self.pitch.waiting.contains(&clip);
-        self.pitch.waiting.retain(|c| *c != clip);
-        self.cancel_polyphonic(clip) || waiting
+    /// Stop waiting for a clip's (or take's) notes (either way); whether
+    /// it was. (A polyphonic detection runs on and is dropped; a source's
+    /// melodic analysis is kept for the session.)
+    fn cancel_detection(&mut self, target: AudioRef) -> bool {
+        let waiting = self.pitch.waiting.contains(&target);
+        self.pitch.waiting.retain(|c| *c != target);
+        self.cancel_polyphonic(target) || waiting
     }
 
     /// Collect finished analyses and give the clips waiting for them
@@ -336,17 +329,17 @@ impl Session {
         if !done {
             return;
         }
-        let ready: Vec<ClipId> = self
+        let ready: Vec<AudioRef> = self
             .pitch
             .waiting
             .iter()
             .copied()
-            .filter(|c| match self.project.clip(*c).map(|c| &c.content) {
-                Some(ClipContent::Audio(a)) => {
+            .filter(|r| match self.project.audio(*r) {
+                Some(a) => {
                     let source = analysed_source(a);
                     !self.pitch.jobs.iter().any(|(s, _)| *s == source)
                 }
-                _ => true,
+                None => true,
             })
             .collect();
         self.pitch.waiting.retain(|c| !ready.contains(c));
@@ -356,17 +349,14 @@ impl Session {
         self.revision += 1;
     }
 
-    /// Give `clips` the notes their (analysed) sources hold. A clip with
-    /// a polyphonic edit plays its recording again, the edit's corrections
-    /// carried over to the notes found.
-    fn apply_detection(&mut self, clips: &[ClipId]) -> Result<()> {
+    /// Give `audio` the notes their (analysed) sources hold. A clip (or
+    /// take) with a polyphonic edit plays its recording again, the edit's
+    /// corrections carried over to the notes found.
+    fn apply_detection(&mut self, audio: &[AudioRef]) -> Result<()> {
         let rate = self.project.sample_rate as f64;
-        let mut commands = Vec::new();
-        for &id in clips {
-            let Some(c) = self.project.clip(id) else {
-                continue;
-            };
-            let Ok(mut a) = audio_of(c) else {
+        let mut changes = Vec::new();
+        for &id in audio {
+            let Some(mut a) = self.project.audio(id).cloned() else {
                 continue;
             };
             let Some((track, source_rate)) = self.pitch.tracks.get(&analysed_source(&a)) else {
@@ -380,27 +370,25 @@ impl Session {
                 a.source = p.original;
             }
             a.pitch = Some(edit);
-            commands.push(faderframe_project::Command::SetClipContent {
-                clip: id,
-                start: c.start,
-                content: Box::new(ClipContent::Audio(a)),
-            });
+            changes.push((id, a));
         }
+        // (Takes of one folder in one command.)
+        let commands = self.project.set_audio(changes);
         if commands.is_empty() {
             return Ok(());
         }
         self.batch("Detect Pitch", commands)
     }
 
-    /// Where source frame `at` of clip `c` plays on the timeline.
-    fn pitch_time(&self, c: &Clip, a: &AudioClip, at: i64) -> MusicalTime {
+    /// Where source frame `at` of audio `a` plays on the timeline, its
+    /// first frame playing at project frame `base`.
+    fn pitch_time(&self, base: i64, a: &AudioClip, at: i64) -> MusicalTime {
         let p = &self.project;
         let rate = p.sample_rate as f64;
         let out = match &a.warp {
             Some(w) => w.output_of(a.source_offset, a.length, at),
             None => at - a.source_offset,
         };
-        let base = p.timeline.to_samples(c.start, rate);
         p.timeline.to_musical(base + out, rate)
     }
 
@@ -415,10 +403,10 @@ impl Session {
         Some((key.root % 12, steps))
     }
 
-    /// Edit the notes of a clip's pitch edit.
-    pub fn edit_pitch(&mut self, clip: ClipId, op: PitchOp) -> Result<()> {
-        let c = self.gesture_clip(clip)?;
-        let mut a = audio_of(&c)?;
+    /// Edit the notes of a clip's (or take's) pitch edit.
+    pub fn edit_pitch(&mut self, target: AudioRef, op: PitchOp) -> Result<()> {
+        let (_, mut a) = self.gesture_audio(target)?;
+        let base = self.project.audio_start(target).unwrap_or(0);
         let Some(mut e) = a.pitch.take() else {
             return Err(SessionError::Other(
                 "detect the clip's pitch before editing it".into(),
@@ -459,7 +447,7 @@ impl Session {
                 drift,
             } => {
                 for i in chosen(&notes, count) {
-                    let t = self.pitch_time(&c, &a, e.notes[i].placed().0);
+                    let t = self.pitch_time(base, &a, e.notes[i].placed().0);
                     let scale = self.scale_at(t);
                     let n = &mut e.notes[i];
                     let heard = n.heard();
@@ -566,11 +554,11 @@ impl Session {
                 if let Some(p) = e.polyphonic {
                     a.source = p.original;
                 }
-                return self.set_audio("Remove Pitch Edit", &c, c.start, a);
+                return self.set_audio_of("Remove Pitch Edit", target, a);
             }
         };
         a.pitch = Some(e);
-        self.set_audio(label, &c, c.start, a)
+        self.set_audio_of(label, target, a)
     }
 
     /// The pitch track of a clip's source, once analysed (for display).

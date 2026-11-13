@@ -59,7 +59,7 @@ fn bass(s: &Session) -> ClipId {
 }
 
 fn volume(s: &Session, clip: ClipId) -> Vec<EnvelopePoint> {
-    s.clip_envelope(clip)
+    s.clip_envelope(clip.into())
         .map(|e| e.volume.clone())
         .unwrap_or_default()
 }
@@ -140,7 +140,7 @@ fn the_clip_menu_shows_clears_envelopes_and_opens_strip_silence() {
     let mut s = Session::demo(EngineConfig::default()).unwrap();
     let clip = bass(&s);
     s.dispatch(Action::SetClipEnvelope {
-        clip,
+        audio: clip.into(),
         lane: EnvelopeLane::Pan,
         points: vec![EnvelopePoint::new(0, 0.5)],
     })
@@ -160,7 +160,7 @@ fn the_clip_menu_shows_clears_envelopes_and_opens_strip_silence() {
     );
     s.dispatch(find("Clear Pan Envelope").action.clone().unwrap())
         .unwrap();
-    assert!(s.clip_envelope(clip).is_none());
+    assert!(s.clip_envelope(clip.into()).is_none());
     s.dispatch(find("Show Pan").action.clone().unwrap())
         .unwrap();
     assert_eq!(s.clip_envelope_shown(), Some(EnvelopeLane::Pan));

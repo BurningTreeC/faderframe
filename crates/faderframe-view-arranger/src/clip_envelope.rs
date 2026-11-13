@@ -1,5 +1,5 @@
-//! Clip envelopes on the arranger's audio clips, and the Strip Silence
-//! preview.
+//! Clip envelopes on the arranger's audio clips and on the takes in the
+//! lanes of an open take folder, and the Strip Silence preview.
 //!
 //! While a lane is shown (`Session::clip_envelope_shown`: Edit → Clip
 //! Envelopes, or the clip menu) audio clips draw it over their waveform
@@ -9,11 +9,15 @@
 //! Alt free, Shift keeps its time, Ctrl fine), a double-click removes it, a
 //! right-click on one sets its segment's shape. Edges still trim and the
 //! name strip still moves the clip. Each drag is one undo step
-//! (`Action::SetClipEnvelope` inside a gesture).
+//! (`Action::SetClipEnvelope` inside a gesture). A take is a clip in its
+//! folder: its lane draws and edits its own envelope the same way (comping
+//! in the lanes waits until the envelopes are hidden), and the folder's
+//! main lane draws the comp's (what it plays, not edited there).
 
 use super::*;
 use crate::clip_edit::EditDrag;
 use faderframe_automation::CurveShape;
+use faderframe_project::AudioRef;
 use faderframe_project::clip_envelope::{EnvelopeLane, EnvelopePoint};
 
 /// Pick radius of a point (pixels).
@@ -21,27 +25,41 @@ const POINT_PICK: f32 = 6.0;
 /// Drawn size of a point.
 const POINT_SIZE: f32 = 6.0;
 
-/// A point of a clip's envelope being dragged (or just added).
+/// Where an envelope is drawn and edited: an audio clip's body, or a
+/// take's part of its lane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EnvelopePlace {
+    pub audio: AudioRef,
+    /// Project frames from the clip's start (the folder's, for a take) to
+    /// its first frame.
+    pub offset: i64,
+    /// Its frames.
+    pub length: i64,
+    /// Where it is drawn (values from y).
+    pub content: Rect,
+}
+
+/// A point of an envelope being dragged (or just added).
 #[derive(Clone, Debug)]
 pub(crate) struct EnvelopeDrag {
-    pub clip: ClipId,
+    /// The clip or take, as the press found it.
+    pub place: EnvelopePlace,
     pub lane: EnvelopeLane,
     pub index: usize,
     /// The lane's points as the press found them (the drag is absolute
     /// from these).
     pub points: Vec<EnvelopePoint>,
     pub origin: Point,
-    /// The clip's content area at the press (values from y).
-    pub content: Rect,
     /// Past the drag threshold (or a point added: already an edit).
     pub moved: bool,
 }
 
 impl ArrangerView {
-    /// The shown envelope lane's points of an audio clip (empty: none).
-    fn envelope_points(model: &Session, clip: ClipId, lane: EnvelopeLane) -> Vec<EnvelopePoint> {
+    /// The shown envelope lane's points of an audio clip or take (empty:
+    /// none).
+    fn envelope_points(model: &Session, audio: AudioRef, lane: EnvelopeLane) -> Vec<EnvelopePoint> {
         model
-            .clip_envelope(clip)
+            .clip_envelope(audio)
             .map(|e| e.lane(lane).to_vec())
             .unwrap_or_default()
     }
@@ -51,6 +69,60 @@ impl ArrangerView {
     pub(crate) fn edits_envelope(model: &Session, clip: &Clip) -> Option<EnvelopeLane> {
         let lane = model.clip_envelope_shown()?;
         matches!(clip.content, ClipContent::Audio(_)).then_some(lane)
+    }
+
+    /// An audio clip's envelope over its body `rect`.
+    pub(crate) fn clip_envelope_place(&self, clip: &Clip, rect: Rect) -> Option<EnvelopePlace> {
+        Some(EnvelopePlace {
+            audio: clip.id.into(),
+            offset: 0,
+            length: clip.as_audio()?.length,
+            content: self.content_rect(rect),
+        })
+    }
+
+    /// Take `k`'s part of its lane in folder `clip` (the lanes open).
+    pub(crate) fn take_envelope_place(
+        &self,
+        model: &Session,
+        size: Size,
+        clip: &Clip,
+        k: usize,
+    ) -> Option<EnvelopePlace> {
+        if !model.takes_open(clip.id) {
+            return None;
+        }
+        let take = clip.as_takes()?.takes.get(k)?;
+        let rect = self.clip_view_rect(model, size, clip.id)?;
+        let lane_h = model.take_lane_height(clip.track);
+        // The main lane's rect starts 3 px into its row.
+        let lanes_top = rect.y - 3.0 + self.base_h(model, clip.track);
+        let lane = Rect::new(rect.x, lanes_top + k as f32 * lane_h, rect.w, lane_h - 1.0);
+        Some(self.take_body_place(model, clip, k, take, lane))
+    }
+
+    /// Take `k` (`take`) of folder `clip` drawn in `lane`: its body.
+    pub(crate) fn take_body_place(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        k: usize,
+        take: &faderframe_project::Take,
+        lane: Rect,
+    ) -> EnvelopePlace {
+        let x0 = self.x_of_frame(model, clip, take.start);
+        let x1 = self.x_of_frame(model, clip, take.end());
+        let body = Rect::new(x0, lane.y + 1.0, (x1 - x0).max(0.0), lane.h - 2.0);
+        let audio = model
+            .project()
+            .take_ref(clip.id, k)
+            .map_or(AudioRef::Clip(clip.id), AudioRef::Take);
+        EnvelopePlace {
+            audio,
+            offset: take.start,
+            length: take.audio.length,
+            content: body.inset_xy(0.0, 2.0),
+        }
     }
 
     /// y of a value in the clip's content area.
@@ -64,12 +136,17 @@ impl ArrangerView {
         lane.from_unit(u)
     }
 
+    /// x of frame `at` of the clip or take at `place` (in clip `clip`).
+    fn envelope_x(&self, model: &Session, clip: &Clip, place: &EnvelopePlace, at: i64) -> f32 {
+        self.x_of_frame(model, clip, place.offset + at)
+    }
+
     /// The point under `pos` (index), if any.
     fn envelope_point_at(
         &self,
         model: &Session,
         clip: &Clip,
-        content: Rect,
+        place: &EnvelopePlace,
         lane: EnvelopeLane,
         points: &[EnvelopePoint],
         pos: Point,
@@ -79,8 +156,8 @@ impl ArrangerView {
             .enumerate()
             .map(|(i, p)| {
                 let at = Point::new(
-                    self.x_of_frame(model, clip, p.at),
-                    Self::envelope_y(content, lane, p.value),
+                    self.envelope_x(model, clip, place, p.at),
+                    Self::envelope_y(place.content, lane, p.value),
                 );
                 (i, at.distance(pos))
             })
@@ -89,20 +166,29 @@ impl ArrangerView {
             .map(|(i, _)| i)
     }
 
-    /// Clip frame at x, on the grid unless Alt (or snapping is off).
-    fn envelope_frame(&self, model: &Session, clip: &Clip, x: f32, mods: Modifiers) -> i64 {
+    /// The frame of the clip or take at x, on the grid unless Alt (or
+    /// snapping is off).
+    fn envelope_frame(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        place: &EnvelopePlace,
+        x: f32,
+        mods: Modifiers,
+    ) -> i64 {
         let p = model.project();
         let rate = f64::from(p.sample_rate);
         let t = self.snap(self.time_at(x), model, mods);
-        p.timeline.to_samples(t, rate) - p.timeline.to_samples(clip.start, rate)
+        p.timeline.to_samples(t, rate) - p.timeline.to_samples(clip.start, rate) - place.offset
     }
 
-    /// A press on an audio clip's body while its envelope is shown.
+    /// A press on an audio clip's body, or on a take in its lane, while an
+    /// envelope lane is shown.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn press_envelope(
         &mut self,
         c: &Clip,
-        rect: Rect,
+        place: EnvelopePlace,
         lane: EnvelopeLane,
         pos: Point,
         clicks: u32,
@@ -110,14 +196,14 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
-        let content = self.content_rect(rect);
-        let mut points = Self::envelope_points(model, c.id, lane);
-        let hit = self.envelope_point_at(model, c, content, lane, &points, pos);
+        let content = place.content;
+        let mut points = Self::envelope_points(model, place.audio, lane);
+        let hit = self.envelope_point_at(model, c, &place, lane, &points, pos);
         if clicks >= 2 {
             if let Some(i) = hit {
                 points.remove(i);
                 cx.emit(Action::SetClipEnvelope {
-                    clip: c.id,
+                    audio: place.audio,
                     lane,
                     points,
                 });
@@ -138,8 +224,9 @@ impl ArrangerView {
             Some(i) => (i, false),
             None => {
                 // A new point on the line where it was pressed.
-                let len = c.as_audio().map_or(0, |a| a.length);
-                let at = self.envelope_frame(model, c, pos.x, mods).clamp(0, len);
+                let at = self
+                    .envelope_frame(model, c, &place, pos.x, mods)
+                    .clamp(0, place.length);
                 let value = Self::envelope_value(content, lane, pos.y);
                 let i = points.partition_point(|p| p.at <= at);
                 let shape = i
@@ -149,7 +236,7 @@ impl ArrangerView {
                 points.insert(i, EnvelopePoint { at, value, shape });
                 cx.emit(Action::BeginGesture("Clip Envelope".into()));
                 cx.emit(Action::SetClipEnvelope {
-                    clip: c.id,
+                    audio: place.audio,
                     lane,
                     points: points.clone(),
                 });
@@ -157,12 +244,11 @@ impl ArrangerView {
             }
         };
         self.edit_drag = Some(EditDrag::Envelope(EnvelopeDrag {
-            clip: c.id,
+            place,
             lane,
             index,
             points,
             origin: pos,
-            content,
             moved,
         }));
         cx.set_cursor(Cursor::Crosshair);
@@ -186,19 +272,20 @@ impl ArrangerView {
             cx.emit(Action::BeginGesture("Clip Envelope".into()));
             d.moved = true;
         }
-        let Some(c) = model.project().clip(d.clip) else {
+        let Some(c) = model.project().clip(d.place.audio.clip()) else {
             return;
         };
         let Some(old) = d.points.get(d.index).copied() else {
             return;
         };
-        let content = d.content;
+        let content = d.place.content;
         let lo = d.index.checked_sub(1).map_or(i64::MIN, |i| d.points[i].at);
         let hi = d.points.get(d.index + 1).map_or(i64::MAX, |p| p.at);
         let at = if mods.shift {
             old.at
         } else {
-            self.envelope_frame(model, c, pos.x, mods).clamp(lo, hi)
+            self.envelope_frame(model, c, &d.place, pos.x, mods)
+                .clamp(lo, hi)
         };
         let mut value = Self::envelope_value(content, d.lane, pos.y);
         if mods.ctrl {
@@ -213,13 +300,14 @@ impl ArrangerView {
             shape: old.shape,
         };
         cx.emit(Action::SetClipEnvelope {
-            clip: d.clip,
+            audio: d.place.audio,
             lane: d.lane,
             points,
         });
     }
 
-    /// Menu of a point: its segment's shape, remove it.
+    /// Menu of an audio clip's envelope point under `pos`: its segment's
+    /// shape, remove it.
     pub(crate) fn envelope_point_menu(
         &self,
         model: &Session,
@@ -229,14 +317,39 @@ impl ArrangerView {
     ) -> Option<HostRequest<Action>> {
         let lane = Self::edits_envelope(model, clip)?;
         let rect = self.clip_view_rect(model, size, clip.id)?;
-        let content = self.content_rect(rect);
-        let points = Self::envelope_points(model, clip.id, lane);
-        let i = self.envelope_point_at(model, clip, content, lane, &points, pos)?;
+        let place = self.clip_envelope_place(clip, rect)?;
+        self.envelope_point_menu_at(model, clip, place, lane, pos)
+    }
+
+    /// Menu of the envelope point under `pos` of a take in its lane.
+    pub(crate) fn take_envelope_point_menu(
+        &self,
+        model: &Session,
+        size: Size,
+        clip: &Clip,
+        take: usize,
+        pos: Point,
+    ) -> Option<HostRequest<Action>> {
+        let lane = model.clip_envelope_shown()?;
+        let place = self.take_envelope_place(model, size, clip, take)?;
+        self.envelope_point_menu_at(model, clip, place, lane, pos)
+    }
+
+    fn envelope_point_menu_at(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        place: EnvelopePlace,
+        lane: EnvelopeLane,
+        pos: Point,
+    ) -> Option<HostRequest<Action>> {
+        let points = Self::envelope_points(model, place.audio, lane);
+        let i = self.envelope_point_at(model, clip, &place, lane, &points, pos)?;
         let with = |f: &dyn Fn(&mut Vec<EnvelopePoint>)| {
             let mut p = points.clone();
             f(&mut p);
             Action::SetClipEnvelope {
-                clip: clip.id,
+                audio: place.audio,
                 lane,
                 points: p,
             }
@@ -276,10 +389,11 @@ impl ArrangerView {
         Some(HostRequest::ContextMenu { at: pos, items })
     }
 
-    /// The clip menu's "Clip Envelope" submenu for `targets`.
+    /// The "Clip Envelope" submenu (the clip menu's, a take lane's) for
+    /// `targets`.
     pub(crate) fn clip_envelope_items(
         model: &Session,
-        targets: &[ClipId],
+        targets: &[AudioRef],
     ) -> Vec<MenuItem<Action>> {
         let shown = model.clip_envelope_shown();
         let mut items = vec![
@@ -311,7 +425,7 @@ impl ArrangerView {
                 MenuItem::new(
                     label,
                     Action::ClearClipEnvelope {
-                        clips: targets.to_vec(),
+                        audio: targets.to_vec(),
                         lane,
                     },
                 )
@@ -327,9 +441,7 @@ impl ArrangerView {
         items
     }
 
-    /// The shown lane over an audio clip: the line, and its points while
-    /// the clip is selected or hovered (or the envelope differs from
-    /// neutral, so a ride is seen at a glance).
+    /// The shown lane over an audio clip: the line and its points.
     pub(crate) fn paint_envelope(
         &self,
         p: &mut dyn Painter,
@@ -340,13 +452,92 @@ impl ArrangerView {
         let Some(lane) = Self::edits_envelope(model, clip) else {
             return;
         };
-        let content = self.content_rect(rect);
+        let Some(place) = self.clip_envelope_place(clip, rect) else {
+            return;
+        };
+        let points = Self::envelope_points(model, place.audio, lane);
+        self.paint_envelope_at(p, model, clip, &place, lane, &points, true);
+    }
+
+    /// The shown lane over a take in its lane (`lane_rect`): the line and
+    /// its points.
+    pub(crate) fn paint_take_envelope(
+        &self,
+        p: &mut dyn Painter,
+        model: &Session,
+        clip: &Clip,
+        k: usize,
+        take: &faderframe_project::Take,
+        lane_rect: Rect,
+    ) {
+        let Some(lane) = model.clip_envelope_shown() else {
+            return;
+        };
+        let place = self.take_body_place(model, clip, k, take, lane_rect);
+        let points = take
+            .audio
+            .envelope
+            .as_ref()
+            .map(|e| e.lane(lane).to_vec())
+            .unwrap_or_default();
+        self.paint_envelope_at(p, model, clip, &place, lane, &points, true);
+    }
+
+    /// The shown lane over a take folder's main lane (`area`): what the
+    /// comp plays, each piece its take's envelope there (a line only: it is
+    /// edited in the take lanes).
+    pub(crate) fn paint_comp_envelope(
+        &self,
+        p: &mut dyn Painter,
+        model: &Session,
+        clip: &Clip,
+        f: &TakeFolder,
+        area: Rect,
+    ) {
+        let Some(lane) = model.clip_envelope_shown() else {
+            return;
+        };
+        for piece in f.played() {
+            let (x0, x1) = (
+                self.x_of_frame(model, clip, piece.start),
+                self.x_of_frame(model, clip, piece.start + piece.audio.length),
+            );
+            let place = EnvelopePlace {
+                audio: AudioRef::Clip(clip.id),
+                offset: piece.start,
+                length: piece.audio.length,
+                content: Rect::new(x0, area.y, (x1 - x0).max(0.0), area.h),
+            };
+            let points = piece
+                .audio
+                .envelope
+                .as_ref()
+                .map(|e| e.lane(lane).to_vec())
+                .unwrap_or_default();
+            self.paint_envelope_at(p, model, clip, &place, lane, &points, false);
+        }
+    }
+
+    /// `points` of `lane` over `place` (in clip `clip`): the line across its
+    /// content area, and the points (`with_points`).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_envelope_at(
+        &self,
+        p: &mut dyn Painter,
+        model: &Session,
+        clip: &Clip,
+        place: &EnvelopePlace,
+        lane: EnvelopeLane,
+        points: &[EnvelopePoint],
+        with_points: bool,
+    ) {
+        let content = place.content;
         if content.h < 6.0 || content.w < 2.0 {
             return;
         }
-        let points = Self::envelope_points(model, clip.id, lane);
         let color = self.theme.arranger.automation;
         let y_of = |v: f64| Self::envelope_y(content, lane, v);
+        let x_of = |at: i64| self.envelope_x(model, clip, place, at);
         let (x0, x1) = (content.x, content.right());
         let mut line = Path::new();
         match points.first() {
@@ -358,12 +549,12 @@ impl ArrangerView {
             Some(first) => {
                 line.move_to(Point::new(x0, y_of(first.value)));
                 for (i, a) in points.iter().enumerate() {
-                    let xa = self.x_of_frame(model, clip, a.at);
+                    let xa = x_of(a.at);
                     line.line_to(Point::new(xa.clamp(x0, x1), y_of(a.value)));
                     let Some(b) = points.get(i + 1) else {
                         continue;
                     };
-                    let xb = self.x_of_frame(model, clip, b.at);
+                    let xb = x_of(b.at);
                     if xb < x0 || xa > x1 {
                         continue;
                     }
@@ -388,8 +579,11 @@ impl ArrangerView {
             }
         }
         p.stroke_path(&line, 1.5, color);
-        for a in &points {
-            let x = self.x_of_frame(model, clip, a.at);
+        if !with_points {
+            return;
+        }
+        for a in points {
+            let x = x_of(a.at);
             if x < x0 - POINT_SIZE || x > x1 + POINT_SIZE {
                 continue;
             }

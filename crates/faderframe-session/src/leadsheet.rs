@@ -649,8 +649,13 @@ impl Session {
                 .pieces()
                 .into_iter()
                 .filter_map(|piece| {
+                    // The take's clip cut to the piece: the source it
+                    // plays there, as an audio clip's is heard.
                     let take = f.takes.get(piece.take)?;
-                    let source = self.sources.get(&take.source)?.clone();
+                    let cut = take
+                        .audio
+                        .cut(piece.start - take.start, piece.end - take.start)?;
+                    let source = self.sources.get(&cut.source)?.clone();
                     Some((
                         Place::Piece {
                             clip: c.id,
@@ -658,8 +663,8 @@ impl Session {
                         },
                         Listen {
                             source,
-                            from: take.source_offset + piece.start,
-                            span: piece.end - piece.start,
+                            from: cut.source_offset,
+                            span: cut.source_span(),
                         },
                     ))
                 })

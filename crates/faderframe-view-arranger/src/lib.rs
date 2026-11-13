@@ -375,6 +375,31 @@ struct WaveSpan {
     warp: Option<Vec<faderframe_project::WarpMarker>>,
 }
 
+impl WaveSpan {
+    /// The waveform of `audio` (a clip's, or a take's cut to a part of
+    /// its folder) from engine sample `start`, `gain_db` more on it (a
+    /// folder's gain).
+    fn of_audio(
+        clip: ClipId,
+        start: i64,
+        audio: &faderframe_project::AudioClip,
+        gain_db: f32,
+    ) -> Self {
+        Self {
+            clip,
+            source: audio.source,
+            start,
+            source_offset: audio.source_offset,
+            length: audio.length,
+            gain: db_to_gain(audio.gain_db + gain_db),
+            warp: audio
+                .warp
+                .as_ref()
+                .map(|w| w.points(audio.source_offset, audio.length)),
+        }
+    }
+}
+
 /// Engine samples of a (non-warped) span ↔ the source's own frames.
 /// Width of a waveform's kept tiles (logical pixels).
 const WAVE_TILE: f32 = 256.0;
@@ -1193,6 +1218,7 @@ impl ArrangerView {
                 }
                 if k >= 0.0
                     && (k as usize) < f.takes.len()
+                    && model.clip_envelope_shown().is_none()
                     && let Some(word) = self.take_word_at(
                         model,
                         clip,
@@ -1614,15 +1640,14 @@ impl ArrangerView {
         let base = Self::clip_start_sample(model, clip);
         for piece in f.pieces() {
             let take = &f.takes[piece.take];
-            let span = WaveSpan {
-                clip: clip.id,
-                source: take.source,
-                start: base + Self::engine_frames(model, piece.start),
-                source_offset: take.source_offset + piece.start,
-                length: piece.end - piece.start,
-                gain: db_to_gain(f.gain_db + take.gain_db),
-                warp: None,
+            let Some(cut) = take
+                .audio
+                .cut(piece.start - take.start, piece.end - take.start)
+            else {
+                continue;
             };
+            let start = base + Self::engine_frames(model, piece.start);
+            let span = WaveSpan::of_audio(clip.id, start, &cut, f.gain_db);
             self.paint_waveform(p, area, vis, &span, model, color);
         }
         // Comp boundaries.
@@ -1672,22 +1697,19 @@ impl ArrangerView {
                 color.darken(0.8).with_alpha(0.9),
             );
             let tx0 = self.x_of_sample(model, base + Self::engine_frames(model, take.start));
-            let tx1 = self.x_of_sample(model, base + Self::engine_frames(model, take.end));
+            let tx1 = self.x_of_sample(model, base + Self::engine_frames(model, take.end()));
             let body = Rect::new(tx0, lane.y + 1.0, tx1 - tx0, lane.h - 2.0);
             p.fill_rounded(
                 body,
                 2.0,
                 &Paint::Solid(color.darken(0.62).with_alpha(0.85)),
             );
-            let wave = WaveSpan {
-                clip: clip.id,
-                source: take.source,
-                start: base + Self::engine_frames(model, take.start),
-                source_offset: take.source_offset + take.start,
-                length: take.end - take.start,
-                gain: db_to_gain(f.gain_db + take.gain_db),
-                warp: None,
-            };
+            let wave = WaveSpan::of_audio(
+                clip.id,
+                base + Self::engine_frames(model, take.start),
+                &take.audio,
+                f.gain_db,
+            );
             self.paint_waveform(
                 p,
                 body.inset_xy(0.0, 2.0),
@@ -1709,15 +1731,14 @@ impl ArrangerView {
                 }
                 let r = Rect::new(x0, lane.y + 1.0, x1 - x0, lane.h - 2.0);
                 p.fill(r, color.with_alpha(0.45));
-                let span = WaveSpan {
-                    clip: clip.id,
-                    source: take.source,
-                    start: base + Self::engine_frames(model, piece.start),
-                    source_offset: take.source_offset + piece.start,
-                    length: piece.end - piece.start,
-                    gain: wave.gain,
-                    warp: None,
+                let Some(cut) = take
+                    .audio
+                    .cut(piece.start - take.start, piece.end - take.start)
+                else {
+                    continue;
                 };
+                let start = base + Self::engine_frames(model, piece.start);
+                let span = WaveSpan::of_audio(clip.id, start, &cut, f.gain_db);
                 self.paint_waveform(
                     p,
                     r.inset_xy(0.0, 2.0),
@@ -1728,6 +1749,8 @@ impl ArrangerView {
                 );
                 p.stroke_rounded(r, 1.5, 1.0, color.lighten(0.35));
             }
+            // Its envelope, while one is shown.
+            self.paint_take_envelope(p, model, clip, k, take, lane);
             // The words it sings (comping by lyric).
             self.paint_take_words(p, lane, vis, clip, f, k, model);
             // The ▶ that auditions it; the take heard is outlined.
@@ -1986,18 +2009,8 @@ impl ArrangerView {
         let content = self.clip_content_rect(rect);
         match &clip.content {
             ClipContent::Audio(audio) => {
-                let span = WaveSpan {
-                    clip: clip.id,
-                    source: audio.source,
-                    start: Self::clip_start_sample(model, clip),
-                    source_offset: audio.source_offset,
-                    length: audio.length,
-                    gain: db_to_gain(audio.gain_db),
-                    warp: audio
-                        .warp
-                        .as_ref()
-                        .map(|w| w.points(audio.source_offset, audio.length)),
-                };
+                let start = Self::clip_start_sample(model, clip);
+                let span = WaveSpan::of_audio(clip.id, start, audio, 0.0);
                 self.paint_waveform(p, content, vis, &span, model, color);
                 self.paint_redraw(p, model, clip.id, content, &span);
                 self.paint_warp(p, model, clip, rect);
@@ -2008,6 +2021,9 @@ impl ArrangerView {
         self.paint_fades(p, model, clip, rect, color);
         self.paint_strip_preview(p, model, clip, rect);
         self.paint_envelope(p, model, clip, rect);
+        if let ClipContent::Takes(f) = &clip.content {
+            self.paint_comp_envelope(p, model, clip, f, self.content_rect(rect));
+        }
         self.paint_gain(p, clip, rect, text_color);
         if clip.muted {
             p.fill(rect, Color::rgba(0.08, 0.08, 0.09, 0.6));
@@ -3619,7 +3635,7 @@ impl ArrangerView {
                 } else {
                     "Edit Pitch (find its notes)"
                 },
-                Action::OpenPitchEditor(clip.id),
+                Action::OpenPitchEditor(clip.id.into()),
             ));
         }
         {
@@ -3675,13 +3691,16 @@ impl ArrangerView {
                 {
                     let item = MenuItem::new(
                         format!("Convert {} to MIDI", how.label()),
-                        Action::ConvertToMidi { clip: clip.id, how },
+                        Action::ConvertToMidi {
+                            audio: clip.id.into(),
+                            how,
+                        },
                     );
                     items.push(if i == 0 { item.separated() } else { item });
                 }
                 items.push(MenuItem::new(
                     "Clip Effects…",
-                    Action::OpenClipEffects(clip.id),
+                    Action::OpenClipEffects(clip.id.into()),
                 ));
                 // Melodyne and the like: open the clip with an ARA plug-in
                 // (or in the one its track has).
@@ -3697,7 +3716,7 @@ impl ArrangerView {
                 }
                 items.push(MenuItem::new(
                     "Spectral Editor (Remove Noises, Heal)…",
-                    Action::OpenSpectralEditor(clip.id),
+                    Action::OpenSpectralEditor(clip.id.into()),
                 ));
                 items.push(MenuItem::new(
                     "Transcribe Words to the Lyrics Lane",
@@ -3714,7 +3733,10 @@ impl ArrangerView {
                 }
                 items.push(MenuItem::submenu(
                     "Clip Envelope",
-                    Self::clip_envelope_items(model, &targets),
+                    Self::clip_envelope_items(
+                        model,
+                        &targets.iter().map(|c| (*c).into()).collect::<Vec<_>>(),
+                    ),
                 ));
                 items.push(MenuItem::new(
                     "Strip Silence…",
@@ -3883,6 +3905,47 @@ impl ArrangerView {
             .checked(hearing)
             .separated(),
         );
+        // A take is a clip of its own: its pitch, spectrum, effects,
+        // notes and envelope are edited on their own.
+        if let Some(r) = model.project().take_ref(clip.id, take) {
+            let found = f.takes.get(take).is_some_and(|t| t.audio.pitch.is_some());
+            items.push(MenuItem::new(
+                if found {
+                    format!("Edit Pitch of “{name}”")
+                } else {
+                    format!("Edit Pitch of “{name}” (find its notes)")
+                },
+                Action::OpenPitchEditor(r.into()),
+            ));
+            items.push(MenuItem::new(
+                format!("Spectral Editor for “{name}” (Remove Noises, Heal)…"),
+                Action::OpenSpectralEditor(r.into()),
+            ));
+            items.push(MenuItem::new(
+                format!("Clip Effects on “{name}”…"),
+                Action::OpenClipEffects(r.into()),
+            ));
+            use faderframe_session::to_midi::ToMidi;
+            items.push(MenuItem::submenu(
+                format!("Convert “{name}” to MIDI"),
+                [ToMidi::Melody, ToMidi::Harmony, ToMidi::Drums]
+                    .into_iter()
+                    .map(|how| {
+                        MenuItem::new(
+                            how.label(),
+                            Action::ConvertToMidi {
+                                audio: r.into(),
+                                how,
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+            items.push(MenuItem::submenu(
+                "Clip Envelope",
+                Self::clip_envelope_items(model, &[r.into()]),
+            ));
+        }
         let now = model.take_lane_height(clip.track);
         let heights = [
             ("Small", 20.0),
@@ -4256,6 +4319,22 @@ impl ArrangerView {
                 pos: frame,
                 ..
             } => {
+                // An envelope shown: the lane edits its take's (a take is a
+                // clip of its own) — over the take; the rest of the lane
+                // has nothing to edit (comping waits).
+                if let Some(lane) = model.clip_envelope_shown() {
+                    let Some(c) = model.project().clip(clip) else {
+                        return false;
+                    };
+                    let Some(place) = self.take_envelope_place(model, size, c, take) else {
+                        return false;
+                    };
+                    let (x0, x1) = (place.content.x, place.content.right());
+                    if pos.x < x0 - 3.0 || pos.x > x1 + 3.0 {
+                        return true;
+                    }
+                    return self.press_envelope(c, place, lane, pos, clicks, mods, model, cx);
+                }
                 let Some(f) = model.project().clip(clip).and_then(|c| c.as_takes()) else {
                     return false;
                 };
@@ -5290,7 +5369,16 @@ impl CanvasView<Session, Action> for ArrangerView {
                         cx.request(menu);
                     }
                     Some(Hit::Global(g)) => cx.request(self.global_menu(g, model, pos)),
-                    Some(Hit::TakeLane { clip, take, .. } | Hit::TakeAudition { clip, take }) => {
+                    Some(Hit::TakeLane { clip, take, .. }) => {
+                        if let Some(c) = model.project().clip(clip) {
+                            // A take's envelope point: its shape, remove it.
+                            match self.take_envelope_point_menu(model, size, c, take, pos) {
+                                Some(menu) => cx.request(menu),
+                                None => cx.request(Self::take_menu(model, c, take, pos)),
+                            }
+                        }
+                    }
+                    Some(Hit::TakeAudition { clip, take }) => {
                         if let Some(c) = model.project().clip(clip) {
                             cx.request(Self::take_menu(model, c, take, pos));
                         }

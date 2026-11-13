@@ -1,5 +1,6 @@
-//! Audio to MIDI: an audio clip's notes on a new instrument track, as a
-//! MIDI clip in the same place.
+//! Audio to MIDI: the notes of an audio clip or of one take of a take
+//! folder (an [`AudioRef`]) on a new instrument track, as a MIDI clip in
+//! the same place.
 //!
 //! Three ways to hear it, run in a thread on the clip's part of its
 //! source: **Melody** (a single voice or instrument) by the pitch-editing
@@ -15,8 +16,8 @@ use crate::pitch::mono_of;
 use crate::{NoticeLevel, Result, Session, SessionError};
 use faderframe_core::{ClipId, TrackId};
 use faderframe_project::{
-    Clip, ClipContent, Command, MidiClip, MidiNote, PluginRef, PluginSlot, Track, TrackColor,
-    TrackKind,
+    AudioRef, Clip, ClipContent, Command, MidiClip, MidiNote, PluginRef, PluginSlot, Track,
+    TrackColor, TrackKind,
 };
 use faderframe_timeline::MusicalTime;
 use std::thread::JoinHandle;
@@ -48,8 +49,9 @@ pub(crate) struct Found {
     pub(crate) velocity: u8,
 }
 
-/// A conversion running: its clip, how, and the notes it will find.
-type Job = (ClipId, ToMidi, JoinHandle<Option<Vec<Found>>>);
+/// A conversion running: its clip or take, how, and the notes it will
+/// find.
+type Job = (AudioRef, ToMidi, JoinHandle<Option<Vec<Found>>>);
 
 /// Conversions running.
 #[derive(Default)]
@@ -195,19 +197,15 @@ fn drums(x: &[f32], rate: f64) -> Vec<Found> {
 }
 
 impl Session {
-    /// Hear an audio clip's notes and put them on a new instrument track
-    /// (see the module docs).
-    pub fn convert_to_midi(&mut self, clip: ClipId, how: ToMidi) -> Result<()> {
-        let c = self
-            .project
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other(format!("no clip {clip}")))?;
-        let Some(a) = c.as_audio() else {
+    /// Hear the notes of an audio clip or take and put them on a new
+    /// instrument track (see the module docs).
+    pub fn convert_to_midi(&mut self, audio: AudioRef, how: ToMidi) -> Result<()> {
+        let Some(a) = self.project.audio(audio) else {
             return Err(SessionError::Other(
-                "only audio clips turn into MIDI".into(),
+                "only audio clips and takes turn into MIDI".into(),
             ));
         };
+        let name = self.project.audio_name(audio).unwrap_or_default();
         let source = self
             .sources
             .get(&a.source)
@@ -230,13 +228,12 @@ impl Session {
                 }
             })
             .map_err(|e| SessionError::Other(e.to_string()))?;
-        self.conversions.jobs.push((clip, how, job));
+        self.conversions.jobs.push((audio, how, job));
         self.notify(
             NoticeLevel::Info,
             format!(
-                "Listening for the {} in ‘{}’…",
-                how.label().to_lowercase(),
-                c.name
+                "Listening for the {} in ‘{name}’…",
+                how.label().to_lowercase()
             ),
         );
         self.revision += 1;
@@ -256,9 +253,9 @@ impl Session {
                 i += 1;
                 continue;
             }
-            let (clip, how, job) = self.conversions.jobs.swap_remove(i);
+            let (audio, how, job) = self.conversions.jobs.swap_remove(i);
             let result = match job.join().ok().flatten() {
-                Some(found) => self.place_midi(clip, how, &found).map(|_| ()),
+                Some(found) => self.place_midi(audio, how, &found).map(|_| ()),
                 None => Err(SessionError::Other(
                     "the clip's audio could not be read".into(),
                 )),
@@ -271,40 +268,38 @@ impl Session {
     }
 
     /// The new track with its instrument and the notes as a clip.
-    fn place_midi(&mut self, clip: ClipId, how: ToMidi, found: &[Found]) -> Result<TrackId> {
-        let c = self
-            .project
-            .clip(clip)
-            .cloned()
-            .ok_or_else(|| SessionError::Other("the clip is gone".into()))?;
-        let Some(a) = c.as_audio().cloned() else {
-            return Err(SessionError::Other(
-                "only audio clips turn into MIDI".into(),
-            ));
-        };
+    fn place_midi(&mut self, audio: AudioRef, how: ToMidi, found: &[Found]) -> Result<TrackId> {
+        let gone = || SessionError::Other("the clip or take is gone".into());
+        let a = self.project.audio(audio).cloned().ok_or_else(gone)?;
+        let base = self.project.audio_start(audio).ok_or_else(gone)?;
+        let c_name = self.project.audio_name(audio).ok_or_else(gone)?;
+        let c_track = self.project.clip(audio.clip()).ok_or_else(gone)?.track;
         if found.is_empty() {
             return Err(SessionError::Other(format!(
-                "no {} heard in ‘{}’",
+                "no {} heard in ‘{c_name}’",
                 if how == ToMidi::Drums {
                     "hits"
                 } else {
                     "notes"
-                },
-                c.name
+                }
             )));
         }
         let p = &mut self.project;
         let rate = p.sample_rate as f64;
-        let base = p.timeline.to_samples(c.start, rate);
-        // Seconds into the clip's source part → the timeline, relative to
-        // the clip.
+        // Where it plays (a take: in its folder, from its own start).
+        let c_start = match audio {
+            AudioRef::Clip(c) => p.clip(c).ok_or_else(gone)?.start,
+            AudioRef::Take(_) => p.timeline.to_musical(base, rate),
+        };
+        // Seconds into its source part → the timeline, relative to its
+        // start.
         let at = |p: &faderframe_project::Project, s: f64| {
             let f = a.source_offset + (s * rate).round() as i64;
             let out = match &a.warp {
                 Some(w) => w.output_of(a.source_offset, a.length, f),
                 None => f - a.source_offset,
             };
-            p.timeline.to_musical(base + out.clamp(0, a.length), rate) - c.start
+            p.timeline.to_musical(base + out.clamp(0, a.length), rate) - c_start
         };
         let min = MusicalTime::from_quarters(1.0 / 32.0);
         let mut notes: Vec<MidiNote> = found
@@ -327,15 +322,15 @@ impl Session {
             })
             .collect();
         notes.sort_by_key(|n| (n.start, n.key));
-        let length = c.end(&p.timeline, p.sample_rate) - c.start;
+        let length = p.timeline.end_of_sample_span(c_start, a.length, rate) - c_start;
         let track_id: TrackId = p.ids.allocate();
-        let source_track = p.track(c.track).map(|t| t.color);
+        let source_track = p.track(c_track).map(|t| t.color);
         let index = p
             .tracks
             .iter()
-            .position(|t| t.id == c.track)
+            .position(|t| t.id == c_track)
             .map_or(p.tracks.len(), |i| i + 1);
-        let name = format!("{} {}", c.name, how.label());
+        let name = format!("{c_name} {}", how.label());
         let track = Track::new(
             track_id,
             TrackKind::Instrument,
@@ -373,7 +368,7 @@ impl Session {
                     track: track_id,
                     name: name.clone(),
                     color: None,
-                    start: c.start,
+                    start: c_start,
                     muted: false,
                     content: ClipContent::Midi(MidiClip {
                         length,

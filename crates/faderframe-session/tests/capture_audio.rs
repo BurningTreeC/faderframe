@@ -107,10 +107,8 @@ fn source(s: &Session, id: faderframe_core::AudioSourceId) -> Vec<f32> {
 
 /// What a take plays at folder frames `from..to`.
 fn take_audio(s: &Session, t: &Take, from: i64, to: i64) -> Vec<f32> {
-    let data = source(s, t.source);
-    (from..to)
-        .map(|r| data[(t.source_offset + r) as usize])
-        .collect()
+    let data = source(s, t.audio.source);
+    (from..to).map(|r| data[t.source_at(r) as usize]).collect()
 }
 
 fn set_capture(s: &mut Session, change: impl FnOnce(&mut AudioCaptureSettings)) {
@@ -224,7 +222,7 @@ fn a_run_played_while_playing_is_what_recording_it_would_have_been() {
     let (recorded, captured) = (&f.takes[0], &f.takes[1]);
     assert!(captured.name.contains("Capture"), "{}", captured.name);
     let from = recorded.start.max(captured.start);
-    let to = recorded.end.min(captured.end);
+    let to = recorded.end().min(captured.end());
     assert!(to - from > i64::from(SR), "{from}..{to}");
     let a = take_audio(&s, recorded, from, to);
     let b = take_audio(&s, captured, from, to);
@@ -291,7 +289,7 @@ fn loop_passes_are_captured_as_takes_in_their_places() {
     let whole: Vec<&Take> = f
         .takes
         .iter()
-        .filter(|k| k.end - k.start == i64::from(SR))
+        .filter(|k| k.audio.length == i64::from(SR))
         .collect();
     assert!(whole.len() >= 2, "{:?}", f.takes);
     let first = take_audio(&s, whole[0], 0, i64::from(SR));
