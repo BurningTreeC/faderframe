@@ -135,6 +135,18 @@ pub fn mxf_by_ffmpeg() -> bool {
     init().is_ok() && streams::MXF_BY_FFMPEG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether MXF files are read by GStreamer's own demuxer of a version that
+/// crashes on some (before 1.28.4) because no FFmpeg demuxer could take its
+/// place (no gst-libav).
+pub fn mxf_may_crash() -> bool {
+    use gst::prelude::*;
+    init().is_ok()
+        && !streams::MXF_BY_FFMPEG.load(std::sync::atomic::Ordering::Relaxed)
+        && gst::ElementFactory::find("mxfdemux")
+            .and_then(|f| f.plugin())
+            .is_some_and(|p| streams::mxf_demuxer_crashes(&p.version()))
+}
+
 /// Whether GStreamer has the element `name` (a plugin may be missing).
 pub fn has_element(name: &str) -> bool {
     init().is_ok() && gst::ElementFactory::find(name).is_some()
