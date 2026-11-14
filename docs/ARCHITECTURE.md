@@ -448,7 +448,7 @@ Solo is solo-in-place: a soloed track keeps everything it feeds and
 everything that feeds it audible (`Project::solo_audible`), and the result is
 written into per-strip mute slots. A soloed VCA solos the tracks it scales.
 **Dim solo** (`Project::solo_dim_db`, `Command::SetSoloDim`; Solo Mode in a
-solo button's menu and a track's: −10, −15, −20 or −30 dB): the tracks solo
+solo button's menu and a track's: −3, −5, −10, −15 or −20 dB): the tracks solo
 leaves out play that much down instead of muted — the strip's `solo_gain`
 slot (ramped like a mute, crosstalk too), MIDI tracks no longer held back
 by solo (their instruments dim), solo-safe strips untouched;

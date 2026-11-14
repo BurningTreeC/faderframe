@@ -2909,6 +2909,22 @@ impl ArrangerView {
         Some(HeaderLayout::new(self.header_rect(model, t, row.y)))
     }
 
+    /// A solo button's menu: the solo mode (mute or dim the others), then
+    /// MIDI learn of the track's solo.
+    fn solo_menu(model: &Session, track: TrackId, at: Point) -> HostRequest<Action> {
+        let target = faderframe_project::MappingTarget::TrackSolo { track };
+        let mut items: Vec<MenuItem<Action>> =
+            model.solo_mode_menu().into_iter().map(entry_item).collect();
+        items.push(MenuItem::disabled(model.mapping_target_label(&target)).separated());
+        items.extend(
+            model
+                .midi_learn_menu(target)
+                .into_iter()
+                .map(|(label, action)| MenuItem::new(label, action)),
+        );
+        HostRequest::ContextMenu { at, items }
+    }
+
     fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let mut items = vec![
             MenuItem::new("Add Audio Track (Mono)", Action::AddTrack(TrackKind::Audio)),
@@ -5319,6 +5335,11 @@ impl CanvasView<Session, Action> for ArrangerView {
                             at: Point::new(r.x, r.bottom()),
                             items: scratch::arrangement_menu(model),
                         });
+                    }
+                    // The solo button: the solo mode, then its MIDI learn
+                    // (as in the mixer).
+                    Some(Hit::Header(id, HeaderPart::Solo)) => {
+                        cx.request(Self::solo_menu(model, id, pos));
                     }
                     Some(Hit::Header(id, _)) => {
                         if let Some(t) = model.project().track(id) {

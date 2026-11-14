@@ -3150,3 +3150,39 @@ fn an_automation_lane_is_sized_by_its_bottom_edge() {
         );
     }
 }
+
+/// A track header's solo button has the solo menu (as the mixer's): the
+/// solo mode first, then its MIDI learn; the rest of the header keeps the
+/// track menu.
+#[test]
+fn a_header_solo_button_has_the_solo_menu() {
+    let s = session();
+    let track = ArrangerView::lane_tracks(&s)[0].id;
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let l = view.header_layout(&s, track, size).unwrap();
+    let menu = |view: &mut ArrangerView, at: Point| {
+        let ev = ViewEvent::PointerDown {
+            pos: at,
+            button: PointerButton::Secondary,
+            modifiers: Modifiers::NONE,
+            clicks: 1,
+        };
+        let (_, req) = run(view, ev, size, &s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req.into_iter().next() else {
+            panic!("a menu")
+        };
+        items
+    };
+    let items = menu(&mut view, l.solo.center());
+    assert_eq!(items[0].label, "Solo Mutes the Others");
+    assert!(items.iter().any(|i| i.label.starts_with("Dim Solo")));
+    assert!(items.iter().any(|i| i.label.starts_with("MIDI Learn")));
+    let items = menu(&mut view, l.name.center());
+    assert!(
+        items.iter().any(|i| i.label == "Solo Mode"),
+        "the track menu"
+    );
+    assert_ne!(items[0].label, "Solo Mutes the Others");
+}

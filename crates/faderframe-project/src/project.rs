@@ -844,7 +844,7 @@ impl Project {
     }
 
     /// Dim solo's levels to choose from (dB).
-    pub const SOLO_DIM_CHOICES: [f32; 4] = [-10.0, -15.0, -20.0, -30.0];
+    pub const SOLO_DIM_CHOICES: [f32; 5] = [-3.0, -5.0, -10.0, -15.0, -20.0];
 
     /// Tracks solo silences: those [`Self::solo_audible`] leaves out, unless
     /// solo dims them ([`Self::solo_dim_db`]); `None` when it silences
