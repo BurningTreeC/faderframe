@@ -485,6 +485,9 @@ struct Shared {
     /// `u64::MAX`), shown for a signal still being measured again while
     /// the tracks a change reached are shown already.
     previous: Vec<(u64, Arc<TrackProfile>)>,
+    /// Tracks playing one part together ([`parts`]): never compared with
+    /// each other for masking (phase and timing still are).
+    part_pairs: Vec<(TrackId, TrackId)>,
 }
 
 impl Shared {
@@ -910,6 +913,42 @@ fn eq_slot(
     }
 }
 
+/// Buses Mix Intelligence analyses as one part ([`Track::mix_part`]): each
+/// with the analysed tracks (`planned`, compared) feeding it, and their
+/// role when they share one.
+fn parts(
+    project: &Project,
+    planned: &[Planned],
+) -> Vec<(TrackId, Vec<TrackId>, Option<TrackRole>)> {
+    let edges = project.routing_edges();
+    let mut out = Vec::new();
+    for bus in project
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Bus && t.mix_part)
+    {
+        let mut members: Vec<TrackId> = edges
+            .iter()
+            .filter(|(from, to)| {
+                *to == bus.id && planned.iter().any(|p| p.track == *from && p.compare)
+            })
+            .map(|(from, _)| *from)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        if members.is_empty() {
+            continue;
+        }
+        let roles: Vec<Option<TrackRole>> = members
+            .iter()
+            .map(|m| planned.iter().find(|p| p.track == *m).and_then(|p| p.role))
+            .collect();
+        let role = roles[0].filter(|_| roles.windows(2).all(|w| w[0] == w[1]));
+        out.push((bus.id, members, role));
+    }
+    out
+}
+
 fn job_worker(
     planned: Vec<Planned>,
     base: Project,
@@ -1120,6 +1159,7 @@ fn source_worker(
         rules: &shared.rules,
         cancel: Some(&progress.render.cancel),
         related: Vec::new(),
+        same_part: shared.part_pairs.clone(),
     };
     let mut report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
     // DC offsets in the material itself.
@@ -1975,6 +2015,32 @@ impl Session {
                 });
             }
         }
+        // Buses analysed as one part (doubled guitars, backing vocals: see
+        // [`parts`]) are one sound in masking: the bus is compared with
+        // the rest of the mix, so its EQ goes there, and the tracks are not
+        // (with each other least of all). Measuring sources (no bus), the
+        // tracks stay compared, never with each other.
+        let mut part_pairs = Vec::new();
+        for (bus, members, role) in parts(&base, &planned) {
+            for (i, &x) in members.iter().enumerate() {
+                for &y in &members[i + 1..] {
+                    part_pairs.push((x, y));
+                }
+            }
+            let Some(at) = planned.iter().position(|p| p.track == bus) else {
+                continue;
+            };
+            let focus = planned
+                .iter()
+                .any(|p| p.focus && members.contains(&p.track));
+            for p in planned.iter_mut().filter(|p| members.contains(&p.track)) {
+                p.compare = false;
+            }
+            let b = &mut planned[at];
+            b.compare = true;
+            b.focus |= focus;
+            b.role = b.role.or(role);
+        }
         // Sections in the range (seconds from its start; samples for the
         // master's loudness per section).
         let mut sections = Vec::new();
@@ -2068,6 +2134,7 @@ impl Session {
             extra: extra_plan,
             held: self.mix.held.snapshot(),
             previous: Vec::new(),
+            part_pairs,
         };
         // The last analysis' signals of the same range and settings: shown
         // for those being measured again while the changed tracks are shown.
@@ -3286,6 +3353,7 @@ mod tests {
             rules: &rules,
             cancel: None,
             related: Vec::new(),
+            same_part: Vec::new(),
         };
         let _ = faderframe_mix_intelligence::diagnose(&input).unwrap_or_else(|e| panic!("{e}"));
         (t0.elapsed().as_secs_f64(), tracks.len() + 1)

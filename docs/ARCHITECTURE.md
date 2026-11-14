@@ -12132,7 +12132,13 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   importance, confidence = signal × roles × amount × level × resolution.
   Track roles (`Track::role`, `Command::SetTrackRole`, set only by the
   user; names are never taken for roles) weigh the pair (drum-kit pairs
-  are not compared, kick/bass and foreground targets weigh most).
+  are not compared, kick/bass and foreground targets weigh most). A bus
+  marked One Part (`Track::mix_part`, `Command::SetTrackMixPart`, the
+  Roles panel) stands for the tracks it sums: it is compared in their
+  place, so its EQ cuts go on it, and they are not compared, nor with each
+  other (`session::mix::parts`; measuring sources, where no bus is
+  measured, only their pairs are left out); it takes their role when they
+  share one.
   *Levels*: master true peak over −1 dBTP, overs, a track over full scale
   alone, non-finite samples, adjacent sections 8 LU apart. *Stereo*:
   fold-down loss against the sum without cancellation (`(√L+√R)²/4`: a

@@ -520,6 +520,7 @@ fn diagnose_signals<'a>(
         rules: &shared.rules,
         cancel: Some(cancel),
         related: related(base, &ids),
+        same_part: shared.part_pairs.clone(),
     };
     let mut report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
     let focus: Vec<TrackId> = planned

@@ -237,3 +237,71 @@ fn an_experiment_applied_before_other_edits_is_taken_back_alone() {
     assert!(s.dispatch(Action::Mix(MixOp::Undo(step))).is_err());
     s.wait_for_mix();
 }
+
+/// A bus analysed as one part (doubled guitars into one bus): in masking
+/// the bus stands for its tracks — they are not compared, with each other
+/// least of all — and an EQ cut it gets goes on the bus. Off, the tracks
+/// are compared as before.
+#[test]
+fn a_bus_analysed_as_one_part_stands_for_its_tracks() {
+    use faderframe_project::OutputRouting;
+    let mut p = Project::new("Doubles", SR);
+    let a = sine(&mut p, "Guitar L", 80.0, 0.3, 0.0, 8.0);
+    let b = sine(&mut p, "Guitar R", 84.0, 0.3, 0.0, 8.0);
+    let other = sine(&mut p, "Keys", 82.0, 0.3, 0.0, 8.0);
+    let bus: TrackId = p.ids.allocate();
+    let mut t = Track::new(bus, TrackKind::Bus, "Guitars", TrackColor::palette(2));
+    t.mix_part = true;
+    p.tracks.push(t);
+    for g in [a, b] {
+        p.track_mut(g).unwrap().output = OutputRouting::Track { track: bus };
+    }
+    let mut s = Session::new(p, None, EngineConfig::default()).unwrap();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let masking: Vec<Finding> = s
+        .mix_findings()
+        .into_iter()
+        .filter(|f| f.rule == RuleId::SpectralMasking)
+        .cloned()
+        .collect();
+    assert!(!masking.is_empty(), "the part against the keys");
+    for f in &masking {
+        assert!(
+            !f.tracks.contains(&a) && !f.tracks.contains(&b),
+            "its tracks are not compared: {:?}",
+            f.tracks
+        );
+        assert!(
+            f.tracks.contains(&bus) && f.tracks.contains(&other),
+            "{:?}",
+            f.tracks
+        );
+        for r in &f.recommendations {
+            if let Experiment::EqCut { track, .. } = r.experiment {
+                assert!(track == bus || track == other, "an EQ on {track:?}");
+            }
+        }
+    }
+    assert!(
+        masking.iter().any(|f| f
+            .recommendations
+            .iter()
+            .any(|r| matches!(r.experiment, Experiment::EqCut { track, .. } if track == bus))),
+        "an EQ cut on the bus"
+    );
+    // Off: the guitars are compared again, with each other too.
+    s.dispatch(Action::Edit(Command::SetTrackMixPart {
+        track: bus,
+        on: false,
+    }))
+    .unwrap();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    assert!(
+        s.mix_findings()
+            .into_iter()
+            .any(|f| f.rule == RuleId::SpectralMasking
+                && f.tracks.contains(&a)
+                && f.tracks.contains(&b)),
+        "the doubles against each other"
+    );
+}

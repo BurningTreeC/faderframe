@@ -84,6 +84,7 @@ fn input<'a>(
         rules,
         cancel: None,
         related: Vec::new(),
+        same_part: Vec::new(),
     }
 }
 

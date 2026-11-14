@@ -52,6 +52,7 @@ fn run_pairs(tracks: &[T], selected: &[u64]) -> Report {
         rules: &rules,
         cancel: None,
         related: Vec::new(),
+        same_part: Vec::new(),
     };
     let mut report = diagnose(&input).unwrap_or_default();
     let selected: Vec<TrackId> = selected.iter().map(|i| TrackId(*i)).collect();
@@ -483,6 +484,7 @@ fn run_with_master(tracks: &[T], master: Option<&T>, signal: SignalPoint) -> Rep
         rules: &rules,
         cancel: None,
         related: Vec::new(),
+        same_part: Vec::new(),
     };
     diagnose(&input).unwrap_or_default()
 }
@@ -585,6 +587,7 @@ fn flatten_report(source: &[f32], processed: &[f32], sends: bool) -> Report {
         rules: &rules,
         cancel: None,
         related: Vec::new(),
+        same_part: Vec::new(),
     };
     let mut report = diagnose(&input).unwrap_or_default();
     let extra = ExtraInput {
@@ -724,6 +727,7 @@ fn diagnose_two(a: &T, b: &T, rules: &Rules) -> Report {
         rules,
         cancel: None,
         related: Vec::new(),
+        same_part: Vec::new(),
     };
     diagnose(&input).unwrap_or_default()
 }
