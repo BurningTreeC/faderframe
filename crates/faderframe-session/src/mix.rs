@@ -486,7 +486,7 @@ struct Shared {
     /// the tracks a change reached are shown already.
     previous: Vec<(u64, Arc<TrackProfile>)>,
     /// Tracks playing one part together ([`parts`]): never compared with
-    /// each other for masking.
+    /// each other for masking (phase and timing still are).
     part_pairs: Vec<(TrackId, TrackId)>,
 }
 
@@ -1158,7 +1158,8 @@ fn source_worker(
         sections: shared.sections.clone(),
         rules: &shared.rules,
         cancel: Some(&progress.render.cancel),
-        related: shared.part_pairs.clone(),
+        related: Vec::new(),
+        same_part: shared.part_pairs.clone(),
     };
     let mut report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
     // DC offsets in the material itself.
@@ -3352,6 +3353,7 @@ mod tests {
             rules: &rules,
             cancel: None,
             related: Vec::new(),
+            same_part: Vec::new(),
         };
         let _ = faderframe_mix_intelligence::diagnose(&input).unwrap_or_else(|e| panic!("{e}"));
         (t0.elapsed().as_secs_f64(), tracks.len() + 1)

@@ -86,6 +86,10 @@ pub struct DiagnoseInput<'a> {
     /// Pairs never compared for masking (either order): a track and a bus
     /// or return its signal reaches (that one carries it).
     pub related: Vec<(TrackId, TrackId)>,
+    /// Pairs playing one part (the tracks a bus marked One Part sums: two
+    /// microphones on a kick, doubled guitars): not compared for masking,
+    /// still for phase and timing.
+    pub same_part: Vec<(TrackId, TrackId)>,
 }
 
 /// One subject's levels and stereo picture (facts, no judgement).
@@ -576,6 +580,7 @@ fn masking(
             if input
                 .related
                 .iter()
+                .chain(&input.same_part)
                 .any(|&(x, y)| (x, y) == (a.track, b.track) || (y, x) == (a.track, b.track))
             {
                 continue;

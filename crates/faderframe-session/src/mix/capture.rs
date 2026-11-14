@@ -519,10 +519,8 @@ fn diagnose_signals<'a>(
         sections: shared.sections.clone(),
         rules: &shared.rules,
         cancel: Some(cancel),
-        related: related(base, &ids)
-            .into_iter()
-            .chain(shared.part_pairs.iter().copied())
-            .collect(),
+        related: related(base, &ids),
+        same_part: shared.part_pairs.clone(),
     };
     let mut report = faderframe_mix_intelligence::diagnose(&input).map_err(|e| e.to_string())?;
     let focus: Vec<TrackId> = planned
