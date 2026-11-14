@@ -417,6 +417,7 @@ impl ChannelOverviewView {
             }),
             Hit::MidiOut => Some(MixerView::midi_out_menu(model, t, pos)),
             Hit::Send(i) => Some(MixerView::send_menu(model, t, i, pos)),
+            Hit::Solo => Some(MixerView::solo_menu(model, t.id, pos)),
             _ => Some(MixerView::track_menu(model, t, pos)),
         };
         match request {

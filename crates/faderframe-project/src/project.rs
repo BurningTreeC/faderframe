@@ -162,6 +162,10 @@ pub struct Project {
         skip_serializing_if = "faderframe_core::pan::PanLaw::is_default"
     )]
     pub pan_law: faderframe_core::PanLaw,
+    /// Dim solo: while tracks are soloed the others play this many dB
+    /// down (negative) instead of muted; `None`: solo mutes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solo_dim_db: Option<f32>,
     /// How surround beds fold into stereo and mono. Files from before the
     /// setting fold every speaker where it stands
     /// ([`faderframe_core::surround::Downmix::BY_PLACE`]); new projects use
@@ -316,6 +320,7 @@ impl Project {
             play_start: None,
             crosstalk: false,
             pan_law: faderframe_core::PanLaw::default(),
+            solo_dim_db: None,
             downmix: faderframe_core::surround::Downmix::STANDARD,
             speaker_layouts: Vec::new(),
             console: None,
@@ -836,6 +841,27 @@ impl Project {
     /// Would routing `from → to` create a feedback loop?
     pub fn would_cycle(&self, from: TrackId, to: TrackId) -> bool {
         from == to || self.reaches(to, from, None)
+    }
+
+    /// Dim solo's levels to choose from (dB).
+    pub const SOLO_DIM_CHOICES: [f32; 5] = [-3.0, -5.0, -10.0, -15.0, -20.0];
+
+    /// Tracks solo silences: those [`Self::solo_audible`] leaves out, unless
+    /// solo dims them ([`Self::solo_dim_db`]); `None` when it silences
+    /// nothing.
+    pub fn solo_silenced_except(&self) -> Option<HashSet<TrackId>> {
+        if self.solo_dim_db.is_some() {
+            None
+        } else {
+            self.solo_audible()
+        }
+    }
+
+    /// The gain (linear) of a track that solo leaves out while dimming:
+    /// `None` when solo mutes instead.
+    pub fn solo_dim_gain(&self) -> Option<f32> {
+        self.solo_dim_db
+            .map(|db| faderframe_core::db_to_gain(db.clamp(-60.0, 0.0)))
     }
 
     /// Tracks audible under the current solo state, or `None` when nothing

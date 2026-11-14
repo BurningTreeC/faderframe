@@ -3039,3 +3039,64 @@ fn an_instrument_strip_chooses_its_tuning_and_retuning() {
     };
     assert!(items.iter().all(|i| i.label != "Tuning"));
 }
+
+/// A solo button's menu chooses the solo mode — mute the others or dim
+/// them — before its MIDI learn; the choice is one undo step and saved
+/// with the project only when it dims.
+#[test]
+fn a_solo_buttons_menu_chooses_muting_or_dimming_the_others() {
+    let mut s = session();
+    let t = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.kind == TrackKind::Audio)
+        .unwrap()
+        .id;
+    let theme = Theme::default();
+    let mut view = MixerView::new(theme.clone());
+    let size = Size::new(1600.0, 760.0);
+    let menu = |view: &mut MixerView, s: &Session| {
+        view.paint(&mut RecordingPainter::new(), size, s, &theme);
+        let at = view.layout_of(s, t, size).unwrap().solo.center();
+        let (_, req) = run(view, right(at), size, s);
+        let Some(HostRequest::ContextMenu { items, .. }) = req
+            .into_iter()
+            .find(|r| matches!(r, HostRequest::ContextMenu { .. }))
+        else {
+            panic!("the solo menu")
+        };
+        items
+    };
+    let items = menu(&mut view, &s);
+    assert_eq!(items[0].label, "Solo Mutes the Others");
+    assert_eq!(items[0].checked, Some(true));
+    assert!(
+        items.iter().any(|i| i.label.starts_with("MIDI Learn")),
+        "learn stays"
+    );
+    let dim = items
+        .iter()
+        .find(|i| i.label == "Dim Solo: the Others -20 dB")
+        .and_then(|i| i.action.clone())
+        .unwrap();
+    s.dispatch(dim).unwrap();
+    assert_eq!(s.project().solo_dim_db, Some(-20.0));
+    let items = menu(&mut view, &s);
+    assert_eq!(
+        items
+            .iter()
+            .find(|i| i.checked == Some(true))
+            .map(|i| i.label.as_str()),
+        Some("Dim Solo: the Others -20 dB")
+    );
+    let saved = faderframe_project::file::to_string(s.project(), None).unwrap();
+    assert!(saved.contains("\"solo_dim_db\": -20.0"), "saved");
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(s.project().solo_dim_db, None);
+    assert!(
+        !faderframe_project::file::to_string(s.project(), None)
+            .unwrap()
+            .contains("solo_dim_db")
+    );
+}

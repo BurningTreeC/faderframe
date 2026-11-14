@@ -379,7 +379,7 @@ fn warm_up_of<'a>(tracks: impl IntoIterator<Item = &'a Track>, ms: u32) -> u32 {
 impl ChainView {
     /// `track`'s chain in `project`, rendered at `rate`.
     pub(crate) fn of(project: &Project, track: TrackId, rate: u32) -> Self {
-        let solo = project.solo_audible();
+        let solo = project.solo_silenced_except();
         let closure: Vec<&Track> = chain_closure(project, track)
             .into_iter()
             .filter_map(|id| project.track(id))
@@ -458,7 +458,7 @@ impl ChainView {
         if self.warm_up_ms != warm_up {
             return false;
         }
-        let solo = project.solo_audible();
+        let solo = project.solo_silenced_except();
         self.tracks.iter().all(|p| {
             let Some(t) = project.track(p.track.id) else {
                 return false;

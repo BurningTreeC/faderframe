@@ -64,6 +64,7 @@ impl Processor<EngineContext> for Crosstalk {
         let params = &cx.data.params;
         let static_mute = params.get(self.slots.mute) >= 0.5;
         let solo_mute = params.get(self.slots.solo_mute) >= 0.5;
+        let solo_gain = params.get(self.slots.solo_gain).clamp(0.0, 1.0);
         let auto = cx.data.timeline.automation(self.donor);
         let mute_lane = auto.and_then(|a| a.mute.as_ref());
         let vca_mute = auto.map_or(&[][..], |a| a.vca_mute.as_slice());
@@ -85,7 +86,7 @@ impl Processor<EngineContext> for Crosstalk {
             let target = if mute || solo_mute || vca_muted {
                 0.0
             } else {
-                1.0
+                solo_gain
             };
             let from = if self.gate.is_nan() {
                 target

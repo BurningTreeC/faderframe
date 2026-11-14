@@ -1995,6 +1995,26 @@ impl MixerView {
     }
 
     /// MIDI learn for any mapping target (and removing its mappings).
+    /// A solo button's menu: the solo mode (mute or dim the others), then
+    /// MIDI learn.
+    pub fn solo_menu(model: &Session, track: TrackId, at: Point) -> HostRequest<Action> {
+        let HostRequest::ContextMenu { items: learn, .. } = Self::learn_target_menu(
+            model,
+            faderframe_project::MappingTarget::TrackSolo { track },
+            at,
+        ) else {
+            unreachable!("learn_target_menu is a context menu")
+        };
+        let mut items: Vec<MenuItem<Action>> =
+            model.solo_mode_menu().into_iter().map(menu_item).collect();
+        let mut learn = learn.into_iter();
+        if let Some(first) = learn.next() {
+            items.push(first.separated());
+        }
+        items.extend(learn);
+        HostRequest::ContextMenu { at, items }
+    }
+
     pub fn learn_target_menu(
         model: &Session,
         target: faderframe_project::MappingTarget,
@@ -2590,6 +2610,10 @@ impl MixerView {
             .separated(),
         );
         items.extend(model.group_menu(t.id).into_iter().map(menu_item));
+        items.push(MenuItem::submenu(
+            "Solo Mode",
+            model.solo_mode_menu().into_iter().map(menu_item).collect(),
+        ));
         // The microphones of one source in time and polarity; the
         // track's own delay back to none.
         items.extend(model.auto_align_menu(t.id).into_iter().map(menu_item));
@@ -3618,11 +3642,7 @@ impl MixerView {
                     pos,
                 )
             }),
-            Hit::Solo(id) => Some(Self::learn_target_menu(
-                model,
-                faderframe_project::MappingTarget::TrackSolo { track: id },
-                pos,
-            )),
+            Hit::Solo(id) => Some(Self::solo_menu(model, id, pos)),
             Hit::Record(id) => Some(Self::learn_target_menu(
                 model,
                 faderframe_project::MappingTarget::TrackArm { track: id },

@@ -447,6 +447,13 @@ and be summing tracks (instrument tracks for MIDI tracks), and
 Solo is solo-in-place: a soloed track keeps everything it feeds and
 everything that feeds it audible (`Project::solo_audible`), and the result is
 written into per-strip mute slots. A soloed VCA solos the tracks it scales.
+**Dim solo** (`Project::solo_dim_db`, `Command::SetSoloDim`; Solo Mode in a
+solo button's menu and a track's: −3, −5, −10, −15 or −20 dB): the tracks solo
+leaves out play that much down instead of muted — the strip's `solo_gain`
+slot (ramped like a mute, crosstalk too), MIDI tracks no longer held back
+by solo (their instruments dim), solo-safe strips untouched;
+`Project::solo_silenced_except` is what solo still silences (self-freezing
+reads it). Saved with the project only while it dims.
 
 **VCAs** are tracks without audio: a member's gain is its own fader times
 its VCA's (and that VCA's VCA, `Project::vca_chain`); a muted VCA mutes its

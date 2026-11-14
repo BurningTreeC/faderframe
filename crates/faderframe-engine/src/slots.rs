@@ -27,6 +27,9 @@ pub struct StripSlots {
     /// 1.0 = silenced because other tracks are soloed or a VCA is muted
     /// (kept apart from `mute` so mute automation never overrides them).
     pub solo_mute: ParamSlot,
+    /// Linear gain dim solo leaves it while other tracks are soloed (1.0
+    /// otherwise).
+    pub solo_gain: ParamSlot,
     /// Linear gain of the track's VCAs whose faders are not automated
     /// (automated ones come with the timeline snapshot).
     pub vca: ParamSlot,
@@ -35,7 +38,7 @@ pub struct StripSlots {
     pub surround: [ParamSlot; SURROUND_VALUES],
 }
 
-const STRIP_SLOT_COUNT: u32 = 9 + SURROUND_VALUES as u32;
+const STRIP_SLOT_COUNT: u32 = 10 + SURROUND_VALUES as u32;
 
 /// Parameter slots every strip and fold reads (one set per session).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,7 +347,8 @@ impl SlotRegistry {
             pan_mode: ParamSlot(base + 6),
             pan_left: ParamSlot(base + 7),
             pan_right: ParamSlot(base + 8),
-            surround: std::array::from_fn(|i| ParamSlot(base + 9 + i as u32)),
+            solo_gain: ParamSlot(base + 9),
+            surround: std::array::from_fn(|i| ParamSlot(base + 10 + i as u32)),
         };
         self.strips.insert(track, s);
         Ok(s)
@@ -621,6 +625,9 @@ impl SlotRegistry {
             skip: gliding,
         };
         let solo = project.solo_audible();
+        // Dim solo: the tracks solo leaves out play this much down instead
+        // of muted (MIDI tracks keep playing their instruments, which dim).
+        let dim = project.solo_dim_gain();
         if let Some(c) = &project.console {
             let slot = self.console_drive()?;
             table.set(slot, c.drive_db as f32);
@@ -637,6 +644,8 @@ impl SlotRegistry {
             }
             let folder_muted = project.folder_chain(t).iter().any(|f| f.mute);
             let solo_out = solo.as_ref().is_some_and(|set| !set.contains(&t.id));
+            let solo_dimmed = solo_out && dim.is_some();
+            let solo_out = solo_out && !solo_dimmed;
             if t.kind == faderframe_project::TrackKind::Midi {
                 let slot = self.midi_mute(t.id)?;
                 let muted = t.mute || folder_muted || solo_out;
@@ -677,6 +686,7 @@ impl SlotRegistry {
             let solo_muted = vca_muted || folder_muted || solo_out;
             table.set(s.mute, if t.mute { 1.0 } else { 0.0 });
             table.set(s.solo_mute, if solo_muted { 1.0 } else { 0.0 });
+            table.set(s.solo_gain, dim.filter(|_| solo_dimmed).unwrap_or(1.0));
             table.set(s.phase, if t.phase_invert { 1.0 } else { 0.0 });
             if t.delay_ms != 0.0 || self.delays.contains_key(&t.id) {
                 let slot = self.track_delay(t.id)?;
@@ -727,6 +737,7 @@ impl SlotRegistry {
             table.set(s.pan_right, 1.0);
             table.set(s.phase, 0.0);
             table.set(s.solo_mute, 0.0);
+            table.set(s.solo_gain, 1.0);
             table.set(s.vca, 1.0);
             for (slot, v) in s
                 .surround

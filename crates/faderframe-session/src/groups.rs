@@ -425,6 +425,29 @@ impl GroupMenuEntry {
 }
 
 impl Session {
+    /// The Solo Mode entries (a solo button's menu, a track's): solo
+    /// mutes the other tracks, or dims them by one of
+    /// [`faderframe_project::Project::SOLO_DIM_CHOICES`].
+    pub fn solo_mode_menu(&self) -> Vec<GroupMenuEntry> {
+        use faderframe_project::{Command, Project};
+        let now = self.project().solo_dim_db;
+        let entry = |label: String, db: Option<f32>, separated: bool| GroupMenuEntry {
+            label,
+            action: Some(Action::Edit(Command::SetSoloDim { db })),
+            checked: Some(now == db),
+            separated,
+        };
+        std::iter::once(entry("Solo Mutes the Others".into(), None, false))
+            .chain(Project::SOLO_DIM_CHOICES.iter().enumerate().map(|(i, db)| {
+                entry(
+                    format!("Dim Solo: the Others {db:+.0} dB"),
+                    Some(*db),
+                    i == 0,
+                )
+            }))
+            .collect()
+    }
+
     /// Group and VCA entries of a track's menu.
     pub fn group_menu(&self, track: TrackId) -> Vec<GroupMenuEntry> {
         let p = &self.project;

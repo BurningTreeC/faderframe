@@ -103,6 +103,55 @@ fn mute_and_solo_are_applied_with_ramps() {
     assert!(approx(solo[1][1000], 0.1, 1e-5), "{}", solo[1][1000]);
 }
 
+/// Dim solo: while A is soloed, B plays 20 dB down instead of muted (a
+/// tenth of its level), ramped; back to muting, B goes silent, and solo
+/// off brings it back whole.
+#[test]
+fn dim_solo_plays_the_others_down_instead_of_muting_them() {
+    let mut tp = TestProject::new(SR);
+    let a = tp.track(TrackKind::Audio, "A", ChannelLayout::Stereo);
+    let b = tp.track(TrackKind::Audio, "B", ChannelLayout::Stereo);
+    let sa = tp.dc(2, 0.1, SR as usize);
+    let sb = tp.dc(2, 0.2, SR as usize);
+    tp.clip(a, sa, MusicalTime::ZERO, SR as i64);
+    tp.clip(b, sb, MusicalTime::ZERO, SR as i64);
+    let mut r = OfflineRenderer::new(&tp.project, &tp.sources, config(), 256, 2).unwrap();
+    r.play_from(0).unwrap();
+    r.render(1024);
+    let mut h = History::default();
+    let mut edit = |tp: &mut TestProject, r: &mut OfflineRenderer, c: Command| {
+        let impact = h.apply(&mut tp.project, c).unwrap();
+        r.controller.sync(&tp.project, &tp.sources, impact).unwrap();
+        r.render(1024)
+    };
+    edit(&mut tp, &mut r, Command::SetSoloDim { db: Some(-20.0) });
+    let dimmed = edit(
+        &mut tp,
+        &mut r,
+        Command::SetTrackSolo { track: a, on: true },
+    );
+    assert!(
+        approx(dimmed[0][1000], 0.1 + 0.02, 1e-5),
+        "{}",
+        dimmed[0][1000]
+    );
+    assert!(
+        dimmed[0][..256].windows(2).all(|w| w[1] <= w[0] + 1e-7),
+        "the dim ramps down"
+    );
+    let muted = edit(&mut tp, &mut r, Command::SetSoloDim { db: None });
+    assert!(approx(muted[0][1000], 0.1, 1e-5), "{}", muted[0][1000]);
+    let back = edit(
+        &mut tp,
+        &mut r,
+        Command::SetTrackSolo {
+            track: a,
+            on: false,
+        },
+    );
+    assert!(approx(back[0][1000], 0.3, 1e-5), "{}", back[0][1000]);
+}
+
 #[test]
 fn post_fader_send_feeds_aux_return() {
     let mut tp = TestProject::new(SR);
