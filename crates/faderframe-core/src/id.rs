@@ -60,19 +60,23 @@ macro_rules! define_id {
 
 define_id!(
     /// A track, bus, aux or master channel.
-    TrackId, "track#"
+    TrackId,
+    "track#"
 );
 define_id!(
     /// An audio or MIDI clip on the timeline.
-    ClipId, "clip#"
+    ClipId,
+    "clip#"
 );
 define_id!(
     /// An aux/bus send on a track.
-    SendId, "send#"
+    SendId,
+    "send#"
 );
 define_id!(
     /// A hosted plugin instance (insert or instrument).
-    PluginInstanceId, "plugin#"
+    PluginInstanceId,
+    "plugin#"
 );
 
 impl PluginInstanceId {
@@ -97,111 +101,137 @@ impl PluginInstanceId {
 }
 define_id!(
     /// An audio source (file or generated material) referenced by clips.
-    AudioSourceId, "source#"
+    AudioSourceId,
+    "source#"
 );
 define_id!(
     /// A group of tracks whose controls are linked.
-    GroupId, "group#"
+    GroupId,
+    "group#"
 );
 define_id!(
     /// A named section of the arrangement (Intro, Verse, Chorus …).
-    SectionId, "section#"
+    SectionId,
+    "section#"
 );
 define_id!(
     /// A timeline marker.
-    MarkerId, "marker#"
+    MarkerId,
+    "marker#"
 );
 define_id!(
     /// A cue of dialogue to replace (ADR).
-    AdrCueId, "cue#"
+    AdrCueId,
+    "cue#"
 );
 define_id!(
     /// A song of the album.
-    SongId, "song#"
+    SongId,
+    "song#"
 );
 define_id!(
     /// An automation lane.
-    AutomationLaneId, "lane#"
+    AutomationLaneId,
+    "lane#"
 );
 define_id!(
     /// A controller mapping (MIDI learn).
-    MidiMappingId, "mapping#"
+    MidiMappingId,
+    "mapping#"
 );
 define_id!(
     /// A note inside a MIDI clip.
-    NoteId, "note#"
+    NoteId,
+    "note#"
 );
 define_id!(
     /// Clips sharing their content (aliases).
-    ClipLinkId, "link#"
+    ClipLinkId,
+    "link#"
 );
 define_id!(
     /// A modulator of a track (LFO, follower, steps, random, macro).
-    ModulatorId, "mod#"
+    ModulatorId,
+    "mod#"
 );
 define_id!(
     /// A scene (row) of the clip launcher.
-    SceneId, "scene#"
+    SceneId,
+    "scene#"
 );
 define_id!(
     /// A video file the project shows.
-    VideoSourceId, "video#"
+    VideoSourceId,
+    "video#"
 );
 define_id!(
     /// A placed stretch of a video on a video track.
-    VideoClipId, "vclip#"
+    VideoClipId,
+    "vclip#"
 );
 define_id!(
     /// A video track.
-    VideoTrackId, "vtrack#"
+    VideoTrackId,
+    "vtrack#"
 );
 define_id!(
     /// A cue mix (a performer's headphone mix on its own outputs).
-    CueId, "cuemix#"
+    CueId,
+    "cuemix#"
 );
 define_id!(
     /// A scratch pad: another arrangement of the project's tracks.
-    ScratchPadId, "pad#"
+    ScratchPadId,
+    "pad#"
 );
 define_id!(
     /// A reference track (a finished record compared with the mix).
-    ReferenceId, "ref#"
+    ReferenceId,
+    "ref#"
 );
 define_id!(
     /// A mix scene: a snapshot of the console, stored and recalled.
-    MixSceneId, "mixscene#"
+    MixSceneId,
+    "mixscene#"
 );
 define_id!(
     /// An articulation (expression) map: what each articulation of an
     /// instrument sends (keyswitches, programs, controllers, a channel).
-    ArticulationMapId, "artmap#"
+    ArticulationMapId,
+    "artmap#"
 );
 define_id!(
     /// A drum map: names, order and output notes of a track's drum sounds.
-    DrumMapId, "drummap#"
+    DrumMapId,
+    "drummap#"
 );
 define_id!(
     /// A state of the interactive score (music for a game): a section or a
     /// launcher scene that loops until the game asks for another.
-    MusicStateId, "musicstate#"
+    MusicStateId,
+    "musicstate#"
 );
 define_id!(
     /// A layer of the interactive score: tracks heard together, faded in
     /// and out by parameters (intensity).
-    MusicLayerId, "musiclayer#"
+    MusicLayerId,
+    "musiclayer#"
 );
 define_id!(
     /// A transition rule of the interactive score.
-    TransitionId, "transition#"
+    TransitionId,
+    "transition#"
 );
 define_id!(
     /// A stinger of the interactive score: a short phrase played over the
     /// music on a sync point.
-    StingerId, "stinger#"
+    StingerId,
+    "stinger#"
 );
 define_id!(
     /// A parameter of the interactive score (intensity, danger …).
-    ScoreParamId, "scoreparam#"
+    ScoreParamId,
+    "scoreparam#"
 );
 
 /// Identifier of a parameter *within* a processor or plugin.
