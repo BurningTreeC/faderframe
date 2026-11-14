@@ -625,6 +625,12 @@ pub struct Track {
     /// sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<faderframe_core::TrackRole>,
+    /// A bus Mix Intelligence analyses as one part: in masking it stands
+    /// for the tracks it sums (doubled guitars, stacked vocals), which are
+    /// then not compared themselves, nor with each other.
+    /// [`crate::Command::SetTrackMixPart`] sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mix_part: bool,
     /// Sources that move the track's parameters (LFOs, followers, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modulators: Vec<crate::modulation::Modulator>,
@@ -765,6 +771,7 @@ impl Track {
             ripple_excluded: false,
             time_base: TimeBase::Musical,
             role: None,
+            mix_part: false,
             modulators: Vec::new(),
             containers: Default::default(),
             no_self_freeze: false,

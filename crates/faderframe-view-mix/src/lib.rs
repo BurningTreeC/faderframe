@@ -63,6 +63,8 @@ pub enum Hit {
     Match,
     Reject,
     Role(TrackId),
+    /// A bus analysed as one part, or its tracks (a switch).
+    Part(TrackId),
     Levels,
 }
 
@@ -1724,7 +1726,10 @@ impl MixView {
             w,
             "What each track plays. The analysis weighs pairs by roles (a lead vocal over its \
              accompaniment, a kick against its bass; parts of one drum kit are not compared). \
-             Track names are never read as roles; tracks without one are analysed neutrally.",
+             Track names are never read as roles; tracks without one are analysed neutrally. \
+             A bus marked One Part (doubled guitars, stacked vocals) is compared with the rest \
+             in their place, and its EQ goes there; its tracks are not compared, nor with each \
+             other.",
             th.fonts.small,
             th.ui.text_dim,
         );
@@ -1737,15 +1742,33 @@ impl MixView {
                 &TextStyle::new(th.fonts.small, th.ui.text),
             );
             let label = role.map_or("No role", TrackRole::label);
+            let bus = model
+                .project()
+                .track(t)
+                .filter(|t| t.kind == faderframe_project::TrackKind::Bus);
+            // A bus: its role, and the One Part switch beside it.
+            let role_w = if bus.is_some() { w * 0.3 } else { w * 0.5 };
             self.button(
                 p,
-                Rect::new(x + w * 0.5, y + 2.0, w * 0.5, 20.0),
+                Rect::new(x + w * 0.5, y + 2.0, role_w, 20.0),
                 label,
                 Hit::Role(t),
                 role.is_some(),
                 true,
                 "Choose what the track plays",
             );
+            if let Some(b) = bus {
+                self.button(
+                    p,
+                    Rect::new(x + w * 0.8 + 4.0, y + 2.0, w * 0.2 - 4.0, 20.0),
+                    "One Part",
+                    Hit::Part(t),
+                    b.mix_part,
+                    true,
+                    "Analyse the bus as one part: in masking it stands for the tracks it sums \
+                     (doubled guitars, stacked vocals), and their EQ goes on it",
+                );
+            }
             p.hline(r.x, r.right(), r.bottom(), th.ui.border.with_alpha(0.4));
             y += 26.0;
         }
@@ -2248,6 +2271,13 @@ impl MixView {
                 cx.emit(Action::Mix(MixOp::LoudnessMatch(!on)));
             }
             Hit::Reject => cx.emit(Action::Mix(MixOp::Reject)),
+            Hit::Part(t) => {
+                let on = model.project().track(t).is_some_and(|t| t.mix_part);
+                cx.emit(Action::Edit(faderframe_project::Command::SetTrackMixPart {
+                    track: t,
+                    on: !on,
+                }));
+            }
             Hit::Role(t) => {
                 let now = model.project().track(t).and_then(|t| t.role);
                 cx.request(HostRequest::ContextMenu {

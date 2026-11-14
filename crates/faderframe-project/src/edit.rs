@@ -449,6 +449,12 @@ pub enum Command {
         track: TrackId,
         role: Option<faderframe_core::TrackRole>,
     },
+    /// Whether Mix Intelligence analyses a bus as one part
+    /// ([`Track::mix_part`]).
+    SetTrackMixPart {
+        track: TrackId,
+        on: bool,
+    },
     /// Freeze (`Some`) or unfreeze a track.
     SetTrackFreeze {
         track: TrackId,
@@ -1091,6 +1097,8 @@ impl Command {
             } => "Include in Ripple".into(),
             SetTrackTimeBase { base, .. } => format!("Time Base: {}", base.label()),
             SetTrackRole { .. } => "Set Track Role".into(),
+            SetTrackMixPart { on: true, .. } => "Analyse as One Part".into(),
+            SetTrackMixPart { on: false, .. } => "Analyse Its Tracks".into(),
             SetTrackFreeze {
                 freeze: Some(_), ..
             } => "Freeze Track".into(),
@@ -1289,6 +1297,7 @@ impl Command {
             // Moves nothing: tempo changes from now on keep its place.
             | SetTrackTimeBase { .. }
             | SetTrackRole { .. }
+            | SetTrackMixPart { .. }
             | SetClipLink { .. }
             | SetAlbum { .. }
             | SetLyrics { .. }
@@ -2118,6 +2127,11 @@ impl Command {
                 let t = track_mut(p, track)?;
                 let old = std::mem::replace(&mut t.role, role);
                 SetTrackRole { track, role: old }
+            }
+            SetTrackMixPart { track, on } => {
+                let t = track_mut(p, track)?;
+                let old = std::mem::replace(&mut t.mix_part, on);
+                SetTrackMixPart { track, on: old }
             }
             SetTrackFreeze { track, freeze } => {
                 let t = track_mut(p, track)?;
