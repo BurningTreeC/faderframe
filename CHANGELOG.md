@@ -2,6 +2,62 @@
 
 What changed in each FaderFrame release, newest first. Generated from the commit history by `scripts/changelog.py`; the downloads are on the [releases page](https://github.com/BurningTreeC/faderframe/releases).
 
+## [0.47.0](https://github.com/BurningTreeC/faderframe/releases/tag/v0.47.0) — 2026-11-13
+
+- **Takes are clips: a take keeps every edit, and each clip editor works on one take ([#67](https://github.com/BurningTreeC/faderframe/issues/67))**
+
+  <details><summary>Details</summary>
+
+  [#67](https://github.com/BurningTreeC/faderframe/issues/67): folding a clip into a take folder dropped its edits (pitch, warp,
+  reversal, gain, fades, envelope, effects, spectral edits), and a take
+  could not be edited. A take is now an audio clip placed in its folder
+  (file version 3; older folders load as takes holding their region), so
+  recording in Takes mode folds clips in with all their edits, each at
+  the level it had, and a folder taken into another brings its gain and
+  edge fades into its takes. What a comp plays is worked out in one place
+  (TakeFolder::played: each take cut at the comp's boundaries, edits and
+  all, as AudioClip::cut cuts), used by playback, the stretcher voices
+  and Flatten Comp, so a comp and its flattened pieces sound the same.
+  Separate on a reversed clip now keeps what each piece played.
+
+  Takes have ids of their own that edits keep, and every clip editor
+  works on a clip or on one take: a take lane's menu opens the pitch
+  editor, the spectral editor and clip effects on that take, converts it
+  to MIDI and holds its clip envelope. While a clip envelope is shown the
+  take lanes draw and edit their takes' envelopes (comping waits until
+  it is hidden) and the folder's main lane draws what the comp plays.
+  Strip Silence leaves take folders out and says to flatten the comp
+  first: a take cannot be cut into pieces inside its folder.
+
+  </details>
+
+- **Windows crash reports name where it crashed: the stack, the modules, symbols kept apart ([#62](https://github.com/BurningTreeC/faderframe/issues/62))**
+
+  <details><summary>Details</summary>
+
+  [#62](https://github.com/BurningTreeC/faderframe/issues/62): a Windows crash report had the exception's code and address and a
+  backtrace of `<unknown>` frames (the program is stripped). It now comes
+  from a crate of its own, faderframe-crash, written a part at a time so
+  that a fault while walking a broken stack keeps what came before: the
+  code, the thread's name and id, where it happened as module + offset
+  with the nearest export, what an access violation touched, the
+  registers, the stack walked from the exception's context
+  (RtlVirtualUnwind, memory read only where VirtualQuery says it reads),
+  and the loaded modules with their link time stamps and CodeView ids. A
+  Windows panic's stack is walked the same way.
+
+  Nothing is symbolised in the process: the program is linked with a
+  build id, the Windows bundle keeps its debug info apart before
+  stripping (FaderFrame-<version>-windows-x64-symbols.zip, a release
+  asset), and scripts/symbolize_crash.py adds the functions and lines to
+  a report, refusing symbols of another build. The graphics-driver check
+  reads a Windows report's stack, never its module list (which names
+  every driver loaded).
+
+  </details>
+
+[All changes since 0.46.0](https://github.com/BurningTreeC/faderframe/compare/v0.46.0...v0.47.0)
+
 ## [0.46.0](https://github.com/BurningTreeC/faderframe/releases/tag/v0.46.0) — 2026-11-11
 
 - **Plugins get time to load before renders, automation lanes sized, EQ band controls under the graph ([#56](https://github.com/BurningTreeC/faderframe/issues/56), [#57](https://github.com/BurningTreeC/faderframe/issues/57), [#61](https://github.com/BurningTreeC/faderframe/issues/61))**
