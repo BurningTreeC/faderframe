@@ -365,6 +365,18 @@ impl ArrangerView {
         if self.gain_badge(clip, rect).is_some_and(|b| b.contains(pos)) {
             return ClipZone::Gain;
         }
+        // A clip envelope shown: the body edits it (below the name strip).
+        let envelope = Self::edits_envelope(model, clip).is_some()
+            && pos.y >= header_bottom
+            && matches!(
+                tool,
+                EditTool::Smart | EditTool::Select | EditTool::Grab | EditTool::GrabSeparation
+            );
+        // Its points before the edges and the fade handles: the first and
+        // last sit on the clip's edges, where trimming would win.
+        if envelope && let Some(i) = self.envelope_point_under(model, clip, rect, pos) {
+            return ClipZone::EnvelopePoint(i);
+        }
         if fade_tools {
             for edge in [ClipEdge::Start, ClipEdge::End] {
                 if near(self.bend_handle(model, clip, rect, edge)) {
@@ -411,18 +423,8 @@ impl ArrangerView {
                 return ClipZone::Trim(ClipEdge::End);
             }
         }
-        // A clip envelope shown: the body edits it (below the name strip).
-        if Self::edits_envelope(model, clip).is_some()
-            && pos.y >= header_bottom
-            && matches!(
-                tool,
-                EditTool::Smart | EditTool::Select | EditTool::Grab | EditTool::GrabSeparation
-            )
-        {
-            return match self.envelope_point_under(model, clip, rect, pos) {
-                Some(i) => ClipZone::EnvelopePoint(i),
-                None => ClipZone::Envelope,
-            };
+        if envelope {
+            return ClipZone::Envelope;
         }
         match tool {
             EditTool::Trim | EditTool::TrimStretch => ClipZone::Trim(if pos.x < rect.center().x {

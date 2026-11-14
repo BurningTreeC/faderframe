@@ -294,3 +294,42 @@ fn adding_keeps_the_line_and_the_point_under_the_pointer_is_lit() {
     );
     assert_eq!(volume(&s, clip).len(), 3, "moved, not added");
 }
+
+/// The first and last points sit on the clip's edges: over them the point
+/// wins (a move, not a trim); a little above or below, the edge still
+/// trims.
+#[test]
+fn points_on_the_clips_edges_win_over_trimming() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let clip = bass(&s);
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let content = view.content_rect(rect);
+    let c = s.project().clip(clip).unwrap().clone();
+    let len = c.as_audio().unwrap().length;
+    s.dispatch(Action::ShowClipEnvelope(Some(EnvelopeLane::Volume)))
+        .unwrap();
+    s.dispatch(Action::SetClipEnvelope {
+        audio: clip.into(),
+        lane: EnvelopeLane::Volume,
+        points: vec![EnvelopePoint::new(0, -6.0), EnvelopePoint::new(len, -6.0)],
+    })
+    .unwrap();
+    let y = view_y(content, -6.0);
+    for (i, x, edge) in [
+        (0, rect.x + 1.0, ClipEdge::Start),
+        (1, rect.right() - 1.0, ClipEdge::End),
+    ] {
+        assert_eq!(
+            view.clip_zone(&s, &c, rect, Point::new(x, y)),
+            ClipZone::EnvelopePoint(i)
+        );
+        assert_eq!(
+            view.clip_zone(&s, &c, rect, Point::new(x, y + 12.0)),
+            ClipZone::Trim(edge),
+            "away from the point the edge trims"
+        );
+    }
+}
