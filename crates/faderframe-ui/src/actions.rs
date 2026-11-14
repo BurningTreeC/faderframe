@@ -96,6 +96,13 @@ pub fn install(app: &Rc<AppState>) {
         entry(app, "restart-audio", |a| a.start_audio()),
         entry(app, "about", crate::dialogs::about),
         entry(app, "varispeed", crate::dialogs::varispeed),
+        // Development aid for scripted runs (screenshots at the monitor's
+        // size): maximize the main window.
+        entry(app, "maximize", |a| {
+            if let Some(w) = a.window.borrow().as_ref() {
+                w.maximize();
+            }
+        }),
         // Development aid: render the main window into the PNG named by
         // $FADERFRAME_SCREENSHOT (the app's own pixels only).
         entry(app, "screenshot", |a| {
