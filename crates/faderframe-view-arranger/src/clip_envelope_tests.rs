@@ -273,8 +273,8 @@ fn adding_keeps_the_line_and_the_point_under_the_pointer_is_lit() {
     assert!(p.texts().contains(&label.as_str()), "{label}");
     let tip = view.envelope_tooltip(&s, size, on).unwrap();
     assert!(tip.starts_with(&format!("Volume {label} at ")), "{tip}");
-    // Elsewhere on the clip: adding, a plus.
-    let off = Point::new(rect.x + rect.w * 0.25, content.y + content.h * 0.5);
+    // Elsewhere on the clip, off the line: adding, a plus.
+    let off = Point::new(rect.x + rect.w * 0.25, content.bottom() - 2.0);
     let zone = view.clip_zone(&s, &c, rect, off);
     assert_eq!(zone, ClipZone::Envelope);
     assert_eq!(ArrangerView::zone_cursor(zone), Cursor::Add);
@@ -332,4 +332,70 @@ fn points_on_the_clips_edges_win_over_trimming() {
             "away from the point the edge trims"
         );
     }
+}
+
+/// The line between two points is grabbed: a drag moves both points up or
+/// down together (their times stay; one undo step), a click without a drag
+/// adds a point there; hovering it lights both points and the pointer
+/// says up or down.
+#[test]
+fn the_line_between_two_points_is_dragged_and_clicked() {
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 700.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let clip = bass(&s);
+    let rect = view.clip_view_rect(&s, size, clip).unwrap();
+    let content = view.content_rect(rect);
+    let c = s.project().clip(clip).unwrap().clone();
+    let len = c.as_audio().unwrap().length;
+    s.dispatch(Action::ShowClipEnvelope(Some(EnvelopeLane::Volume)))
+        .unwrap();
+    let (a, b) = (len / 4, len * 3 / 4);
+    s.dispatch(Action::SetClipEnvelope {
+        audio: clip.into(),
+        lane: EnvelopeLane::Volume,
+        points: vec![EnvelopePoint::new(a, -6.0), EnvelopePoint::new(b, -6.0)],
+    })
+    .unwrap();
+    let on = Point::new(
+        view.x_of_frame(&s, &c, (a + b) / 2),
+        view_y(content, -6.0) + 2.0,
+    );
+    let zone = view.clip_zone(&s, &c, rect, on);
+    assert_eq!(zone, ClipZone::EnvelopeSegment);
+    assert_eq!(ArrangerView::zone_cursor(zone), Cursor::ResizeVertical);
+    // Hovered: both points lit.
+    send(&mut view, &mut s, hover(on), size);
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let lit = p
+        .ops
+        .iter()
+        .filter(|op| matches!(op, DrawOp::Rect(r) if (r.w - 9.0).abs() < 0.01))
+        .count();
+    assert_eq!(lit, 2, "both points lit");
+    // Dragged 20 px up: both rise alike, their times kept, one step.
+    let steps = s.history_steps().0.len();
+    send(&mut view, &mut s, press(on, 1), size);
+    let up = Point::new(on.x + 30.0, on.y - 20.0);
+    send(&mut view, &mut s, moved(Point::new(on.x, on.y - 5.0)), size);
+    send(&mut view, &mut s, moved(up), size);
+    send(&mut view, &mut s, released(up), size);
+    let after = volume(&s, clip);
+    assert_eq!(after.len(), 2, "no point added");
+    assert_eq!((after[0].at, after[1].at), (a, b));
+    let expected = EnvelopeLane::Volume
+        .from_unit(EnvelopeLane::Volume.to_unit(-6.0) + 20.0 / f64::from(content.h));
+    for p in &after {
+        assert!((p.value - expected).abs() < 0.05, "{after:?} vs {expected}");
+    }
+    assert_eq!(s.history_steps().0.len(), steps + 1);
+    // A click on it without a drag: a point there, on the line.
+    let on = Point::new(on.x, view_y(content, after[0].value) + 1.0);
+    send(&mut view, &mut s, press(on, 1), size);
+    send(&mut view, &mut s, released(on), size);
+    let added = volume(&s, clip);
+    assert_eq!(added.len(), 3);
+    assert!((added[1].value - after[0].value).abs() < 1e-6, "{added:?}");
 }

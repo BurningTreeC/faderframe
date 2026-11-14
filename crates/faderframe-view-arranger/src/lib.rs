@@ -484,7 +484,10 @@ pub struct ArrangerView {
     /// The clip zone under the pointer (cursor and handle highlight).
     zone_hover: Option<(ClipId, ClipZone)>,
     /// The clip envelope point under the pointer (drawn lit).
-    envelope_hover: Option<(faderframe_project::AudioRef, usize)>,
+    envelope_hover: Option<(
+        faderframe_project::AudioRef,
+        crate::clip_envelope::EnvelopeHover,
+    )>,
     /// Last zoom request handled.
     zoom_seen: u64,
     /// View width at the last paint/event.
@@ -5425,7 +5428,7 @@ impl CanvasView<Session, Action> for ArrangerView {
                 true
             }
             ViewEvent::PointerMove { pos, .. } => {
-                let envelope = self.envelope_point_hovered(model, size, pos);
+                let envelope = self.envelope_hovered(model, size, pos);
                 if envelope != self.envelope_hover {
                     self.envelope_hover = envelope;
                     cx.redraw();
@@ -5468,7 +5471,14 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::TakeToggle(_)) => Cursor::Pointer,
                         Some(Hit::HeaderEdge) => Cursor::ResizeHorizontal,
                         // A take's envelope: add on the line, move a point.
-                        Some(Hit::TakeLane { .. }) if self.envelope_hover.is_some() => Cursor::Move,
+                        Some(Hit::TakeLane { .. }) if self.envelope_hover.is_some() => {
+                            match self.envelope_hover {
+                                Some((_, crate::clip_envelope::EnvelopeHover::Segment(_))) => {
+                                    Cursor::ResizeVertical
+                                }
+                                _ => Cursor::Move,
+                            }
+                        }
                         Some(Hit::TakeLane { .. }) if model.clip_envelope_shown().is_some() => {
                             Cursor::Add
                         }

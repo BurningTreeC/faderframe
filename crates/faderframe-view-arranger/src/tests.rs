@@ -463,7 +463,9 @@ fn a_take_lane_edits_its_takes_envelope_while_one_is_shown() {
             .is_some_and(|t| t.starts_with(&format!("Volume {value}"))),
     );
     let mut cx = EventCx::new(&mut cx_actions, &mut cx_requests);
-    view.event(&hover(Point::new(x0 + 60.0, lane_y(1))), size, &s, &mut cx);
+    // Off the line, at the bottom of the take.
+    let off = Point::new(x0 + 60.0, place.content.bottom() - 2.0);
+    view.event(&hover(off), size, &s, &mut cx);
     assert_eq!(cx.cursor(), Some(Cursor::Add));
 }
 
