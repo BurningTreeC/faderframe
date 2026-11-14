@@ -44,9 +44,11 @@ pub enum ClipZone {
     Transient(i64),
     /// Audio in warp view: drag to warp, double-click for a marker.
     WarpBody,
-    /// An audio clip's body while a clip envelope lane is shown: points
-    /// added, moved, removed ([`crate::clip_envelope`]).
+    /// An audio clip's body while a clip envelope lane is shown: a click
+    /// adds a point on the line ([`crate::clip_envelope`]).
     Envelope,
+    /// A point of that envelope (its index): dragged, removed.
+    EnvelopePoint(usize),
 }
 
 impl ClipZone {
@@ -57,7 +59,9 @@ impl ClipZone {
             ClipZone::Trim(_) | ClipZone::WarpMarker(_) | ClipZone::Transient(_) => {
                 Cursor::ResizeHorizontal
             }
-            ClipZone::Fade(_) | ClipZone::WarpBody | ClipZone::Envelope => Cursor::Crosshair,
+            ClipZone::Fade(_) | ClipZone::WarpBody => Cursor::Crosshair,
+            ClipZone::Envelope => Cursor::Add,
+            ClipZone::EnvelopePoint(_) => Cursor::Move,
             ClipZone::Bend(_) | ClipZone::Gain => Cursor::ResizeVertical,
         }
     }
@@ -415,7 +419,10 @@ impl ArrangerView {
                 EditTool::Smart | EditTool::Select | EditTool::Grab | EditTool::GrabSeparation
             )
         {
-            return ClipZone::Envelope;
+            return match self.envelope_point_under(model, clip, rect, pos) {
+                Some(i) => ClipZone::EnvelopePoint(i),
+                None => ClipZone::Envelope,
+            };
         }
         match tool {
             EditTool::Trim | EditTool::TrimStretch => ClipZone::Trim(if pos.x < rect.center().x {
@@ -721,7 +728,7 @@ impl ArrangerView {
             _ => {}
         }
         let zone = self.clip_zone(model, c, rect, pos);
-        if zone == ClipZone::Envelope
+        if matches!(zone, ClipZone::Envelope | ClipZone::EnvelopePoint(_))
             && let Some(lane) = Self::edits_envelope(model, c)
             && let Some(place) = self.clip_envelope_place(c, rect)
         {
@@ -908,7 +915,7 @@ impl ArrangerView {
                 moved: false,
             },
             // Handled before (press_envelope).
-            ClipZone::Envelope => return true,
+            ClipZone::Envelope | ClipZone::EnvelopePoint(_) => return true,
             ClipZone::WarpBody => {
                 let ClipContent::Audio(a) = &c.content else {
                     return true;
@@ -1002,7 +1009,7 @@ impl ArrangerView {
                 shape: None,
                 bend: Some(0),
             }),
-            ClipZone::Envelope => {}
+            ClipZone::Envelope | ClipZone::EnvelopePoint(_) => {}
             ClipZone::WarpBody | ClipZone::Transient(_) | ClipZone::WarpMarker(_) => {
                 if let ClipContent::Audio(a) = &c.content {
                     let source = match zone {
@@ -1802,7 +1809,7 @@ impl ArrangerView {
                 }
             }
             EditDrag::Envelope(d) => {
-                if d.moved {
+                if d.moved || d.added {
                     cx.emit(Action::EndGesture);
                 }
             }

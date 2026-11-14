@@ -111,4 +111,6 @@ pub enum Cursor {
     Text,
     Crosshair,
     Move,
+    /// A plus: a click adds something (an envelope point).
+    Add,
 }

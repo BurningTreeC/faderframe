@@ -483,6 +483,8 @@ pub struct ArrangerView {
     edit_drag: Option<clip_edit::EditDrag>,
     /// The clip zone under the pointer (cursor and handle highlight).
     zone_hover: Option<(ClipId, ClipZone)>,
+    /// The clip envelope point under the pointer (drawn lit).
+    envelope_hover: Option<(faderframe_project::AudioRef, usize)>,
     /// Last zoom request handled.
     zoom_seen: u64,
     /// View width at the last paint/event.
@@ -702,6 +704,7 @@ impl ArrangerView {
             rows: Vec::new(),
             edit_drag: None,
             zone_hover: None,
+            envelope_hover: None,
             zoom_seen: 0,
             view_w: f32::MAX,
             // No lyrics or video yet: their lanes show once there are some.
@@ -5422,6 +5425,11 @@ impl CanvasView<Session, Action> for ArrangerView {
                 true
             }
             ViewEvent::PointerMove { pos, .. } => {
+                let envelope = self.envelope_point_hovered(model, size, pos);
+                if envelope != self.envelope_hover {
+                    self.envelope_hover = envelope;
+                    cx.redraw();
+                }
                 let hit = self.hit_test(pos, size, model);
                 let zone = self.zone_at(model, size, pos);
                 if zone != self.zone_hover {
@@ -5459,6 +5467,11 @@ impl CanvasView<Session, Action> for ArrangerView {
                         Some(Hit::Clip { .. }) => Cursor::Grab,
                         Some(Hit::TakeToggle(_)) => Cursor::Pointer,
                         Some(Hit::HeaderEdge) => Cursor::ResizeHorizontal,
+                        // A take's envelope: add on the line, move a point.
+                        Some(Hit::TakeLane { .. }) if self.envelope_hover.is_some() => Cursor::Move,
+                        Some(Hit::TakeLane { .. }) if model.clip_envelope_shown().is_some() => {
+                            Cursor::Add
+                        }
                         Some(Hit::TakeLane { .. }) => Cursor::Crosshair,
                         Some(Hit::TakeAudition { .. }) => Cursor::Pointer,
                         Some(Hit::TakeWord { .. } | Hit::LyricWord { .. }) => Cursor::Pointer,
@@ -5497,7 +5510,7 @@ impl CanvasView<Session, Action> for ArrangerView {
             }
             ViewEvent::PointerLeave => {
                 self.hover = None;
-                if self.zone_hover.take().is_some() {
+                if self.zone_hover.take().is_some() | self.envelope_hover.take().is_some() {
                     cx.redraw();
                 }
                 false
@@ -5668,6 +5681,9 @@ impl CanvasView<Session, Action> for ArrangerView {
     }
 
     fn tooltip(&self, pos: Point, size: Size, model: &Session) -> Option<String> {
+        if let Some(tip) = self.envelope_tooltip(model, size, pos) {
+            return Some(tip);
+        }
         match self.hit_test(pos, size, model)? {
             Hit::Global(g) => self.global_tooltip(g, model),
             Hit::Clip { clip, .. } => {

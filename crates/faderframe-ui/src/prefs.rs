@@ -48,6 +48,9 @@ pub struct Preferences {
     pub follow_playhead: bool,
     /// Which global lanes the arranger shows, across projects and restarts.
     pub global_lanes: faderframe_session::lanes::GlobalLanes,
+    /// The clip envelope audio clips show (Edit → Clip Envelopes; `None`:
+    /// hidden), across projects and restarts.
+    pub clip_envelope: Option<faderframe_project::clip_envelope::EnvelopeLane>,
     /// "takes" or "replace".
     pub record_mode: String,
     /// "takes", "last-pass" or "new-tracks".
@@ -207,6 +210,7 @@ impl Default for Preferences {
             grid_strength: faderframe_ui_canvas::GridLook::DEFAULT,
             follow_playhead: true,
             global_lanes: Default::default(),
+            clip_envelope: None,
             record_mode: RecordMode::default().id().into(),
             loop_record_mode: LoopRecordMode::default().id().into(),
             metronome: MetronomeMode::Recording.id().into(),
@@ -545,6 +549,23 @@ mod tests {
             serde_json::from_str(r#"{"global_lanes":{"tempo":false}}"#).unwrap();
         assert!(!partial.global_lanes.tempo);
         assert!(partial.global_lanes.markers);
+    }
+
+    /// The clip envelope shown is kept (hidden in older files).
+    #[test]
+    fn the_clip_envelope_shown_round_trips() {
+        use faderframe_project::clip_envelope::EnvelopeLane;
+        let old: Preferences = serde_json::from_str(r#"{"snap":false}"#).unwrap();
+        assert_eq!(old.clip_envelope, None);
+        for lane in [Some(EnvelopeLane::Volume), Some(EnvelopeLane::Pan), None] {
+            let prefs = Preferences {
+                clip_envelope: lane,
+                ..old.clone()
+            };
+            let saved = serde_json::to_string(&prefs).unwrap();
+            let restored: Preferences = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.clip_envelope, lane);
+        }
     }
 
     /// Capture Audio keeps the inputs by default (older files too) and

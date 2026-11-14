@@ -371,6 +371,7 @@ impl AppState {
     /// Apply an action from any view or menu.
     pub fn dispatch(self: &Rc<Self>, action: Action) {
         let lanes_before = self.session.borrow().editor.lanes;
+        let envelope_before = self.session.borrow().editor.clip_envelope;
         let objects_before = self.session.borrow().editor.snap_objects;
         let ripple_before = self.session.borrow().ripple_settings();
         let result = self.session.borrow_mut().dispatch(action);
@@ -386,6 +387,15 @@ impl AppState {
             }
             // The View → Lanes ticks, wherever the change came from.
             crate::actions::sync_lane_actions(self);
+        }
+        // The clip envelope shown, kept for the next start.
+        let envelope = self.session.borrow().editor.clip_envelope;
+        if envelope != envelope_before {
+            let mut prefs = crate::prefs::Preferences::load();
+            prefs.clip_envelope = envelope;
+            if let Err(e) = prefs.save() {
+                tracing::warn!("cannot save the clip envelope preference: {e}");
+            }
         }
         crate::actions::remember_snap_objects(self, objects_before);
         crate::actions::remember_ripple(self, ripple_before);

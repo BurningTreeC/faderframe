@@ -339,6 +339,7 @@ fn activate(app: &gtk::Application, options: &RunOptions) -> Rc<AppState> {
     session.editor.stop_to_start = prefs.stop_to_start;
     session.editor.insertion_follows_playback = !prefs.return_to_play_start;
     session.editor.lanes = prefs.global_lanes;
+    session.editor.clip_envelope = prefs.clip_envelope;
     if let Err(e) = session.dispatch(faderframe_session::Action::SetRecordSettings(
         prefs.record_settings(),
     )) {
