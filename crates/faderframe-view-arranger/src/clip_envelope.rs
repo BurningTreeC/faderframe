@@ -5,11 +5,16 @@
 //! Envelopes, or the clip menu) audio clips draw it over their waveform
 //! — volume on a fader law with 0 dB at three quarters of the height, pan
 //! with the centre in the middle — and their body edits it: a click adds a
-//! point (and drags it), a drag moves one (snapped to the grid in time;
-//! Alt free, Shift keeps its time, Ctrl fine), a double-click removes it, a
-//! right-click on one sets its segment's shape. Edges still trim and the
-//! name strip still moves the clip. Each drag is one undo step
-//! (`Action::SetClipEnvelope` inside a gesture). A take is a clip in its
+//! point on the line, at the value the line has there, so adding never
+//! moves the line (the pointer turns into a plus); a drag past the
+//! threshold then moves it, and a drag on a point (lit, the pointer a move
+//! cross, its value beside it) moves that one — by how far the pointer
+//! went, so grabbing it a little off its centre does not make it jump
+//! (snapped to the grid in time; Alt free, Shift keeps its time, Ctrl
+//! fine). A double-click removes a point, a right-click on one sets its
+//! segment's shape. Edges still trim and the name strip still moves the
+//! clip. Each edit is one undo step (`Action::SetClipEnvelope` inside a
+//! gesture). A take is a clip in its
 //! folder: its lane draws and edits its own envelope the same way (comping
 //! in the lanes waits until the envelopes are hidden), and the folder's
 //! main lane draws the comp's (what it plays, not edited there).
@@ -24,6 +29,30 @@ use faderframe_project::clip_envelope::{EnvelopeLane, EnvelopePoint};
 const POINT_PICK: f32 = 6.0;
 /// Drawn size of a point.
 const POINT_SIZE: f32 = 6.0;
+/// Drawn size of the point under the pointer or being dragged.
+const POINT_LIT: f32 = 9.0;
+/// How near the line (pixels) a press grabs its segment.
+const LINE_PICK: f32 = 4.0;
+
+/// What of an envelope is under the pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EnvelopeHover {
+    /// A point (its index).
+    Point(usize),
+    /// The line between two points, or from the clip's edge to the nearest
+    /// one: the points a drag moves.
+    Segment(Vec<usize>),
+}
+
+impl EnvelopeHover {
+    /// The points it lights.
+    fn points(&self) -> Vec<usize> {
+        match self {
+            EnvelopeHover::Point(i) => vec![*i],
+            EnvelopeHover::Segment(v) => v.clone(),
+        }
+    }
+}
 
 /// Where an envelope is drawn and edited: an audio clip's body, or a
 /// take's part of its lane.
@@ -50,8 +79,14 @@ pub(crate) struct EnvelopeDrag {
     /// from these).
     pub points: Vec<EnvelopePoint>,
     pub origin: Point,
-    /// Past the drag threshold (or a point added: already an edit).
+    /// Past the drag threshold.
     pub moved: bool,
+    /// The press added the point (its gesture already begun).
+    pub added: bool,
+    /// A segment grabbed: the points it moves (`index` unused). A click
+    /// without a drag adds `pending` instead.
+    pub segment: Vec<usize>,
+    pub pending: Option<EnvelopePoint>,
 }
 
 impl ArrangerView {
@@ -130,12 +165,6 @@ impl ArrangerView {
         content.bottom() - lane.to_unit(v) as f32 * content.h
     }
 
-    /// The value at y.
-    fn envelope_value(content: Rect, lane: EnvelopeLane, y: f32) -> f64 {
-        let u = ((content.bottom() - y) / content.h.max(1.0)) as f64;
-        lane.from_unit(u)
-    }
-
     /// x of frame `at` of the clip or take at `place` (in clip `clip`).
     fn envelope_x(&self, model: &Session, clip: &Clip, place: &EnvelopePlace, at: i64) -> f32 {
         self.x_of_frame(model, clip, place.offset + at)
@@ -164,6 +193,187 @@ impl ArrangerView {
             .filter(|(_, d)| *d <= POINT_PICK)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i)
+    }
+
+    /// The shown lane's point under `pos` on audio clip `clip` (drawn at
+    /// `rect`).
+    pub(crate) fn envelope_point_under(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        rect: Rect,
+        pos: Point,
+    ) -> Option<usize> {
+        let lane = Self::edits_envelope(model, clip)?;
+        let place = self.clip_envelope_place(clip, rect)?;
+        let points = Self::envelope_points(model, place.audio, lane);
+        self.envelope_point_at(model, clip, &place, lane, &points, pos)
+    }
+
+    /// The segment of the line under `pos` (within [`LINE_PICK`]): the
+    /// points on either side of it (one at the clip's ends); none without
+    /// points.
+    #[allow(clippy::too_many_arguments)]
+    fn envelope_segment_at(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        place: &EnvelopePlace,
+        lane: EnvelopeLane,
+        points: &[EnvelopePoint],
+        pos: Point,
+    ) -> Option<Vec<usize>> {
+        if points.is_empty() || pos.x < place.content.x || pos.x > place.content.right() {
+            return None;
+        }
+        let free = Modifiers {
+            alt: true,
+            ..Modifiers::NONE
+        };
+        let at = self.envelope_frame(model, clip, place, pos.x, free);
+        let value = faderframe_project::clip_envelope::value_at(points, at as f64)?;
+        if (Self::envelope_y(place.content, lane, value) - pos.y).abs() > LINE_PICK {
+            return None;
+        }
+        let i = points.partition_point(|p| p.at <= at);
+        Some(
+            [i.checked_sub(1), (i < points.len()).then_some(i)]
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+    }
+
+    /// The shown lane's segment under `pos` on audio clip `clip` (drawn at
+    /// `rect`).
+    pub(crate) fn envelope_segment_under(
+        &self,
+        model: &Session,
+        clip: &Clip,
+        rect: Rect,
+        pos: Point,
+    ) -> Option<Vec<usize>> {
+        let lane = Self::edits_envelope(model, clip)?;
+        let place = self.clip_envelope_place(clip, rect)?;
+        let points = Self::envelope_points(model, place.audio, lane);
+        self.envelope_segment_at(model, clip, &place, lane, &points, pos)
+    }
+
+    /// The envelope a press at `pos` would edit — an audio clip's body or
+    /// a take in its lane, a lane shown — and the point under it, if any.
+    fn envelope_target(
+        &self,
+        model: &Session,
+        size: Size,
+        pos: Point,
+    ) -> Option<(ClipId, EnvelopePlace, EnvelopeLane, Option<EnvelopeHover>)> {
+        let lane = model.clip_envelope_shown()?;
+        let (c, place) = match self.hit_test(pos, size, model)? {
+            Hit::Clip { clip, .. } => {
+                let c = model.project().clip(clip)?;
+                let rect = self.clip_view_rect(model, size, clip)?;
+                if !matches!(
+                    self.clip_zone(model, c, rect, pos),
+                    crate::clip_edit::ClipZone::Envelope
+                        | crate::clip_edit::ClipZone::EnvelopePoint(_)
+                        | crate::clip_edit::ClipZone::EnvelopeSegment
+                ) {
+                    return None;
+                }
+                (c, self.clip_envelope_place(c, rect)?)
+            }
+            Hit::TakeLane { clip, take, .. } => {
+                let c = model.project().clip(clip)?;
+                let place = self.take_envelope_place(model, size, c, take)?;
+                if pos.x < place.content.x - 3.0 || pos.x > place.content.right() + 3.0 {
+                    return None;
+                }
+                (c, place)
+            }
+            _ => return None,
+        };
+        let points = Self::envelope_points(model, place.audio, lane);
+        let hover = match self.envelope_point_at(model, c, &place, lane, &points, pos) {
+            Some(i) => Some(EnvelopeHover::Point(i)),
+            None => self
+                .envelope_segment_at(model, c, &place, lane, &points, pos)
+                .map(EnvelopeHover::Segment),
+        };
+        Some((c.id, place, lane, hover))
+    }
+
+    /// The envelope point or segment under `pos` (what is drawn lit while
+    /// hovering).
+    pub(crate) fn envelope_hovered(
+        &self,
+        model: &Session,
+        size: Size,
+        pos: Point,
+    ) -> Option<(AudioRef, EnvelopeHover)> {
+        let (_, place, _, hover) = self.envelope_target(model, size, pos)?;
+        Some((place.audio, hover?))
+    }
+
+    /// The points of `audio` drawn lit: the ones being dragged, else the
+    /// ones under the pointer.
+    fn lit_envelope_points(&self, audio: AudioRef) -> Vec<usize> {
+        if let Some(EditDrag::Envelope(d)) = &self.edit_drag {
+            if d.place.audio != audio {
+                return Vec::new();
+            }
+            return if d.segment.is_empty() {
+                vec![d.index]
+            } else {
+                d.segment.clone()
+            };
+        }
+        self.envelope_hover
+            .as_ref()
+            .filter(|(a, _)| *a == audio)
+            .map_or_else(Vec::new, |(_, h)| h.points())
+    }
+
+    /// The tooltip over an envelope a press would edit: a point's value and
+    /// time and what pressing it does, or what a click on the line does.
+    pub(crate) fn envelope_tooltip(
+        &self,
+        model: &Session,
+        size: Size,
+        pos: Point,
+    ) -> Option<String> {
+        let (clip, place, lane, hover) = self.envelope_target(model, size, pos)?;
+        if let Some(EnvelopeHover::Segment(v)) = &hover {
+            return Some(format!(
+                "{} envelope · Drag: move this segment up or down ({}; Ctrl: fine) · Click: \
+                 add a point on the line",
+                lane.label(),
+                if v.len() == 1 {
+                    "its point"
+                } else {
+                    "both points"
+                }
+            ));
+        }
+        let Some(EnvelopeHover::Point(i)) = hover else {
+            return Some(format!(
+                "{} envelope · Click: add a point on the line (it stays where it is), then \
+                 drag it · Alt: off the grid",
+                lane.label()
+            ));
+        };
+        let point = *Self::envelope_points(model, place.audio, lane).get(i)?;
+        let p = model.project();
+        let c = p.clip(clip)?;
+        let rate = f64::from(p.sample_rate);
+        let start = p.timeline.to_samples(c.start, rate);
+        let at = p.timeline.to_musical(start + place.offset + point.at, rate);
+        Some(format!(
+            "{} {} at {}\nDrag: move (Shift: keep its time, Ctrl: fine, Alt: off the grid) · \
+             Double-click: remove · Right-click: its curve",
+            lane.label(),
+            lane.value_text(point.value),
+            p.timeline.format_bbt(at)
+        ))
     }
 
     /// The frame of the clip or take at x, on the grid unless Alt (or
@@ -196,7 +406,6 @@ impl ArrangerView {
         model: &Session,
         cx: &mut EventCx<'_, Action>,
     ) -> bool {
-        let content = place.content;
         let mut points = Self::envelope_points(model, place.audio, lane);
         let hit = self.envelope_point_at(model, c, &place, lane, &points, pos);
         if clicks >= 2 {
@@ -220,20 +429,33 @@ impl ArrangerView {
                 mode: SelectMode::Replace,
             });
         }
-        let (index, moved) = match hit {
+        // On the line: a drag moves the segment, a click adds a point (on
+        // release).
+        let segment = if hit.is_none() {
+            self.envelope_segment_at(model, c, &place, lane, &points, pos)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let pending = (!segment.is_empty()).then(|| {
+            let at = self
+                .envelope_frame(model, c, &place, pos.x, mods)
+                .clamp(0, place.length);
+            Self::point_on_line(&points, lane, at)
+        });
+        let (index, added) = match hit {
             Some(i) => (i, false),
+            None if !segment.is_empty() => (0, false),
             None => {
-                // A new point on the line where it was pressed.
+                // A new point on the line, at the value the line has there
+                // (the press's height would bend the line by however far
+                // off it the click landed).
                 let at = self
                     .envelope_frame(model, c, &place, pos.x, mods)
                     .clamp(0, place.length);
-                let value = Self::envelope_value(content, lane, pos.y);
+                let new = Self::point_on_line(&points, lane, at);
                 let i = points.partition_point(|p| p.at <= at);
-                let shape = i
-                    .checked_sub(1)
-                    .and_then(|i| points.get(i))
-                    .map_or(CurveShape::Linear, |p| p.shape);
-                points.insert(i, EnvelopePoint { at, value, shape });
+                points.insert(i, new);
                 cx.emit(Action::BeginGesture("Clip Envelope".into()));
                 cx.emit(Action::SetClipEnvelope {
                     audio: place.audio,
@@ -249,10 +471,50 @@ impl ArrangerView {
             index,
             points,
             origin: pos,
-            moved,
+            moved: false,
+            added,
+            pending,
+            segment: segment.clone(),
         }));
-        cx.set_cursor(Cursor::Crosshair);
+        cx.set_cursor(if segment.is_empty() {
+            Cursor::Move
+        } else {
+            Cursor::ResizeVertical
+        });
+        cx.redraw();
         true
+    }
+
+    /// A new point at frame `at` on the line of `points` (its value there,
+    /// the shape of the segment it splits).
+    fn point_on_line(points: &[EnvelopePoint], lane: EnvelopeLane, at: i64) -> EnvelopePoint {
+        let value = faderframe_project::clip_envelope::value_at(points, at as f64)
+            .unwrap_or_else(|| lane.neutral());
+        let i = points.partition_point(|p| p.at <= at);
+        let shape = i
+            .checked_sub(1)
+            .and_then(|i| points.get(i))
+            .map_or(CurveShape::Linear, |p| p.shape);
+        EnvelopePoint { at, value, shape }
+    }
+
+    /// The press on an envelope ends: its gesture closes; a segment clicked
+    /// without a drag gets its point.
+    pub(crate) fn envelope_release(d: &EnvelopeDrag, cx: &mut EventCx<'_, Action>) {
+        if d.moved || d.added {
+            cx.emit(Action::EndGesture);
+            return;
+        }
+        if let Some(new) = d.pending {
+            let mut points = d.points.clone();
+            let i = points.partition_point(|p| p.at <= new.at);
+            points.insert(i, new);
+            cx.emit(Action::SetClipEnvelope {
+                audio: d.place.audio,
+                lane: d.lane,
+                points,
+            });
+        }
     }
 
     /// The dragged point follows the pointer, kept between its
@@ -269,16 +531,37 @@ impl ArrangerView {
             if pos.distance(d.origin) < DRAG_THRESHOLD {
                 return;
             }
-            cx.emit(Action::BeginGesture("Clip Envelope".into()));
+            if !d.added {
+                cx.emit(Action::BeginGesture("Clip Envelope".into()));
+            }
             d.moved = true;
         }
         let Some(c) = model.project().clip(d.place.audio.clip()) else {
             return;
         };
+        let content = d.place.content;
+        if !d.segment.is_empty() {
+            // The segment: its points up or down together, by how far the
+            // pointer went (Ctrl: fine); their times stay.
+            let mut dy = (d.origin.y - pos.y) / content.h.max(1.0);
+            if mods.ctrl {
+                dy *= 0.1;
+            }
+            let mut points = d.points.clone();
+            for &i in &d.segment {
+                let v = d.lane.to_unit(d.points[i].value) + f64::from(dy);
+                points[i].value = d.lane.clamp(d.lane.from_unit(v));
+            }
+            cx.emit(Action::SetClipEnvelope {
+                audio: d.place.audio,
+                lane: d.lane,
+                points,
+            });
+            return;
+        }
         let Some(old) = d.points.get(d.index).copied() else {
             return;
         };
-        let content = d.place.content;
         let lo = d.index.checked_sub(1).map_or(i64::MIN, |i| d.points[i].at);
         let hi = d.points.get(d.index + 1).map_or(i64::MAX, |p| p.at);
         let at = if mods.shift {
@@ -287,12 +570,14 @@ impl ArrangerView {
             self.envelope_frame(model, c, &d.place, pos.x, mods)
                 .clamp(lo, hi)
         };
-        let mut value = Self::envelope_value(content, d.lane, pos.y);
+        // By how far the pointer went (on the lane's scale), not to where
+        // it is: a point grabbed off its centre does not jump. Ctrl: fine,
+        // a tenth of the move.
+        let mut dy = (d.origin.y - pos.y) / content.h.max(1.0);
         if mods.ctrl {
-            // Ctrl: fine, a tenth of the move from where it was.
-            let was = Self::envelope_value(content, d.lane, d.origin.y);
-            value = old.value + (value - was) * 0.1;
+            dy *= 0.1;
         }
+        let value = d.lane.from_unit(d.lane.to_unit(old.value) + f64::from(dy));
         let mut points = d.points.clone();
         points[d.index] = EnvelopePoint {
             at,
@@ -582,21 +867,50 @@ impl ArrangerView {
         if !with_points {
             return;
         }
-        for a in points {
+        let lit = self.lit_envelope_points(place.audio);
+        for (i, a) in points.iter().enumerate() {
             let x = x_of(a.at);
-            if x < x0 - POINT_SIZE || x > x1 + POINT_SIZE {
+            if x < x0 - POINT_LIT || x > x1 + POINT_LIT {
                 continue;
             }
             let c = Point::new(x, y_of(a.value));
-            let r = Rect::new(
-                c.x - POINT_SIZE * 0.5,
-                c.y - POINT_SIZE * 0.5,
-                POINT_SIZE,
-                POINT_SIZE,
-            );
-            p.fill(r, color);
-            p.stroke_rounded(r, 0.0, 1.0, self.theme.arranger.background);
+            let size = if lit.contains(&i) {
+                POINT_LIT
+            } else {
+                POINT_SIZE
+            };
+            let r = Rect::new(c.x - size * 0.5, c.y - size * 0.5, size, size);
+            if lit.contains(&i) {
+                // The one a press would take: bigger, ringed in the text
+                // colour, its value beside it.
+                p.fill(r, color.lighten(0.25));
+                p.stroke_rounded(r, 0.0, 1.5, self.theme.ui.text);
+                self.paint_envelope_value(p, content, c, lane.value_text(a.value));
+            } else {
+                p.fill(r, color);
+                p.stroke_rounded(r, 0.0, 1.0, self.theme.arranger.background);
+            }
         }
+    }
+
+    /// A point's value in a small label beside it (above it, below near
+    /// the top; to its left near the right end).
+    fn paint_envelope_value(&self, p: &mut dyn Painter, content: Rect, at: Point, text: String) {
+        let th = &self.theme;
+        let style = TextStyle::new(th.fonts.tiny + 0.5, th.ui.text).family(th.fonts.numerals);
+        let w = p.text_width(&text, &style) + 8.0;
+        let h = 14.0;
+        let mut x = at.x + POINT_LIT;
+        if x + w > content.right() {
+            x = at.x - POINT_LIT - w;
+        }
+        let mut y = at.y - POINT_LIT - h;
+        if y < content.y {
+            y = at.y + POINT_LIT;
+        }
+        let r = Rect::new(x, y, w, h);
+        p.fill_rounded(r, 3.0, &Paint::Solid(th.ui.background.with_alpha(0.85)));
+        p.text(&text, r, &style.center());
     }
 
     /// While the Strip Silence dialog is open: its clips' silences shaded

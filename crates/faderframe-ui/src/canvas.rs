@@ -305,6 +305,7 @@ fn cursor_name(c: Cursor) -> &'static str {
         Cursor::Text => "text",
         Cursor::Crosshair => "crosshair",
         Cursor::Move => "move",
+        Cursor::Add => "cell",
     }
 }
 

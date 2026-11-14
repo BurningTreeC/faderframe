@@ -7709,13 +7709,28 @@ clips draw it over their waveform in the theme's automation colour
 (volume on a fader law with 0 dB three quarters up, `EnvelopeLane::
 {to_unit, from_unit}`; pan with the centre in the middle) and their body
 is `ClipZone::Envelope` for the Smart, Selector and Grabber tools (edges
-still trim, the name strip still moves): a click adds a point on the
-grid (Alt: free) and drags it, a drag moves a point between its
-neighbours (Shift keeps its time, Ctrl fine), a double-click removes it,
-a right-click sets its segment's shape or removes it — each one
-`Action::SetClipEnvelope { audio, lane, points }` inside a gesture, one
-undo step (`view-arranger/src/clip_envelope.rs`; `EnvelopePlace` = the
-clip or take, its offset in the clip and the area drawn). In an open take
+still trim, the name strip still moves), `ClipZone::EnvelopePoint(i)` on
+a point: a click on the line adds a point on the grid (Alt: free) at the
+value the line has there (`clip_envelope::value_at`, neutral without
+points), so adding never moves the line, and a drag past the threshold
+then moves it; a drag on a point moves it between its neighbours by how
+far the pointer goes on the lane's scale (not to the pointer: grabbing
+it off its centre does not make it jump; Shift keeps its time, Ctrl
+fine); the line itself (`ClipZone::EnvelopeSegment`, within 4 px of it)
+is a segment: a drag moves the points on either side of it up or down
+together (one at the clip's ends; their times stay), a click without a
+drag adds a point there; points come before the clip's edges and fade
+handles (the first and last sit on the edges); a double-click removes a
+point, a right-click sets its segment's shape
+or removes it — each one `Action::SetClipEnvelope { audio, lane, points }`
+inside a gesture, one undo step (`view-arranger/src/clip_envelope.rs`;
+`EnvelopePlace` = the clip or take, its offset in the clip and the area
+drawn). The pointer is a plus (`Cursor::Add`) over the line and a move
+cross over a point; the point under it or being dragged is drawn larger
+and ringed with its value beside it, and the tooltip gives its value,
+time and what pressing it does (`envelope_target`, for a clip's body and
+a take's lane alike). The lane shown is kept in the preferences
+(`Preferences::clip_envelope`) across restarts. In an open take
 folder each take's lane does the same for its take (comping by click and
 swipe, and the words of comping by lyric, wait until the envelopes are
 hidden), and the main lane draws the comp's envelope as played. The clip menu also

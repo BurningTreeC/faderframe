@@ -424,8 +424,12 @@ fn a_take_lane_edits_its_takes_envelope_while_one_is_shown() {
             && (r.w - 6.0).abs() < 0.01
             && r.center().y > lane.0 && r.center().y < lane.0 + lane.1)));
     assert!(p.balanced_clips());
-    // A right-click on it: the point's menu.
-    let point = Point::new(px, lane_y(1) + 6.0);
+    // A right-click on it: the point's menu. (It went onto the line, at
+    // 0 dB, and down by the drag: where its value is drawn in the take.)
+    let place = view.take_envelope_place(&s, size, &c, 1).unwrap();
+    let y = place.content.bottom()
+        - EnvelopeLane::Volume.to_unit(e.volume[0].value) as f32 * place.content.h;
+    let point = Point::new(px, y);
     let ev = ViewEvent::PointerDown {
         pos: point,
         button: PointerButton::Secondary,
@@ -438,6 +442,31 @@ fn a_take_lane_edits_its_takes_envelope_while_one_is_shown() {
     };
     let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
     assert!(labels.contains(&"Remove Point"), "{labels:?}");
+    // Hovering the point: a move cross, the point lit with its value, and
+    // its tooltip; elsewhere in the take: a plus.
+    let hover = |pos| ViewEvent::PointerMove {
+        pos,
+        modifiers: Modifiers::NONE,
+        dragging: false,
+    };
+    let mut cx_actions = Vec::new();
+    let mut cx_requests = Vec::new();
+    let mut cx = EventCx::new(&mut cx_actions, &mut cx_requests);
+    view.event(&hover(point), size, &s, &mut cx);
+    assert_eq!(cx.cursor(), Some(Cursor::Move));
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &theme);
+    let value = EnvelopeLane::Volume.value_text(e.volume[0].value);
+    assert!(p.texts().contains(&value.as_str()), "{value}");
+    assert!(
+        view.tooltip(point, size, &s)
+            .is_some_and(|t| t.starts_with(&format!("Volume {value}"))),
+    );
+    let mut cx = EventCx::new(&mut cx_actions, &mut cx_requests);
+    // Off the line, at the bottom of the take.
+    let off = Point::new(x0 + 60.0, place.content.bottom() - 2.0);
+    view.event(&hover(off), size, &s, &mut cx);
+    assert_eq!(cx.cursor(), Some(Cursor::Add));
 }
 
 #[test]
