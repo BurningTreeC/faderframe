@@ -1,5 +1,6 @@
-//! Unused media at close: files of the project's Audio folder that neither
-//! the saved project nor its versions use.
+//! Unused media at close: files of the project's Audio folder that the
+//! project brought there and neither the saved project nor its versions
+//! use — never another project's (projects in one folder share it).
 #![allow(clippy::unwrap_used)]
 
 use faderframe_audio_files::{WavFormat, write_wav};
@@ -79,7 +80,8 @@ fn only_files_no_saved_state_uses_are_unused() {
     s.dispatch(Action::Edit(Command::RemoveClip { clip: pad_clip }))
         .unwrap();
     s.save().unwrap();
-    // A stray file, and a sample (left alone).
+    // A file no source of the project names (another project's, one put
+    // there by hand), and a sample: both left alone.
     tone(&media.join("Stray.wav"));
     std::fs::create_dir_all(media.join("Samples")).unwrap();
     tone(&media.join("Samples").join("Hit.wav"));
@@ -88,12 +90,11 @@ fn only_files_no_saved_state_uses_are_unused() {
     let got = names(&unused.files);
     let pad_name = pad.file_name().unwrap().to_string_lossy().to_string();
     assert!(got.contains(&pad_name), "{got:?}");
-    assert!(got.contains(&"Stray.wav".to_string()), "{got:?}");
+    assert!(!got.contains(&"Stray.wav".to_string()), "{got:?}");
     assert!(
-        got.iter().all(|n| n == &pad_name
-            || n == "Stray.wav"
-            || n.starts_with(pad.file_stem().unwrap().to_str().unwrap())),
-        "only the pad (and its peaks) and the stray: {got:?}"
+        got.iter()
+            .all(|n| n.starts_with(pad.file_stem().unwrap().to_str().unwrap())),
+        "only the pad and its peaks: {got:?}"
     );
     assert!(
         !got.iter().any(|n| n.starts_with("Bass")),
@@ -101,5 +102,48 @@ fn only_files_no_saved_state_uses_are_unused() {
     );
     assert!(!got.iter().any(|n| n.starts_with("Kick")));
     assert!(unused.bytes > 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two projects saved in one folder share its Audio folder: closing one
+/// never offers the other's recordings, only what it brought there itself
+/// and no longer uses.
+#[test]
+fn another_projects_files_in_the_same_folder_are_never_offered() {
+    let dir = tmp("shared");
+    for n in ["Vocal", "Master", "Scrap"] {
+        tone(&dir.join(format!("{n}.wav")));
+    }
+    let folder = dir.join("Songs");
+    // The song: a vocal, kept.
+    let mut song =
+        Session::new(Project::new("Song", 48_000), None, EngineConfig::default()).unwrap();
+    import(&mut song, &dir.join("Vocal.wav"));
+    song.save_as(&folder.join("Song.ffproj")).unwrap();
+    // The master, beside it: its mix, and a scrap it no longer uses.
+    let mut master = Session::new(
+        Project::new("Master", 48_000),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
+    import(&mut master, &dir.join("Master.wav"));
+    let (scrap_clip, scrap) = import(&mut master, &dir.join("Scrap.wav"));
+    master
+        .dispatch(Action::Edit(Command::RemoveClip { clip: scrap_clip }))
+        .unwrap();
+    master.save_as(&folder.join("Master.ffproj")).unwrap();
+    let media = folder.join(MEDIA_FOLDER);
+    assert!(media.join("Vocal.wav").is_file() && media.join("Master.wav").is_file());
+
+    let got = names(&master.unused_media().unwrap().files);
+    let scrap_stem = scrap.file_stem().unwrap().to_string_lossy().to_string();
+    assert!(got.iter().any(|n| n.starts_with(&scrap_stem)), "{got:?}");
+    assert!(
+        got.iter().all(|n| n.starts_with(&scrap_stem)),
+        "only the master's own scrap, never the song's vocal: {got:?}"
+    );
+    // And the other way round: the song offers nothing of the master's.
+    assert_eq!(song.unused_media().unwrap().files, Vec::<PathBuf>::new());
     let _ = std::fs::remove_dir_all(&dir);
 }
