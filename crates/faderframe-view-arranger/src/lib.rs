@@ -2941,6 +2941,10 @@ impl ArrangerView {
         );
         // Groups and VCAs.
         items.extend(model.group_menu(t.id).into_iter().map(entry_item));
+        items.push(MenuItem::submenu(
+            "Solo Mode",
+            model.solo_mode_menu().into_iter().map(entry_item).collect(),
+        ));
         // A sample of the selection (audio tracks), and its slices.
         items.extend(sample_items(model, t.id, None));
         items.extend(slice_items(model, t.id, None));

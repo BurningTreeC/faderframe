@@ -143,7 +143,7 @@ impl Drop for Job {
 /// tracks keying it muted (they still key: sidechains tap them before
 /// their faders). Nothing else of the project's mix is built.
 pub(crate) fn trimmed(project: &Project, track: TrackId, closure: &[TrackId]) -> Project {
-    let solo = project.solo_audible();
+    let solo = project.solo_silenced_except();
     let muted: Vec<(TrackId, bool)> = closure
         .iter()
         .filter_map(|id| project.track(*id))

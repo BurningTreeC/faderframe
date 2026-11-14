@@ -537,6 +537,12 @@ impl Processor<EngineContext> for ChannelStrip {
         let downmix = self.shared.downmix(params);
         let static_mute = params.get(self.slots.mute) >= 0.5 && !self.solo_safe;
         let solo_muted = params.get(self.slots.solo_mute) >= 0.5 && !self.solo_safe;
+        // Dim solo (never on a solo-safe strip).
+        let solo_gain = if self.solo_safe {
+            1.0
+        } else {
+            params.get(self.slots.solo_gain).clamp(0.0, 1.0)
+        };
         let polarity = if params.get(self.slots.phase) >= 0.5 {
             -1.0
         } else {
@@ -626,7 +632,7 @@ impl Processor<EngineContext> for ChannelStrip {
             let audible = if mute || solo_muted || vca_muted {
                 0.0
             } else {
-                polarity
+                polarity * solo_gain
             };
             let (fader_m, pan_m) = if travel == 0.0 && pan_mod == 0.0 {
                 (fader, pan)

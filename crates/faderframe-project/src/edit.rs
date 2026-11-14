@@ -469,6 +469,11 @@ pub enum Command {
     },
     /// The project's pan law: how mono pan and each channel of dual pan
     /// spread a source (never balance).
+    /// Dim solo's level ([`crate::Project::solo_dim_db`]; `None`: solo
+    /// mutes).
+    SetSoloDim {
+        db: Option<f32>,
+    },
     SetPanLaw {
         law: faderframe_core::PanLaw,
     },
@@ -1102,6 +1107,8 @@ impl Command {
             MoveTrack { .. } => "Move Track".into(),
             SetCrosstalk { .. } => "Analogue Crosstalk".into(),
             SetPanLaw { .. } => "Pan Law".into(),
+            SetSoloDim { db: Some(_) } => "Dim Solo".into(),
+            SetSoloDim { db: None } => "Solo Mutes".into(),
             SetDownmix { .. } => "Surround Downmix".into(),
             SetSpeakerLayouts { .. } => "Speaker Layouts".into(),
             SetConsole { console: Some(c) } => format!("Console: {}", c.name()),
@@ -1238,6 +1245,7 @@ impl Command {
             | SetTrackPanMode { .. }
             | SetTrackDualPan { .. }
             | SetPanLaw { .. }
+            | SetSoloDim { .. }
             | SetDownmix { .. }
             | SetTrackSurround { .. }
             | SetTrackMute { .. }
@@ -2290,6 +2298,17 @@ impl Command {
             SetPanLaw { law } => {
                 let old = std::mem::replace(&mut p.pan_law, law);
                 SetPanLaw { law: old }
+            }
+            SetSoloDim { db } => {
+                let db = db.map(|d| {
+                    if d.is_finite() {
+                        d.clamp(-60.0, 0.0)
+                    } else {
+                        -15.0
+                    }
+                });
+                let old = std::mem::replace(&mut p.solo_dim_db, db);
+                SetSoloDim { db: old }
             }
             SetDownmix { downmix } => {
                 let old = std::mem::replace(&mut p.downmix, downmix.clamped());
