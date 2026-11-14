@@ -3150,3 +3150,74 @@ fn an_automation_lane_is_sized_by_its_bottom_edge() {
         );
     }
 }
+
+/// With several tracks selected, dragging one's edge makes every selected
+/// track that tall (the others keep theirs); a double-click on the edge
+/// sets them all back; an unselected track's edge sizes it alone.
+#[test]
+fn dragging_a_selected_tracks_edge_sizes_every_selected_track() {
+    let mut s = session();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let tracks: Vec<TrackId> = ArrangerView::lane_tracks(&s).iter().map(|t| t.id).collect();
+    assert!(tracks.len() >= 3);
+    let (first, second, third) = (tracks[0], tracks[1], tracks[2]);
+    // The second is taller already: selected, it takes the first's height.
+    s.dispatch(Action::SetTrackHeight {
+        track: Some(second),
+        height: view.row_h() + 40.0,
+    })
+    .unwrap();
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![first, second],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let h = view.base_h(&s, first);
+    let edge = view.row_rect(0, size).y + h;
+    let at = Point::new(40.0, edge + 2.0);
+    let drag = |view: &mut ArrangerView, s: &mut Session, from: Point, by: f32| {
+        run(view, down(from), size, s);
+        let to = Point::new(from.x, from.y + by);
+        let (actions, _) = run(view, mv(to), size, s);
+        for a in actions {
+            s.dispatch(a).unwrap();
+        }
+        run(view, up(to), size, s);
+    };
+    drag(&mut view, &mut s, at, 30.0);
+    assert_eq!(s.track_height(first), Some(h + 30.0));
+    assert_eq!(s.track_height(second), Some(h + 30.0), "selected with it");
+    assert_eq!(s.track_height(third), None, "not selected");
+    // A double-click on the edge: both back to the default.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let edge = view.row_rect(0, size).y + view.base_h(&s, first);
+    let at = Point::new(40.0, edge + 2.0);
+    let double = ViewEvent::PointerDown {
+        pos: at,
+        button: PointerButton::Primary,
+        modifiers: Modifiers::NONE,
+        clicks: 2,
+    };
+    let (actions, _) = run(&mut view, double, size, &s);
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    let default = view.row_h();
+    for t in [first, second] {
+        assert!(
+            s.track_height(t).is_none_or(|h| h == default),
+            "{:?}",
+            s.track_height(t)
+        );
+    }
+    // The third's edge, unselected: it alone.
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let r = view.row_rect(2, size);
+    let edge3 = r.y + view.base_h(&s, third);
+    drag(&mut view, &mut s, Point::new(40.0, edge3 + 2.0), 20.0);
+    assert_eq!(s.track_height(third), Some(default + 20.0));
+    assert!(s.track_height(first).is_none_or(|h| h == default));
+}

@@ -3039,3 +3039,68 @@ fn an_instrument_strip_chooses_its_tuning_and_retuning() {
     };
     assert!(items.iter().all(|i| i.label != "Tuning"));
 }
+
+/// With several strips selected, dragging one's edge makes every selected
+/// strip that wide, and so does the strip menu's width; an unselected
+/// strip's edge sizes it alone.
+#[test]
+fn dragging_a_selected_strips_edge_sizes_every_selected_strip() {
+    let mut s = session();
+    let mut view = MixerView::new(Theme::default());
+    let size = Size::new(1800.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let normal = Theme::default().console.strip_width;
+    let ids: Vec<TrackId> = MixerView::channel_tracks(&s).iter().map(|t| t.id).collect();
+    assert!(ids.len() >= 3);
+    s.dispatch(Action::SelectTracks {
+        tracks: vec![ids[0], ids[1]],
+        mode: SelectMode::Replace,
+    })
+    .unwrap();
+    view.paint(&mut RecordingPainter::new(), size, &s, &Theme::default());
+    let first = view.strip_rect(0, size);
+    let edge = Point::new(first.right() + 1.0, 300.0);
+    run(&mut view, down(edge, 1), size, &s);
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::PointerMove {
+            pos: Point::new(edge.x + 40.0, 300.0),
+            modifiers: Modifiers::NONE,
+            dragging: true,
+        },
+        size,
+        &s,
+    );
+    for a in actions {
+        s.dispatch(a).unwrap();
+    }
+    assert_eq!(s.strip_width(ids[0]), Some(normal + 40.0));
+    assert_eq!(
+        s.strip_width(ids[1]),
+        Some(normal + 40.0),
+        "selected with it"
+    );
+    assert_eq!(s.strip_width(ids[2]), None, "not selected");
+    // The menu of a selected strip: its width for both.
+    let t = MixerView::channel_tracks(&s)[1];
+    let HostRequest::ContextMenu { items, .. } = MixerView::track_menu(&s, t, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let narrow = items.iter().find(|i| i.label == "Narrow Strip").unwrap();
+    s.dispatch(narrow.action.clone().unwrap()).unwrap();
+    assert_eq!(s.strip_width(ids[0]), Some(64.0));
+    assert_eq!(s.strip_width(ids[1]), Some(64.0));
+    // An unselected strip's menu: it alone.
+    let t = MixerView::channel_tracks(&s)[2];
+    let HostRequest::ContextMenu { items, .. } = MixerView::track_menu(&s, t, Point::new(0.0, 0.0))
+    else {
+        panic!("a menu")
+    };
+    let wide = items
+        .iter()
+        .find(|i| i.label.ends_with(" Strip") && i.label != "Narrow Strip")
+        .unwrap();
+    s.dispatch(wide.action.clone().unwrap()).unwrap();
+    assert_eq!(s.strip_width(ids[0]), Some(64.0), "untouched");
+}

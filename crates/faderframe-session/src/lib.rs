@@ -2937,6 +2937,22 @@ impl Session {
         self.workspace.automation_lane_height(lane)
     }
 
+    /// The tracks a resize of `track` (its height in the arranger, its
+    /// strip's width in the mixer) applies to: every selected track when it
+    /// is one of several selected, else it alone; in the project's order.
+    pub fn resize_targets(&self, track: TrackId) -> Vec<TrackId> {
+        let selected = &self.selection.tracks;
+        if selected.len() < 2 || !selected.contains(&track) {
+            return vec![track];
+        }
+        self.project
+            .tracks
+            .iter()
+            .map(|t| t.id)
+            .filter(|id| selected.contains(id))
+            .collect()
+    }
+
     /// A mixer strip's width, if not the theme's.
     pub fn strip_width(&self, track: TrackId) -> Option<f32> {
         self.workspace.strip_width(track)

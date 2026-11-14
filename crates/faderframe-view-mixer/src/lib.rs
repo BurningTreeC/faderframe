@@ -1995,6 +1995,24 @@ impl MixerView {
     }
 
     /// MIDI learn for any mapping target (and removing its mappings).
+    /// `width` for `track`'s strip and the strips selected with it
+    /// ([`Session::resize_targets`]), or for every strip (`None`).
+    fn widths(model: &Session, track: Option<TrackId>, width: Option<f32>) -> Action {
+        match track {
+            None => Action::SetStripWidth { track: None, width },
+            Some(track) => Action::Several(
+                model
+                    .resize_targets(track)
+                    .into_iter()
+                    .map(|t| Action::SetStripWidth {
+                        track: Some(t),
+                        width,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
     pub fn learn_target_menu(
         model: &Session,
         target: faderframe_project::MappingTarget,
@@ -2724,10 +2742,7 @@ impl MixerView {
             for (i, (label, w)) in STRIP_WIDTHS.iter().enumerate() {
                 let item = MenuItem::new(
                     format!("{label} Strip"),
-                    Action::SetStripWidth {
-                        track: Some(t.id),
-                        width: *w,
-                    },
+                    Self::widths(model, Some(t.id), *w),
                 )
                 .checked(now == *w);
                 items.push(if i == 0 { item.separated() } else { item });
@@ -3081,11 +3096,9 @@ impl MixerView {
         match hit {
             Hit::Width(id) => {
                 if clicks >= 2 {
-                    // Back to the default (Shift: every strip).
-                    cx.emit(Action::SetStripWidth {
-                        track: (!mods.shift).then_some(id),
-                        width: None,
-                    });
+                    // Back to the default: the selected strips with it
+                    // (Shift: every strip).
+                    cx.emit(Self::widths(model, (!mods.shift).then_some(id), None));
                 } else {
                     let i = Self::channel_tracks(model).iter().position(|t| t.id == id);
                     self.drag = Some(Drag::Width {
@@ -4342,10 +4355,7 @@ impl MixerView {
                     }) => {
                         let (lo, hi) = faderframe_session::STRIP_WIDTH_RANGE;
                         let w = (start + pos.x - start_x).round().clamp(lo, hi);
-                        cx.emit(Action::SetStripWidth {
-                            track: (!all).then_some(track),
-                            width: Some(w),
-                        });
+                        cx.emit(Self::widths(model, (!all).then_some(track), Some(w)));
                         cx.set_cursor(Cursor::ResizeHorizontal);
                     }
                     Some(Drag::InsertSlots { start_y, start }) => {

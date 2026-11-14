@@ -2909,6 +2909,27 @@ impl ArrangerView {
         Some(HeaderLayout::new(self.header_rect(model, t, row.y)))
     }
 
+    /// `height` for `track` and the tracks selected with it
+    /// ([`Session::resize_targets`]), or for every track (`None`).
+    fn heights(model: &Session, track: Option<TrackId>, height: f32) -> Action {
+        match track {
+            None => Action::SetTrackHeight {
+                track: None,
+                height,
+            },
+            Some(track) => Action::Several(
+                model
+                    .resize_targets(track)
+                    .into_iter()
+                    .map(|t| Action::SetTrackHeight {
+                        track: Some(t),
+                        height,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
     fn track_menu(model: &Session, t: &Track, at: Point) -> HostRequest<Action> {
         let mut items = vec![
             MenuItem::new("Add Audio Track (Mono)", Action::AddTrack(TrackKind::Audio)),
@@ -4139,10 +4160,13 @@ impl ArrangerView {
                 let edit = |cx: &mut EventCx<'_, Action>, c| cx.emit(Action::Edit(c));
                 match part {
                     HeaderPart::Automation => cx.emit(Action::ToggleTrackAutomation(id)),
-                    HeaderPart::Resize if clicks >= 2 => cx.emit(Action::SetTrackHeight {
-                        track: (!mods.alt).then_some(id),
-                        height: self.row_h(),
-                    }),
+                    // Back to the default: the selected tracks with it (Alt:
+                    // every track).
+                    HeaderPart::Resize if clicks >= 2 => cx.emit(Self::heights(
+                        model,
+                        (!mods.alt).then_some(id),
+                        self.row_h(),
+                    )),
                     HeaderPart::Resize => {
                         self.drag = Some(Drag::Height {
                             track: id,
@@ -4754,10 +4778,7 @@ impl ArrangerView {
             }) => {
                 let h = (start_h + pos.y - start_y).round();
                 if (h - self.base_h(model, track)).abs() >= 1.0 {
-                    cx.emit(Action::SetTrackHeight {
-                        track: (!all).then_some(track),
-                        height: h,
-                    });
+                    cx.emit(Self::heights(model, (!all).then_some(track), h));
                 }
             }
             Some(Drag::TakeLanes {
