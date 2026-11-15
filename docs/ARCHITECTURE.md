@@ -12201,9 +12201,13 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   ("Undo Mix Intelligence: …", later edits kept; refused whole when a later
   step removed what it changed).
 * `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
-  ranked findings (filtered, sorted) in severity sections — Fix, Consider,
-  Info (folded at first) — with findings of one rule about the same tracks
-  as one entry (`arrange`, `group_key`); each one's measurements
+  ranked findings (filtered, sorted) in sections — by severity (Fix,
+  Consider, Info: folded at first), by track (a track with its role; a
+  finding about two under both) or by kind (`Sections`) — with findings of
+  one rule about the same tracks as one entry (`arrange`, `group_key`),
+  every entry with a strip of when it happens (the song's sections as
+  ticks) and the sections it is in; role families have colours
+  (`role_color`) beside track names; each one's measurements
   (clickable events: the tracks selected and the range shown), its tracks
   with their roles, a band chart, interpretation, method, limitations and
   experiments; levels; roles (a name's suggestion, `TrackRole::suggest`,

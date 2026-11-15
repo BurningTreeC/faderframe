@@ -18,7 +18,7 @@
 use faderframe_core::{PluginInstanceId, TrackId, TrackRole};
 use faderframe_mix_intelligence::bands::format_hz;
 use faderframe_mix_intelligence::{
-    Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject,
+    Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject, TimeSpan,
 };
 use faderframe_project::Command;
 use faderframe_session::mix::{Applied, MixOp, MixResults, MixScope, MixStatus};
@@ -75,8 +75,10 @@ pub enum Hit {
     SuggestedRole(TrackId),
     /// Take every suggested role (one undo step).
     AllSuggestedRoles,
-    /// Fold or unfold a severity section of the list.
-    Tier(Grade),
+    /// Fold or unfold a section of the list.
+    Tier(SectionKey),
+    /// What the list's sections are made by (cycles).
+    Sections,
     /// The band map ([`Panel::Map`]).
     Map,
     /// A collision drawn on the band map: its finding.
@@ -157,16 +159,57 @@ pub struct MixView {
     hover: Option<Hit>,
     /// The header's height as painted last (two rows when narrow).
     header_h: f32,
-    /// Severity sections folded in the list (Info at first).
-    folded: Vec<Grade>,
+    /// What the list's sections are made by.
+    sections: Sections,
+    /// Sections folded in the list (Info at first).
+    folded: Vec<SectionKey>,
     /// Groups of findings opened in the list ([`group_key`]).
     opened: Vec<u64>,
 }
 
+/// What the list's sections are made by ([`Hit::Sections`] cycles them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sections {
+    /// Fix, Consider, Info.
+    Severity,
+    /// A section per track (a finding about two under both).
+    Track,
+    /// A section per category (masking, levels, phase …).
+    Kind,
+}
+
+impl Sections {
+    fn label(self) -> &'static str {
+        match self {
+            Sections::Severity => "By severity",
+            Sections::Track => "By track",
+            Sections::Kind => "By kind",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Sections::Severity => Sections::Track,
+            Sections::Track => Sections::Kind,
+            Sections::Kind => Sections::Severity,
+        }
+    }
+}
+
+/// A section of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionKey {
+    Severity(Grade),
+    Track(TrackId),
+    /// Findings about no track (the master, the mix as a whole).
+    Mix,
+    Kind(Category),
+}
+
 /// A line of the findings list.
 enum Row<'a> {
-    /// A severity section's heading: how many it holds.
-    Tier(Grade, usize),
+    /// A section's heading: how many it holds.
+    Tier(SectionKey, usize),
     /// Findings of one rule about the same tracks (masking in several
     /// bands, levels of one track …), as one entry.
     Group(u64, Vec<&'a Finding>),
@@ -194,28 +237,61 @@ fn group_key(f: &Finding) -> u64 {
     h.finish()
 }
 
-/// The list's lines for `listed` (in its order): severity sections, the
-/// `folded` ones as their heading; findings of one rule about the same
-/// tracks as one group, its findings under it when `opened` or holding
-/// the `selected` one.
+/// The list's lines for `listed` (in its order): sections made `by`
+/// severity (Fix, Consider, Info), track (in the order they first come;
+/// a finding about two under both) or kind; the `folded` ones as their
+/// heading; findings of one rule about the same tracks as one group, its
+/// findings under it when `opened` or holding the `selected` one.
 fn arrange<'a>(
     listed: Vec<&'a Finding>,
-    folded: &[Grade],
+    by: Sections,
+    folded: &[SectionKey],
     opened: &[u64],
     selected: Option<u64>,
 ) -> Vec<Row<'a>> {
-    let mut out = Vec::new();
-    for grade in [Grade::High, Grade::Moderate, Grade::Low] {
-        let tier: Vec<&Finding> = listed
-            .iter()
-            .copied()
-            .filter(|f| Grade::of_severity(f.severity) == grade)
-            .collect();
-        if tier.is_empty() {
-            continue;
+    let mut sections: Vec<(SectionKey, Vec<&Finding>)> = Vec::new();
+    let mut add =
+        |key: SectionKey, f: &'a Finding| match sections.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(f),
+            None => sections.push((key, vec![f])),
+        };
+    match by {
+        Sections::Severity => {
+            for grade in [Grade::High, Grade::Moderate, Grade::Low] {
+                for f in listed
+                    .iter()
+                    .filter(|f| Grade::of_severity(f.severity) == grade)
+                {
+                    add(SectionKey::Severity(grade), f);
+                }
+            }
         }
-        out.push(Row::Tier(grade, tier.len()));
-        if folded.contains(&grade) {
+        Sections::Track => {
+            for f in &listed {
+                if f.tracks.is_empty() {
+                    add(SectionKey::Mix, f);
+                }
+                let mut seen = Vec::new();
+                for t in &f.tracks {
+                    if !seen.contains(t) {
+                        seen.push(*t);
+                        add(SectionKey::Track(*t), f);
+                    }
+                }
+            }
+        }
+        Sections::Kind => {
+            for c in Category::ALL {
+                for f in listed.iter().filter(|f| f.category() == c) {
+                    add(SectionKey::Kind(c), f);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (section, tier) in sections {
+        out.push(Row::Tier(section, tier.len()));
+        if folded.contains(&section) {
             continue;
         }
         let mut groups: Vec<(u64, Vec<&Finding>)> = Vec::new();
@@ -239,6 +315,20 @@ fn arrange<'a>(
         }
     }
     out
+}
+
+/// The colour of a role's family (drums, low end, in front, the rest,
+/// effects; grey for none), beside track names.
+pub fn role_color(role: Option<TrackRole>) -> Color {
+    use faderframe_core::RoleFamily;
+    match role.map(TrackRole::family) {
+        Some(RoleFamily::DrumKit) => Color::rgba(0.93, 0.58, 0.22, 1.0),
+        Some(RoleFamily::LowEnd) => Color::rgba(0.62, 0.45, 0.92, 1.0),
+        Some(RoleFamily::Foreground) => Color::rgba(0.95, 0.36, 0.42, 1.0),
+        Some(RoleFamily::Accompaniment) => Color::rgba(0.25, 0.72, 0.68, 1.0),
+        Some(RoleFamily::Effects) => Color::rgba(0.55, 0.62, 0.72, 1.0),
+        None => Color::rgba(0.5, 0.5, 0.5, 0.6),
+    }
 }
 
 /// A severity section's name.
@@ -299,7 +389,8 @@ impl MixView {
             visible: None,
             hover: None,
             header_h: HEADER_H,
-            folded: vec![Grade::Low],
+            sections: Sections::Severity,
+            folded: vec![SectionKey::Severity(Grade::Low)],
             opened: Vec::new(),
         }
     }
@@ -451,6 +542,7 @@ impl MixView {
     fn rows<'a>(&self, model: &'a Session) -> Vec<Row<'a>> {
         arrange(
             self.listed(model),
+            self.sections,
             &self.folded,
             &self.opened,
             model.mix_selected_id(),
@@ -781,30 +873,98 @@ impl MixView {
         );
     }
 
-    /// A severity section's heading: its name, how many, folded or not.
-    fn paint_tier_row(&mut self, p: &mut dyn Painter, r: Rect, grade: Grade, n: usize) {
+    /// Where the project's sections start inside the analysed range
+    /// (seconds from its start).
+    fn section_starts(model: &Session, res: &MixResults) -> Vec<f64> {
+        let p = model.project();
+        let rate = f64::from(res.rate.max(1));
+        let total = res.seconds();
+        p.sections
+            .iter()
+            .map(|sec| (p.timeline.to_samples(sec.start, rate) - res.start_sample) as f64 / rate)
+            .filter(|t| *t > 0.0 && *t < total)
+            .collect()
+    }
+
+    /// A thin strip across a list entry: the analysed range, the song's
+    /// sections as ticks, and where the finding(s) happen in `color`.
+    fn paint_time_strip(
+        &self,
+        p: &mut dyn Painter,
+        r: Rect,
+        spans: &[TimeSpan],
+        color: Color,
+        model: &Session,
+    ) {
+        let Some(res) = model.mix_results() else {
+            return;
+        };
+        let total = res.seconds();
+        if total <= 0.0 || spans.is_empty() || r.w < 20.0 {
+            return;
+        }
+        let th = &self.theme;
+        p.fill(r, th.ui.text.with_alpha(0.07));
+        let x_of = |t: f64| r.x + (t / total).clamp(0.0, 1.0) as f32 * r.w;
+        for t in Self::section_starts(model, res) {
+            p.vline(x_of(t), r.y - 1.0, r.bottom() + 1.0, th.ui.text_faint);
+        }
+        for s in spans {
+            let (a, b) = (x_of(s.start), x_of(s.end));
+            p.fill(Rect::new(a, r.y, (b - a).max(2.0), r.h), color);
+        }
+    }
+
+    /// Where a finding happens: its events, else its time.
+    fn spans_of(f: &Finding) -> Vec<TimeSpan> {
+        if f.events.is_empty() {
+            f.time.into_iter().collect()
+        } else {
+            f.events.clone()
+        }
+    }
+
+    /// A section's heading: its name (a track's with its role), how many,
+    /// folded or not; its stripe the severity's or the role's colour.
+    fn paint_tier_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        key: SectionKey,
+        n: usize,
+        model: &Session,
+    ) {
         let th = self.theme.clone();
-        let folded = self.folded.contains(&grade);
+        let folded = self.folded.contains(&key);
         p.fill(r, th.ui.surface_alt);
-        p.fill(
-            Rect::new(r.x, r.y + 5.0, 3.0, r.h - 10.0),
-            self.grade_color(grade),
-        );
+        let (label, stripe) = match key {
+            SectionKey::Severity(g) => (tier_label(g).to_string(), self.grade_color(g)),
+            SectionKey::Track(t) => {
+                let role = model.project().track(t).and_then(|x| x.role);
+                (
+                    format!(
+                        "{} · {}",
+                        model.mix_track_name(t),
+                        role.map_or("no role", TrackRole::short)
+                    ),
+                    role_color(role),
+                )
+            }
+            SectionKey::Mix => ("The mix".to_string(), th.ui.text_faint),
+            SectionKey::Kind(c) => (c.label().to_string(), th.ui.text_faint),
+        };
+        p.fill(Rect::new(r.x, r.y + 5.0, 3.0, r.h - 10.0), stripe);
         p.text(
-            &format!(
-                "{} {} · {n}",
-                if folded { "▸" } else { "▾" },
-                tier_label(grade)
-            ),
+            &format!("{} {label} · {n}", if folded { "▸" } else { "▾" }),
             Rect::new(r.x + 12.0, r.y, r.w - 20.0, r.h),
             &TextStyle::new(th.fonts.small, th.ui.text).bold(),
         );
         p.hline(r.x, r.right(), r.bottom() - 0.5, th.ui.border);
         self.register(Spot {
-            hit: Hit::Tier(grade),
+            hit: Hit::Tier(key),
             rect: r,
             enabled: true,
-            label: format!("{}, {n} findings", tier_label(grade)),
+            label: format!("{label}, {n} findings"),
             tip: if folded {
                 "Show these findings".into()
             } else {
@@ -871,6 +1031,15 @@ impl MixView {
             ),
             Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
             &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        // When in the song, all of them.
+        let spans: Vec<TimeSpan> = fs.iter().flat_map(|f| Self::spans_of(f)).collect();
+        self.paint_time_strip(
+            p,
+            Rect::new(tx, r.bottom() - 5.0, tw, 2.5),
+            &spans,
+            self.grade_color(Grade::of_severity(worst)).with_alpha(0.9),
+            model,
         );
         p.hline(
             r.x,
@@ -962,9 +1131,14 @@ impl MixView {
             .pattern
             .map(|p| format!(" · {}", p.label()))
             .unwrap_or_default();
+        let sections = if f.sections.is_empty() {
+            String::new()
+        } else {
+            format!(" · in {}", f.sections.join(", "))
+        };
         p.text(
             &format!(
-                "Severity {} · Confidence {} · {} experiment{}{pattern}{}",
+                "Severity {} · Confidence {} · {} experiment{}{pattern}{sections}{}",
                 sev.label(),
                 Grade::of_confidence(f.confidence).label(),
                 n,
@@ -977,6 +1151,14 @@ impl MixView {
             ),
             Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
             &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        // When in the song.
+        self.paint_time_strip(
+            p,
+            Rect::new(tx, r.bottom() - 5.0, tw, 2.5),
+            &Self::spans_of(f),
+            self.grade_color(sev).with_alpha(0.9),
+            model,
         );
         if let Some(state) = applied {
             let badge = Self::applied_badge(state);
@@ -1057,6 +1239,17 @@ impl MixView {
             true,
             "Order the list by relevance, time or track",
         );
+        x = self.button_at(
+            p,
+            x,
+            y,
+            h,
+            self.sections.label(),
+            Hit::Sections,
+            false,
+            true,
+            "Make the list's sections by severity, track or kind",
+        );
         let track = self
             .track
             .map_or_else(|| "All tracks".to_string(), |t| model.mix_track_name(t));
@@ -1119,7 +1312,7 @@ impl MixView {
                 continue;
             }
             match row {
-                Row::Tier(grade, n) => self.paint_tier_row(p, r, *grade, *n),
+                Row::Tier(key, n) => self.paint_tier_row(p, r, *key, *n, model),
                 Row::Group(key, fs) => self.paint_group_row(p, r, *key, fs, model),
                 Row::Finding(f, nested) => self.paint_finding_row(p, r, f, *nested, model),
             }
@@ -1608,9 +1801,10 @@ impl MixView {
                     bx = x;
                     y += 24.0;
                 }
+                p.circle(Point::new(bx + 4.0, y + 10.0), 3.5, role_color(role));
                 bx = self.button_at(
                     p,
-                    bx,
+                    bx + 11.0,
                     y,
                     20.0,
                     &label,
@@ -2167,9 +2361,14 @@ impl MixView {
         for (i, (t, sum)) in rows.iter().enumerate() {
             let ry = top + i as f32 * MAP_ROW;
             let role = model.project().track(*t).and_then(|x| x.role);
+            p.circle(
+                Point::new(rect.x + PAD + 4.0, ry + MAP_ROW * 0.5),
+                3.5,
+                role_color(role),
+            );
             p.text(
                 &name(*t),
-                Rect::new(rect.x + PAD, ry, label_w - 44.0, MAP_ROW),
+                Rect::new(rect.x + PAD + 12.0, ry, label_w - 56.0, MAP_ROW),
                 &TextStyle::new(th.fonts.small, th.ui.text),
             );
             p.text(
@@ -2333,13 +2532,14 @@ impl MixView {
             let r = Rect::new(x, y, w, 24.0);
             // Left out on purpose: faint, and said so.
             let ignored = TrackRole::ignored(role);
+            p.circle(Point::new(x + 4.0, y + 12.0), 3.5, role_color(role));
             p.text(
                 &if ignored {
                     format!("{name} · not analysed")
                 } else {
                     name.clone()
                 },
-                Rect::new(x, y, w * 0.5, 24.0),
+                Rect::new(x + 12.0, y, w * 0.5 - 12.0, 24.0),
                 &TextStyle::new(
                     th.fonts.small,
                     if ignored {
@@ -2897,13 +3097,18 @@ impl MixView {
                 cx.emit(Action::Mix(MixOp::LoudnessMatch(!on)));
             }
             Hit::Reject => cx.emit(Action::Mix(MixOp::Reject)),
-            Hit::Tier(grade) => {
-                match self.folded.iter().position(|g| *g == grade) {
+            Hit::Tier(key) => {
+                match self.folded.iter().position(|g| *g == key) {
                     Some(i) => {
                         self.folded.remove(i);
                     }
-                    None => self.folded.push(grade),
+                    None => self.folded.push(key),
                 }
+                cx.redraw();
+            }
+            Hit::Sections => {
+                self.sections = self.sections.next();
+                self.list_scroll = 0.0;
                 cx.redraw();
             }
             Hit::Group(key) => {

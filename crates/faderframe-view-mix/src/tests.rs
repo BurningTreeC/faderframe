@@ -766,7 +766,10 @@ fn findings_are_listed_in_sections_and_groups() {
     let shape = |rows: &[Row<'_>]| -> Vec<String> {
         rows.iter()
             .map(|r| match r {
-                Row::Tier(g, n) => format!("{} {n}", tier_label(*g)),
+                Row::Tier(SectionKey::Severity(g), n) => format!("{} {n}", tier_label(*g)),
+                Row::Tier(SectionKey::Track(t), n) => format!("track {} {n}", t.0),
+                Row::Tier(SectionKey::Mix, n) => format!("mix {n}"),
+                Row::Tier(SectionKey::Kind(c), n) => format!("{} {n}", c.label()),
                 Row::Group(_, v) => format!(
                     "group {}",
                     v.iter()
@@ -779,20 +782,48 @@ fn findings_are_listed_in_sections_and_groups() {
             .collect()
     };
     // A×B twice among the high ones (either order of the tracks): one group.
-    let rows = arrange(listed.clone(), &[Grade::Low], &[], None);
+    let info = [SectionKey::Severity(Grade::Low)];
+    let by = Sections::Severity;
+    let rows = arrange(listed.clone(), by, &info, &[], None);
     assert_eq!(
         shape(&rows),
         ["Fix 3", "group 1+2", "3", "Consider 1", "4", "Info 1"]
     );
     // Opened, or holding the selection: its findings under it.
     let key = group_key(&fs[0]);
-    let opened = arrange(listed.clone(), &[Grade::Low], &[key], None);
+    let opened = arrange(listed.clone(), by, &info, &[key], None);
     assert_eq!(shape(&opened)[1..4], ["group 1+2", "  1", "  2"]);
-    let selected = arrange(listed.clone(), &[Grade::Low], &[], Some(2));
+    let selected = arrange(listed.clone(), by, &info, &[], Some(2));
     assert_eq!(shape(&selected)[1..4], ["group 1+2", "  1", "  2"]);
     // Info unfolded, Fix folded.
-    let rows = arrange(listed, &[Grade::High], &[], None);
+    let rows = arrange(
+        listed.clone(),
+        by,
+        &[SectionKey::Severity(Grade::High)],
+        &[],
+        None,
+    );
     assert_eq!(shape(&rows), ["Fix 3", "Consider 1", "4", "Info 1", "5"]);
+    // By track: a section per track in the order they come, a finding
+    // about two under both (A×B still one group in A's and in B's).
+    let rows = arrange(listed.clone(), Sections::Track, &[], &[], None);
+    assert_eq!(
+        shape(&rows),
+        [
+            "track 1 4",
+            "group 1+2+4",
+            "3",
+            "track 2 4",
+            "group 1+2+4",
+            "5",
+            "track 3 2",
+            "3",
+            "5"
+        ]
+    );
+    // By kind: every one is masking.
+    let rows = arrange(listed, Sections::Kind, &[], &[], None);
+    assert_eq!(shape(&rows)[..2], ["Masking 5", "group 1+2+4"]);
 }
 
 /// After an analysis, with nothing selected, the details side shows the
@@ -872,4 +903,37 @@ fn an_ignored_track_is_shown_as_not_analysed() {
         p.texts()
     );
     assert!(p.texts().contains(&"Ignore (Not Analysed)"));
+}
+
+/// The sections switch cycles severity → track → kind; by track, a
+/// section is a track with its role; every entry carries a strip of when
+/// it happens.
+#[test]
+fn the_list_is_made_by_severity_track_or_kind() {
+    let (mut s, vocal, _) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    s.dispatch(Action::Mix(MixOp::Select(None))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By severity"));
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By track"));
+    assert!(view.rect_of(Hit::Tier(SectionKey::Track(vocal))).is_some());
+    assert!(
+        p.texts().iter().any(|t| t.starts_with("▾ Vocal · no role")),
+        "{:?}",
+        p.texts()
+    );
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By kind"));
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By severity"));
 }
