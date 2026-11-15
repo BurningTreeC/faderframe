@@ -1878,9 +1878,8 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
                 list.append(&b);
             }
             popover.set_child(Some(&list));
-            popover.set_parent(&widget);
+            crate::canvas::attach_popover(&popover, &widget);
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.connect_closed(|p| p.unparent());
             popover.popup();
         });
         row.row.add_controller(menu);

@@ -600,7 +600,7 @@ pub(crate) fn show_menu(app: &Rc<AppState>, name: &str) {
         old.popdown();
     }
     let popover = gtk::PopoverMenu::from_model(Some(&sub));
-    popover.set_parent(&window);
+    crate::canvas::attach_popover(&popover, &window);
     popover.set_has_arrow(false);
     popover.set_position(gtk::PositionType::Bottom);
     popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(120, 4, 1, 1)));
@@ -612,8 +612,6 @@ pub(crate) fn show_menu(app: &Rc<AppState>, name: &str) {
                 m.take();
             }
         });
-        let p = p.clone();
-        glib::idle_add_local_once(move || p.unparent());
     });
     SHOWN.with(|m| *m.borrow_mut() = Some(popover));
 }

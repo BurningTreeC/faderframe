@@ -561,7 +561,7 @@ fn ask_name(
     done: impl Fn(String) + 'static,
 ) -> gtk::Popover {
     let pop = gtk::Popover::new();
-    pop.set_parent(parent);
+    crate::canvas::attach_popover(&pop, parent);
     let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
     column.set_margin_top(4);
     column.set_margin_bottom(4);
@@ -595,10 +595,6 @@ fn ask_name(
     let again = go.clone();
     entry.connect_activate(move |_| again());
     ok.connect_clicked(move |_| go());
-    pop.connect_closed(|p| {
-        let p = p.clone();
-        glib::idle_add_local_once(move || p.unparent());
-    });
     pop.popup();
     entry.grab_focus();
     pop

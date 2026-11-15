@@ -999,7 +999,7 @@ impl CanvasWidget {
                 entry.set_text(&initial);
                 entry.set_width_chars(16);
                 popover.set_child(Some(&entry));
-                popover.set_parent(self);
+                attach_popover(&popover, self);
                 popover.set_pointing_to(Some(&gdk::Rectangle::new(
                     at.x as i32,
                     at.y as i32,
@@ -1019,10 +1019,6 @@ impl CanvasWidget {
                         }
                     }
                 ));
-                popover.connect_closed(|p| {
-                    let p = p.clone();
-                    glib::idle_add_local_once(move || p.unparent());
-                });
                 popover.popup();
                 entry.grab_focus();
                 entry.select_region(0, -1);
@@ -1674,6 +1670,32 @@ impl CanvasWidget {
 /// them and moving between levels never resizes or moves it (a popover
 /// that grows by the edge of the screen may otherwise be closed by the
 /// compositor). A long menu gets a search field over its levels.
+/// Parent a transient popover to `parent` for as long as it is shown:
+/// unparented once it closes (after GTK has finished closing it) — or,
+/// when `parent` goes first (a list row rebuilt while the popover is
+/// open), right then, so the popover never points at a freed widget
+/// (unparenting one that did crashed GTK).
+pub(crate) fn attach_popover(pop: &impl IsA<gtk::Popover>, parent: &impl IsA<gtk::Widget>) {
+    let pop: gtk::Popover = pop.clone().upcast();
+    pop.set_parent(parent);
+    let weak = pop.downgrade();
+    parent.connect_destroy(move |w| {
+        if let Some(p) = weak.upgrade()
+            && p.parent().as_ref() == Some(w.upcast_ref::<gtk::Widget>())
+        {
+            p.unparent();
+        }
+    });
+    pop.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || {
+            if p.parent().is_some() {
+                p.unparent();
+            }
+        });
+    });
+}
+
 pub fn show_menu(
     parent: &gtk::Widget,
     at: Point,
@@ -1706,12 +1728,10 @@ pub fn show_menu(
         }
         None => popover.set_child(Some(&scroller)),
     }
-    popover.set_parent(parent);
+    attach_popover(&popover, parent);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(at.x as i32, at.y as i32, 1, 1)));
-    popover.connect_closed(|p| {
+    popover.connect_closed(|_| {
         OPEN_MENU.with(|m| m.borrow_mut().take());
-        let p = p.clone();
-        glib::idle_add_local_once(move || p.unparent());
     });
     OPEN_MENU.with(|m| {
         *m.borrow_mut() = Some(OpenMenu {
@@ -2353,5 +2373,30 @@ mod tests {
         );
         assert_eq!(super::named_files(&text), vec![a, b]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A popover whose parent goes while it is open (a sidebar row rebuilt)
+    /// is unparented then, and its closing later touches nothing freed: it
+    /// had crashed GTK in `gtk_widget_unparent` from the idle callback.
+    #[test]
+    #[ignore = "requires a GTK display"]
+    fn a_popover_outlives_its_parent_row_safely() {
+        use gtk::prelude::*;
+        gtk::init().expect("GTK display");
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let row = gtk::Label::new(Some("Category"));
+        list.append(&row);
+        let pop = gtk::Popover::new();
+        super::attach_popover(&pop, &row);
+        assert_eq!(pop.parent().as_ref(), Some(row.upcast_ref::<gtk::Widget>()));
+        // The row goes (only the list held it) while the popover is open.
+        list.remove(&row);
+        drop(row);
+        assert!(pop.parent().is_none(), "unparented with its row");
+        // Closing it later, and the idle after, are harmless.
+        pop.emit_by_name::<()>("closed", &[]);
+        let ctx = gtk::glib::MainContext::default();
+        while ctx.iteration(false) {}
+        assert!(pop.parent().is_none());
     }
 }

@@ -40,7 +40,7 @@ pub fn on_right_click_with(
         let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let popover = gtk::Popover::new();
         popover.set_child(Some(&list));
-        popover.set_parent(&anchor);
+        crate::canvas::attach_popover(&popover, &anchor);
         popover.set_has_arrow(true);
         for (k, (label, action)) in entries.into_iter().enumerate() {
             if k == gap && gap > 0 {
@@ -63,10 +63,6 @@ pub fn on_right_click_with(
             });
             list.append(&b);
         }
-        popover.connect_closed(|p| {
-            let p = p.clone();
-            gtk::glib::idle_add_local_once(move || p.unparent());
-        });
         popover.popup();
     });
     widget.add_controller(click);
