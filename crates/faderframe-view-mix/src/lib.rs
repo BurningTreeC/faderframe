@@ -18,7 +18,7 @@
 use faderframe_core::{PluginInstanceId, TrackId, TrackRole};
 use faderframe_mix_intelligence::bands::format_hz;
 use faderframe_mix_intelligence::{
-    Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject,
+    Category, Chart, ChartSeries, Finding, Grade, SignalPoint, Subject, TimeSpan,
 };
 use faderframe_project::Command;
 use faderframe_session::mix::{Applied, MixOp, MixResults, MixScope, MixStatus};
@@ -31,8 +31,12 @@ use faderframe_ui_canvas::{
 
 const HEADER_H: f32 = 34.0;
 const STATUS_H: f32 = 24.0;
+/// The strip asking for roles.
+const ROLES_H: f32 = 26.0;
 const FILTER_H: f32 = 28.0;
 const ROW_H: f32 = 56.0;
+/// A severity section's heading in the list.
+const TIER_H: f32 = 24.0;
 const FOOTER_H: f32 = 24.0;
 const PAD: f32 = 10.0;
 const LINE: f32 = 16.0;
@@ -63,6 +67,24 @@ pub enum Hit {
     Match,
     Reject,
     Role(TrackId),
+    /// A bus analysed as one part, or its tracks (a switch).
+    Part(TrackId),
+    /// Open the Roles panel (the banner's button).
+    OpenRoles,
+    /// Take the role suggested by a track's name.
+    SuggestedRole(TrackId),
+    /// Take every suggested role (one undo step).
+    AllSuggestedRoles,
+    /// Fold or unfold a section of the list.
+    Tier(SectionKey),
+    /// What the list's sections are made by (cycles).
+    Sections,
+    /// The band map ([`Panel::Map`]).
+    Map,
+    /// A collision drawn on the band map: its finding.
+    MapConflict(u64),
+    /// Open or close a group of findings (same rule, same tracks).
+    Group(u64),
     Levels,
 }
 
@@ -75,6 +97,8 @@ pub enum Panel {
     Roles,
     /// Every track's and the master's levels.
     Levels,
+    /// Where each track sits in frequency and where they collide.
+    Map,
 }
 
 /// The list's order.
@@ -133,6 +157,187 @@ pub struct MixView {
     /// place scrolled out of it is not there).
     visible: Option<Rect>,
     hover: Option<Hit>,
+    /// The header's height as painted last (two rows when narrow).
+    header_h: f32,
+    /// What the list's sections are made by.
+    sections: Sections,
+    /// Sections folded in the list (Info at first).
+    folded: Vec<SectionKey>,
+    /// Groups of findings opened in the list ([`group_key`]).
+    opened: Vec<u64>,
+}
+
+/// What the list's sections are made by ([`Hit::Sections`] cycles them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sections {
+    /// Fix, Consider, Info.
+    Severity,
+    /// A section per track (a finding about two under both).
+    Track,
+    /// A section per category (masking, levels, phase …).
+    Kind,
+}
+
+impl Sections {
+    fn label(self) -> &'static str {
+        match self {
+            Sections::Severity => "By severity",
+            Sections::Track => "By track",
+            Sections::Kind => "By kind",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Sections::Severity => Sections::Track,
+            Sections::Track => Sections::Kind,
+            Sections::Kind => Sections::Severity,
+        }
+    }
+}
+
+/// A section of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SectionKey {
+    Severity(Grade),
+    Track(TrackId),
+    /// Findings about no track (the master, the mix as a whole).
+    Mix,
+    Kind(Category),
+}
+
+/// A line of the findings list.
+enum Row<'a> {
+    /// A section's heading: how many it holds.
+    Tier(SectionKey, usize),
+    /// Findings of one rule about the same tracks (masking in several
+    /// bands, levels of one track …), as one entry.
+    Group(u64, Vec<&'a Finding>),
+    /// A finding (in an opened group: `true`).
+    Finding(&'a Finding, bool),
+}
+
+impl Row<'_> {
+    fn height(&self) -> f32 {
+        match self {
+            Row::Tier(..) => TIER_H,
+            _ => ROW_H,
+        }
+    }
+}
+
+/// What a finding is grouped by: its rule and its tracks.
+fn group_key(f: &Finding) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut tracks = f.tracks.clone();
+    tracks.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    f.rule.hash(&mut h);
+    tracks.hash(&mut h);
+    h.finish()
+}
+
+/// The list's lines for `listed` (in its order): sections made `by`
+/// severity (Fix, Consider, Info), track (in the order they first come;
+/// a finding about two under both) or kind; the `folded` ones as their
+/// heading; findings of one rule about the same tracks as one group, its
+/// findings under it when `opened` or holding the `selected` one.
+fn arrange<'a>(
+    listed: Vec<&'a Finding>,
+    by: Sections,
+    folded: &[SectionKey],
+    opened: &[u64],
+    selected: Option<u64>,
+) -> Vec<Row<'a>> {
+    let mut sections: Vec<(SectionKey, Vec<&Finding>)> = Vec::new();
+    let mut add =
+        |key: SectionKey, f: &'a Finding| match sections.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(f),
+            None => sections.push((key, vec![f])),
+        };
+    match by {
+        Sections::Severity => {
+            for grade in [Grade::High, Grade::Moderate, Grade::Low] {
+                for f in listed
+                    .iter()
+                    .filter(|f| Grade::of_severity(f.severity) == grade)
+                {
+                    add(SectionKey::Severity(grade), f);
+                }
+            }
+        }
+        Sections::Track => {
+            for f in &listed {
+                if f.tracks.is_empty() {
+                    add(SectionKey::Mix, f);
+                }
+                let mut seen = Vec::new();
+                for t in &f.tracks {
+                    if !seen.contains(t) {
+                        seen.push(*t);
+                        add(SectionKey::Track(*t), f);
+                    }
+                }
+            }
+        }
+        Sections::Kind => {
+            for c in Category::ALL {
+                for f in listed.iter().filter(|f| f.category() == c) {
+                    add(SectionKey::Kind(c), f);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (section, tier) in sections {
+        out.push(Row::Tier(section, tier.len()));
+        if folded.contains(&section) {
+            continue;
+        }
+        let mut groups: Vec<(u64, Vec<&Finding>)> = Vec::new();
+        for f in tier {
+            let key = group_key(f);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.push(f),
+                None => groups.push((key, vec![f])),
+            }
+        }
+        for (key, fs) in groups {
+            if fs.len() == 1 {
+                out.push(Row::Finding(fs[0], false));
+                continue;
+            }
+            let open = opened.contains(&key) || fs.iter().any(|f| Some(f.id) == selected);
+            out.push(Row::Group(key, fs.clone()));
+            if open {
+                out.extend(fs.into_iter().map(|f| Row::Finding(f, true)));
+            }
+        }
+    }
+    out
+}
+
+/// The colour of a role's family (drums, low end, in front, the rest,
+/// effects; grey for none), beside track names.
+pub fn role_color(role: Option<TrackRole>) -> Color {
+    use faderframe_core::RoleFamily;
+    match role.map(TrackRole::family) {
+        Some(RoleFamily::DrumKit) => Color::rgba(0.93, 0.58, 0.22, 1.0),
+        Some(RoleFamily::LowEnd) => Color::rgba(0.62, 0.45, 0.92, 1.0),
+        Some(RoleFamily::Foreground) => Color::rgba(0.95, 0.36, 0.42, 1.0),
+        Some(RoleFamily::Accompaniment) => Color::rgba(0.25, 0.72, 0.68, 1.0),
+        Some(RoleFamily::Effects) => Color::rgba(0.55, 0.62, 0.72, 1.0),
+        None => Color::rgba(0.5, 0.5, 0.5, 0.6),
+    }
+}
+
+/// A severity section's name.
+fn tier_label(g: Grade) -> &'static str {
+    match g {
+        Grade::High => "Fix",
+        Grade::Moderate => "Consider",
+        Grade::Low => "Info",
+    }
 }
 
 /// m:ss.s
@@ -183,6 +388,10 @@ impl MixView {
             spots: Vec::new(),
             visible: None,
             hover: None,
+            header_h: HEADER_H,
+            sections: Sections::Severity,
+            folded: vec![SectionKey::Severity(Grade::Low)],
+            opened: Vec::new(),
         }
     }
 
@@ -326,6 +535,20 @@ impl MixView {
         }
     }
 
+    /// The list's lines: the findings [`Self::listed`] gives, in severity
+    /// sections (folded ones as their heading only), those of one rule
+    /// about the same tracks as one group (its findings under it when
+    /// opened, or when it holds the selected one).
+    fn rows<'a>(&self, model: &'a Session) -> Vec<Row<'a>> {
+        arrange(
+            self.listed(model),
+            self.sections,
+            &self.folded,
+            &self.opened,
+            model.mix_selected_id(),
+        )
+    }
+
     /// The findings listed: filtered and sorted.
     fn listed<'a>(&self, model: &'a Session) -> Vec<&'a Finding> {
         let mut v: Vec<&Finding> = model
@@ -446,7 +669,30 @@ impl MixView {
             SignalPoint::Source.describe(),
         );
         let w = 70.0;
-        let rx = (size.w - 2.0 * w - 16.0).max(x + 4.0);
+        // Levels and Roles at the right; on a second row when the first is
+        // full (never past the edge).
+        let wrapped = x + 4.0 + 3.0 * w + 22.0 > size.w;
+        let y = if wrapped {
+            self.header_h = 2.0 * HEADER_H - 10.0;
+            let row = Rect::new(0.0, HEADER_H - 1.0, size.w, self.header_h - HEADER_H + 1.0);
+            p.fill(row, th.ui.surface);
+            p.hline(0.0, size.w, self.header_h - 0.5, th.ui.border);
+            HEADER_H - 4.0
+        } else {
+            self.header_h = HEADER_H;
+            y
+        };
+        let rx = (size.w - 3.0 * w - 22.0).max(8.0);
+        self.button(
+            p,
+            Rect::new(rx, y, w, h),
+            "Map",
+            Hit::Map,
+            self.panel == Panel::Map,
+            model.mix_results().is_some(),
+            "Where each track sits in frequency and where the analysis found them colliding",
+        );
+        let rx = rx + w + 6.0;
         self.button(
             p,
             Rect::new(rx, y, w, h),
@@ -468,9 +714,75 @@ impl MixView {
         );
     }
 
+    /// The audio and instrument tracks analysed, and those of them without
+    /// a role.
+    fn roles_missing(model: &Session) -> (usize, usize) {
+        let tracks: Vec<_> = model
+            .mix_tracks()
+            .into_iter()
+            .filter(|(t, _, _)| {
+                model.project().track(*t).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        faderframe_project::TrackKind::Audio
+                            | faderframe_project::TrackKind::Instrument
+                    )
+                })
+            })
+            .collect();
+        let missing = tracks.iter().filter(|(_, _, r)| r.is_none()).count();
+        (tracks.len(), missing)
+    }
+
+    /// Roles matter: a strip under the status while tracks have none (not
+    /// while the Roles panel is open), with a button to it. Its height.
+    fn paint_roles_banner(
+        &mut self,
+        p: &mut dyn Painter,
+        size: Size,
+        y: f32,
+        model: &Session,
+    ) -> f32 {
+        let (all, missing) = Self::roles_missing(model);
+        if missing == 0 || self.panel == Panel::Roles {
+            return 0.0;
+        }
+        let th = self.theme.clone();
+        let r = Rect::new(0.0, y, size.w, ROLES_H);
+        p.fill(r, th.ui.accent.with_alpha(0.16));
+        p.hline(0.0, size.w, r.bottom() - 0.5, th.ui.border);
+        let bw = 84.0;
+        let text = if missing == all {
+            "No track has a role: every pair is weighed alike and the microphones of a drum \
+             kit are compared with each other."
+                .to_string()
+        } else {
+            format!(
+                "{missing} of {all} tracks have no role: they are weighed neutrally (a kit's \
+                 microphones, a kick against its bass are only told apart by roles)."
+            )
+        };
+        p.text(
+            &text,
+            Rect::new(12.0, r.y, (size.w - bw - 36.0).max(40.0), r.h),
+            &TextStyle::new(th.fonts.small, th.ui.text),
+        );
+        self.button(
+            p,
+            Rect::new(size.w - bw - 12.0, r.y + 3.0, bw, r.h - 6.0),
+            "Set Roles",
+            Hit::OpenRoles,
+            false,
+            true,
+            "Say what each track plays (suggestions from the names are offered, never applied \
+             by themselves)",
+        );
+        ROLES_H
+    }
+
     fn paint_status(&mut self, p: &mut dyn Painter, size: Size, model: &Session) {
         let th = self.theme.clone();
-        let r = Rect::new(0.0, HEADER_H, size.w, STATUS_H);
+        let r = Rect::new(0.0, self.header_h, size.w, STATUS_H);
         p.fill(r, th.ui.surface_alt);
         p.hline(0.0, size.w, r.bottom() - 0.5, th.ui.border);
         let style = TextStyle::new(th.fonts.small, th.ui.text_dim);
@@ -561,6 +873,325 @@ impl MixView {
         );
     }
 
+    /// Where the project's sections start inside the analysed range
+    /// (seconds from its start).
+    fn section_starts(model: &Session, res: &MixResults) -> Vec<f64> {
+        let p = model.project();
+        let rate = f64::from(res.rate.max(1));
+        let total = res.seconds();
+        p.sections
+            .iter()
+            .map(|sec| (p.timeline.to_samples(sec.start, rate) - res.start_sample) as f64 / rate)
+            .filter(|t| *t > 0.0 && *t < total)
+            .collect()
+    }
+
+    /// A thin strip across a list entry: the analysed range, the song's
+    /// sections as ticks, and where the finding(s) happen in `color`.
+    fn paint_time_strip(
+        &self,
+        p: &mut dyn Painter,
+        r: Rect,
+        spans: &[TimeSpan],
+        color: Color,
+        model: &Session,
+    ) {
+        let Some(res) = model.mix_results() else {
+            return;
+        };
+        let total = res.seconds();
+        if total <= 0.0 || spans.is_empty() || r.w < 20.0 {
+            return;
+        }
+        let th = &self.theme;
+        p.fill(r, th.ui.text.with_alpha(0.07));
+        let x_of = |t: f64| r.x + (t / total).clamp(0.0, 1.0) as f32 * r.w;
+        for t in Self::section_starts(model, res) {
+            p.vline(x_of(t), r.y - 1.0, r.bottom() + 1.0, th.ui.text_faint);
+        }
+        for s in spans {
+            let (a, b) = (x_of(s.start), x_of(s.end));
+            p.fill(Rect::new(a, r.y, (b - a).max(2.0), r.h), color);
+        }
+    }
+
+    /// Where a finding happens: its events, else its time.
+    fn spans_of(f: &Finding) -> Vec<TimeSpan> {
+        if f.events.is_empty() {
+            f.time.into_iter().collect()
+        } else {
+            f.events.clone()
+        }
+    }
+
+    /// A section's heading: its name (a track's with its role), how many,
+    /// folded or not; its stripe the severity's or the role's colour.
+    fn paint_tier_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        key: SectionKey,
+        n: usize,
+        model: &Session,
+    ) {
+        let th = self.theme.clone();
+        let folded = self.folded.contains(&key);
+        p.fill(r, th.ui.surface_alt);
+        let (label, stripe) = match key {
+            SectionKey::Severity(g) => (tier_label(g).to_string(), self.grade_color(g)),
+            SectionKey::Track(t) => {
+                let role = model.project().track(t).and_then(|x| x.role);
+                (
+                    format!(
+                        "{} · {}",
+                        model.mix_track_name(t),
+                        role.map_or("no role", TrackRole::short)
+                    ),
+                    role_color(role),
+                )
+            }
+            SectionKey::Mix => ("The mix".to_string(), th.ui.text_faint),
+            SectionKey::Kind(c) => (c.label().to_string(), th.ui.text_faint),
+        };
+        p.fill(Rect::new(r.x, r.y + 5.0, 3.0, r.h - 10.0), stripe);
+        p.text(
+            &format!("{} {label} · {n}", if folded { "▸" } else { "▾" }),
+            Rect::new(r.x + 12.0, r.y, r.w - 20.0, r.h),
+            &TextStyle::new(th.fonts.small, th.ui.text).bold(),
+        );
+        p.hline(r.x, r.right(), r.bottom() - 0.5, th.ui.border);
+        self.register(Spot {
+            hit: Hit::Tier(key),
+            rect: r,
+            enabled: true,
+            label: format!("{label}, {n} findings"),
+            tip: if folded {
+                "Show these findings".into()
+            } else {
+                "Fold these findings away".into()
+            },
+            on: !folded,
+        });
+    }
+
+    /// Findings of one rule about the same tracks as one entry: the
+    /// tracks, the rule, the ranges or times, the worst severity.
+    fn paint_group_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        key: u64,
+        fs: &[&Finding],
+        model: &Session,
+    ) {
+        let th = self.theme.clone();
+        let name = Self::name(model);
+        let first = fs[0];
+        let open =
+            self.opened.contains(&key) || fs.iter().any(|f| Some(f.id) == model.mix_selected_id());
+        if self.hover == Some(Hit::Group(key)) {
+            p.fill(r, th.ui.text.with_alpha(0.05));
+        }
+        let worst = fs.iter().map(|f| f.severity).fold(0.0, f64::max);
+        p.fill(
+            Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
+            self.grade_color(Grade::of_severity(worst)),
+        );
+        let tracks: Vec<String> = first.tracks.iter().map(|t| name(*t)).collect();
+        let who = if tracks.is_empty() {
+            "The mix".to_string()
+        } else {
+            tracks.join(" × ")
+        };
+        let (tx, tw) = (r.x + 12.0, r.w - 20.0);
+        p.text(
+            &format!("{} {who}", if open { "▾" } else { "▸" }),
+            Rect::new(tx, r.y + 4.0, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text).bold(),
+        );
+        let ranges: Vec<String> = fs
+            .iter()
+            .filter_map(|f| f.frequency.map(|fr| fr.label()))
+            .collect();
+        let what = if ranges.is_empty() {
+            format!("{} times", fs.len())
+        } else {
+            ranges.join(", ")
+        };
+        p.text(
+            &format!("{}: {what}", first.rule.name()),
+            Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text_dim),
+        );
+        p.text(
+            &format!(
+                "{} findings · worst severity {}",
+                fs.len(),
+                Grade::of_severity(worst).label()
+            ),
+            Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        // When in the song, all of them.
+        let spans: Vec<TimeSpan> = fs.iter().flat_map(|f| Self::spans_of(f)).collect();
+        self.paint_time_strip(
+            p,
+            Rect::new(tx, r.bottom() - 5.0, tw, 2.5),
+            &spans,
+            self.grade_color(Grade::of_severity(worst)).with_alpha(0.9),
+            model,
+        );
+        p.hline(
+            r.x,
+            r.right(),
+            r.bottom() - 0.5,
+            th.ui.border.with_alpha(0.5),
+        );
+        self.register(Spot {
+            hit: Hit::Group(key),
+            rect: r,
+            enabled: true,
+            label: format!("{who}, {} findings of {}", fs.len(), first.rule.name()),
+            tip: if open {
+                "Fold them into one entry".into()
+            } else {
+                "Show them one by one".into()
+            },
+            on: open,
+        });
+    }
+
+    /// One finding's line in the list at `r` (indented in an opened group).
+    fn paint_finding_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        f: &Finding,
+        nested: bool,
+        model: &Session,
+    ) {
+        let th = self.theme.clone();
+        let selected = model.mix_selected_id();
+        let name = Self::name(model);
+        let device = Self::device(model);
+        let r = if nested {
+            Rect::new(r.x + 14.0, r.y, (r.w - 14.0).max(0.0), r.h)
+        } else {
+            r
+        };
+        let dismissed = model.mix_dismissed(f.id);
+        let applied = model.mix_applied_state(f.id);
+        let stale = model.mix_finding_stale(f.id) && applied.is_none();
+        if selected == Some(f.id) {
+            p.fill(r, th.ui.selection.with_alpha(0.35));
+        } else if self.hover == Some(Hit::Row(f.id)) {
+            p.fill(r, th.ui.text.with_alpha(0.05));
+        }
+        let sev = Grade::of_severity(f.severity);
+        p.fill(
+            Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
+            self.grade_color(sev),
+        );
+        let ink = if dismissed || stale || applied == Some(Applied::Resolved) {
+            th.ui.text_faint
+        } else {
+            th.ui.text
+        };
+        let tx = r.x + 12.0;
+        let tw = r.w - 20.0;
+        // Room for the applied badge on the right.
+        let title_w = if applied.is_some() { tw - 76.0 } else { tw };
+        p.text(
+            &f.title_named(&name, &device),
+            Rect::new(tx, r.y + 4.0, title_w.max(0.0), LINE),
+            &TextStyle::new(th.fonts.small, ink).bold(),
+        );
+        let mut second = Vec::new();
+        let names: Vec<String> = f.tracks.iter().map(|t| name(*t)).collect();
+        if !names.is_empty() {
+            second.push(names.join(", "));
+        }
+        if let (Some(t), Some(res)) = (f.time, model.mix_results()) {
+            second.push(Self::span_text(model, res, t.start, t.end));
+        }
+        if let Some(fr) = f.frequency {
+            second.push(fr.label());
+        }
+        p.text(
+            &second.join(" · "),
+            Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text_dim),
+        );
+        let n = f
+            .recommendations
+            .iter()
+            .filter(|r| r.experiment.previewable() || r.experiment.hand_off().is_some())
+            .count();
+        let pattern = f
+            .pattern
+            .map(|p| format!(" · {}", p.label()))
+            .unwrap_or_default();
+        let sections = if f.sections.is_empty() {
+            String::new()
+        } else {
+            format!(" · in {}", f.sections.join(", "))
+        };
+        p.text(
+            &format!(
+                "Severity {} · Confidence {} · {} experiment{}{pattern}{sections}{}",
+                sev.label(),
+                Grade::of_confidence(f.confidence).label(),
+                n,
+                if n == 1 { "" } else { "s" },
+                match (dismissed, stale) {
+                    (true, _) => " · dismissed",
+                    (_, true) => " · stale",
+                    _ => "",
+                }
+            ),
+            Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        // When in the song.
+        self.paint_time_strip(
+            p,
+            Rect::new(tx, r.bottom() - 5.0, tw, 2.5),
+            &Self::spans_of(f),
+            self.grade_color(sev).with_alpha(0.9),
+            model,
+        );
+        if let Some(state) = applied {
+            let badge = Self::applied_badge(state);
+            let style = TextStyle::new(th.fonts.tiny, th.ui.accent).center();
+            let bw = p.text_width(badge, &style) + 12.0;
+            let b = Rect::new(r.right() - bw - 8.0, r.y + 5.0, bw, 15.0);
+            p.fill_rounded(b, 3.0, &th.ui.accent.with_alpha(0.18).into());
+            p.text(badge, b, &style);
+        }
+        p.hline(
+            r.x,
+            r.right(),
+            r.bottom() - 0.5,
+            th.ui.border.with_alpha(0.5),
+        );
+        self.register(Spot {
+            hit: Hit::Row(f.id),
+            rect: r,
+            enabled: true,
+            label: format!(
+                "{}, severity {}{}{}",
+                f.title_named(&name, &device),
+                sev.label().to_lowercase(),
+                if stale { ", stale" } else { "" },
+                applied
+                    .map(|a| format!(", {}", Self::applied_badge(a).to_lowercase()))
+                    .unwrap_or_default()
+            ),
+            tip: f.explanation_named(&name, &device),
+            on: selected == Some(f.id),
+        });
+    }
+
     fn paint_list(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
         let th = self.theme.clone();
         p.fill(rect, th.ui.background);
@@ -608,6 +1239,17 @@ impl MixView {
             true,
             "Order the list by relevance, time or track",
         );
+        x = self.button_at(
+            p,
+            x,
+            y,
+            h,
+            self.sections.label(),
+            Hit::Sections,
+            false,
+            true,
+            "Make the list's sections by severity, track or kind",
+        );
         let track = self
             .track
             .map_or_else(|| "All tracks".to_string(), |t| model.mix_track_name(t));
@@ -632,8 +1274,8 @@ impl MixView {
             (rect.h - FILTER_H - if footer { FOOTER_H } else { 0.0 }).max(0.0),
         );
         self.list = list;
-        let rows = self.listed(model);
-        self.list_content = rows.len() as f32 * ROW_H;
+        let rows = self.rows(model);
+        self.list_content = rows.iter().map(Row::height).sum();
         self.list_scroll = self
             .list_scroll
             .clamp(0.0, (self.list_content - list.h).max(0.0));
@@ -662,117 +1304,18 @@ impl MixView {
                 y += LINE;
             }
         }
-        let selected = model.mix_selected_id();
-        let name = Self::name(model);
-        let device = Self::device(model);
-        for (i, f) in rows.iter().enumerate() {
-            let r = Rect::new(
-                list.x,
-                list.y + i as f32 * ROW_H - self.list_scroll,
-                list.w,
-                ROW_H,
-            );
+        let mut y = list.y - self.list_scroll;
+        for row in &rows {
+            let r = Rect::new(list.x, y, list.w, row.height());
+            y += row.height();
             if r.bottom() < list.y || r.y > list.bottom() {
                 continue;
             }
-            let dismissed = model.mix_dismissed(f.id);
-            let applied = model.mix_applied_state(f.id);
-            let stale = model.mix_finding_stale(f.id) && applied.is_none();
-            if selected == Some(f.id) {
-                p.fill(r, th.ui.selection.with_alpha(0.35));
-            } else if self.hover == Some(Hit::Row(f.id)) {
-                p.fill(r, th.ui.text.with_alpha(0.05));
+            match row {
+                Row::Tier(key, n) => self.paint_tier_row(p, r, *key, *n, model),
+                Row::Group(key, fs) => self.paint_group_row(p, r, *key, fs, model),
+                Row::Finding(f, nested) => self.paint_finding_row(p, r, f, *nested, model),
             }
-            let sev = Grade::of_severity(f.severity);
-            p.fill(
-                Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
-                self.grade_color(sev),
-            );
-            let ink = if dismissed || stale || applied == Some(Applied::Resolved) {
-                th.ui.text_faint
-            } else {
-                th.ui.text
-            };
-            let tx = r.x + 12.0;
-            let tw = r.w - 20.0;
-            // Room for the applied badge on the right.
-            let title_w = if applied.is_some() { tw - 76.0 } else { tw };
-            p.text(
-                &f.title_named(&name, &device),
-                Rect::new(tx, r.y + 4.0, title_w.max(0.0), LINE),
-                &TextStyle::new(th.fonts.small, ink).bold(),
-            );
-            let mut second = Vec::new();
-            let names: Vec<String> = f.tracks.iter().map(|t| name(*t)).collect();
-            if !names.is_empty() {
-                second.push(names.join(", "));
-            }
-            if let (Some(t), Some(res)) = (f.time, model.mix_results()) {
-                second.push(Self::span_text(model, res, t.start, t.end));
-            }
-            if let Some(fr) = f.frequency {
-                second.push(fr.label());
-            }
-            p.text(
-                &second.join(" · "),
-                Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
-                &TextStyle::new(th.fonts.small, th.ui.text_dim),
-            );
-            let n = f
-                .recommendations
-                .iter()
-                .filter(|r| r.experiment.previewable() || r.experiment.hand_off().is_some())
-                .count();
-            let pattern = f
-                .pattern
-                .map(|p| format!(" · {}", p.label()))
-                .unwrap_or_default();
-            p.text(
-                &format!(
-                    "Severity {} · Confidence {} · {} experiment{}{pattern}{}",
-                    sev.label(),
-                    Grade::of_confidence(f.confidence).label(),
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    match (dismissed, stale) {
-                        (true, _) => " · dismissed",
-                        (_, true) => " · stale",
-                        _ => "",
-                    }
-                ),
-                Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
-                &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
-            );
-            if let Some(state) = applied {
-                let badge = Self::applied_badge(state);
-                let style = TextStyle::new(th.fonts.tiny, th.ui.accent).center();
-                let bw = p.text_width(badge, &style) + 12.0;
-                let b = Rect::new(r.right() - bw - 8.0, r.y + 5.0, bw, 15.0);
-                p.fill_rounded(b, 3.0, &th.ui.accent.with_alpha(0.18).into());
-                p.text(badge, b, &style);
-            }
-            p.hline(
-                r.x,
-                r.right(),
-                r.bottom() - 0.5,
-                th.ui.border.with_alpha(0.5),
-            );
-            self.register(Spot {
-                hit: Hit::Row(f.id),
-                rect: r,
-                enabled: true,
-                label: format!(
-                    "{}, severity {}{}{}",
-                    f.title_named(&name, &device),
-                    sev.label().to_lowercase(),
-                    if stale { ", stale" } else { "" },
-                    applied
-                        .map(|a| format!(", {}", Self::applied_badge(a).to_lowercase()))
-                        .unwrap_or_default()
-                ),
-                tip: f.explanation_named(&name, &device),
-                on: selected == Some(f.id),
-            });
         }
         p.pop_clip();
         self.visible = None;
@@ -1244,6 +1787,39 @@ impl MixView {
             th.fonts.normal,
             th.ui.text,
         );
+        // Its tracks with their roles (a click sets one; "?" none yet).
+        if !f.tracks.is_empty() {
+            let mut bx = x;
+            y += 2.0;
+            for t in &f.tracks {
+                let role = model.project().track(*t).and_then(|t| t.role);
+                let label = match role {
+                    Some(r) => format!("{} · {}", name(*t), r.short()),
+                    None => format!("{} · ? role", name(*t)),
+                };
+                if bx > x && bx + 120.0 > x + w {
+                    bx = x;
+                    y += 24.0;
+                }
+                p.circle(Point::new(bx + 4.0, y + 10.0), 3.5, role_color(role));
+                bx = self.button_at(
+                    p,
+                    bx + 11.0,
+                    y,
+                    20.0,
+                    &label,
+                    Hit::Role(*t),
+                    role.is_some(),
+                    true,
+                    if role.is_some() {
+                        "Its role: the analysis weighs the pair by it (click to change)"
+                    } else {
+                        "No role: weighed neutrally — click to say what it plays"
+                    },
+                );
+            }
+            y += 26.0;
+        }
         let applied_state = model.mix_applied_state(f.id);
         if model.mix_finding_stale(f.id) && applied_state.is_none() {
             y = self.para(
@@ -1709,6 +2285,200 @@ impl MixView {
             .clamp(0.0, (self.detail_content - rect.h).max(0.0));
     }
 
+    /// The band map: a row per analysed track (its role beside its name),
+    /// shaded where it has most of its energy (its own long-term spectrum,
+    /// its loudest band darkest), and every masking finding drawn where it
+    /// is — outlined on both tracks' rows, joined — to click for its
+    /// details.
+    fn paint_map(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
+        let th = self.theme.clone();
+        p.fill(rect, th.ui.background);
+        self.detail = rect;
+        let Some(res) = model.mix_results() else {
+            return;
+        };
+        let name = Self::name(model);
+        let (lo_hz, hi_hz) = (20.0f64, 20_000.0f64);
+        let label_w = 128.0f32.min(rect.w * 0.35);
+        let (px0, px1) = (rect.x + PAD + label_w, rect.right() - PAD);
+        let pw = (px1 - px0).max(10.0);
+        let x_of = |hz: f64| {
+            let u = ((hz.clamp(lo_hz, hi_hz) / lo_hz).ln() / (hi_hz / lo_hz).ln()) as f32;
+            px0 + u * pw
+        };
+        p.push_clip(rect);
+        self.visible = Some(rect);
+        let mut y = rect.y + PAD - self.detail_scroll;
+        y = self.para(
+            p,
+            rect.x + PAD,
+            y,
+            rect.w - 2.0 * PAD,
+            "Where each track sits in frequency (shaded where it has most of its energy) and \
+             where the analysis found two colliding (outlined on both, joined). Click a \
+             collision for its details.",
+            th.fonts.small,
+            th.ui.text_dim,
+        );
+        // The frequency axis.
+        let axis_y = y + 2.0;
+        for hz in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0] {
+            let x = x_of(hz);
+            let label = if hz >= 1000.0 {
+                format!("{}k", hz / 1000.0)
+            } else {
+                format!("{hz}")
+            };
+            p.text(
+                &label,
+                Rect::new(x - 20.0, axis_y, 40.0, LINE),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint).center(),
+            );
+        }
+        y = axis_y + LINE + 2.0;
+        // The tracks with a spectrum (the master left out).
+        let rows: Vec<(TrackId, &faderframe_mix_intelligence::Summary)> = res
+            .tracks
+            .iter()
+            .filter_map(|t| {
+                res.report
+                    .summaries
+                    .iter()
+                    .find(|s| s.subject == Subject::Track(*t) && !s.spectrum.is_empty())
+                    .map(|s| (*t, s))
+            })
+            .collect();
+        const MAP_ROW: f32 = 20.0;
+        let top = y;
+        for hz in [100.0, 1000.0, 10_000.0] {
+            p.vline(
+                x_of(hz),
+                top,
+                top + rows.len() as f32 * MAP_ROW,
+                th.ui.border.with_alpha(0.5),
+            );
+        }
+        for (i, (t, sum)) in rows.iter().enumerate() {
+            let ry = top + i as f32 * MAP_ROW;
+            let role = model.project().track(*t).and_then(|x| x.role);
+            p.circle(
+                Point::new(rect.x + PAD + 4.0, ry + MAP_ROW * 0.5),
+                3.5,
+                role_color(role),
+            );
+            p.text(
+                &name(*t),
+                Rect::new(rect.x + PAD + 12.0, ry, label_w - 56.0, MAP_ROW),
+                &TextStyle::new(th.fonts.small, th.ui.text),
+            );
+            p.text(
+                role.map_or("?", TrackRole::short),
+                Rect::new(rect.x + PAD + label_w - 44.0, ry, 40.0, MAP_ROW),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+            );
+            // Shade: within 36 dB of its own loudest band.
+            let top_db = sum
+                .spectrum
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let n = sum.centres.len();
+            for (k, (c, db)) in sum.centres.iter().zip(&sum.spectrum).enumerate() {
+                if *c < lo_hz || *c > hi_hz || !db.is_finite() {
+                    continue;
+                }
+                let edge = |j: usize| (sum.centres[j] * *c).sqrt();
+                let a = if k == 0 { *c / 1.12 } else { edge(k - 1) };
+                let b = if k + 1 >= n { *c * 1.12 } else { edge(k + 1) };
+                let t = ((db - (top_db - 36.0)) / 36.0).clamp(0.0, 1.0) as f32;
+                if t <= 0.02 {
+                    continue;
+                }
+                let (xa, xb) = (x_of(a), x_of(b));
+                p.fill(
+                    Rect::new(xa, ry + 3.0, (xb - xa).max(1.0), MAP_ROW - 6.0),
+                    th.ui.accent.with_alpha(0.12 + 0.6 * t * t),
+                );
+            }
+            p.hline(px0, px1, ry + MAP_ROW - 0.5, th.ui.border.with_alpha(0.4));
+        }
+        // The collisions.
+        let row_of = |t: TrackId| rows.iter().position(|(x, _)| *x == t);
+        for f in model.mix_findings() {
+            if f.rule != faderframe_mix_intelligence::RuleId::SpectralMasking
+                || model.mix_dismissed(f.id)
+            {
+                continue;
+            }
+            let Some(fr) = f.frequency else { continue };
+            let found: Vec<usize> = f.tracks.iter().filter_map(|t| row_of(*t)).collect();
+            if found.len() < 2 {
+                continue;
+            }
+            let (xa, xb) = (x_of(fr.lo), x_of(fr.hi));
+            let color = self.grade_color(Grade::of_severity(f.severity));
+            let lit =
+                self.hover == Some(Hit::MapConflict(f.id)) || model.mix_selected_id() == Some(f.id);
+            let (r0, r1) = (
+                *found.iter().min().unwrap_or(&0),
+                *found.iter().max().unwrap_or(&0),
+            );
+            for i in &found {
+                let box_ = Rect::new(
+                    xa,
+                    top + *i as f32 * MAP_ROW + 2.0,
+                    (xb - xa).max(3.0),
+                    MAP_ROW - 4.0,
+                );
+                p.fill_rounded(
+                    box_,
+                    2.0,
+                    &color.with_alpha(if lit { 0.35 } else { 0.18 }).into(),
+                );
+                p.stroke_rounded(box_, 2.0, if lit { 2.0 } else { 1.0 }, color);
+            }
+            let cx = (xa + xb) * 0.5;
+            p.vline(
+                cx,
+                top + r0 as f32 * MAP_ROW + MAP_ROW - 2.0,
+                top + r1 as f32 * MAP_ROW + 2.0,
+                color,
+            );
+            self.register(Spot {
+                hit: Hit::MapConflict(f.id),
+                rect: Rect::new(
+                    xa - 2.0,
+                    top + r0 as f32 * MAP_ROW,
+                    (xb - xa).max(3.0) + 4.0,
+                    (r1 - r0 + 1) as f32 * MAP_ROW,
+                ),
+                enabled: true,
+                label: f.title_named(&name, &Self::device(model)),
+                tip: format!(
+                    "{} · severity {}",
+                    f.title_named(&name, &Self::device(model)),
+                    Grade::of_severity(f.severity).label().to_lowercase()
+                ),
+                on: lit,
+            });
+        }
+        y = top + rows.len() as f32 * MAP_ROW + 6.0;
+        if rows.is_empty() {
+            y = self.para(
+                p,
+                rect.x + PAD,
+                y,
+                rect.w - 2.0 * PAD,
+                "No track's spectrum was measured.",
+                th.fonts.small,
+                th.ui.text_dim,
+            );
+        }
+        p.pop_clip();
+        self.visible = None;
+        self.detail_content = y + self.detail_scroll - rect.y + PAD;
+    }
+
     fn paint_roles(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
         let th = self.theme.clone();
         p.fill(rect, th.ui.background);
@@ -1724,28 +2494,101 @@ impl MixView {
             w,
             "What each track plays. The analysis weighs pairs by roles (a lead vocal over its \
              accompaniment, a kick against its bass; parts of one drum kit are not compared). \
-             Track names are never read as roles; tracks without one are analysed neutrally.",
+             Ignore leaves a track out of the analysis (a click, a guide, a bed meant to \
+             cover the rest); it still plays in the mix and in the master's measurements. \
+             Track names are never read as roles by themselves: what they suggest is offered \
+             beside them (a click takes it). Tracks without one are analysed neutrally. \
+             A bus marked One Part (doubled guitars, stacked vocals) is compared with the rest \
+             in their place, and its EQ goes there; its tracks are not compared, nor with each \
+             other.",
             th.fonts.small,
             th.ui.text_dim,
         );
         y += 6.0;
-        for (t, name, role) in model.mix_tracks() {
-            let r = Rect::new(x, y, w, 24.0);
-            p.text(
-                &name,
-                Rect::new(x, y, w * 0.5, 24.0),
-                &TextStyle::new(th.fonts.small, th.ui.text),
-            );
-            let label = role.map_or("No role", TrackRole::label);
+        // Suggestions from the names: offered, taken only by a click.
+        let suggested: Vec<(TrackId, TrackRole)> = model
+            .mix_tracks()
+            .into_iter()
+            .filter(|(_, _, r)| r.is_none())
+            .filter_map(|(t, n, _)| TrackRole::suggest(&n).map(|r| (t, r)))
+            .collect();
+        if !suggested.is_empty() {
             self.button(
                 p,
-                Rect::new(x + w * 0.5, y + 2.0, w * 0.5, 20.0),
+                Rect::new(x, y, w.min(320.0), 22.0),
+                &format!(
+                    "Take the {} Suggested Role{} (from the names)",
+                    suggested.len(),
+                    if suggested.len() == 1 { "" } else { "s" }
+                ),
+                Hit::AllSuggestedRoles,
+                false,
+                true,
+                "Each suggestion is shown beside its track; this takes them all, one undo step",
+            );
+            y += 30.0;
+        }
+        for (t, name, role) in model.mix_tracks() {
+            let r = Rect::new(x, y, w, 24.0);
+            // Left out on purpose: faint, and said so.
+            let ignored = TrackRole::ignored(role);
+            p.circle(Point::new(x + 4.0, y + 12.0), 3.5, role_color(role));
+            p.text(
+                &if ignored {
+                    format!("{name} · not analysed")
+                } else {
+                    name.clone()
+                },
+                Rect::new(x + 12.0, y, w * 0.5 - 12.0, 24.0),
+                &TextStyle::new(
+                    th.fonts.small,
+                    if ignored {
+                        th.ui.text_faint
+                    } else {
+                        th.ui.text
+                    },
+                ),
+            );
+            let label = role.map_or("No role", TrackRole::label);
+            // A suggestion beside the name of a track without a role.
+            if let Some((_, r)) = suggested.iter().find(|(s, _)| *s == t) {
+                self.button(
+                    p,
+                    Rect::new(x + w * 0.5 - 92.0, y + 2.0, 86.0, 20.0),
+                    &format!("{}?", r.short()),
+                    Hit::SuggestedRole(t),
+                    false,
+                    true,
+                    format!("Its name suggests {}: click to take it", r.label()),
+                );
+            }
+            let bus = model
+                .project()
+                .track(t)
+                .filter(|t| t.kind == faderframe_project::TrackKind::Bus);
+            // A bus: its role, and the One Part switch beside it.
+            let role_w = if bus.is_some() { w * 0.3 } else { w * 0.5 };
+            self.button(
+                p,
+                Rect::new(x + w * 0.5, y + 2.0, role_w, 20.0),
                 label,
                 Hit::Role(t),
                 role.is_some(),
                 true,
                 "Choose what the track plays",
             );
+            if let Some(b) = bus {
+                self.button(
+                    p,
+                    Rect::new(x + w * 0.8 + 4.0, y + 2.0, w * 0.2 - 4.0, 20.0),
+                    "One Part",
+                    Hit::Part(t),
+                    b.mix_part,
+                    true,
+                    "Analyse the bus as one part: in masking it stands for the tracks it sums \
+                     (doubled guitars, stacked vocals), and their EQ goes on it",
+                );
+            }
             p.hline(r.x, r.right(), r.bottom(), th.ui.border.with_alpha(0.4));
             y += 26.0;
         }
@@ -2173,11 +3016,17 @@ impl MixView {
                 self.signal = s;
                 cx.redraw();
             }
-            Hit::Roles | Hit::Levels => {
-                let want = if hit == Hit::Roles {
-                    Panel::Roles
-                } else {
-                    Panel::Levels
+            Hit::MapConflict(id) => {
+                self.detail_scroll = 0.0;
+                self.panel = Panel::Details;
+                cx.emit(Action::Mix(MixOp::Select(Some(id))));
+                cx.emit(Action::Mix(MixOp::Show(id)));
+            }
+            Hit::Roles | Hit::Levels | Hit::Map => {
+                let want = match hit {
+                    Hit::Roles => Panel::Roles,
+                    Hit::Map => Panel::Map,
+                    _ => Panel::Levels,
                 };
                 self.panel = if self.panel == want {
                     Panel::Details
@@ -2248,6 +3097,81 @@ impl MixView {
                 cx.emit(Action::Mix(MixOp::LoudnessMatch(!on)));
             }
             Hit::Reject => cx.emit(Action::Mix(MixOp::Reject)),
+            Hit::Tier(key) => {
+                match self.folded.iter().position(|g| *g == key) {
+                    Some(i) => {
+                        self.folded.remove(i);
+                    }
+                    None => self.folded.push(key),
+                }
+                cx.redraw();
+            }
+            Hit::Sections => {
+                self.sections = self.sections.next();
+                self.list_scroll = 0.0;
+                cx.redraw();
+            }
+            Hit::Group(key) => {
+                // Open while it holds the selection: closing it lets go of
+                // that too.
+                let holds = model.mix_selected().is_some_and(|f| group_key(f) == key);
+                match self.opened.iter().position(|k| *k == key) {
+                    Some(i) => {
+                        self.opened.remove(i);
+                        if holds {
+                            cx.emit(Action::Mix(MixOp::Select(None)));
+                        }
+                    }
+                    None if holds => cx.emit(Action::Mix(MixOp::Select(None))),
+                    None => self.opened.push(key),
+                }
+                cx.redraw();
+            }
+            Hit::OpenRoles => {
+                self.panel = Panel::Roles;
+                self.detail_scroll = 0.0;
+                cx.redraw();
+            }
+            Hit::SuggestedRole(t) => {
+                if let Some(role) = model
+                    .project()
+                    .track(t)
+                    .and_then(|x| TrackRole::suggest(&x.name))
+                {
+                    cx.emit(Action::Edit(faderframe_project::Command::SetTrackRole {
+                        track: t,
+                        role: Some(role),
+                    }));
+                }
+            }
+            Hit::AllSuggestedRoles => {
+                let commands: Vec<faderframe_project::Command> = model
+                    .mix_tracks()
+                    .into_iter()
+                    .filter(|(_, _, r)| r.is_none())
+                    .filter_map(|(t, n, _)| {
+                        TrackRole::suggest(&n).map(|role| {
+                            faderframe_project::Command::SetTrackRole {
+                                track: t,
+                                role: Some(role),
+                            }
+                        })
+                    })
+                    .collect();
+                if !commands.is_empty() {
+                    cx.emit(Action::Edit(faderframe_project::Command::Batch {
+                        label: "Set Suggested Roles".into(),
+                        commands,
+                    }));
+                }
+            }
+            Hit::Part(t) => {
+                let on = model.project().track(t).is_some_and(|t| t.mix_part);
+                cx.emit(Action::Edit(faderframe_project::Command::SetTrackMixPart {
+                    track: t,
+                    on: !on,
+                }));
+            }
             Hit::Role(t) => {
                 let now = model.project().track(t).and_then(|t| t.role);
                 cx.request(HostRequest::ContextMenu {
@@ -2266,7 +3190,8 @@ impl CanvasView<Session, Action> for MixView {
         p.fill(Rect::from_size(size), theme.ui.background);
         self.paint_header(p, size, model);
         self.paint_status(p, size, model);
-        let top = HEADER_H + STATUS_H;
+        let mut top = self.header_h + STATUS_H;
+        top += self.paint_roles_banner(p, size, top, model);
         let body = Rect::new(0.0, top, size.w, (size.h - top).max(0.0));
         let split = (size.w * 0.42).clamp(240.0_f32.min(size.w), (size.w - 260.0).max(240.0));
         let list = Rect::new(0.0, body.y, split, body.h);
@@ -2281,6 +3206,11 @@ impl CanvasView<Session, Action> for MixView {
         match self.panel {
             Panel::Roles => self.paint_roles(p, detail, model),
             Panel::Levels => self.paint_levels(p, detail, model),
+            Panel::Map => self.paint_map(p, detail, model),
+            // Nothing selected after an analysis: the map is the overview.
+            Panel::Details if model.mix_selected().is_none() && model.mix_results().is_some() => {
+                self.paint_map(p, detail, model)
+            }
             Panel::Details => self.paint_details(p, detail, model),
         }
     }

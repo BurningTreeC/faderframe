@@ -467,7 +467,9 @@ impl RuleId {
                  track's.",
                 "A track is not compared with a bus or return it reaches (that carries the \
                  track itself, or its effect); a bus summing other tracks is not compared \
-                 either — its tracks are.",
+                 either — its tracks are — unless it is marked One Part (Roles): then the \
+                 bus is compared in their place and its tracks are not, nor with each \
+                 other (doubled guitars, stacked vocals).",
                 "Phase interaction between the tracks is not measured.",
             ],
             RuleId::MasterTruePeak => &[

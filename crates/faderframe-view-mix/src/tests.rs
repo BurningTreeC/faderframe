@@ -614,3 +614,326 @@ fn an_applied_experiment_shows_its_undo() {
     assert!(view.rect_of(Hit::Undo(step)).is_none(), "taken back");
     assert!(view.rect_of(Hit::Apply(f.id, i)).is_some());
 }
+
+/// Roles matter, and say so: while tracks have none a strip asks for them
+/// (its button opens the Roles panel); there the names' suggestions are
+/// offered — one by one or all as one step, never taken by themselves;
+/// with every role set the strip is gone.
+#[test]
+fn missing_roles_are_asked_for_and_suggested_from_the_names() {
+    let (mut s, vocal, keys) = session();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts()
+            .iter()
+            .any(|t| t.starts_with("No track has a role")),
+        "{:?}",
+        p.texts()
+    );
+    let _ = click(&mut view, &s, Hit::OpenRoles);
+    let p = paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::OpenRoles).is_none(),
+        "not over the Roles panel"
+    );
+    // "Vocal" and "Keys" suggest roles; nothing is set by itself.
+    assert!(
+        p.texts().contains(&"Lead Vocal?") && p.texts().contains(&"Keys?"),
+        "{:?}",
+        p.texts()
+    );
+    assert_eq!(s.project().track(vocal).unwrap().role, None);
+    let (a, _) = click(&mut view, &s, Hit::SuggestedRole(vocal));
+    assert_eq!(
+        a,
+        [Action::Edit(Command::SetTrackRole {
+            track: vocal,
+            role: Some(TrackRole::LeadVocal)
+        })]
+    );
+    let (a, _) = click(&mut view, &s, Hit::AllSuggestedRoles);
+    let steps = s.history_steps().0.len();
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+    assert_eq!(
+        s.project().track(vocal).unwrap().role,
+        Some(TrackRole::LeadVocal)
+    );
+    assert_eq!(s.project().track(keys).unwrap().role, Some(TrackRole::Keys));
+    // Every role set: no strip, even off the Roles panel.
+    let _ = click(&mut view, &s, Hit::Roles);
+    let p = paint(&mut view, &s);
+    assert!(view.rect_of(Hit::OpenRoles).is_none());
+    assert!(
+        !p.texts()
+            .iter()
+            .any(|t| t.contains("no role") || t.contains("No track has a role"))
+    );
+}
+
+/// Narrow, Levels and Roles go to a second row of the header instead of
+/// past the edge.
+#[test]
+fn levels_and_roles_stay_inside_a_narrow_view() {
+    let (s, _, _) = session();
+    let mut view = MixView::new(Theme::default());
+    let narrow = Size::new(560.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), narrow, &s, &Theme::default());
+    for hit in [Hit::Levels, Hit::Roles] {
+        let r = view.rect_of(hit).unwrap();
+        assert!(r.x >= 0.0 && r.right() <= narrow.w, "{hit:?} at {r:?}");
+    }
+    let analyse = view.rect_of(Hit::Analyse(MixScope::Project)).unwrap();
+    assert!(
+        view.rect_of(Hit::Roles).unwrap().y > analyse.y,
+        "a second row"
+    );
+}
+
+/// A finding names its tracks with their roles; a click on one sets it.
+#[test]
+fn a_finding_shows_its_tracks_roles() {
+    let (mut s, vocal, _) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.tracks.contains(&vocal))
+        .expect("a finding about the vocal")
+        .clone();
+    s.dispatch(Action::Mix(MixOp::Select(Some(f.id)))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"Vocal · ? role"), "{:?}", p.texts());
+    let (_, requests) = click(&mut view, &s, Hit::Role(vocal));
+    assert!(matches!(
+        requests.first(),
+        Some(HostRequest::ContextMenu { .. })
+    ));
+}
+
+/// The list in severity sections — Fix, Consider, Info (folded at first) —
+/// with findings of one rule about the same tracks as one group, opened
+/// on demand or while it holds the selection.
+#[test]
+fn findings_are_listed_in_sections_and_groups() {
+    use faderframe_mix_intelligence::{FrequencyRange, RuleId, Subject};
+    let (a, b, c) = (TrackId(1), TrackId(2), TrackId(3));
+    let finding =
+        |id: u64, rule: RuleId, tracks: Vec<TrackId>, severity: f64, band: (f64, f64)| Finding {
+            id,
+            rule,
+            signal: SignalPoint::Processed,
+            subject: Subject::Tracks {
+                a: tracks[0],
+                b: tracks[tracks.len() - 1],
+            },
+            tracks,
+            time: None,
+            events: Vec::new(),
+            pattern: None,
+            frequency: Some(FrequencyRange {
+                lo: band.0,
+                hi: band.1,
+            }),
+            severity,
+            severity_terms: Vec::new(),
+            confidence: 0.8,
+            confidence_terms: Vec::new(),
+            evidence: Vec::new(),
+            spectrum: None,
+            sections: Vec::new(),
+            recommendations: Vec::new(),
+            caveats: Vec::new(),
+        };
+    let m = RuleId::SpectralMasking;
+    let fs = [
+        finding(1, m, vec![a, b], 0.8, (60.0, 90.0)),
+        finding(2, m, vec![b, a], 0.6, (110.0, 140.0)),
+        finding(3, m, vec![a, c], 0.7, (2000.0, 3000.0)),
+        finding(4, m, vec![a, b], 0.3, (400.0, 500.0)),
+        finding(5, m, vec![c, b], 0.1, (8000.0, 9000.0)),
+    ];
+    let listed: Vec<&Finding> = fs.iter().collect();
+    let shape = |rows: &[Row<'_>]| -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Tier(SectionKey::Severity(g), n) => format!("{} {n}", tier_label(*g)),
+                Row::Tier(SectionKey::Track(t), n) => format!("track {} {n}", t.0),
+                Row::Tier(SectionKey::Mix, n) => format!("mix {n}"),
+                Row::Tier(SectionKey::Kind(c), n) => format!("{} {n}", c.label()),
+                Row::Group(_, v) => format!(
+                    "group {}",
+                    v.iter()
+                        .map(|f| f.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ),
+                Row::Finding(f, nested) => format!("{}{}", if *nested { "  " } else { "" }, f.id),
+            })
+            .collect()
+    };
+    // A×B twice among the high ones (either order of the tracks): one group.
+    let info = [SectionKey::Severity(Grade::Low)];
+    let by = Sections::Severity;
+    let rows = arrange(listed.clone(), by, &info, &[], None);
+    assert_eq!(
+        shape(&rows),
+        ["Fix 3", "group 1+2", "3", "Consider 1", "4", "Info 1"]
+    );
+    // Opened, or holding the selection: its findings under it.
+    let key = group_key(&fs[0]);
+    let opened = arrange(listed.clone(), by, &info, &[key], None);
+    assert_eq!(shape(&opened)[1..4], ["group 1+2", "  1", "  2"]);
+    let selected = arrange(listed.clone(), by, &info, &[], Some(2));
+    assert_eq!(shape(&selected)[1..4], ["group 1+2", "  1", "  2"]);
+    // Info unfolded, Fix folded.
+    let rows = arrange(
+        listed.clone(),
+        by,
+        &[SectionKey::Severity(Grade::High)],
+        &[],
+        None,
+    );
+    assert_eq!(shape(&rows), ["Fix 3", "Consider 1", "4", "Info 1", "5"]);
+    // By track: a section per track in the order they come, a finding
+    // about two under both (A×B still one group in A's and in B's).
+    let rows = arrange(listed.clone(), Sections::Track, &[], &[], None);
+    assert_eq!(
+        shape(&rows),
+        [
+            "track 1 4",
+            "group 1+2+4",
+            "3",
+            "track 2 4",
+            "group 1+2+4",
+            "5",
+            "track 3 2",
+            "3",
+            "5"
+        ]
+    );
+    // By kind: every one is masking.
+    let rows = arrange(listed, Sections::Kind, &[], &[], None);
+    assert_eq!(shape(&rows)[..2], ["Masking 5", "group 1+2+4"]);
+}
+
+/// After an analysis, with nothing selected, the details side shows the
+/// band map: a row per track and the masking drawn where it is; a click
+/// on a collision selects its finding (its details then). The Map button
+/// shows it again.
+#[test]
+fn the_band_map_shows_where_tracks_collide() {
+    use faderframe_mix_intelligence::RuleId;
+    let (mut s, vocal, keys) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.rule == RuleId::SpectralMasking)
+        .expect("the two low tones collide")
+        .clone();
+    assert!(f.tracks.contains(&vocal) && f.tracks.contains(&keys));
+    s.dispatch(Action::Mix(MixOp::Select(None))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().contains(&"Vocal") && p.texts().contains(&"1k"),
+        "{:?}",
+        p.texts()
+    );
+    // Low tones (80 Hz): in the left part of the axis.
+    let conflict = view.rect_of(Hit::MapConflict(f.id)).expect("drawn");
+    assert!(
+        conflict.center().x < SIZE.w * 0.75,
+        "low, at the left: {conflict:?}"
+    );
+    let (a, _) = click(&mut view, &s, Hit::MapConflict(f.id));
+    assert!(a.contains(&Action::Mix(MixOp::Select(Some(f.id)))), "{a:?}");
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::MapConflict(f.id)).is_none(),
+        "its details now"
+    );
+    let _ = click(&mut view, &s, Hit::Map);
+    paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::MapConflict(f.id)).is_some(),
+        "the map again"
+    );
+    let _ = conflict;
+}
+
+/// An ignored track is faint in the Roles panel, said not analysed, and
+/// not counted as missing a role.
+#[test]
+fn an_ignored_track_is_shown_as_not_analysed() {
+    let (mut s, vocal, keys) = session();
+    for (t, role) in [(vocal, TrackRole::Ignore), (keys, TrackRole::Keys)] {
+        s.dispatch(Action::Edit(Command::SetTrackRole {
+            track: t,
+            role: Some(role),
+        }))
+        .unwrap();
+    }
+    let mut view = MixView::new(Theme::default());
+    paint(&mut view, &s);
+    assert!(view.rect_of(Hit::OpenRoles).is_none(), "nothing missing");
+    let _ = click(&mut view, &s, Hit::Roles);
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().contains(&"Vocal · not analysed"),
+        "{:?}",
+        p.texts()
+    );
+    assert!(p.texts().contains(&"Ignore (Not Analysed)"));
+}
+
+/// The sections switch cycles severity → track → kind; by track, a
+/// section is a track with its role; every entry carries a strip of when
+/// it happens.
+#[test]
+fn the_list_is_made_by_severity_track_or_kind() {
+    let (mut s, vocal, _) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    s.dispatch(Action::Mix(MixOp::Select(None))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By severity"));
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By track"));
+    assert!(view.rect_of(Hit::Tier(SectionKey::Track(vocal))).is_some());
+    assert!(
+        p.texts().iter().any(|t| t.starts_with("▾ Vocal · no role")),
+        "{:?}",
+        p.texts()
+    );
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By kind"));
+    let _ = click(&mut view, &s, Hit::Sections);
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"By severity"));
+}

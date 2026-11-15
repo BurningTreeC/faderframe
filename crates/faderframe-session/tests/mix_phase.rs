@@ -396,3 +396,42 @@ fn a_panned_copy_is_the_same_audio_not_masking() {
         );
     }
 }
+
+/// Two microphones on one snare summed in a bus marked One Part: in masking
+/// the bus stands for them (they are not compared with each other), but
+/// their phase is still measured — an inverted bottom microphone is found.
+#[test]
+fn microphones_in_a_one_part_bus_are_still_checked_for_phase() {
+    use faderframe_project::{OutputRouting, TrackColor, TrackKind};
+    let mut p = Project::new("Phase", SR);
+    let a = generated(&mut p, "Snare Top", drums(7), Some(TrackRole::Snare));
+    let b = generated(&mut p, "Snare Bottom", drums(7), Some(TrackRole::Snare));
+    {
+        let t = track_mut(&mut p, b);
+        t.phase_invert = true;
+        t.volume_db = -3.0;
+    }
+    let bus: TrackId = p.ids.allocate();
+    let mut t = Track::new(bus, TrackKind::Bus, "Snare", TrackColor::palette(2));
+    t.mix_part = true;
+    p.tracks.push(t);
+    for m in [a, b] {
+        track_mut(&mut p, m).output = OutputRouting::Track { track: bus };
+    }
+    let mut s = Session::new(p, None, EngineConfig::default()).unwrap();
+    analyse(&mut s, SignalPoint::Processed);
+    let found = of_rule(&s, RuleId::PolarityInverted);
+    assert_eq!(
+        found.len(),
+        1,
+        "{:#?}",
+        s.mix_results().unwrap().report.findings
+    );
+    assert_eq!(found[0].subject, Subject::Tracks { a, b });
+    assert!(
+        !of_rule(&s, RuleId::SpectralMasking)
+            .iter()
+            .any(|f| f.tracks.contains(&a) && f.tracks.contains(&b)),
+        "not compared for masking"
+    );
+}

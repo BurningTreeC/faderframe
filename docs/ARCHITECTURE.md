@@ -12132,7 +12132,16 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   importance, confidence = signal × roles × amount × level × resolution.
   Track roles (`Track::role`, `Command::SetTrackRole`, set only by the
   user; names are never taken for roles) weigh the pair (drum-kit pairs
-  are not compared, kick/bass and foreground targets weigh most).
+  are not compared, kick/bass and foreground targets weigh most); the role
+  Ignore (`TrackRole::Ignore`: a click, a guide, a bed meant to cover the
+  rest) leaves a track or bus out of the analysis — listed as skipped, in
+  no finding — while it still plays in the master and its buses. A bus
+  marked One Part (`Track::mix_part`, `Command::SetTrackMixPart`, the
+  Roles panel) stands for the tracks it sums: it is compared in their
+  place, so its EQ cuts go on it, and they are not compared, nor with each
+  other (`session::mix::parts`; measuring sources, where no bus is
+  measured, only their pairs are left out); it takes their role when they
+  share one.
   *Levels*: master true peak over −1 dBTP, overs, a track over full scale
   alone, non-finite samples, adjacent sections 8 LU apart. *Stereo*:
   fold-down loss against the sum without cancellation (`(√L+√R)²/4`: a
@@ -12192,9 +12201,22 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   ("Undo Mix Intelligence: …", later edits kept; refused whole when a later
   step removed what it changed).
 * `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
-  ranked findings (filtered, sorted), each one's measurements (clickable
-  events: the tracks selected and the range shown), a band chart,
-  interpretation, method, limitations and experiments; levels; roles.
+  ranked findings (filtered, sorted) in sections — by severity (Fix,
+  Consider, Info: folded at first), by track (a track with its role; a
+  finding about two under both) or by kind (`Sections`) — with findings of
+  one rule about the same tracks as one entry (`arrange`, `group_key`),
+  every entry with a strip of when it happens (the song's sections as
+  ticks) and the sections it is in; role families have colours
+  (`role_color`) beside track names; each one's measurements
+  (clickable events: the tracks selected and the range shown), its tracks
+  with their roles, a band chart, interpretation, method, limitations and
+  experiments; levels; roles (a name's suggestion, `TrackRole::suggest`,
+  offered beside it and taken only by a click); the band map (`Panel::Map`,
+  also shown when nothing is selected): a row per track shaded by its
+  long-term spectrum (`Summary::{centres, spectrum}`), every masking
+  finding outlined on both rows, joined, clickable. While audio tracks
+  have no role a strip says so, with a button to the Roles panel; the
+  header puts Map, Levels and Roles on a second row when narrow.
 
 **Phase, timing, width, dynamics, same audio** (a second stage,
 `session::mix::extra`, for what needs more than one profile per track):

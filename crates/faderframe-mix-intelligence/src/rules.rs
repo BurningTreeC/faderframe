@@ -86,6 +86,10 @@ pub struct DiagnoseInput<'a> {
     /// Pairs never compared for masking (either order): a track and a bus
     /// or return its signal reaches (that one carries it).
     pub related: Vec<(TrackId, TrackId)>,
+    /// Pairs playing one part (the tracks a bus marked One Part sums: two
+    /// microphones on a kick, doubled guitars): not compared for masking,
+    /// still for phase and timing.
+    pub same_part: Vec<(TrackId, TrackId)>,
 }
 
 /// One subject's levels and stereo picture (facts, no judgement).
@@ -105,6 +109,10 @@ pub struct Summary {
     pub correlation: f64,
     /// Levels of the broad regions ([`crate::bands::BROAD_NAMES`], dB).
     pub broad: Vec<f64>,
+    /// The long-term spectrum: the analysis bands' centres (Hz) and each
+    /// band's mean level over the range (dB), for overviews.
+    pub centres: Vec<f64>,
+    pub spectrum: Vec<f64>,
     /// Integrated loudness per section (master only).
     pub sections: Vec<(String, Option<f64>)>,
 }
@@ -576,6 +584,7 @@ fn masking(
             if input
                 .related
                 .iter()
+                .chain(&input.same_part)
                 .any(|&(x, y)| (x, y) == (a.track, b.track) || (y, x) == (a.track, b.track))
             {
                 continue;
@@ -1074,6 +1083,8 @@ fn summary(subject: Subject, p: &TrackProfile, sections: &[(String, TimeSpan)]) 
         max_short_term: l.loudness.and_then(|x| finite(x.max_short_term)),
         correlation: stereo::overall_correlation(p),
         broad,
+        centres: p.layout.bands().iter().map(|b| b.centre).collect(),
+        spectrum: mean.iter().map(|v| power_db(*v)).collect(),
         sections: sections
             .iter()
             .zip(p.span_loudness.iter().chain(std::iter::repeat(&None)))
