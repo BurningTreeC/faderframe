@@ -31,6 +31,10 @@ pub enum TrackRole {
     /// Effects, atmospheres, risers.
     Effects,
     Other,
+    /// Not analysed by Mix Intelligence (a click, a guide or scratch track,
+    /// a bed meant to cover the rest): it still plays in the mix and in
+    /// what the master and its buses measure.
+    Ignore,
 }
 
 /// Where a role belongs (what the masking rules weigh pairs by).
@@ -49,7 +53,7 @@ pub enum RoleFamily {
 }
 
 impl TrackRole {
-    pub const ALL: [TrackRole; 13] = [
+    pub const ALL: [TrackRole; 14] = [
         TrackRole::Kick,
         TrackRole::Snare,
         TrackRole::Drums,
@@ -63,6 +67,7 @@ impl TrackRole {
         TrackRole::Pads,
         TrackRole::Effects,
         TrackRole::Other,
+        TrackRole::Ignore,
     ];
 
     pub fn label(self) -> &'static str {
@@ -80,7 +85,13 @@ impl TrackRole {
             TrackRole::Pads => "Pads and Strings",
             TrackRole::Effects => "Effects",
             TrackRole::Other => "Other",
+            TrackRole::Ignore => "Ignore (Not Analysed)",
         }
+    }
+
+    /// Mix Intelligence leaves the track out ([`TrackRole::Ignore`]).
+    pub fn ignored(role: Option<TrackRole>) -> bool {
+        role == Some(TrackRole::Ignore)
     }
 
     /// A short name (lists, menus of several tracks).
@@ -88,6 +99,7 @@ impl TrackRole {
         match self {
             TrackRole::Drums => "Drums",
             TrackRole::Pads => "Pads",
+            TrackRole::Ignore => "Ignored",
             _ => self.label(),
         }
     }
@@ -105,6 +117,12 @@ impl TrackRole {
         let word = |list: &[&str]| words.iter().any(|w| list.contains(w));
         let starts = |list: &[&str]| words.iter().any(|w| list.iter().any(|p| w.starts_with(p)));
         let has = |list: &[&str]| list.iter().any(|p| lower.contains(p));
+        // Tracks that help recording, not the mix: offered to be left out.
+        if starts(&["click", "metronom", "guide", "scratch", "klik"])
+            || word(&["ref", "reference", "referencja", "cue"])
+        {
+            return Some(TrackRole::Ignore);
+        }
         // Most specific first: a bass drum is a kick, a lead vocal not a
         // backing one.
         if has(&["bass drum", "kick"]) || word(&["bd", "kik", "stopa", "centrala"]) {
@@ -168,7 +186,8 @@ impl TrackRole {
             TrackRole::Kick | TrackRole::Snare | TrackRole::Drums => RoleFamily::DrumKit,
             TrackRole::Bass => RoleFamily::LowEnd,
             TrackRole::LeadVocal | TrackRole::LeadInstrument => RoleFamily::Foreground,
-            TrackRole::Effects => RoleFamily::Effects,
+            // Never analysed; weighed like effects should one be compared.
+            TrackRole::Effects | TrackRole::Ignore => RoleFamily::Effects,
             TrackRole::Percussion
             | TrackRole::BackingVocals
             | TrackRole::RhythmGuitar
@@ -213,6 +232,10 @@ mod tests {
             ("Organy", Some(Keys)),
             ("Strings", Some(Pads)),
             ("Riser FX", Some(Effects)),
+            ("Click", Some(Ignore)),
+            ("Guide Vox", Some(Ignore)),
+            ("Scratch Gtr", Some(Ignore)),
+            ("Ref Mix", Some(Ignore)),
             ("Napierdol", None),
             ("Audio 1", None),
         ] {

@@ -305,3 +305,53 @@ fn a_bus_analysed_as_one_part_stands_for_its_tracks() {
         "the doubles against each other"
     );
 }
+
+/// A track whose role is Ignore is left out of the analysis — said so,
+/// in no finding — but still plays: the master's loudness carries it.
+#[test]
+fn a_track_with_the_ignore_role_is_left_out_but_still_heard() {
+    use faderframe_core::TrackRole;
+    let (mut s, [a, b, h]) = session();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let master_before = s
+        .mix_results()
+        .unwrap()
+        .report
+        .summaries
+        .iter()
+        .find(|x| matches!(x.subject, faderframe_mix_intelligence::Subject::Master(_)))
+        .map(|x| x.rms)
+        .unwrap();
+    assert!(
+        s.mix_findings().iter().any(|f| f.tracks.contains(&b)),
+        "b collides with a"
+    );
+    s.dispatch(Action::Edit(Command::SetTrackRole {
+        track: b,
+        role: Some(TrackRole::Ignore),
+    }))
+    .unwrap();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let r = s.mix_results().unwrap();
+    assert!(
+        r.skipped
+            .iter()
+            .any(|(t, why)| *t == b && why.contains("Ignore")),
+        "{:?}",
+        r.skipped
+    );
+    assert!(!r.tracks.contains(&b));
+    assert!(s.mix_findings().iter().all(|f| !f.tracks.contains(&b)));
+    assert!(r.tracks.contains(&a) && r.tracks.contains(&h));
+    let master_after = r
+        .report
+        .summaries
+        .iter()
+        .find(|x| matches!(x.subject, faderframe_mix_intelligence::Subject::Master(_)))
+        .map(|x| x.rms)
+        .unwrap();
+    assert!(
+        (master_after - master_before).abs() < 0.01,
+        "still in the mix"
+    );
+}

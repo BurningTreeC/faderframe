@@ -2295,6 +2295,8 @@ impl MixView {
             w,
             "What each track plays. The analysis weighs pairs by roles (a lead vocal over its \
              accompaniment, a kick against its bass; parts of one drum kit are not compared). \
+             Ignore leaves a track out of the analysis (a click, a guide, a bed meant to \
+             cover the rest); it still plays in the mix and in the master's measurements. \
              Track names are never read as roles by themselves: what they suggest is offered \
              beside them (a click takes it). Tracks without one are analysed neutrally. \
              A bus marked One Part (doubled guitars, stacked vocals) is compared with the rest \
@@ -2329,10 +2331,23 @@ impl MixView {
         }
         for (t, name, role) in model.mix_tracks() {
             let r = Rect::new(x, y, w, 24.0);
+            // Left out on purpose: faint, and said so.
+            let ignored = TrackRole::ignored(role);
             p.text(
-                &name,
+                &if ignored {
+                    format!("{name} · not analysed")
+                } else {
+                    name.clone()
+                },
                 Rect::new(x, y, w * 0.5, 24.0),
-                &TextStyle::new(th.fonts.small, th.ui.text),
+                &TextStyle::new(
+                    th.fonts.small,
+                    if ignored {
+                        th.ui.text_faint
+                    } else {
+                        th.ui.text
+                    },
+                ),
             );
             let label = role.map_or("No role", TrackRole::label);
             // A suggestion beside the name of a track without a role.

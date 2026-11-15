@@ -848,3 +848,28 @@ fn the_band_map_shows_where_tracks_collide() {
     );
     let _ = conflict;
 }
+
+/// An ignored track is faint in the Roles panel, said not analysed, and
+/// not counted as missing a role.
+#[test]
+fn an_ignored_track_is_shown_as_not_analysed() {
+    let (mut s, vocal, keys) = session();
+    for (t, role) in [(vocal, TrackRole::Ignore), (keys, TrackRole::Keys)] {
+        s.dispatch(Action::Edit(Command::SetTrackRole {
+            track: t,
+            role: Some(role),
+        }))
+        .unwrap();
+    }
+    let mut view = MixView::new(Theme::default());
+    paint(&mut view, &s);
+    assert!(view.rect_of(Hit::OpenRoles).is_none(), "nothing missing");
+    let _ = click(&mut view, &s, Hit::Roles);
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().contains(&"Vocal · not analysed"),
+        "{:?}",
+        p.texts()
+    );
+    assert!(p.texts().contains(&"Ignore (Not Analysed)"));
+}

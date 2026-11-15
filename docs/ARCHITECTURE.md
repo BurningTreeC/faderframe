@@ -12132,7 +12132,10 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   importance, confidence = signal × roles × amount × level × resolution.
   Track roles (`Track::role`, `Command::SetTrackRole`, set only by the
   user; names are never taken for roles) weigh the pair (drum-kit pairs
-  are not compared, kick/bass and foreground targets weigh most). A bus
+  are not compared, kick/bass and foreground targets weigh most); the role
+  Ignore (`TrackRole::Ignore`: a click, a guide, a bed meant to cover the
+  rest) leaves a track or bus out of the analysis — listed as skipped, in
+  no finding — while it still plays in the master and its buses. A bus
   marked One Part (`Track::mix_part`, `Command::SetTrackMixPart`, the
   Roles panel) stands for the tracks it sums: it is compared in their
   place, so its EQ cuts go on it, and they are not compared, nor with each
