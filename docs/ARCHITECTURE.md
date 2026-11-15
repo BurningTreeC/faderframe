@@ -12198,9 +12198,18 @@ and FNV fingerprints keep ids and cache keys stable). Three layers:
   ("Undo Mix Intelligence: …", later edits kept; refused whole when a later
   step removed what it changed).
 * `faderframe-view-mix` (`ViewKind::MixIntelligence`, `app.show-mix`): the
-  ranked findings (filtered, sorted), each one's measurements (clickable
-  events: the tracks selected and the range shown), a band chart,
-  interpretation, method, limitations and experiments; levels; roles.
+  ranked findings (filtered, sorted) in severity sections — Fix, Consider,
+  Info (folded at first) — with findings of one rule about the same tracks
+  as one entry (`arrange`, `group_key`); each one's measurements
+  (clickable events: the tracks selected and the range shown), its tracks
+  with their roles, a band chart, interpretation, method, limitations and
+  experiments; levels; roles (a name's suggestion, `TrackRole::suggest`,
+  offered beside it and taken only by a click); the band map (`Panel::Map`,
+  also shown when nothing is selected): a row per track shaded by its
+  long-term spectrum (`Summary::{centres, spectrum}`), every masking
+  finding outlined on both rows, joined, clickable. While audio tracks
+  have no role a strip says so, with a button to the Roles panel; the
+  header puts Map, Levels and Roles on a second row when narrow.
 
 **Phase, timing, width, dynamics, same audio** (a second stage,
 `session::mix::extra`, for what needs more than one profile per track):

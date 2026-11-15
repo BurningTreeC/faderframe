@@ -794,3 +794,57 @@ fn findings_are_listed_in_sections_and_groups() {
     let rows = arrange(listed, &[Grade::High], &[], None);
     assert_eq!(shape(&rows), ["Fix 3", "Consider 1", "4", "Info 1", "5"]);
 }
+
+/// After an analysis, with nothing selected, the details side shows the
+/// band map: a row per track and the masking drawn where it is; a click
+/// on a collision selects its finding (its details then). The Map button
+/// shows it again.
+#[test]
+fn the_band_map_shows_where_tracks_collide() {
+    use faderframe_mix_intelligence::RuleId;
+    let (mut s, vocal, keys) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.rule == RuleId::SpectralMasking)
+        .expect("the two low tones collide")
+        .clone();
+    assert!(f.tracks.contains(&vocal) && f.tracks.contains(&keys));
+    s.dispatch(Action::Mix(MixOp::Select(None))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts().contains(&"Vocal") && p.texts().contains(&"1k"),
+        "{:?}",
+        p.texts()
+    );
+    // Low tones (80 Hz): in the left part of the axis.
+    let conflict = view.rect_of(Hit::MapConflict(f.id)).expect("drawn");
+    assert!(
+        conflict.center().x < SIZE.w * 0.75,
+        "low, at the left: {conflict:?}"
+    );
+    let (a, _) = click(&mut view, &s, Hit::MapConflict(f.id));
+    assert!(a.contains(&Action::Mix(MixOp::Select(Some(f.id)))), "{a:?}");
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::MapConflict(f.id)).is_none(),
+        "its details now"
+    );
+    let _ = click(&mut view, &s, Hit::Map);
+    paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::MapConflict(f.id)).is_some(),
+        "the map again"
+    );
+    let _ = conflict;
+}

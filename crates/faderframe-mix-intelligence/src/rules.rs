@@ -109,6 +109,10 @@ pub struct Summary {
     pub correlation: f64,
     /// Levels of the broad regions ([`crate::bands::BROAD_NAMES`], dB).
     pub broad: Vec<f64>,
+    /// The long-term spectrum: the analysis bands' centres (Hz) and each
+    /// band's mean level over the range (dB), for overviews.
+    pub centres: Vec<f64>,
+    pub spectrum: Vec<f64>,
     /// Integrated loudness per section (master only).
     pub sections: Vec<(String, Option<f64>)>,
 }
@@ -1079,6 +1083,8 @@ fn summary(subject: Subject, p: &TrackProfile, sections: &[(String, TimeSpan)]) 
         max_short_term: l.loudness.and_then(|x| finite(x.max_short_term)),
         correlation: stereo::overall_correlation(p),
         broad,
+        centres: p.layout.bands().iter().map(|b| b.centre).collect(),
+        spectrum: mean.iter().map(|v| power_db(*v)).collect(),
         sections: sections
             .iter()
             .zip(p.span_loudness.iter().chain(std::iter::repeat(&None)))

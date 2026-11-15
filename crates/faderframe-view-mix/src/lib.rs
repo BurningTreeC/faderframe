@@ -77,6 +77,10 @@ pub enum Hit {
     AllSuggestedRoles,
     /// Fold or unfold a severity section of the list.
     Tier(Grade),
+    /// The band map ([`Panel::Map`]).
+    Map,
+    /// A collision drawn on the band map: its finding.
+    MapConflict(u64),
     /// Open or close a group of findings (same rule, same tracks).
     Group(u64),
     Levels,
@@ -91,6 +95,8 @@ pub enum Panel {
     Roles,
     /// Every track's and the master's levels.
     Levels,
+    /// Where each track sits in frequency and where they collide.
+    Map,
 }
 
 /// The list's order.
@@ -573,7 +579,7 @@ impl MixView {
         let w = 70.0;
         // Levels and Roles at the right; on a second row when the first is
         // full (never past the edge).
-        let wrapped = x + 4.0 + 2.0 * w + 16.0 > size.w;
+        let wrapped = x + 4.0 + 3.0 * w + 22.0 > size.w;
         let y = if wrapped {
             self.header_h = 2.0 * HEADER_H - 10.0;
             let row = Rect::new(0.0, HEADER_H - 1.0, size.w, self.header_h - HEADER_H + 1.0);
@@ -584,7 +590,17 @@ impl MixView {
             self.header_h = HEADER_H;
             y
         };
-        let rx = (size.w - 2.0 * w - 16.0).max(8.0);
+        let rx = (size.w - 3.0 * w - 22.0).max(8.0);
+        self.button(
+            p,
+            Rect::new(rx, y, w, h),
+            "Map",
+            Hit::Map,
+            self.panel == Panel::Map,
+            model.mix_results().is_some(),
+            "Where each track sits in frequency and where the analysis found them colliding",
+        );
+        let rx = rx + w + 6.0;
         self.button(
             p,
             Rect::new(rx, y, w, h),
@@ -2075,6 +2091,195 @@ impl MixView {
             .clamp(0.0, (self.detail_content - rect.h).max(0.0));
     }
 
+    /// The band map: a row per analysed track (its role beside its name),
+    /// shaded where it has most of its energy (its own long-term spectrum,
+    /// its loudest band darkest), and every masking finding drawn where it
+    /// is — outlined on both tracks' rows, joined — to click for its
+    /// details.
+    fn paint_map(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
+        let th = self.theme.clone();
+        p.fill(rect, th.ui.background);
+        self.detail = rect;
+        let Some(res) = model.mix_results() else {
+            return;
+        };
+        let name = Self::name(model);
+        let (lo_hz, hi_hz) = (20.0f64, 20_000.0f64);
+        let label_w = 128.0f32.min(rect.w * 0.35);
+        let (px0, px1) = (rect.x + PAD + label_w, rect.right() - PAD);
+        let pw = (px1 - px0).max(10.0);
+        let x_of = |hz: f64| {
+            let u = ((hz.clamp(lo_hz, hi_hz) / lo_hz).ln() / (hi_hz / lo_hz).ln()) as f32;
+            px0 + u * pw
+        };
+        p.push_clip(rect);
+        self.visible = Some(rect);
+        let mut y = rect.y + PAD - self.detail_scroll;
+        y = self.para(
+            p,
+            rect.x + PAD,
+            y,
+            rect.w - 2.0 * PAD,
+            "Where each track sits in frequency (shaded where it has most of its energy) and \
+             where the analysis found two colliding (outlined on both, joined). Click a \
+             collision for its details.",
+            th.fonts.small,
+            th.ui.text_dim,
+        );
+        // The frequency axis.
+        let axis_y = y + 2.0;
+        for hz in [50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0] {
+            let x = x_of(hz);
+            let label = if hz >= 1000.0 {
+                format!("{}k", hz / 1000.0)
+            } else {
+                format!("{hz}")
+            };
+            p.text(
+                &label,
+                Rect::new(x - 20.0, axis_y, 40.0, LINE),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint).center(),
+            );
+        }
+        y = axis_y + LINE + 2.0;
+        // The tracks with a spectrum (the master left out).
+        let rows: Vec<(TrackId, &faderframe_mix_intelligence::Summary)> = res
+            .tracks
+            .iter()
+            .filter_map(|t| {
+                res.report
+                    .summaries
+                    .iter()
+                    .find(|s| s.subject == Subject::Track(*t) && !s.spectrum.is_empty())
+                    .map(|s| (*t, s))
+            })
+            .collect();
+        const MAP_ROW: f32 = 20.0;
+        let top = y;
+        for hz in [100.0, 1000.0, 10_000.0] {
+            p.vline(
+                x_of(hz),
+                top,
+                top + rows.len() as f32 * MAP_ROW,
+                th.ui.border.with_alpha(0.5),
+            );
+        }
+        for (i, (t, sum)) in rows.iter().enumerate() {
+            let ry = top + i as f32 * MAP_ROW;
+            let role = model.project().track(*t).and_then(|x| x.role);
+            p.text(
+                &name(*t),
+                Rect::new(rect.x + PAD, ry, label_w - 44.0, MAP_ROW),
+                &TextStyle::new(th.fonts.small, th.ui.text),
+            );
+            p.text(
+                role.map_or("?", TrackRole::short),
+                Rect::new(rect.x + PAD + label_w - 44.0, ry, 40.0, MAP_ROW),
+                &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+            );
+            // Shade: within 36 dB of its own loudest band.
+            let top_db = sum
+                .spectrum
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let n = sum.centres.len();
+            for (k, (c, db)) in sum.centres.iter().zip(&sum.spectrum).enumerate() {
+                if *c < lo_hz || *c > hi_hz || !db.is_finite() {
+                    continue;
+                }
+                let edge = |j: usize| (sum.centres[j] * *c).sqrt();
+                let a = if k == 0 { *c / 1.12 } else { edge(k - 1) };
+                let b = if k + 1 >= n { *c * 1.12 } else { edge(k + 1) };
+                let t = ((db - (top_db - 36.0)) / 36.0).clamp(0.0, 1.0) as f32;
+                if t <= 0.02 {
+                    continue;
+                }
+                let (xa, xb) = (x_of(a), x_of(b));
+                p.fill(
+                    Rect::new(xa, ry + 3.0, (xb - xa).max(1.0), MAP_ROW - 6.0),
+                    th.ui.accent.with_alpha(0.12 + 0.6 * t * t),
+                );
+            }
+            p.hline(px0, px1, ry + MAP_ROW - 0.5, th.ui.border.with_alpha(0.4));
+        }
+        // The collisions.
+        let row_of = |t: TrackId| rows.iter().position(|(x, _)| *x == t);
+        for f in model.mix_findings() {
+            if f.rule != faderframe_mix_intelligence::RuleId::SpectralMasking
+                || model.mix_dismissed(f.id)
+            {
+                continue;
+            }
+            let Some(fr) = f.frequency else { continue };
+            let found: Vec<usize> = f.tracks.iter().filter_map(|t| row_of(*t)).collect();
+            if found.len() < 2 {
+                continue;
+            }
+            let (xa, xb) = (x_of(fr.lo), x_of(fr.hi));
+            let color = self.grade_color(Grade::of_severity(f.severity));
+            let lit =
+                self.hover == Some(Hit::MapConflict(f.id)) || model.mix_selected_id() == Some(f.id);
+            let (r0, r1) = (
+                *found.iter().min().unwrap_or(&0),
+                *found.iter().max().unwrap_or(&0),
+            );
+            for i in &found {
+                let box_ = Rect::new(
+                    xa,
+                    top + *i as f32 * MAP_ROW + 2.0,
+                    (xb - xa).max(3.0),
+                    MAP_ROW - 4.0,
+                );
+                p.fill_rounded(
+                    box_,
+                    2.0,
+                    &color.with_alpha(if lit { 0.35 } else { 0.18 }).into(),
+                );
+                p.stroke_rounded(box_, 2.0, if lit { 2.0 } else { 1.0 }, color);
+            }
+            let cx = (xa + xb) * 0.5;
+            p.vline(
+                cx,
+                top + r0 as f32 * MAP_ROW + MAP_ROW - 2.0,
+                top + r1 as f32 * MAP_ROW + 2.0,
+                color,
+            );
+            self.register(Spot {
+                hit: Hit::MapConflict(f.id),
+                rect: Rect::new(
+                    xa - 2.0,
+                    top + r0 as f32 * MAP_ROW,
+                    (xb - xa).max(3.0) + 4.0,
+                    (r1 - r0 + 1) as f32 * MAP_ROW,
+                ),
+                enabled: true,
+                label: f.title_named(&name, &Self::device(model)),
+                tip: format!(
+                    "{} · severity {}",
+                    f.title_named(&name, &Self::device(model)),
+                    Grade::of_severity(f.severity).label().to_lowercase()
+                ),
+                on: lit,
+            });
+        }
+        y = top + rows.len() as f32 * MAP_ROW + 6.0;
+        if rows.is_empty() {
+            y = self.para(
+                p,
+                rect.x + PAD,
+                y,
+                rect.w - 2.0 * PAD,
+                "No track's spectrum was measured.",
+                th.fonts.small,
+                th.ui.text_dim,
+            );
+        }
+        p.pop_clip();
+        self.visible = None;
+        self.detail_content = y + self.detail_scroll - rect.y + PAD;
+    }
+
     fn paint_roles(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
         let th = self.theme.clone();
         p.fill(rect, th.ui.background);
@@ -2596,11 +2801,17 @@ impl MixView {
                 self.signal = s;
                 cx.redraw();
             }
-            Hit::Roles | Hit::Levels => {
-                let want = if hit == Hit::Roles {
-                    Panel::Roles
-                } else {
-                    Panel::Levels
+            Hit::MapConflict(id) => {
+                self.detail_scroll = 0.0;
+                self.panel = Panel::Details;
+                cx.emit(Action::Mix(MixOp::Select(Some(id))));
+                cx.emit(Action::Mix(MixOp::Show(id)));
+            }
+            Hit::Roles | Hit::Levels | Hit::Map => {
+                let want = match hit {
+                    Hit::Roles => Panel::Roles,
+                    Hit::Map => Panel::Map,
+                    _ => Panel::Levels,
                 };
                 self.panel = if self.panel == want {
                     Panel::Details
@@ -2775,6 +2986,11 @@ impl CanvasView<Session, Action> for MixView {
         match self.panel {
             Panel::Roles => self.paint_roles(p, detail, model),
             Panel::Levels => self.paint_levels(p, detail, model),
+            Panel::Map => self.paint_map(p, detail, model),
+            // Nothing selected after an analysis: the map is the overview.
+            Panel::Details if model.mix_selected().is_none() && model.mix_results().is_some() => {
+                self.paint_map(p, detail, model)
+            }
             Panel::Details => self.paint_details(p, detail, model),
         }
     }
