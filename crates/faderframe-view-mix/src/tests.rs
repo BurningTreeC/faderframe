@@ -614,3 +614,108 @@ fn an_applied_experiment_shows_its_undo() {
     assert!(view.rect_of(Hit::Undo(step)).is_none(), "taken back");
     assert!(view.rect_of(Hit::Apply(f.id, i)).is_some());
 }
+
+/// Roles matter, and say so: while tracks have none a strip asks for them
+/// (its button opens the Roles panel); there the names' suggestions are
+/// offered — one by one or all as one step, never taken by themselves;
+/// with every role set the strip is gone.
+#[test]
+fn missing_roles_are_asked_for_and_suggested_from_the_names() {
+    let (mut s, vocal, keys) = session();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(
+        p.texts()
+            .iter()
+            .any(|t| t.starts_with("No track has a role")),
+        "{:?}",
+        p.texts()
+    );
+    let _ = click(&mut view, &s, Hit::OpenRoles);
+    let p = paint(&mut view, &s);
+    assert!(
+        view.rect_of(Hit::OpenRoles).is_none(),
+        "not over the Roles panel"
+    );
+    // "Vocal" and "Keys" suggest roles; nothing is set by itself.
+    assert!(
+        p.texts().contains(&"Lead Vocal?") && p.texts().contains(&"Keys?"),
+        "{:?}",
+        p.texts()
+    );
+    assert_eq!(s.project().track(vocal).unwrap().role, None);
+    let (a, _) = click(&mut view, &s, Hit::SuggestedRole(vocal));
+    assert_eq!(
+        a,
+        [Action::Edit(Command::SetTrackRole {
+            track: vocal,
+            role: Some(TrackRole::LeadVocal)
+        })]
+    );
+    let (a, _) = click(&mut view, &s, Hit::AllSuggestedRoles);
+    let steps = s.history_steps().0.len();
+    for x in a {
+        s.dispatch(x).unwrap();
+    }
+    assert_eq!(s.history_steps().0.len(), steps + 1, "one step");
+    assert_eq!(
+        s.project().track(vocal).unwrap().role,
+        Some(TrackRole::LeadVocal)
+    );
+    assert_eq!(s.project().track(keys).unwrap().role, Some(TrackRole::Keys));
+    // Every role set: no strip, even off the Roles panel.
+    let _ = click(&mut view, &s, Hit::Roles);
+    let p = paint(&mut view, &s);
+    assert!(view.rect_of(Hit::OpenRoles).is_none());
+    assert!(
+        !p.texts()
+            .iter()
+            .any(|t| t.contains("no role") || t.contains("No track has a role"))
+    );
+}
+
+/// Narrow, Levels and Roles go to a second row of the header instead of
+/// past the edge.
+#[test]
+fn levels_and_roles_stay_inside_a_narrow_view() {
+    let (s, _, _) = session();
+    let mut view = MixView::new(Theme::default());
+    let narrow = Size::new(560.0, 900.0);
+    view.paint(&mut RecordingPainter::new(), narrow, &s, &Theme::default());
+    for hit in [Hit::Levels, Hit::Roles] {
+        let r = view.rect_of(hit).unwrap();
+        assert!(r.x >= 0.0 && r.right() <= narrow.w, "{hit:?} at {r:?}");
+    }
+    let analyse = view.rect_of(Hit::Analyse(MixScope::Project)).unwrap();
+    assert!(
+        view.rect_of(Hit::Roles).unwrap().y > analyse.y,
+        "a second row"
+    );
+}
+
+/// A finding names its tracks with their roles; a click on one sets it.
+#[test]
+fn a_finding_shows_its_tracks_roles() {
+    let (mut s, vocal, _) = session();
+    s.dispatch(Action::Mix(MixOp::Analyse {
+        scope: MixScope::Project,
+        signal: SignalPoint::Processed,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let f = s
+        .mix_findings()
+        .into_iter()
+        .find(|f| f.tracks.contains(&vocal))
+        .expect("a finding about the vocal")
+        .clone();
+    s.dispatch(Action::Mix(MixOp::Select(Some(f.id)))).unwrap();
+    let mut view = MixView::new(Theme::default());
+    let p = paint(&mut view, &s);
+    assert!(p.texts().contains(&"Vocal · ? role"), "{:?}", p.texts());
+    let (_, requests) = click(&mut view, &s, Hit::Role(vocal));
+    assert!(matches!(
+        requests.first(),
+        Some(HostRequest::ContextMenu { .. })
+    ));
+}

@@ -31,6 +31,8 @@ use faderframe_ui_canvas::{
 
 const HEADER_H: f32 = 34.0;
 const STATUS_H: f32 = 24.0;
+/// The strip asking for roles.
+const ROLES_H: f32 = 26.0;
 const FILTER_H: f32 = 28.0;
 const ROW_H: f32 = 56.0;
 const FOOTER_H: f32 = 24.0;
@@ -65,6 +67,12 @@ pub enum Hit {
     Role(TrackId),
     /// A bus analysed as one part, or its tracks (a switch).
     Part(TrackId),
+    /// Open the Roles panel (the banner's button).
+    OpenRoles,
+    /// Take the role suggested by a track's name.
+    SuggestedRole(TrackId),
+    /// Take every suggested role (one undo step).
+    AllSuggestedRoles,
     Levels,
 }
 
@@ -135,6 +143,8 @@ pub struct MixView {
     /// place scrolled out of it is not there).
     visible: Option<Rect>,
     hover: Option<Hit>,
+    /// The header's height as painted last (two rows when narrow).
+    header_h: f32,
 }
 
 /// m:ss.s
@@ -185,6 +195,7 @@ impl MixView {
             spots: Vec::new(),
             visible: None,
             hover: None,
+            header_h: HEADER_H,
         }
     }
 
@@ -448,7 +459,20 @@ impl MixView {
             SignalPoint::Source.describe(),
         );
         let w = 70.0;
-        let rx = (size.w - 2.0 * w - 16.0).max(x + 4.0);
+        // Levels and Roles at the right; on a second row when the first is
+        // full (never past the edge).
+        let wrapped = x + 4.0 + 2.0 * w + 16.0 > size.w;
+        let y = if wrapped {
+            self.header_h = 2.0 * HEADER_H - 10.0;
+            let row = Rect::new(0.0, HEADER_H - 1.0, size.w, self.header_h - HEADER_H + 1.0);
+            p.fill(row, th.ui.surface);
+            p.hline(0.0, size.w, self.header_h - 0.5, th.ui.border);
+            HEADER_H - 4.0
+        } else {
+            self.header_h = HEADER_H;
+            y
+        };
+        let rx = (size.w - 2.0 * w - 16.0).max(8.0);
         self.button(
             p,
             Rect::new(rx, y, w, h),
@@ -470,9 +494,75 @@ impl MixView {
         );
     }
 
+    /// The audio and instrument tracks analysed, and those of them without
+    /// a role.
+    fn roles_missing(model: &Session) -> (usize, usize) {
+        let tracks: Vec<_> = model
+            .mix_tracks()
+            .into_iter()
+            .filter(|(t, _, _)| {
+                model.project().track(*t).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        faderframe_project::TrackKind::Audio
+                            | faderframe_project::TrackKind::Instrument
+                    )
+                })
+            })
+            .collect();
+        let missing = tracks.iter().filter(|(_, _, r)| r.is_none()).count();
+        (tracks.len(), missing)
+    }
+
+    /// Roles matter: a strip under the status while tracks have none (not
+    /// while the Roles panel is open), with a button to it. Its height.
+    fn paint_roles_banner(
+        &mut self,
+        p: &mut dyn Painter,
+        size: Size,
+        y: f32,
+        model: &Session,
+    ) -> f32 {
+        let (all, missing) = Self::roles_missing(model);
+        if missing == 0 || self.panel == Panel::Roles {
+            return 0.0;
+        }
+        let th = self.theme.clone();
+        let r = Rect::new(0.0, y, size.w, ROLES_H);
+        p.fill(r, th.ui.accent.with_alpha(0.16));
+        p.hline(0.0, size.w, r.bottom() - 0.5, th.ui.border);
+        let bw = 84.0;
+        let text = if missing == all {
+            "No track has a role: every pair is weighed alike and the microphones of a drum \
+             kit are compared with each other."
+                .to_string()
+        } else {
+            format!(
+                "{missing} of {all} tracks have no role: they are weighed neutrally (a kit's \
+                 microphones, a kick against its bass are only told apart by roles)."
+            )
+        };
+        p.text(
+            &text,
+            Rect::new(12.0, r.y, (size.w - bw - 36.0).max(40.0), r.h),
+            &TextStyle::new(th.fonts.small, th.ui.text),
+        );
+        self.button(
+            p,
+            Rect::new(size.w - bw - 12.0, r.y + 3.0, bw, r.h - 6.0),
+            "Set Roles",
+            Hit::OpenRoles,
+            false,
+            true,
+            "Say what each track plays (suggestions from the names are offered, never applied \
+             by themselves)",
+        );
+        ROLES_H
+    }
+
     fn paint_status(&mut self, p: &mut dyn Painter, size: Size, model: &Session) {
         let th = self.theme.clone();
-        let r = Rect::new(0.0, HEADER_H, size.w, STATUS_H);
+        let r = Rect::new(0.0, self.header_h, size.w, STATUS_H);
         p.fill(r, th.ui.surface_alt);
         p.hline(0.0, size.w, r.bottom() - 0.5, th.ui.border);
         let style = TextStyle::new(th.fonts.small, th.ui.text_dim);
@@ -1246,6 +1336,38 @@ impl MixView {
             th.fonts.normal,
             th.ui.text,
         );
+        // Its tracks with their roles (a click sets one; "?" none yet).
+        if !f.tracks.is_empty() {
+            let mut bx = x;
+            y += 2.0;
+            for t in &f.tracks {
+                let role = model.project().track(*t).and_then(|t| t.role);
+                let label = match role {
+                    Some(r) => format!("{} · {}", name(*t), r.short()),
+                    None => format!("{} · ? role", name(*t)),
+                };
+                if bx > x && bx + 120.0 > x + w {
+                    bx = x;
+                    y += 24.0;
+                }
+                bx = self.button_at(
+                    p,
+                    bx,
+                    y,
+                    20.0,
+                    &label,
+                    Hit::Role(*t),
+                    role.is_some(),
+                    true,
+                    if role.is_some() {
+                        "Its role: the analysis weighs the pair by it (click to change)"
+                    } else {
+                        "No role: weighed neutrally — click to say what it plays"
+                    },
+                );
+            }
+            y += 26.0;
+        }
         let applied_state = model.mix_applied_state(f.id);
         if model.mix_finding_stale(f.id) && applied_state.is_none() {
             y = self.para(
@@ -1726,7 +1848,8 @@ impl MixView {
             w,
             "What each track plays. The analysis weighs pairs by roles (a lead vocal over its \
              accompaniment, a kick against its bass; parts of one drum kit are not compared). \
-             Track names are never read as roles; tracks without one are analysed neutrally. \
+             Track names are never read as roles by themselves: what they suggest is offered \
+             beside them (a click takes it). Tracks without one are analysed neutrally. \
              A bus marked One Part (doubled guitars, stacked vocals) is compared with the rest \
              in their place, and its EQ goes there; its tracks are not compared, nor with each \
              other.",
@@ -1734,6 +1857,29 @@ impl MixView {
             th.ui.text_dim,
         );
         y += 6.0;
+        // Suggestions from the names: offered, taken only by a click.
+        let suggested: Vec<(TrackId, TrackRole)> = model
+            .mix_tracks()
+            .into_iter()
+            .filter(|(_, _, r)| r.is_none())
+            .filter_map(|(t, n, _)| TrackRole::suggest(&n).map(|r| (t, r)))
+            .collect();
+        if !suggested.is_empty() {
+            self.button(
+                p,
+                Rect::new(x, y, w.min(320.0), 22.0),
+                &format!(
+                    "Take the {} Suggested Role{} (from the names)",
+                    suggested.len(),
+                    if suggested.len() == 1 { "" } else { "s" }
+                ),
+                Hit::AllSuggestedRoles,
+                false,
+                true,
+                "Each suggestion is shown beside its track; this takes them all, one undo step",
+            );
+            y += 30.0;
+        }
         for (t, name, role) in model.mix_tracks() {
             let r = Rect::new(x, y, w, 24.0);
             p.text(
@@ -1742,6 +1888,18 @@ impl MixView {
                 &TextStyle::new(th.fonts.small, th.ui.text),
             );
             let label = role.map_or("No role", TrackRole::label);
+            // A suggestion beside the name of a track without a role.
+            if let Some((_, r)) = suggested.iter().find(|(s, _)| *s == t) {
+                self.button(
+                    p,
+                    Rect::new(x + w * 0.5 - 92.0, y + 2.0, 86.0, 20.0),
+                    &format!("{}?", r.short()),
+                    Hit::SuggestedRole(t),
+                    false,
+                    true,
+                    format!("Its name suggests {}: click to take it", r.label()),
+                );
+            }
             let bus = model
                 .project()
                 .track(t)
@@ -2271,6 +2429,44 @@ impl MixView {
                 cx.emit(Action::Mix(MixOp::LoudnessMatch(!on)));
             }
             Hit::Reject => cx.emit(Action::Mix(MixOp::Reject)),
+            Hit::OpenRoles => {
+                self.panel = Panel::Roles;
+                self.detail_scroll = 0.0;
+                cx.redraw();
+            }
+            Hit::SuggestedRole(t) => {
+                if let Some(role) = model
+                    .project()
+                    .track(t)
+                    .and_then(|x| TrackRole::suggest(&x.name))
+                {
+                    cx.emit(Action::Edit(faderframe_project::Command::SetTrackRole {
+                        track: t,
+                        role: Some(role),
+                    }));
+                }
+            }
+            Hit::AllSuggestedRoles => {
+                let commands: Vec<faderframe_project::Command> = model
+                    .mix_tracks()
+                    .into_iter()
+                    .filter(|(_, _, r)| r.is_none())
+                    .filter_map(|(t, n, _)| {
+                        TrackRole::suggest(&n).map(|role| {
+                            faderframe_project::Command::SetTrackRole {
+                                track: t,
+                                role: Some(role),
+                            }
+                        })
+                    })
+                    .collect();
+                if !commands.is_empty() {
+                    cx.emit(Action::Edit(faderframe_project::Command::Batch {
+                        label: "Set Suggested Roles".into(),
+                        commands,
+                    }));
+                }
+            }
             Hit::Part(t) => {
                 let on = model.project().track(t).is_some_and(|t| t.mix_part);
                 cx.emit(Action::Edit(faderframe_project::Command::SetTrackMixPart {
@@ -2296,7 +2492,8 @@ impl CanvasView<Session, Action> for MixView {
         p.fill(Rect::from_size(size), theme.ui.background);
         self.paint_header(p, size, model);
         self.paint_status(p, size, model);
-        let top = HEADER_H + STATUS_H;
+        let mut top = self.header_h + STATUS_H;
+        top += self.paint_roles_banner(p, size, top, model);
         let body = Rect::new(0.0, top, size.w, (size.h - top).max(0.0));
         let split = (size.w * 0.42).clamp(240.0_f32.min(size.w), (size.w - 260.0).max(240.0));
         let list = Rect::new(0.0, body.y, split, body.h);
