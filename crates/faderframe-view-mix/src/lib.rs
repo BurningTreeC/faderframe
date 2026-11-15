@@ -35,6 +35,8 @@ const STATUS_H: f32 = 24.0;
 const ROLES_H: f32 = 26.0;
 const FILTER_H: f32 = 28.0;
 const ROW_H: f32 = 56.0;
+/// A severity section's heading in the list.
+const TIER_H: f32 = 24.0;
 const FOOTER_H: f32 = 24.0;
 const PAD: f32 = 10.0;
 const LINE: f32 = 16.0;
@@ -73,6 +75,10 @@ pub enum Hit {
     SuggestedRole(TrackId),
     /// Take every suggested role (one undo step).
     AllSuggestedRoles,
+    /// Fold or unfold a severity section of the list.
+    Tier(Grade),
+    /// Open or close a group of findings (same rule, same tracks).
+    Group(u64),
     Levels,
 }
 
@@ -145,6 +151,97 @@ pub struct MixView {
     hover: Option<Hit>,
     /// The header's height as painted last (two rows when narrow).
     header_h: f32,
+    /// Severity sections folded in the list (Info at first).
+    folded: Vec<Grade>,
+    /// Groups of findings opened in the list ([`group_key`]).
+    opened: Vec<u64>,
+}
+
+/// A line of the findings list.
+enum Row<'a> {
+    /// A severity section's heading: how many it holds.
+    Tier(Grade, usize),
+    /// Findings of one rule about the same tracks (masking in several
+    /// bands, levels of one track …), as one entry.
+    Group(u64, Vec<&'a Finding>),
+    /// A finding (in an opened group: `true`).
+    Finding(&'a Finding, bool),
+}
+
+impl Row<'_> {
+    fn height(&self) -> f32 {
+        match self {
+            Row::Tier(..) => TIER_H,
+            _ => ROW_H,
+        }
+    }
+}
+
+/// What a finding is grouped by: its rule and its tracks.
+fn group_key(f: &Finding) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut tracks = f.tracks.clone();
+    tracks.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    f.rule.hash(&mut h);
+    tracks.hash(&mut h);
+    h.finish()
+}
+
+/// The list's lines for `listed` (in its order): severity sections, the
+/// `folded` ones as their heading; findings of one rule about the same
+/// tracks as one group, its findings under it when `opened` or holding
+/// the `selected` one.
+fn arrange<'a>(
+    listed: Vec<&'a Finding>,
+    folded: &[Grade],
+    opened: &[u64],
+    selected: Option<u64>,
+) -> Vec<Row<'a>> {
+    let mut out = Vec::new();
+    for grade in [Grade::High, Grade::Moderate, Grade::Low] {
+        let tier: Vec<&Finding> = listed
+            .iter()
+            .copied()
+            .filter(|f| Grade::of_severity(f.severity) == grade)
+            .collect();
+        if tier.is_empty() {
+            continue;
+        }
+        out.push(Row::Tier(grade, tier.len()));
+        if folded.contains(&grade) {
+            continue;
+        }
+        let mut groups: Vec<(u64, Vec<&Finding>)> = Vec::new();
+        for f in tier {
+            let key = group_key(f);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.push(f),
+                None => groups.push((key, vec![f])),
+            }
+        }
+        for (key, fs) in groups {
+            if fs.len() == 1 {
+                out.push(Row::Finding(fs[0], false));
+                continue;
+            }
+            let open = opened.contains(&key) || fs.iter().any(|f| Some(f.id) == selected);
+            out.push(Row::Group(key, fs.clone()));
+            if open {
+                out.extend(fs.into_iter().map(|f| Row::Finding(f, true)));
+            }
+        }
+    }
+    out
+}
+
+/// A severity section's name.
+fn tier_label(g: Grade) -> &'static str {
+    match g {
+        Grade::High => "Fix",
+        Grade::Moderate => "Consider",
+        Grade::Low => "Info",
+    }
 }
 
 /// m:ss.s
@@ -196,6 +293,8 @@ impl MixView {
             visible: None,
             hover: None,
             header_h: HEADER_H,
+            folded: vec![Grade::Low],
+            opened: Vec::new(),
         }
     }
 
@@ -337,6 +436,19 @@ impl MixView {
             Applied::Checking => "Checking",
             Applied::Resolved => "Resolved",
         }
+    }
+
+    /// The list's lines: the findings [`Self::listed`] gives, in severity
+    /// sections (folded ones as their heading only), those of one rule
+    /// about the same tracks as one group (its findings under it when
+    /// opened, or when it holds the selected one).
+    fn rows<'a>(&self, model: &'a Session) -> Vec<Row<'a>> {
+        arrange(
+            self.listed(model),
+            &self.folded,
+            &self.opened,
+            model.mix_selected_id(),
+        )
     }
 
     /// The findings listed: filtered and sorted.
@@ -653,6 +765,235 @@ impl MixView {
         );
     }
 
+    /// A severity section's heading: its name, how many, folded or not.
+    fn paint_tier_row(&mut self, p: &mut dyn Painter, r: Rect, grade: Grade, n: usize) {
+        let th = self.theme.clone();
+        let folded = self.folded.contains(&grade);
+        p.fill(r, th.ui.surface_alt);
+        p.fill(
+            Rect::new(r.x, r.y + 5.0, 3.0, r.h - 10.0),
+            self.grade_color(grade),
+        );
+        p.text(
+            &format!(
+                "{} {} · {n}",
+                if folded { "▸" } else { "▾" },
+                tier_label(grade)
+            ),
+            Rect::new(r.x + 12.0, r.y, r.w - 20.0, r.h),
+            &TextStyle::new(th.fonts.small, th.ui.text).bold(),
+        );
+        p.hline(r.x, r.right(), r.bottom() - 0.5, th.ui.border);
+        self.register(Spot {
+            hit: Hit::Tier(grade),
+            rect: r,
+            enabled: true,
+            label: format!("{}, {n} findings", tier_label(grade)),
+            tip: if folded {
+                "Show these findings".into()
+            } else {
+                "Fold these findings away".into()
+            },
+            on: !folded,
+        });
+    }
+
+    /// Findings of one rule about the same tracks as one entry: the
+    /// tracks, the rule, the ranges or times, the worst severity.
+    fn paint_group_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        key: u64,
+        fs: &[&Finding],
+        model: &Session,
+    ) {
+        let th = self.theme.clone();
+        let name = Self::name(model);
+        let first = fs[0];
+        let open =
+            self.opened.contains(&key) || fs.iter().any(|f| Some(f.id) == model.mix_selected_id());
+        if self.hover == Some(Hit::Group(key)) {
+            p.fill(r, th.ui.text.with_alpha(0.05));
+        }
+        let worst = fs.iter().map(|f| f.severity).fold(0.0, f64::max);
+        p.fill(
+            Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
+            self.grade_color(Grade::of_severity(worst)),
+        );
+        let tracks: Vec<String> = first.tracks.iter().map(|t| name(*t)).collect();
+        let who = if tracks.is_empty() {
+            "The mix".to_string()
+        } else {
+            tracks.join(" × ")
+        };
+        let (tx, tw) = (r.x + 12.0, r.w - 20.0);
+        p.text(
+            &format!("{} {who}", if open { "▾" } else { "▸" }),
+            Rect::new(tx, r.y + 4.0, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text).bold(),
+        );
+        let ranges: Vec<String> = fs
+            .iter()
+            .filter_map(|f| f.frequency.map(|fr| fr.label()))
+            .collect();
+        let what = if ranges.is_empty() {
+            format!("{} times", fs.len())
+        } else {
+            ranges.join(", ")
+        };
+        p.text(
+            &format!("{}: {what}", first.rule.name()),
+            Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text_dim),
+        );
+        p.text(
+            &format!(
+                "{} findings · worst severity {}",
+                fs.len(),
+                Grade::of_severity(worst).label()
+            ),
+            Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        p.hline(
+            r.x,
+            r.right(),
+            r.bottom() - 0.5,
+            th.ui.border.with_alpha(0.5),
+        );
+        self.register(Spot {
+            hit: Hit::Group(key),
+            rect: r,
+            enabled: true,
+            label: format!("{who}, {} findings of {}", fs.len(), first.rule.name()),
+            tip: if open {
+                "Fold them into one entry".into()
+            } else {
+                "Show them one by one".into()
+            },
+            on: open,
+        });
+    }
+
+    /// One finding's line in the list at `r` (indented in an opened group).
+    fn paint_finding_row(
+        &mut self,
+        p: &mut dyn Painter,
+        r: Rect,
+        f: &Finding,
+        nested: bool,
+        model: &Session,
+    ) {
+        let th = self.theme.clone();
+        let selected = model.mix_selected_id();
+        let name = Self::name(model);
+        let device = Self::device(model);
+        let r = if nested {
+            Rect::new(r.x + 14.0, r.y, (r.w - 14.0).max(0.0), r.h)
+        } else {
+            r
+        };
+        let dismissed = model.mix_dismissed(f.id);
+        let applied = model.mix_applied_state(f.id);
+        let stale = model.mix_finding_stale(f.id) && applied.is_none();
+        if selected == Some(f.id) {
+            p.fill(r, th.ui.selection.with_alpha(0.35));
+        } else if self.hover == Some(Hit::Row(f.id)) {
+            p.fill(r, th.ui.text.with_alpha(0.05));
+        }
+        let sev = Grade::of_severity(f.severity);
+        p.fill(
+            Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
+            self.grade_color(sev),
+        );
+        let ink = if dismissed || stale || applied == Some(Applied::Resolved) {
+            th.ui.text_faint
+        } else {
+            th.ui.text
+        };
+        let tx = r.x + 12.0;
+        let tw = r.w - 20.0;
+        // Room for the applied badge on the right.
+        let title_w = if applied.is_some() { tw - 76.0 } else { tw };
+        p.text(
+            &f.title_named(&name, &device),
+            Rect::new(tx, r.y + 4.0, title_w.max(0.0), LINE),
+            &TextStyle::new(th.fonts.small, ink).bold(),
+        );
+        let mut second = Vec::new();
+        let names: Vec<String> = f.tracks.iter().map(|t| name(*t)).collect();
+        if !names.is_empty() {
+            second.push(names.join(", "));
+        }
+        if let (Some(t), Some(res)) = (f.time, model.mix_results()) {
+            second.push(Self::span_text(model, res, t.start, t.end));
+        }
+        if let Some(fr) = f.frequency {
+            second.push(fr.label());
+        }
+        p.text(
+            &second.join(" · "),
+            Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
+            &TextStyle::new(th.fonts.small, th.ui.text_dim),
+        );
+        let n = f
+            .recommendations
+            .iter()
+            .filter(|r| r.experiment.previewable() || r.experiment.hand_off().is_some())
+            .count();
+        let pattern = f
+            .pattern
+            .map(|p| format!(" · {}", p.label()))
+            .unwrap_or_default();
+        p.text(
+            &format!(
+                "Severity {} · Confidence {} · {} experiment{}{pattern}{}",
+                sev.label(),
+                Grade::of_confidence(f.confidence).label(),
+                n,
+                if n == 1 { "" } else { "s" },
+                match (dismissed, stale) {
+                    (true, _) => " · dismissed",
+                    (_, true) => " · stale",
+                    _ => "",
+                }
+            ),
+            Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
+            &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
+        );
+        if let Some(state) = applied {
+            let badge = Self::applied_badge(state);
+            let style = TextStyle::new(th.fonts.tiny, th.ui.accent).center();
+            let bw = p.text_width(badge, &style) + 12.0;
+            let b = Rect::new(r.right() - bw - 8.0, r.y + 5.0, bw, 15.0);
+            p.fill_rounded(b, 3.0, &th.ui.accent.with_alpha(0.18).into());
+            p.text(badge, b, &style);
+        }
+        p.hline(
+            r.x,
+            r.right(),
+            r.bottom() - 0.5,
+            th.ui.border.with_alpha(0.5),
+        );
+        self.register(Spot {
+            hit: Hit::Row(f.id),
+            rect: r,
+            enabled: true,
+            label: format!(
+                "{}, severity {}{}{}",
+                f.title_named(&name, &device),
+                sev.label().to_lowercase(),
+                if stale { ", stale" } else { "" },
+                applied
+                    .map(|a| format!(", {}", Self::applied_badge(a).to_lowercase()))
+                    .unwrap_or_default()
+            ),
+            tip: f.explanation_named(&name, &device),
+            on: selected == Some(f.id),
+        });
+    }
+
     fn paint_list(&mut self, p: &mut dyn Painter, rect: Rect, model: &Session) {
         let th = self.theme.clone();
         p.fill(rect, th.ui.background);
@@ -724,8 +1065,8 @@ impl MixView {
             (rect.h - FILTER_H - if footer { FOOTER_H } else { 0.0 }).max(0.0),
         );
         self.list = list;
-        let rows = self.listed(model);
-        self.list_content = rows.len() as f32 * ROW_H;
+        let rows = self.rows(model);
+        self.list_content = rows.iter().map(Row::height).sum();
         self.list_scroll = self
             .list_scroll
             .clamp(0.0, (self.list_content - list.h).max(0.0));
@@ -754,117 +1095,18 @@ impl MixView {
                 y += LINE;
             }
         }
-        let selected = model.mix_selected_id();
-        let name = Self::name(model);
-        let device = Self::device(model);
-        for (i, f) in rows.iter().enumerate() {
-            let r = Rect::new(
-                list.x,
-                list.y + i as f32 * ROW_H - self.list_scroll,
-                list.w,
-                ROW_H,
-            );
+        let mut y = list.y - self.list_scroll;
+        for row in &rows {
+            let r = Rect::new(list.x, y, list.w, row.height());
+            y += row.height();
             if r.bottom() < list.y || r.y > list.bottom() {
                 continue;
             }
-            let dismissed = model.mix_dismissed(f.id);
-            let applied = model.mix_applied_state(f.id);
-            let stale = model.mix_finding_stale(f.id) && applied.is_none();
-            if selected == Some(f.id) {
-                p.fill(r, th.ui.selection.with_alpha(0.35));
-            } else if self.hover == Some(Hit::Row(f.id)) {
-                p.fill(r, th.ui.text.with_alpha(0.05));
+            match row {
+                Row::Tier(grade, n) => self.paint_tier_row(p, r, *grade, *n),
+                Row::Group(key, fs) => self.paint_group_row(p, r, *key, fs, model),
+                Row::Finding(f, nested) => self.paint_finding_row(p, r, f, *nested, model),
             }
-            let sev = Grade::of_severity(f.severity);
-            p.fill(
-                Rect::new(r.x, r.y + 6.0, 3.0, r.h - 12.0),
-                self.grade_color(sev),
-            );
-            let ink = if dismissed || stale || applied == Some(Applied::Resolved) {
-                th.ui.text_faint
-            } else {
-                th.ui.text
-            };
-            let tx = r.x + 12.0;
-            let tw = r.w - 20.0;
-            // Room for the applied badge on the right.
-            let title_w = if applied.is_some() { tw - 76.0 } else { tw };
-            p.text(
-                &f.title_named(&name, &device),
-                Rect::new(tx, r.y + 4.0, title_w.max(0.0), LINE),
-                &TextStyle::new(th.fonts.small, ink).bold(),
-            );
-            let mut second = Vec::new();
-            let names: Vec<String> = f.tracks.iter().map(|t| name(*t)).collect();
-            if !names.is_empty() {
-                second.push(names.join(", "));
-            }
-            if let (Some(t), Some(res)) = (f.time, model.mix_results()) {
-                second.push(Self::span_text(model, res, t.start, t.end));
-            }
-            if let Some(fr) = f.frequency {
-                second.push(fr.label());
-            }
-            p.text(
-                &second.join(" · "),
-                Rect::new(tx, r.y + 4.0 + LINE, tw, LINE),
-                &TextStyle::new(th.fonts.small, th.ui.text_dim),
-            );
-            let n = f
-                .recommendations
-                .iter()
-                .filter(|r| r.experiment.previewable() || r.experiment.hand_off().is_some())
-                .count();
-            let pattern = f
-                .pattern
-                .map(|p| format!(" · {}", p.label()))
-                .unwrap_or_default();
-            p.text(
-                &format!(
-                    "Severity {} · Confidence {} · {} experiment{}{pattern}{}",
-                    sev.label(),
-                    Grade::of_confidence(f.confidence).label(),
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    match (dismissed, stale) {
-                        (true, _) => " · dismissed",
-                        (_, true) => " · stale",
-                        _ => "",
-                    }
-                ),
-                Rect::new(tx, r.y + 4.0 + 2.0 * LINE, tw, LINE),
-                &TextStyle::new(th.fonts.tiny, th.ui.text_faint),
-            );
-            if let Some(state) = applied {
-                let badge = Self::applied_badge(state);
-                let style = TextStyle::new(th.fonts.tiny, th.ui.accent).center();
-                let bw = p.text_width(badge, &style) + 12.0;
-                let b = Rect::new(r.right() - bw - 8.0, r.y + 5.0, bw, 15.0);
-                p.fill_rounded(b, 3.0, &th.ui.accent.with_alpha(0.18).into());
-                p.text(badge, b, &style);
-            }
-            p.hline(
-                r.x,
-                r.right(),
-                r.bottom() - 0.5,
-                th.ui.border.with_alpha(0.5),
-            );
-            self.register(Spot {
-                hit: Hit::Row(f.id),
-                rect: r,
-                enabled: true,
-                label: format!(
-                    "{}, severity {}{}{}",
-                    f.title_named(&name, &device),
-                    sev.label().to_lowercase(),
-                    if stale { ", stale" } else { "" },
-                    applied
-                        .map(|a| format!(", {}", Self::applied_badge(a).to_lowercase()))
-                        .unwrap_or_default()
-                ),
-                tip: f.explanation_named(&name, &device),
-                on: selected == Some(f.id),
-            });
         }
         p.pop_clip();
         self.visible = None;
@@ -2429,6 +2671,31 @@ impl MixView {
                 cx.emit(Action::Mix(MixOp::LoudnessMatch(!on)));
             }
             Hit::Reject => cx.emit(Action::Mix(MixOp::Reject)),
+            Hit::Tier(grade) => {
+                match self.folded.iter().position(|g| *g == grade) {
+                    Some(i) => {
+                        self.folded.remove(i);
+                    }
+                    None => self.folded.push(grade),
+                }
+                cx.redraw();
+            }
+            Hit::Group(key) => {
+                // Open while it holds the selection: closing it lets go of
+                // that too.
+                let holds = model.mix_selected().is_some_and(|f| group_key(f) == key);
+                match self.opened.iter().position(|k| *k == key) {
+                    Some(i) => {
+                        self.opened.remove(i);
+                        if holds {
+                            cx.emit(Action::Mix(MixOp::Select(None)));
+                        }
+                    }
+                    None if holds => cx.emit(Action::Mix(MixOp::Select(None))),
+                    None => self.opened.push(key),
+                }
+                cx.redraw();
+            }
             Hit::OpenRoles => {
                 self.panel = Panel::Roles;
                 self.detail_scroll = 0.0;

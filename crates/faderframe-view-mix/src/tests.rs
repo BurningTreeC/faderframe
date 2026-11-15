@@ -719,3 +719,78 @@ fn a_finding_shows_its_tracks_roles() {
         Some(HostRequest::ContextMenu { .. })
     ));
 }
+
+/// The list in severity sections — Fix, Consider, Info (folded at first) —
+/// with findings of one rule about the same tracks as one group, opened
+/// on demand or while it holds the selection.
+#[test]
+fn findings_are_listed_in_sections_and_groups() {
+    use faderframe_mix_intelligence::{FrequencyRange, RuleId, Subject};
+    let (a, b, c) = (TrackId(1), TrackId(2), TrackId(3));
+    let finding =
+        |id: u64, rule: RuleId, tracks: Vec<TrackId>, severity: f64, band: (f64, f64)| Finding {
+            id,
+            rule,
+            signal: SignalPoint::Processed,
+            subject: Subject::Tracks {
+                a: tracks[0],
+                b: tracks[tracks.len() - 1],
+            },
+            tracks,
+            time: None,
+            events: Vec::new(),
+            pattern: None,
+            frequency: Some(FrequencyRange {
+                lo: band.0,
+                hi: band.1,
+            }),
+            severity,
+            severity_terms: Vec::new(),
+            confidence: 0.8,
+            confidence_terms: Vec::new(),
+            evidence: Vec::new(),
+            spectrum: None,
+            sections: Vec::new(),
+            recommendations: Vec::new(),
+            caveats: Vec::new(),
+        };
+    let m = RuleId::SpectralMasking;
+    let fs = [
+        finding(1, m, vec![a, b], 0.8, (60.0, 90.0)),
+        finding(2, m, vec![b, a], 0.6, (110.0, 140.0)),
+        finding(3, m, vec![a, c], 0.7, (2000.0, 3000.0)),
+        finding(4, m, vec![a, b], 0.3, (400.0, 500.0)),
+        finding(5, m, vec![c, b], 0.1, (8000.0, 9000.0)),
+    ];
+    let listed: Vec<&Finding> = fs.iter().collect();
+    let shape = |rows: &[Row<'_>]| -> Vec<String> {
+        rows.iter()
+            .map(|r| match r {
+                Row::Tier(g, n) => format!("{} {n}", tier_label(*g)),
+                Row::Group(_, v) => format!(
+                    "group {}",
+                    v.iter()
+                        .map(|f| f.id.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ),
+                Row::Finding(f, nested) => format!("{}{}", if *nested { "  " } else { "" }, f.id),
+            })
+            .collect()
+    };
+    // A×B twice among the high ones (either order of the tracks): one group.
+    let rows = arrange(listed.clone(), &[Grade::Low], &[], None);
+    assert_eq!(
+        shape(&rows),
+        ["Fix 3", "group 1+2", "3", "Consider 1", "4", "Info 1"]
+    );
+    // Opened, or holding the selection: its findings under it.
+    let key = group_key(&fs[0]);
+    let opened = arrange(listed.clone(), &[Grade::Low], &[key], None);
+    assert_eq!(shape(&opened)[1..4], ["group 1+2", "  1", "  2"]);
+    let selected = arrange(listed.clone(), &[Grade::Low], &[], Some(2));
+    assert_eq!(shape(&selected)[1..4], ["group 1+2", "  1", "  2"]);
+    // Info unfolded, Fix folded.
+    let rows = arrange(listed, &[Grade::High], &[], None);
+    assert_eq!(shape(&rows), ["Fix 3", "Consider 1", "4", "Info 1", "5"]);
+}
