@@ -1658,6 +1658,26 @@ impl Generic {
     }
 }
 
+/// A parameter's name under its group's heading: without the group (or
+/// its last part) it starts with.
+fn short_name(name: &str, group: Option<&str>) -> String {
+    let Some(group) = group else {
+        return name.to_string();
+    };
+    let last = group.rsplit('/').next().unwrap_or(group);
+    for prefix in [group, last] {
+        if let Some(rest) = name.strip_prefix(prefix)
+            && let Some(rest) = rest.strip_prefix(['/', ' ', ':', '-'])
+        {
+            let rest = rest.trim_start_matches([' ', '/', ':', '-']);
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
 fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
     if let Some(w) = EDITORS.with(|e| e.generic.borrow().get(&plugin).cloned()) {
         w.present();
@@ -1715,12 +1735,11 @@ fn open_generic(app: &Rc<AppState>, plugin: PluginInstanceId) {
     let mut module = None;
     for p in &params {
         let info = p.info.clone();
-        // CLAP parameters carry a module path ("Filter/Cutoff"): section
-        // headers instead of repeated prefixes.
-        let (group, short) = match info.name.rsplit_once('/') {
-            Some((g, n)) => (Some(g.to_string()), n.to_string()),
-            None => (None, info.name.clone()),
-        };
+        // The plugin's own groups (CLAP's module path, VST3's units): section
+        // headers instead of repeated prefixes. A '/' in a name alone is
+        // part of it ("Motors Ac/Dc").
+        let group = p.group.clone();
+        let short = short_name(&info.name, group.as_deref());
         if group.is_some() && group != module {
             let heading = gtk::Label::new(group.as_deref().map(str::to_uppercase).as_deref());
             heading.set_xalign(0.0);
@@ -2019,5 +2038,20 @@ mod tests {
         let mut toggle = info(ParameterUnit::None, true);
         toggle.max = 1.0;
         assert_eq!(unit_text(&toggle, 1.0), "On");
+    }
+
+    /// A '/' in a name with no group is part of the name (x42 Whirl's
+    /// "Motors Ac/Dc"); a group's prefix goes under its heading.
+    #[test]
+    fn names_are_shortened_only_by_their_own_group() {
+        assert_eq!(short_name("Motors Ac/Dc", None), "Motors Ac/Dc");
+        assert_eq!(short_name("Filter/Cutoff", Some("Filter")), "Cutoff");
+        assert_eq!(
+            short_name("Scene A/Osc 1/Pitch", Some("Scene A/Osc 1")),
+            "Pitch"
+        );
+        assert_eq!(short_name("Osc 1 Pitch", Some("Scene A/Osc 1")), "Pitch");
+        assert_eq!(short_name("Cutoff", Some("Filter")), "Cutoff");
+        assert_eq!(short_name("Filter", Some("Filter")), "Filter");
     }
 }

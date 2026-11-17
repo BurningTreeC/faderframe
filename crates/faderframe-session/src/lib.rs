@@ -2200,6 +2200,9 @@ pub struct PluginParameterView {
     pub value: f64,
     /// Explicitly stored in the project slot.
     pub explicit: bool,
+    /// The plugin's own group of it ("Filter/Env"), if any
+    /// ([`faderframe_plugin_host::PluginInstance::parameter_group`]).
+    pub group: Option<String>,
 }
 
 /// A plugin offered in insert/instrument menus.
@@ -6273,6 +6276,7 @@ impl Session {
                     .unwrap_or(info.default);
                 PluginParameterView {
                     explicit: explicit.contains(&info.id),
+                    group: self.engine.plugin_parameter_group(plugin, info.id),
                     info,
                     value,
                 }
