@@ -147,3 +147,36 @@ fn another_projects_files_in_the_same_folder_are_never_offered() {
     assert_eq!(song.unused_media().unwrap().files, Vec::<PathBuf>::new());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_copy_saved_under_a_new_name_never_offers_what_the_original_uses() {
+    let dir = tmp("copy");
+    for n in ["Drums", "Guitar", "Scrap"] {
+        tone(&dir.join(format!("{n}.wav")));
+    }
+    let folder = dir.join("Songs");
+    let mut s = Session::new(Project::new("Song", 48_000), None, EngineConfig::default()).unwrap();
+    import(&mut s, &dir.join("Drums.wav"));
+    let (guitar_clip, guitar) = import(&mut s, &dir.join("Guitar.wav"));
+    let (scrap_clip, scrap) = import(&mut s, &dir.join("Scrap.wav"));
+    s.dispatch(Action::Edit(Command::RemoveClip { clip: scrap_clip }))
+        .unwrap();
+    s.save_as(&folder.join("Song.ffproj")).unwrap();
+    // Saved again under a new name and cut down to the drums: it still
+    // lists the guitar, which the song plays.
+    s.dispatch(Action::Edit(Command::RemoveClip { clip: guitar_clip }))
+        .unwrap();
+    s.save_as(&folder.join("Drums only.ffproj")).unwrap();
+
+    let got = names(&s.unused_media().unwrap().files);
+    let stem = |p: &Path| p.file_stem().unwrap().to_string_lossy().to_string();
+    assert!(
+        got.iter().any(|n| n.starts_with(&stem(&scrap))),
+        "nothing uses the scrap: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|n| n.starts_with(&stem(&guitar))),
+        "the song still plays the guitar: {got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

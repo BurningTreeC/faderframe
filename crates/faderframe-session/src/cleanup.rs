@@ -4,7 +4,9 @@
 //! neither the saved project nor any of its saved versions uses. A file no
 //! source of the project names is never offered: projects saved in one
 //! folder share its `Audio` folder, and another project's recordings are
-//! not this one's to throw away. While a session
+//! not this one's to throw away. Nor is a file another project in the
+//! folder uses, even one this project names too (a copy saved under a new
+//! name and cut down still lists the original's recordings). While a session
 //! is open its undo history may still need a file a clip no longer plays
 //! (a deleted clip comes back on Undo); once it closes, only the saved
 //! files speak for them. A source a saved file lists counts as used when
@@ -73,17 +75,29 @@ impl Session {
                 _ => None,
             })
             .collect();
+        // The other projects in the folder: what they use stays too.
+        let mut others = Vec::new();
+        for other in std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()) {
+            let is_project = other.extension().and_then(|e| e.to_str())
+                == Some(faderframe_project::file::FILE_EXTENSION);
+            if is_project && other.is_file() && same(&other) != same(path) {
+                others.push(other);
+            }
+        }
         // Each saved file as text without the sources nothing uses: a file
         // named there is named by something else.
-        let mut texts = Vec::with_capacity(saved.len());
-        for f in &saved {
+        let mut texts = Vec::with_capacity(saved.len() + others.len());
+        let own = saved.len();
+        for (i, f) in saved.iter().chain(&others).enumerate() {
             let text = std::fs::read_to_string(f).ok()?;
             let mut loaded = faderframe_project::file::from_str(&text).ok()?;
             let p = &mut loaded.project;
-            owned.extend(p.sources.values().filter_map(|s| match &s.spec {
-                SourceSpec::File { path, .. } => Some(at(path)),
-                _ => None,
-            }));
+            if i < own {
+                owned.extend(p.sources.values().filter_map(|s| match &s.spec {
+                    SourceSpec::File { path, .. } => Some(at(path)),
+                    _ => None,
+                }));
+            }
             let keep = p.used_sources();
             p.sources.retain(|id, _| keep.contains(id));
             for s in p.sources.values() {
