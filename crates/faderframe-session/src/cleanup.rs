@@ -1,5 +1,12 @@
-//! Unused media: audio files in the project's `Audio` folder that neither
-//! the saved project nor any of its saved versions uses. While a session
+//! Unused media: audio files in the project's `Audio` folder that the
+//! project brought there (a source of the saved project, a saved version
+//! or the open session names it: recorded, imported, rendered) and that
+//! neither the saved project nor any of its saved versions uses. A file no
+//! source of the project names is never offered: projects saved in one
+//! folder share its `Audio` folder, and another project's recordings are
+//! not this one's to throw away. Nor is a file another project in the
+//! folder uses, even one this project names too (a copy saved under a new
+//! name and cut down still lists the original's recordings). While a session
 //! is open its undo history may still need a file a clip no longer plays
 //! (a deleted clip comes back on Undo); once it closes, only the saved
 //! files speak for them. A source a saved file lists counts as used when
@@ -49,25 +56,53 @@ impl Session {
         let mut saved = vec![path.to_path_buf()];
         saved.extend(self.versions().into_iter().map(|v| v.path));
         let mut used: HashSet<PathBuf> = HashSet::new();
+        // Every file a source of the project names, used or not: the only
+        // ones it may offer.
+        let at = |path: &Path| {
+            // Relative paths are from the project's folder (versions too).
+            same(&if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                dir.join(path)
+            })
+        };
+        let mut owned: HashSet<PathBuf> = self
+            .project
+            .sources
+            .values()
+            .filter_map(|s| match &s.spec {
+                SourceSpec::File { path, .. } => Some(at(path)),
+                _ => None,
+            })
+            .collect();
+        // The other projects in the folder: what they use stays too.
+        let mut others = Vec::new();
+        for other in std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()) {
+            let is_project = other.extension().and_then(|e| e.to_str())
+                == Some(faderframe_project::file::FILE_EXTENSION);
+            if is_project && other.is_file() && same(&other) != same(path) {
+                others.push(other);
+            }
+        }
         // Each saved file as text without the sources nothing uses: a file
         // named there is named by something else.
-        let mut texts = Vec::with_capacity(saved.len());
-        for f in &saved {
+        let mut texts = Vec::with_capacity(saved.len() + others.len());
+        let own = saved.len();
+        for (i, f) in saved.iter().chain(&others).enumerate() {
             let text = std::fs::read_to_string(f).ok()?;
             let mut loaded = faderframe_project::file::from_str(&text).ok()?;
             let p = &mut loaded.project;
+            if i < own {
+                owned.extend(p.sources.values().filter_map(|s| match &s.spec {
+                    SourceSpec::File { path, .. } => Some(at(path)),
+                    _ => None,
+                }));
+            }
             let keep = p.used_sources();
             p.sources.retain(|id, _| keep.contains(id));
             for s in p.sources.values() {
                 if let SourceSpec::File { path, .. } = &s.spec {
-                    // Relative paths are from the project's folder (versions
-                    // too).
-                    let p = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        dir.join(path)
-                    };
-                    used.insert(same(&p));
+                    used.insert(at(path));
                 }
             }
             texts.push(faderframe_project::file::to_string(p, None).ok()?);
@@ -86,7 +121,9 @@ impl Session {
             .collect();
         candidates.sort();
         for file in candidates {
-            if used.contains(&same(&file)) {
+            let it = same(&file);
+            // Not this project's, or used.
+            if !owned.contains(&it) || used.contains(&it) {
                 continue;
             }
             let Some(name) = file.file_name().and_then(|n| n.to_str()) else {

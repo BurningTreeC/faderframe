@@ -6386,8 +6386,13 @@ modulation targets, the Performance view, graph node names, plugin
 outputs, sandbox notices). Numbers follow the chain's order.
 
 *Unused media* (`session::cleanup`, `Session::unused_media`): the audio
-files directly in the saved project's `Audio` folder that neither the
-saved file nor any saved version uses — a listed source counts when
+files directly in the saved project's `Audio` folder that the project
+brought there — a source of the saved file, a saved version or the open
+session names it — and that neither the saved file nor any saved version
+uses. A file no source of the project names is never offered: projects
+saved in one folder share its `Audio` folder (a song and its master side
+by side), and closing one once sent the other's recordings to the trash.
+A listed source counts when
 `Project::used_sources` (clips, takes, clip-effect, spectral and
 polyphonic originals, freezes) has it, and a file named anywhere else in
 a saved file is kept; `Samples` and other subfolders are left alone,
