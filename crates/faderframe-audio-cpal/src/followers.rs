@@ -210,10 +210,16 @@ pub struct Watcher {
 }
 
 impl Watcher {
+    /// Looking for a device and opening it can take seconds (Windows
+    /// refusing an input it does not let FaderFrame use: #94); the
+    /// followers' lock, which the control side takes to show the devices,
+    /// is held only to attach a link, never meanwhile.
     pub fn tick(&mut self) {
         let now = Instant::now();
-        let mut followers = self.followers.lock().unwrap_or_else(|e| e.into_inner());
-        followers.collect();
+        self.followers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .collect();
         for f in &mut self.streams {
             if f.stream.is_some() && f.failed.load(Ordering::Relaxed) {
                 // Unplugged (or its device otherwise gone): its channels
@@ -250,7 +256,12 @@ impl Watcher {
             ) else {
                 continue;
             };
-            let Some(end) = followers.attach(f.index, open.sample_rate, open.block) else {
+            let attached = self
+                .followers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .attach(f.index, open.sample_rate, open.block);
+            let Some(end) = attached else {
                 continue;
             };
             f.failed.store(false, Ordering::Relaxed);
