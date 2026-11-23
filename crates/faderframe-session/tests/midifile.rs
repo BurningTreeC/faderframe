@@ -375,3 +375,56 @@ fn programs_poly_pressure_and_release_velocities_survive_import_and_export() {
     };
     assert_eq!(strip(&m2), strip(&m));
 }
+
+/// A file dropped on an instrument track lands on it (one part), not on a
+/// new track; dropped on an audio track it gets its own.
+#[test]
+fn a_file_dropped_on_an_instrument_track_lands_on_it() {
+    let mut demo = Session::demo(EngineConfig::default()).unwrap();
+    let path = dir().join("dropped.mid");
+    let melody = demo
+        .project()
+        .clips
+        .values()
+        .find(|c| c.name == "Melody")
+        .unwrap()
+        .id;
+    demo.export_midi_file(&path, Some(&[melody])).unwrap();
+
+    let mut s = Session::demo(EngineConfig::default()).unwrap();
+    let kind_of = |s: &Session, kind| {
+        s.project()
+            .tracks
+            .iter()
+            .find(|t| t.kind == kind)
+            .unwrap()
+            .id
+    };
+    let (instrument, audio) = (
+        kind_of(&s, TrackKind::Instrument),
+        kind_of(&s, TrackKind::Audio),
+    );
+    let tracks = s.project().tracks.len();
+    let at = MusicalTime::from_quarters(64.0);
+    s.dispatch(Action::ImportFiles {
+        files: vec![path.clone()],
+        track: Some(instrument),
+        at,
+    })
+    .unwrap();
+    assert_eq!(s.project().tracks.len(), tracks, "no new track");
+    assert!(
+        s.project()
+            .clips_of(instrument)
+            .iter()
+            .any(|c| c.start == at && c.as_midi().is_some()),
+        "on the instrument track"
+    );
+    s.dispatch(Action::ImportFiles {
+        files: vec![path],
+        track: Some(audio),
+        at,
+    })
+    .unwrap();
+    assert_eq!(s.project().tracks.len(), tracks + 1, "a new track for it");
+}

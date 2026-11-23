@@ -63,6 +63,23 @@ impl Session {
         at: MusicalTime,
         tempo: bool,
     ) -> Result<Vec<TrackId>> {
+        self.import_midi_file_onto(path, at, tempo, None)
+    }
+
+    /// [`Self::import_midi_file`], its first part onto `onto` where that is
+    /// an instrument or MIDI track (dropped on it); the rest on new tracks.
+    pub fn import_midi_file_onto(
+        &mut self,
+        path: &Path,
+        at: MusicalTime,
+        tempo: bool,
+        onto: Option<TrackId>,
+    ) -> Result<Vec<TrackId>> {
+        let mut onto = onto.filter(|t| {
+            self.project
+                .track(*t)
+                .is_some_and(|t| matches!(t.kind, TrackKind::Instrument | TrackKind::Midi))
+        });
         if crate::midi2file::is_midi2_clip_file(path) {
             return self.import_midi2_clip(path, at, tempo).map(|t| vec![t]);
         }
@@ -198,11 +215,12 @@ impl Session {
         }
 
         let p = &mut self.project;
-        let mut index = p
-            .tracks
-            .iter()
-            .rposition(|t| t.kind.has_clips())
+        // New tracks go under the one dropped on, else after the last.
+        let mut index = onto
+            .and_then(|t| p.track_index(t))
+            .or_else(|| p.tracks.iter().rposition(|t| t.kind.has_clips()))
             .map_or(0, |i| i + 1);
+        let mut placed = None;
         let mut created = Vec::new();
         for part in parts {
             let mut notes: Vec<MidiNote> = Vec::new();
@@ -342,14 +360,23 @@ impl Session {
                 meter.bar_start(bar + 1)
             };
             let length = (bar_end - at).max(MusicalTime::from_quarters(1.0));
-            let track_id: TrackId = p.ids.allocate();
-            let color = TrackColor::palette(p.tracks.len() + created.len());
-            let track = Track::new(track_id, TrackKind::Instrument, part.name.clone(), color);
-            cmds.push(Command::AddTrack {
-                track: Box::new(track),
-                index,
-            });
-            index += 1;
+            let track_id: TrackId = match onto.take() {
+                Some(t) => {
+                    placed = Some(t);
+                    t
+                }
+                None => {
+                    let id = p.ids.allocate();
+                    let color = TrackColor::palette(p.tracks.len() + created.len());
+                    let track = Track::new(id, TrackKind::Instrument, part.name.clone(), color);
+                    cmds.push(Command::AddTrack {
+                        track: Box::new(track),
+                        index,
+                    });
+                    index += 1;
+                    id
+                }
+            };
             let clip_id: ClipId = p.ids.allocate();
             cmds.push(Command::AddClip {
                 clip: Box::new(Clip {
@@ -376,12 +403,18 @@ impl Session {
                     }),
                 }),
             });
-            created.push(track_id);
+            if placed != Some(track_id) {
+                created.push(track_id);
+            }
         }
         self.batch("Import MIDI File", cmds)?;
+        let shown: Vec<TrackId> = placed.into_iter().chain(created.iter().copied()).collect();
         self.selection
-            .select_tracks(&created, crate::SelectMode::Replace);
+            .select_tracks(&shown, crate::SelectMode::Replace);
         let n = created.len();
+        if n == 0 {
+            return Ok(created);
+        }
         let text = format!(
             "imported {n} track{} from {} — choose an instrument for {}",
             if n == 1 { "" } else { "s" },

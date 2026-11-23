@@ -137,7 +137,7 @@ pub struct PreviewSettings {
     pub sync: bool,
     /// In the project's key (transposed).
     pub key: bool,
-    /// Loops and MIDI files go round until stopped.
+    /// Loops (audio and MIDI) go round until stopped.
     pub looped: bool,
     /// A file previews when it is selected.
     pub auto: bool,
@@ -640,7 +640,13 @@ pub fn is_loop(bpm: Option<f64>, seconds: Option<f64>) -> bool {
     let (Some(bpm), Some(s)) = (bpm, seconds) else {
         return false;
     };
-    let beats = s * bpm / 60.0;
+    beats_loop(s * bpm / 60.0)
+}
+
+/// An even number of beats (within 3 %): a loop's length. A MIDI file's
+/// last event on it goes round; one ending elsewhere (a fill, a phrase
+/// with a tail) plays once, as audio that is not a loop does.
+pub fn beats_loop(beats: f64) -> bool {
     let whole = beats.round();
     whole >= 2.0 && whole as i64 % 2 == 0 && (beats - whole).abs() <= whole * 0.03
 }
@@ -902,8 +908,11 @@ impl Session {
                 let auto = self.browser.user.preview.auto;
                 let one = (paths.len() == 1).then(|| paths[0].clone());
                 self.browser.selected = paths;
+                // A click on the file already heard (to drag it, say)
+                // leaves its preview as it is.
                 if auto
                     && let Some(p) = one
+                    && !self.still_heard(&p)
                     && FileKind::of(&p).is_some()
                     && p.is_file()
                 {
@@ -1589,7 +1598,7 @@ impl Session {
                     .set_midi_preview(Some(MidiPreview {
                         events,
                         length,
-                        looped: settings.looped,
+                        looped: settings.looped && beats_loop(notes.quarters),
                         start,
                     }))
                     .map_err(|e| SessionError::Other(e.to_string()))?
@@ -1629,6 +1638,23 @@ impl Session {
                     .find(|t| t.kind == TrackKind::Instrument)
             })
             .map(|t| t.id)
+    }
+
+    /// `path`'s preview plays on (not ended).
+    fn still_heard(&self, path: &Path) -> bool {
+        let Some(p) = self.browser.preview.as_ref().filter(|p| p.path == path) else {
+            return false;
+        };
+        match &p.sound {
+            Sound::Audio { generation, .. } => !self
+                .engine
+                .listening()
+                .link
+                .preview()
+                .shared()
+                .has_ended(*generation),
+            Sound::Midi { status, .. } => !status.has_ended(),
+        }
     }
 
     /// The preview's worker and end (`true`: what is shown changed).
@@ -1691,7 +1717,7 @@ impl Session {
         for f in &midi {
             match to {
                 Destination::Arranger => {
-                    self.import_midi_file(f, at, false)?;
+                    self.import_midi_file_onto(f, at, false, track)?;
                     self.browser.user.used(f);
                 }
                 Destination::Launcher { .. } => self.notify(
@@ -1993,6 +2019,10 @@ mod tests {
         assert!(!is_loop(Some(120.0), Some(1.75)));
         assert!(!is_loop(None, Some(4.0)));
         assert!(!is_loop(Some(120.0), Some(0.5)));
+        // MIDI files by their last event: two bars round, a tail doesn't.
+        assert!(beats_loop(8.0));
+        assert!(beats_loop(15.75));
+        assert!(!beats_loop(8.58));
         assert_eq!(nearest_tempo(170.0, 90.0), 85.0);
         assert_eq!(nearest_tempo(60.0, 120.0), 120.0);
         assert_eq!(nearest_tempo(100.0, 104.0), 100.0);
