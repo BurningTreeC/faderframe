@@ -31,6 +31,8 @@ headerbar popovermenubar { background: transparent; }
 .transport button.click-active { color: @ff_selection; }
 .transport button.quantize-toggle { font-weight: 800; }
 .transport button.q-active { color: @ff_accent; }
+.transport .linked > button { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.transport menubutton.metronome-options > button { min-width: 14px; padding: 0 1px; border-top-left-radius: 0; border-bottom-left-radius: 0; }
 .lcd { border-radius: 6px; margin: 4px 6px; }
 notebook.dock-tabs > header {
     background-color: @ff_surface;

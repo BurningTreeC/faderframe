@@ -1022,7 +1022,19 @@ pub fn build(app: &Rc<AppState>) -> gtk::ApplicationWindow {
         }
     });
     metronome.add_controller(settings);
-    transport.append(&metronome);
+    // Its choices (when it clicks, the count-in) a click away.
+    let metronome_options = gtk::MenuButton::new();
+    metronome_options.set_icon_name("pan-down-symbolic");
+    metronome_options.set_menu_model(Some(&crate::recording::metronome_menu(
+        &crate::prefs::Preferences::load().record_settings(),
+    )));
+    metronome_options.set_tooltip_text(Some("Metronome and count-in options"));
+    metronome_options.add_css_class("metronome-options");
+    let metronome_group = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    metronome_group.add_css_class("linked");
+    metronome_group.append(&metronome);
+    metronome_group.append(&metronome_options);
+    transport.append(&metronome_group);
     let edit_button = gtk::Button::with_label("Edit");
     edit_button.set_tooltip_text(Some(
         "Edit toolbar: edit modes, tools, grid and nudge, options, selection (Ctrl+E)",

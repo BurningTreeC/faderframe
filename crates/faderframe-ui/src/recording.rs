@@ -430,6 +430,43 @@ fn radio_menu(action: &str, items: impl IntoIterator<Item = (String, String)>) -
     m
 }
 
+/// When the metronome clicks (Off, While recording, Always).
+fn metronome_modes() -> gio::Menu {
+    radio_menu(
+        "app.metronome",
+        MetronomeMode::ALL.map(|x| (x.label().to_string(), x.id().to_string())),
+    )
+}
+
+/// Count-in: on or off, its length, the click only during it.
+fn count_in_menu(r: &RecordSettings) -> gio::Menu {
+    let count = gio::Menu::new();
+    count.append(Some("Count In Before Recording"), Some("app.count-in"));
+    count.append_section(
+        None,
+        &radio_menu("app.count-in-length", count_in_choices(r.count_in_length)),
+    );
+    let click = gio::Menu::new();
+    click.append(
+        Some("Click Only During Count-in"),
+        Some("app.count-in-click-only"),
+    );
+    count.append_section(None, &click);
+    count
+}
+
+/// The metronome's menu beside its toolbar button: the Transport menu's
+/// metronome and count-in choices without the trip through the menu bar.
+pub fn metronome_menu(r: &RecordSettings) -> gio::Menu {
+    let m = gio::Menu::new();
+    m.append_section(Some("Metronome"), &metronome_modes());
+    m.append_section(Some("Count-in"), &count_in_menu(r));
+    let settings = gio::Menu::new();
+    settings.append(Some("Metronome Settings…"), Some("app.metronome-settings"));
+    m.append_section(None, &settings);
+    m
+}
+
 /// The recording part of the Transport menu (its choices as `r` has them:
 /// a length set in the Preferences shows too).
 pub fn menu_for(r: &RecordSettings) -> gio::Menu {
@@ -453,27 +490,9 @@ pub fn menu_for(r: &RecordSettings) -> gio::Menu {
             LoopRecordMode::ALL.map(|x| (x.label().to_string(), x.id().to_string())),
         ),
     );
-    opts.append_submenu(
-        Some("Metronome"),
-        &radio_menu(
-            "app.metronome",
-            MetronomeMode::ALL.map(|x| (x.label().to_string(), x.id().to_string())),
-        ),
-    );
+    opts.append_submenu(Some("Metronome"), &metronome_modes());
     opts.append(Some("Metronome Settings…"), Some("app.metronome-settings"));
-    let count = gio::Menu::new();
-    count.append(Some("Count In Before Recording"), Some("app.count-in"));
-    count.append_section(
-        None,
-        &radio_menu("app.count-in-length", count_in_choices(r.count_in_length)),
-    );
-    let click = gio::Menu::new();
-    click.append(
-        Some("Click Only During Count-in"),
-        Some("app.count-in-click-only"),
-    );
-    count.append_section(None, &click);
-    opts.append_submenu(Some("Count-in"), &count);
+    opts.append_submenu(Some("Count-in"), &count_in_menu(r));
     let pre = radio_menu("app.preroll", roll_choices(r.preroll, "No pre-roll"));
     let how = gio::Menu::new();
     how.append(Some("Start on a Bar Line"), Some("app.preroll-on-bar"));
