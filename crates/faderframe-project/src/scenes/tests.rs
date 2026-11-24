@@ -30,6 +30,7 @@ fn project() -> (Project, TrackId, TrackId, TrackId) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     p.tracks.insert(0, ta);
     p.tracks.insert(

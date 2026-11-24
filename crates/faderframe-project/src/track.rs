@@ -418,6 +418,11 @@ pub struct PluginSlot {
     /// Logic's mono-to-stereo insert; see [`Self::widens_mono`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mono_to_stereo: bool,
+    /// Set when Mix Intelligence put the slot there: the finding it came
+    /// from, as the mixer's tooltip says it. Kept until the user takes the
+    /// slot as their own (`Command::SetPluginMixOrigin` with `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix_origin: Option<String>,
 }
 
 impl PluginSlot {
@@ -973,6 +978,7 @@ mod tests {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let mut t = Track::new(
             TrackId(1),
@@ -1012,6 +1018,7 @@ mod tests {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let mut t = Track::new(
             TrackId(1),

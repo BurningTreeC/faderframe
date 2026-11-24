@@ -44,6 +44,7 @@ fn renderer(latency: u32) -> OfflineRenderer {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     }
     let config = EngineConfig {

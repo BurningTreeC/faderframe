@@ -368,6 +368,7 @@ fn counting_in_does_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     let config = EngineConfig {
         sample_rate: SR,
@@ -447,6 +448,7 @@ fn automation_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let ramp = || {
         AutomationCurve::from_points(
@@ -535,6 +537,7 @@ fn many_ramping_lanes_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let continuous = [
         id::INPUT,
@@ -646,6 +649,7 @@ fn delay_compensation_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     track.inserts.push(PluginSlot {
         id: gain,
@@ -655,6 +659,7 @@ fn delay_compensation_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     for target in [
         AutomationTarget::TrackVolume,
@@ -920,6 +925,7 @@ fn folder_buses_and_sends_placing_their_source_do_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     let lane = tp.project.ids.allocate();
     tp.project
@@ -1237,6 +1243,7 @@ fn modulation_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let param = |p: u32| ModTarget::Plugin {
         plugin,
@@ -1504,6 +1511,7 @@ fn containers_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     let (outer, inner) = (slot(builtin::CONTAINER), slot(builtin::CONTAINER));
     let (utility, reverb, gate) = (
@@ -1577,6 +1585,7 @@ fn containers_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     let split = slot(&mut project, builtin::CONTAINER);
     let (a, b) = (
@@ -2179,6 +2188,7 @@ fn render_ahead_without_allocating(buses: bool, patient: bool) -> u64 {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     }
     if buses {
@@ -2381,6 +2391,7 @@ fn the_equalisers_do_not_allocate() {
             state: None,
             sidechain: Some(key_track),
             mono_to_stereo: false,
+            mix_origin: None,
         });
     }
     track.inserts.push(PluginSlot {
@@ -2395,6 +2406,7 @@ fn the_equalisers_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let ramp = |lo: f64, hi: f64| {
         AutomationCurve::from_points(
@@ -3039,6 +3051,7 @@ fn the_stock_devices_do_not_allocate() {
             state: None,
             sidechain: keyed.then_some(key_track),
             mono_to_stereo: false,
+            mix_origin: None,
         });
         track.automation.lanes.push(AutomationLane {
             id: lane,
@@ -3430,6 +3443,7 @@ fn the_instruments_do_not_allocate() {
             state,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         tracks.insert(t);
         ids.push(id);
@@ -3627,6 +3641,7 @@ fn microphone_preamps_do_not_allocate_while_automating_or_resetting() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         track.automation.lanes.push(AutomationLane {
             id: lane,
@@ -3717,6 +3732,7 @@ fn surround_preamps_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     for realtime in [false, true] {
         let mut r = OfflineRenderer::new(&tp.project, &tp.sources, EngineConfig::default(), 128, 6)
@@ -3777,6 +3793,7 @@ fn the_console_does_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         for realtime in [false, true] {
             let mut r =
@@ -3896,6 +3913,7 @@ fn the_guitar_station_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     let automate = |lane, parameter: u32, values: [f64; 3]| AutomationLane {
         id: lane,
@@ -3987,6 +4005,7 @@ fn the_midi_effects_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     let inserts = vec![
         // Up-down over two octaves, swung, held; a random velocity
@@ -4223,6 +4242,7 @@ fn the_hardware_insert_and_its_ping_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.track_mut(t).unwrap().inserts.push(slot);
     let config = EngineConfig {
@@ -4314,6 +4334,7 @@ fn cue_mixes_do_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
     let mut cues: Vec<CueId> = Vec::new();
     for (first, layout, tap) in [
@@ -4585,6 +4606,7 @@ fn blocks_an_instrument_misses_do_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     }];
     // Thirty-second notes on four channels, a pedal stepping with them.
     let mut notes = Vec::new();
@@ -5044,6 +5066,7 @@ fn self_frozen_tracks_do_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         tp.project.track_mut(t).unwrap().inserts.push(slot);
     }
@@ -5394,6 +5417,7 @@ fn an_ara_renderer_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     let ara = PluginSlot {
         id: tp.project.ids.allocate(),
@@ -5407,6 +5431,7 @@ fn an_ara_renderer_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.ara.slots.insert(ara.id);
     tp.project.track_mut(t).unwrap().inserts = vec![latency, ara];
@@ -5554,6 +5579,7 @@ fn ambisonics_and_head_tracking_do_not_allocate() {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         track.automation.lanes.push(AutomationLane {
             id: lane,
@@ -5771,6 +5797,7 @@ fn retuning_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     let listener = |id: &str| PluginRef {
         format: faderframe_project::PluginFormat::Clap,
@@ -5926,6 +5953,7 @@ fn midi2_resolution_does_not_allocate() {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     };
     tp.project.track_mut(synth).unwrap().inserts = vec![synth_slot];
     for t in [out, synth] {
@@ -6248,6 +6276,7 @@ fn the_convolution_multiband_and_vocoder_do_not_allocate() {
             state,
             sidechain: keyed.then_some(key_track),
             mono_to_stereo: false,
+            mix_origin: None,
         });
         track.automation.lanes.push(AutomationLane {
             id: lane,

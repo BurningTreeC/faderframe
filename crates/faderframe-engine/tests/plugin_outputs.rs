@@ -173,6 +173,7 @@ fn slot(tp: &mut TestProject, plugin: PluginRef, latency: Option<u32>) -> Plugin
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     }
 }
 

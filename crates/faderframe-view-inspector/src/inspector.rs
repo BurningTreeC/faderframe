@@ -1333,6 +1333,10 @@ impl InspectorView {
         if d.failed {
             badge(p, "⚠", c.led.record);
         }
+        // Put there by Mix Intelligence (the mixer's slot has a bar).
+        if d.mix_origin.is_some() {
+            badge(p, "MI", th.ui.accent);
+        }
         if let Some(l) = d.latency {
             badge(
                 p,
@@ -1704,10 +1708,16 @@ impl CanvasView<Session, Action> for InspectorView {
                     .into()
             }
             Hit::Device(i) => format!(
-                "{} ({}, {}) · Click: editor · Ctrl+click: bypass · Alt+click: remove · Drag: move · Right-click: more",
+                "{} ({}, {}) · Click: editor · Ctrl+click: bypass · Alt+click: remove · Drag: move · Right-click: more{}",
                 devices[i].name,
                 devices[i].role.tag().to_lowercase(),
-                devices[i].format
+                devices[i].format,
+                devices[i]
+                    .mix_origin
+                    .as_ref()
+                    .map_or(String::new(), |why| format!(
+                        "\nAdded by Mix Intelligence: {why}"
+                    ))
             ),
             Hit::Power(i) => format!(
                 "{} · Click to {}",
