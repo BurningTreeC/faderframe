@@ -5417,7 +5417,8 @@ impl Session {
                     }
                 }
                 for f in midi {
-                    if let Err(e) = self.import_midi_file(&f, at, empty && at == MusicalTime::ZERO)
+                    if let Err(e) =
+                        self.import_midi_file_onto(&f, at, empty && at == MusicalTime::ZERO, track)
                     {
                         self.notify(NoticeLevel::Error, e.to_string());
                     }
@@ -7347,6 +7348,9 @@ impl Drop for Session {
         // before the scratch media may go.
         self.end_recordings_for_close();
         self.cancel_imports();
+        // The browser's index and the user's tags, ratings and folder are
+        // written after a pause: one not over yet.
+        self.flush_browser();
         // The album rendered to play it.
         self.album_state.discard_preview();
         self.ddp_state.discard();

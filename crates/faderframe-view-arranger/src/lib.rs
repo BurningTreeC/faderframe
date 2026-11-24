@@ -2839,8 +2839,10 @@ impl ArrangerView {
         );
     }
 
-    /// Where files dropped at `pos` go: an audio track under the pointer,
-    /// otherwise new tracks; time snapped to the grid.
+    /// Where files dropped at `pos` go: the audio, instrument or MIDI track
+    /// under the pointer (sounds land on an audio track, MIDI files on an
+    /// instrument or MIDI one, the rest on new tracks); time snapped to the
+    /// grid.
     fn drop_target(
         &self,
         pos: Point,
@@ -2859,7 +2861,12 @@ impl ArrangerView {
         let target = self
             .row_at(pos.y)
             .and_then(|i| tracks.get(i))
-            .filter(|t| t.kind == TrackKind::Audio)
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    TrackKind::Audio | TrackKind::Instrument | TrackKind::Midi
+                )
+            })
             .map(|t| t.id);
         Some((target, at))
     }

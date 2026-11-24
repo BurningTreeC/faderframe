@@ -233,6 +233,30 @@ fn files_are_read_analysed_and_kept_until_they_change() {
 }
 
 #[test]
+fn the_browser_opens_where_it_was_left() {
+    let dir = temp("last-folder");
+    let lib = library(&dir);
+    let mut s = session(&dir);
+    op(&mut s, BrowserOp::AddFolder(lib.clone()));
+    op(&mut s, BrowserOp::Open(browser::Place::Folder(lib.clone())));
+    op(&mut s, BrowserOp::Enter(lib.join("More")));
+    drop(s);
+    let mut again = session(&dir);
+    assert!(again.wait_for_browser(WAIT));
+    assert_eq!(
+        again.browser().place(),
+        &browser::Place::Folder(lib.clone())
+    );
+    assert_eq!(again.browser().folder(), Some(lib.join("More").as_path()));
+    assert_eq!(names(&again), vec!["..", "Hit.wav"]);
+    // A folder gone since: the place's top.
+    drop(again);
+    std::fs::remove_dir_all(lib.join("More")).unwrap();
+    let third = session(&dir);
+    assert_eq!(third.browser().folder(), Some(lib.as_path()));
+}
+
+#[test]
 fn searches_filters_ratings_tags_and_likeness() {
     let dir = temp("filters");
     let lib = library(&dir);

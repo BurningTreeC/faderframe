@@ -137,7 +137,7 @@ pub struct PreviewSettings {
     pub sync: bool,
     /// In the project's key (transposed).
     pub key: bool,
-    /// Loops and MIDI files go round until stopped.
+    /// Loops (audio and MIDI) go round until stopped.
     pub looped: bool,
     /// A file previews when it is selected.
     pub auto: bool,
@@ -640,7 +640,13 @@ pub fn is_loop(bpm: Option<f64>, seconds: Option<f64>) -> bool {
     let (Some(bpm), Some(s)) = (bpm, seconds) else {
         return false;
     };
-    let beats = s * bpm / 60.0;
+    beats_loop(s * bpm / 60.0)
+}
+
+/// An even number of beats (within 3 %): a loop's length. A MIDI file's
+/// last event on it goes round; one ending elsewhere (a fill, a phrase
+/// with a tail) plays once, as audio that is not a loop does.
+pub fn beats_loop(beats: f64) -> bool {
     let whole = beats.round();
     whole >= 2.0 && whole as i64 % 2 == 0 && (beats - whole).abs() <= whole * 0.03
 }
@@ -683,7 +689,10 @@ impl Session {
         self.browser.index = Index::load(&dir.join("index.json"));
         self.browser.user = UserData::load(&dir.join("user.json"));
         self.browser.loaded = true;
-        if self.browser.folder.is_none() && self.browser.place != Place::Recent {
+        if self.browser.folder.is_none()
+            && self.browser.place != Place::Recent
+            && !self.reopen_last_place()
+        {
             let place = if self.media_dir.is_dir() {
                 Place::ProjectMedia
             } else {
@@ -692,6 +701,34 @@ impl Session {
             self.open_place(place);
         }
         self.browser.rows_dirty = true;
+    }
+
+    /// Look where the browser looked last, if that is still there.
+    fn reopen_last_place(&mut self) -> bool {
+        let Some(place) = self.browser.user.last_place.clone() else {
+            return false;
+        };
+        let Some(root) = self.browser_place_root(&place) else {
+            if place != Place::Recent {
+                return false;
+            }
+            self.open_place(place);
+            return true;
+        };
+        if !root.is_dir() {
+            return false;
+        }
+        let folder = self
+            .browser
+            .user
+            .last_folder
+            .clone()
+            .filter(|f| f.starts_with(&root) && f.is_dir())
+            .unwrap_or(root);
+        self.browser.place = place;
+        self.browser.folder = Some(folder);
+        self.list_folder();
+        true
     }
 
     /// The places listed: the fixed ones, then the user's folders.
@@ -902,8 +939,11 @@ impl Session {
                 let auto = self.browser.user.preview.auto;
                 let one = (paths.len() == 1).then(|| paths[0].clone());
                 self.browser.selected = paths;
+                // A click on the file already heard (to drag it, say)
+                // leaves its preview as it is.
                 if auto
                     && let Some(p) = one
+                    && !self.still_heard(&p)
                     && FileKind::of(&p).is_some()
                     && p.is_file()
                 {
@@ -1051,6 +1091,13 @@ impl Session {
             && self.browser.folder.as_ref().is_some_and(|f| !f.exists())
         {
             self.browser.folder = self.browser_place_root(&self.browser.place);
+        }
+        if self.browser.user.last_place.as_ref() != Some(&self.browser.place)
+            || self.browser.user.last_folder != self.browser.folder
+        {
+            self.browser.user.last_place = Some(self.browser.place.clone());
+            self.browser.user.last_folder = self.browser.folder.clone();
+            self.user_changed();
         }
         let Some(dir) = self.browser.folder.clone() else {
             // Recent: the files themselves.
@@ -1589,7 +1636,7 @@ impl Session {
                     .set_midi_preview(Some(MidiPreview {
                         events,
                         length,
-                        looped: settings.looped,
+                        looped: settings.looped && beats_loop(notes.quarters),
                         start,
                     }))
                     .map_err(|e| SessionError::Other(e.to_string()))?
@@ -1629,6 +1676,23 @@ impl Session {
                     .find(|t| t.kind == TrackKind::Instrument)
             })
             .map(|t| t.id)
+    }
+
+    /// `path`'s preview plays on (not ended).
+    fn still_heard(&self, path: &Path) -> bool {
+        let Some(p) = self.browser.preview.as_ref().filter(|p| p.path == path) else {
+            return false;
+        };
+        match &p.sound {
+            Sound::Audio { generation, .. } => !self
+                .engine
+                .listening()
+                .link
+                .preview()
+                .shared()
+                .has_ended(*generation),
+            Sound::Midi { status, .. } => !status.has_ended(),
+        }
     }
 
     /// The preview's worker and end (`true`: what is shown changed).
@@ -1691,7 +1755,7 @@ impl Session {
         for f in &midi {
             match to {
                 Destination::Arranger => {
-                    self.import_midi_file(f, at, false)?;
+                    self.import_midi_file_onto(f, at, false, track)?;
                     self.browser.user.used(f);
                 }
                 Destination::Launcher { .. } => self.notify(
@@ -1993,6 +2057,10 @@ mod tests {
         assert!(!is_loop(Some(120.0), Some(1.75)));
         assert!(!is_loop(None, Some(4.0)));
         assert!(!is_loop(Some(120.0), Some(0.5)));
+        // MIDI files by their last event: two bars round, a tail doesn't.
+        assert!(beats_loop(8.0));
+        assert!(beats_loop(15.75));
+        assert!(!beats_loop(8.58));
         assert_eq!(nearest_tempo(170.0, 90.0), 85.0);
         assert_eq!(nearest_tempo(60.0, 120.0), 120.0);
         assert_eq!(nearest_tempo(100.0, 104.0), 100.0);
