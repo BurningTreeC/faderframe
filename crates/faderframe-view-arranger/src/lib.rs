@@ -1134,39 +1134,51 @@ impl ArrangerView {
         }
         if pos.x < self.header_w() {
             let l = HeaderLayout::new(self.header_rect(model, t, row.y));
-            if t.is_folder() {
-                let part = [
-                    (fold_rect(&l), HeaderPart::Fold),
-                    (l.mute, HeaderPart::Mute),
-                    (l.solo, HeaderPart::Solo),
-                    (folder_group_rect(&l), HeaderPart::Group),
-                    (folder_name_rect(&l), HeaderPart::Name),
-                    (
-                        Rect::new(l.stripe.x, l.stripe.y, l.stripe.w + 3.0, l.stripe.h),
-                        HeaderPart::Color,
-                    ),
-                ]
-                .into_iter()
-                .find(|(r, _)| r.contains(pos))
-                .map_or(HeaderPart::Body, |(_, p)| p);
-                return Some(Hit::Header(t.id, part));
-            }
             // Pan, fader and meter only where they are painted (not on
-            // MIDI tracks).
+            // MIDI tracks or plain folders).
             let audio = t.kind.has_audio();
             let fader = audio || t.kind == TrackKind::Vca;
-            let part = [
-                (Some(l.mute), HeaderPart::Mute),
-                (Some(l.solo), HeaderPart::Solo),
-                (Some(l.record), HeaderPart::Record),
-                (Some(l.monitor), HeaderPart::Monitor),
-                (Some(l.automation), HeaderPart::Automation),
+            let mix = [
                 (l.pan.filter(|_| audio), HeaderPart::Pan),
                 (
                     fader.then(|| l.volume.inset_xy(-2.0, -3.0)),
                     HeaderPart::Volume,
                 ),
                 (fader.then_some(l.meter), HeaderPart::Meter),
+            ];
+            if t.is_folder() {
+                let part = [
+                    (Some(fold_rect(&l)), HeaderPart::Fold),
+                    (Some(l.mute), HeaderPart::Mute),
+                    (Some(l.solo), HeaderPart::Solo),
+                    (Some(folder_group_rect(&l)), HeaderPart::Group),
+                    (Some(folder_name_rect(&l)), HeaderPart::Name),
+                    (
+                        Some(Rect::new(
+                            l.stripe.x,
+                            l.stripe.y,
+                            l.stripe.w + 3.0,
+                            l.stripe.h,
+                        )),
+                        HeaderPart::Color,
+                    ),
+                ]
+                .into_iter()
+                .chain(mix)
+                .find(|(r, _)| r.is_some_and(|r| r.contains(pos)))
+                .map_or(HeaderPart::Body, |(_, p)| p);
+                return Some(Hit::Header(t.id, part));
+            }
+            let part = [
+                (Some(l.mute), HeaderPart::Mute),
+                (Some(l.solo), HeaderPart::Solo),
+                (Some(l.record), HeaderPart::Record),
+                (Some(l.monitor), HeaderPart::Monitor),
+                (Some(l.automation), HeaderPart::Automation),
+            ]
+            .into_iter()
+            .chain(mix)
+            .chain([
                 (Some(l.name), HeaderPart::Name),
                 (
                     Some(Rect::new(
@@ -1177,8 +1189,7 @@ impl ArrangerView {
                     )),
                     HeaderPart::Color,
                 ),
-            ]
-            .into_iter()
+            ])
             .find(|(r, _)| r.is_some_and(|r| r.contains(pos)))
             .map_or(HeaderPart::Body, |(_, p)| p);
             return Some(Hit::Header(t.id, part));
@@ -2188,6 +2199,7 @@ impl ArrangerView {
             color_of(t.color).lighten(0.15),
             th,
         );
+        self.paint_mix_controls(p, l, t, model);
     }
 
     /// What a folder holds, at a glance: each track's clips as a thin bar.
@@ -2232,6 +2244,108 @@ impl ArrangerView {
                     &Paint::Solid(color_of(clip.color.unwrap_or(c.color)).with_alpha(0.85)),
                 );
             }
+        }
+    }
+
+    /// A track's pan knob, mini fader and meter (what it has of them; a
+    /// folder bus's header has them too).
+    fn paint_mix_controls(
+        &self,
+        p: &mut dyn Painter,
+        l: &HeaderLayout,
+        t: &Track,
+        model: &Session,
+    ) {
+        let th = &self.theme;
+        let c = &th.console;
+        if let Some(pan) = l.pan
+            && t.kind.has_audio()
+        {
+            // Dual pan: the image's middle, a dot at each channel.
+            let dual = model
+                .project()
+                .dual_panned(t)
+                .then(|| model.shown_dual_pan(t));
+            let value = dual.map_or(model.shown_pan(t), |d| (d.left + d.right) * 0.5);
+            controls::knob(
+                p,
+                pan,
+                (value + 1.0) * 0.5,
+                true,
+                KnobLook {
+                    cap: c.pan_cap,
+                    ring: c.panel_label,
+                },
+                th,
+            );
+            if let Some(d) = dual {
+                let (o, r) = (pan.center(), pan.w.min(pan.h) * 0.5 - 1.6);
+                for side in [d.left, d.right] {
+                    let a = controls::knob_angle((side + 1.0) * 0.5);
+                    let at = Point::new(o.x + r * a.cos(), o.y + r * a.sin());
+                    p.circle(at, 2.6, th.ui.background);
+                    p.circle(at, 1.7, th.ui.text);
+                }
+            }
+        }
+        if t.kind.has_audio() || t.kind == TrackKind::Vca {
+            // Mini horizontal fader.
+            let v = l.volume;
+            let pos = self.law.db_to_position(model.shown_volume_db(t));
+            let slot = Rect::new(v.x, v.center().y - 1.5, v.w, 3.0);
+            p.fill_rounded(slot, 1.5, &Paint::Solid(c.fader.slot));
+            p.fill_rounded(
+                Rect::new(slot.x, slot.y, slot.w * pos, slot.h),
+                1.5,
+                &Paint::Solid(color_of(t.color).with_alpha(0.75)),
+            );
+            let ux = slot.x + slot.w * self.law.unity_position();
+            if c.look.fader_kind == FaderKind::Pill {
+                // A round thumb with a dot of the track's colour.
+                p.vline(ux, v.y + 1.0, v.bottom() - 1.0, th.ui.text.with_alpha(0.22));
+                let d = (v.h + 2.0).min(11.0);
+                let cap = Rect::new(
+                    slot.x + slot.w * pos - d * 0.5,
+                    v.center().y - d * 0.5,
+                    d,
+                    d,
+                );
+                p.shadow(cap, d * 0.5, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 1.0, 3.0);
+                p.fill_rounded(
+                    cap,
+                    d * 0.5,
+                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
+                );
+                let px = 1.0 / p.scale_factor().max(1.0);
+                p.stroke_rounded(
+                    cap.inset(px * 0.5),
+                    d * 0.5,
+                    px,
+                    th.ui.text.with_alpha(0.16),
+                );
+                p.circle(cap.center(), 1.8, color_of(t.color));
+            } else {
+                p.vline(ux, v.y, v.bottom(), Color::rgba(1.0, 1.0, 1.0, 0.25));
+                let cap = Rect::new(slot.x + slot.w * pos - 4.0, v.y - 1.0, 8.0, v.h + 2.0);
+                p.shadow(cap, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.6), 0.0, 1.0, 2.0);
+                p.fill_rounded(
+                    cap,
+                    2.0,
+                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
+                );
+            }
+            p.text(
+                &format_db(model.shown_volume_db(t)),
+                l.volume_text,
+                &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim)
+                    .family(th.fonts.numerals)
+                    .right(),
+            );
+            let m = model.meter(t.id);
+            let lv = |ch: &faderframe_session::MeterChannel| {
+                MeterLevel::new(ch.level_db, ch.hold_db, ch.clipped)
+            };
+            controls::meter(p, l.meter, &[lv(&m.left), lv(&m.right)], th);
         }
     }
 
@@ -2385,95 +2499,7 @@ impl ArrangerView {
             th.arranger.automation,
             th,
         );
-        if let Some(pan) = l.pan
-            && t.kind.has_audio()
-        {
-            // Dual pan: the image's middle, a dot at each channel.
-            let dual = model
-                .project()
-                .dual_panned(t)
-                .then(|| model.shown_dual_pan(t));
-            let value = dual.map_or(model.shown_pan(t), |d| (d.left + d.right) * 0.5);
-            controls::knob(
-                p,
-                pan,
-                (value + 1.0) * 0.5,
-                true,
-                KnobLook {
-                    cap: c.pan_cap,
-                    ring: c.panel_label,
-                },
-                th,
-            );
-            if let Some(d) = dual {
-                let (o, r) = (pan.center(), pan.w.min(pan.h) * 0.5 - 1.6);
-                for side in [d.left, d.right] {
-                    let a = controls::knob_angle((side + 1.0) * 0.5);
-                    let at = Point::new(o.x + r * a.cos(), o.y + r * a.sin());
-                    p.circle(at, 2.6, th.ui.background);
-                    p.circle(at, 1.7, th.ui.text);
-                }
-            }
-        }
-        if t.kind.has_audio() || t.kind == TrackKind::Vca {
-            // Mini horizontal fader.
-            let v = l.volume;
-            let pos = self.law.db_to_position(model.shown_volume_db(t));
-            let slot = Rect::new(v.x, v.center().y - 1.5, v.w, 3.0);
-            p.fill_rounded(slot, 1.5, &Paint::Solid(c.fader.slot));
-            p.fill_rounded(
-                Rect::new(slot.x, slot.y, slot.w * pos, slot.h),
-                1.5,
-                &Paint::Solid(color_of(t.color).with_alpha(0.75)),
-            );
-            let ux = slot.x + slot.w * self.law.unity_position();
-            if c.look.fader_kind == FaderKind::Pill {
-                // A round thumb with a dot of the track's colour.
-                p.vline(ux, v.y + 1.0, v.bottom() - 1.0, th.ui.text.with_alpha(0.22));
-                let d = (v.h + 2.0).min(11.0);
-                let cap = Rect::new(
-                    slot.x + slot.w * pos - d * 0.5,
-                    v.center().y - d * 0.5,
-                    d,
-                    d,
-                );
-                p.shadow(cap, d * 0.5, Color::rgba(0.0, 0.0, 0.0, 0.5), 0.0, 1.0, 3.0);
-                p.fill_rounded(
-                    cap,
-                    d * 0.5,
-                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
-                );
-                let px = 1.0 / p.scale_factor().max(1.0);
-                p.stroke_rounded(
-                    cap.inset(px * 0.5),
-                    d * 0.5,
-                    px,
-                    th.ui.text.with_alpha(0.16),
-                );
-                p.circle(cap.center(), 1.8, color_of(t.color));
-            } else {
-                p.vline(ux, v.y, v.bottom(), Color::rgba(1.0, 1.0, 1.0, 0.25));
-                let cap = Rect::new(slot.x + slot.w * pos - 4.0, v.y - 1.0, 8.0, v.h + 2.0);
-                p.shadow(cap, 2.0, Color::rgba(0.0, 0.0, 0.0, 0.6), 0.0, 1.0, 2.0);
-                p.fill_rounded(
-                    cap,
-                    2.0,
-                    &Paint::vertical(cap, c.fader.cap_top, c.fader.cap_bottom),
-                );
-            }
-            p.text(
-                &format_db(model.shown_volume_db(t)),
-                l.volume_text,
-                &TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim)
-                    .family(th.fonts.numerals)
-                    .right(),
-            );
-            let m = model.meter(t.id);
-            let lv = |ch: &faderframe_session::MeterChannel| {
-                MeterLevel::new(ch.level_db, ch.hold_db, ch.clipped)
-            };
-            controls::meter(p, l.meter, &[lv(&m.left), lv(&m.right)], th);
-        }
+        self.paint_mix_controls(p, l, t, model);
     }
 
     fn paint_ruler(&self, p: &mut dyn Painter, ruler: Rect, model: &Session) {

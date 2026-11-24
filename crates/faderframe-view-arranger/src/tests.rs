@@ -1813,6 +1813,91 @@ fn a_folder_becomes_a_bus_from_its_menu_and_says_so() {
     assert_eq!(rows[at + 1], bass, "what it holds right under it");
 }
 
+/// A folder bus's header has a track's pan, fader and meter (what it holds
+/// plays through it), and they work as a track's do; a plain folder's has
+/// none of them.
+#[test]
+fn a_folder_bus_header_has_a_fader_and_a_meter() {
+    let mut s = bare_session();
+    let bass = s
+        .project()
+        .tracks
+        .iter()
+        .find(|t| t.name == "Bass")
+        .unwrap()
+        .id;
+    s.dispatch(Action::NewFolder { tracks: vec![bass] })
+        .unwrap();
+    let folder = *s.selection.tracks.iter().next().unwrap();
+    let mut view = ArrangerView::new(Theme::default());
+    let size = Size::new(1400.0, 1400.0);
+    let parts = |view: &mut ArrangerView, s: &Session| {
+        view.paint(&mut RecordingPainter::new(), size, s, &Theme::default());
+        let l = view.header_layout(s, folder, size).unwrap();
+        // The pan knob only in a header tall enough for it.
+        [Some(l.volume), Some(l.meter), l.pan]
+            .map(|r| r.map(|r| view.hit_test(r.center(), size, s)))
+    };
+    for hit in parts(&mut view, &s).into_iter().flatten() {
+        assert!(
+            !matches!(
+                hit,
+                Some(Hit::Header(
+                    _,
+                    HeaderPart::Volume | HeaderPart::Meter | HeaderPart::Pan
+                ))
+            ),
+            "a plain folder: {hit:?}"
+        );
+    }
+    s.dispatch(Action::SetFolderBus { folder, on: true })
+        .unwrap();
+    for (hit, part) in parts(&mut view, &s).into_iter().zip([
+        HeaderPart::Volume,
+        HeaderPart::Meter,
+        HeaderPart::Pan,
+    ]) {
+        if let Some(hit) = hit {
+            assert_eq!(hit, Some(Hit::Header(folder, part)));
+        }
+    }
+    // Made tall, its pan knob too.
+    s.dispatch(Action::SetTrackHeight {
+        track: Some(folder),
+        height: 90.0,
+    })
+    .unwrap();
+    assert_eq!(
+        parts(&mut view, &s)[2],
+        Some(Some(Hit::Header(folder, HeaderPart::Pan)))
+    );
+    let mut p = RecordingPainter::new();
+    view.paint(&mut p, size, &s, &Theme::default());
+    let db = format_db(s.project().track(folder).unwrap().volume_db);
+    assert!(p.texts().contains(&db.as_str()), "its level in dB");
+    // The wheel over its fader turns it down.
+    let l = view.header_layout(&s, folder, size).unwrap();
+    let (actions, _) = run(
+        &mut view,
+        ViewEvent::Scroll {
+            pos: l.volume.center(),
+            dx: 0.0,
+            dy: 3.0,
+            precise: false,
+            modifiers: Modifiers::NONE,
+        },
+        size,
+        &s,
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::Edit(Command::SetTrackVolume { track, db }) if *track == folder && *db < 0.0
+        )),
+        "{actions:?}"
+    );
+}
+
 /// A folder's header has a Group switch (G, where a track's record button
 /// is; its menu has the same entry, checked): pressing it groups the
 /// folder's tracks; then a range drawn on one of them is painted on every
