@@ -5417,7 +5417,8 @@ impl Session {
                     }
                 }
                 for f in midi {
-                    if let Err(e) = self.import_midi_file(&f, at, empty && at == MusicalTime::ZERO)
+                    if let Err(e) =
+                        self.import_midi_file_onto(&f, at, empty && at == MusicalTime::ZERO, track)
                     {
                         self.notify(NoticeLevel::Error, e.to_string());
                     }

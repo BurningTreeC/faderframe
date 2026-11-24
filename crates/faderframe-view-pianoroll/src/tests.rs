@@ -1391,3 +1391,46 @@ fn velocity_drags_are_at_16_bits() {
     let back = notes(&s).into_iter().find(|m| m.id == n.id).unwrap();
     assert_eq!(back.velocity16(), n.velocity16());
 }
+
+/// A MIDI file dropped on the notes becomes a clip on the shown clip's
+/// track, where it was dropped; the editor shows it then.
+#[test]
+fn a_midi_file_dropped_on_the_notes_becomes_a_clip_shown_here() {
+    let mut s = session();
+    let (shown, track, start) = {
+        let (id, clip, _) = PianoRollView::clip(&s).unwrap();
+        (id, clip.track, clip.start)
+    };
+    let path = std::env::temp_dir().join(format!("ff-pianoroll-drop-{}.mid", std::process::id()));
+    s.export_midi_file(&path, Some(&[shown])).unwrap();
+    let mut view = PianoRollView::new(Theme::default());
+    paint(&mut view, &s);
+    let grid = view.layout(SIZE).grid;
+    let y = grid.y + grid.h / 2.0;
+    assert!(view.drag_files(Some(Point::new(grid.x + 10.0, y)), SIZE, &s));
+    assert!(
+        !view.drag_files(Some(Point::new(grid.x + 10.0, grid.y - 5.0)), SIZE, &s),
+        "not on the toolbar"
+    );
+
+    let x = view.x_of(MusicalTime::from_quarters(4.0));
+    let action = view
+        .drop_files(std::slice::from_ref(&path), Point::new(x, y), SIZE, &s)
+        .unwrap();
+    let at = start + MusicalTime::from_quarters(4.0);
+    assert_eq!(
+        action,
+        Action::ImportFiles {
+            files: vec![path],
+            track: Some(track),
+            at,
+        }
+    );
+    let tracks = s.project().tracks.len();
+    s.dispatch(action).unwrap();
+    assert_eq!(s.project().tracks.len(), tracks, "no new track");
+    let new = s.editor_clip().unwrap();
+    assert_ne!(new, shown, "the editor shows the new clip");
+    let c = s.project().clip(new).unwrap();
+    assert_eq!((c.track, c.start), (track, at));
+}
