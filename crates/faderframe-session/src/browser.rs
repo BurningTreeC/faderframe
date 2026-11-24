@@ -689,7 +689,10 @@ impl Session {
         self.browser.index = Index::load(&dir.join("index.json"));
         self.browser.user = UserData::load(&dir.join("user.json"));
         self.browser.loaded = true;
-        if self.browser.folder.is_none() && self.browser.place != Place::Recent {
+        if self.browser.folder.is_none()
+            && self.browser.place != Place::Recent
+            && !self.reopen_last_place()
+        {
             let place = if self.media_dir.is_dir() {
                 Place::ProjectMedia
             } else {
@@ -698,6 +701,34 @@ impl Session {
             self.open_place(place);
         }
         self.browser.rows_dirty = true;
+    }
+
+    /// Look where the browser looked last, if that is still there.
+    fn reopen_last_place(&mut self) -> bool {
+        let Some(place) = self.browser.user.last_place.clone() else {
+            return false;
+        };
+        let Some(root) = self.browser_place_root(&place) else {
+            if place != Place::Recent {
+                return false;
+            }
+            self.open_place(place);
+            return true;
+        };
+        if !root.is_dir() {
+            return false;
+        }
+        let folder = self
+            .browser
+            .user
+            .last_folder
+            .clone()
+            .filter(|f| f.starts_with(&root) && f.is_dir())
+            .unwrap_or(root);
+        self.browser.place = place;
+        self.browser.folder = Some(folder);
+        self.list_folder();
+        true
     }
 
     /// The places listed: the fixed ones, then the user's folders.
@@ -1060,6 +1091,13 @@ impl Session {
             && self.browser.folder.as_ref().is_some_and(|f| !f.exists())
         {
             self.browser.folder = self.browser_place_root(&self.browser.place);
+        }
+        if self.browser.user.last_place.as_ref() != Some(&self.browser.place)
+            || self.browser.user.last_folder != self.browser.folder
+        {
+            self.browser.user.last_place = Some(self.browser.place.clone());
+            self.browser.user.last_folder = self.browser.folder.clone();
+            self.user_changed();
         }
         let Some(dir) = self.browser.folder.clone() else {
             // Recent: the files themselves.

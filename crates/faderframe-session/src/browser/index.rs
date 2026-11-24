@@ -293,6 +293,11 @@ pub struct UserData {
     /// Search the folders inside too.
     #[serde(default = "yes")]
     pub deep: bool,
+    /// Where the browser looked last: it opens there again.
+    #[serde(default)]
+    pub last_place: Option<super::Place>,
+    #[serde(default)]
+    pub last_folder: Option<PathBuf>,
 }
 
 fn yes() -> bool {
@@ -308,6 +313,8 @@ impl Default for UserData {
             folders: Vec::new(),
             preview: super::PreviewSettings::default(),
             deep: true,
+            last_place: None,
+            last_folder: None,
         }
     }
 }

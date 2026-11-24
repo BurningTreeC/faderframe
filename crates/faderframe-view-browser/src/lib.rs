@@ -22,8 +22,8 @@ use faderframe_session::browser::{
 use faderframe_session::{Action, Session};
 use faderframe_ui_canvas::access::{AccessNode, AccessRole, access_id_str};
 use faderframe_ui_canvas::{
-    CanvasView, Cursor, EventCx, HostRequest, Key as KeyCode, MenuItem, Paint, Painter, Point,
-    PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
+    CanvasView, Cursor, EventCx, FontWeight, HostRequest, Key as KeyCode, MenuItem, Paint, Painter,
+    Point, PointerButton, Rect, ScrollAxis, ScrollInfo, Size, TextStyle, Theme, ViewEvent,
 };
 use std::path::{Path, PathBuf};
 
@@ -884,6 +884,7 @@ impl CanvasView<Session, Action> for BrowserView {
         self.clamp(size, model);
         p.fill(Rect::new(0.0, 0.0, size.w, size.h), th.ui.background);
         let small = TextStyle::new(th.fonts.small, th.ui.text);
+        let folder = TextStyle::new(th.fonts.normal + 1.0, th.ui.text).weight(FontWeight::Medium);
         let dim = TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_dim);
         let faint = TextStyle::new(th.fonts.tiny + 0.5, th.ui.text_faint);
         let b = model.browser();
@@ -1058,8 +1059,15 @@ impl CanvasView<Session, Action> for BrowserView {
             } else {
                 small
             };
-            let top_line = Rect::new(text_x, rr.y + 2.0, (name_r.right() - text_x).max(0.0), 16.0);
-            p.text(&label, top_line, &name_style);
+            if row.is_file() {
+                let top_line =
+                    Rect::new(text_x, rr.y + 2.0, (name_r.right() - text_x).max(0.0), 16.0);
+                p.text(&label, top_line, &name_style);
+            } else {
+                // Folders have no picture under the name: it takes the row.
+                let whole = Rect::new(text_x, rr.y, (rr.right() - text_x - PAD).max(0.0), rr.h);
+                p.text(&label, whole, &folder);
+            }
             if row.is_file() {
                 // The waveform (or notes) under the name.
                 let thumb = Rect::new(
