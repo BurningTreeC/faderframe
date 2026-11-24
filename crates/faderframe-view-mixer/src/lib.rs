@@ -1706,6 +1706,16 @@ impl MixerView {
                             format!("{name}{key}")
                         };
                         controls::well_label(p, *slot, &text, s.bypass || failed, th);
+                        if s.mix_origin.is_some() {
+                            // Put there by Mix Intelligence: a bar in its
+                            // accent at the slot's left.
+                            let bar = Rect::new(slot.x + 2.0, slot.y + 2.0, 3.0, slot.h - 4.0);
+                            p.fill_rounded(
+                                bar,
+                                1.5,
+                                &faderframe_ui_canvas::Paint::Solid(th.ui.accent),
+                            );
+                        }
                     }
                     None => controls::well_label(p, *slot, "—", true, th),
                 }
@@ -2323,6 +2333,18 @@ impl MixerView {
                     faderframe_automation::AutomationTarget::PluginBypass(s.id),
                     "Bypass: MIDI",
                 ));
+                // Put there by Mix Intelligence: take it as the user's own
+                // (the device stays, its mark goes).
+                if s.mix_origin.is_some() {
+                    items.push(MenuItem::new(
+                        "Keep as My Own",
+                        Action::Edit(Command::SetPluginMixOrigin {
+                            track: t.id,
+                            plugin: s.id,
+                            origin: None,
+                        }),
+                    ));
+                }
                 if !builtin && !model.plugin_failed(s.id) {
                     items.push(MenuItem::new(
                         if model.plugin_sandboxed(s.id) {
@@ -3798,8 +3820,12 @@ impl MixerView {
             }
             .into(),
             Hit::Insert(id, i) => {
-                if Self::track(model, id).is_some_and(|t| i < t.inserts.len()) {
-                    "Insert · Click: editor · Ctrl-click: bypass · Alt-click: remove · Drag: reorder (Ctrl: duplicate), onto another track: copy (Shift: move) · Right-click: more".into()
+                if let Some(s) = Self::track(model, id).and_then(|t| t.inserts.get(i)) {
+                    let usage = "Insert · Click: editor · Ctrl-click: bypass · Alt-click: remove · Drag: reorder (Ctrl: duplicate), onto another track: copy (Shift: move) · Right-click: more";
+                    match &s.mix_origin {
+                        Some(why) => format!("Added by Mix Intelligence: {why}\n{usage}"),
+                        None => usage.into(),
+                    }
                 } else {
                     "Empty insert · Click to open the plugin browser · Right-click for a quick list"
                         .into()

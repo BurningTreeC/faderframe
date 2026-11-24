@@ -152,6 +152,7 @@ impl Session {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let id = slot.id;
         let index = index.min(c.inserts.len());

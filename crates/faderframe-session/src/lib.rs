@@ -4708,6 +4708,7 @@ impl Session {
                         state: None,
                         sidechain: None,
                         mono_to_stereo: false,
+                        mix_origin: None,
                     })
                 } else {
                     None
@@ -4768,6 +4769,7 @@ impl Session {
                     state: None,
                     sidechain: None,
                     mono_to_stereo: false,
+                    mix_origin: None,
                 };
                 // A container comes with its first chains.
                 if slot.plugin.is_container() {
@@ -5319,6 +5321,7 @@ impl Session {
                         state: None,
                         sidechain: None,
                         mono_to_stereo: false,
+                        mix_origin: None,
                     };
                     commands.push(Command::InsertPlugin { track, index, slot });
                 }

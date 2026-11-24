@@ -44,6 +44,7 @@ fn small_session(name: &str) -> (Session, TrackId, std::path::PathBuf) {
         state: None,
         sidechain: None,
         mono_to_stereo: false,
+        mix_origin: None,
     });
     t.clips.push(clip);
     let at = p.tracks.len() - 1;

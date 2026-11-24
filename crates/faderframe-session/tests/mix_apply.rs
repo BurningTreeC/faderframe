@@ -237,3 +237,59 @@ fn an_experiment_applied_before_other_edits_is_taken_back_alone() {
     assert!(s.dispatch(Action::Mix(MixOp::Undo(step))).is_err());
     s.wait_for_mix();
 }
+
+/// The EQ an experiment puts in says so (`PluginSlot::mix_origin`: the
+/// finding and the experiment), in the file too; Keep as My Own takes the
+/// mark off — one undo step, the device staying.
+#[test]
+fn an_applied_slot_says_where_it_came_from_until_kept_as_ones_own() {
+    let (mut s, _) = session();
+    analyse(&mut s, MixScope::Project, SignalPoint::Processed);
+    let (f, i, masker) = eq_cut(&s);
+    s.dispatch(Action::Mix(MixOp::Apply {
+        finding: f.id,
+        recommendation: i,
+    }))
+    .unwrap();
+    s.wait_for_mix();
+    let slot = |s: &Session| {
+        s.project()
+            .track(masker)
+            .unwrap()
+            .inserts
+            .iter()
+            .find(|x| x.plugin.id == faderframe_core::builtin::EQ)
+            .cloned()
+            .unwrap()
+    };
+    let eq = slot(&s);
+    let origin = eq.mix_origin.clone().expect("marked");
+    assert!(origin.contains("EQ cut on"), "{origin}");
+    // Kept in the file; an unmarked slot writes nothing new.
+    let json = serde_json::to_string(&eq).unwrap();
+    let back: faderframe_project::PluginSlot = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.mix_origin.as_deref(), Some(origin.as_str()));
+    let plain = faderframe_project::PluginSlot {
+        mix_origin: None,
+        ..eq.clone()
+    };
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("mix_origin")
+    );
+    // Keep as My Own: the mark goes, the EQ stays; undo brings it back.
+    s.dispatch(Action::Edit(Command::SetPluginMixOrigin {
+        track: masker,
+        plugin: eq.id,
+        origin: None,
+    }))
+    .unwrap();
+    assert_eq!(slot(&s).mix_origin, None);
+    assert_eq!(eq_count(&s, masker), 1);
+    let (done, _) = s.history_steps();
+    assert_eq!(done.last().map(String::as_str), Some("Keep as My Own"));
+    s.dispatch(Action::Undo).unwrap();
+    assert_eq!(slot(&s).mix_origin.as_deref(), Some(origin.as_str()));
+    s.wait_for_mix();
+}

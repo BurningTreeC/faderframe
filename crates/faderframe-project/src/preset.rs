@@ -160,6 +160,7 @@ impl PresetPlugin {
             state: self.state.clone(),
             sidechain: None,
             mono_to_stereo: self.mono_to_stereo,
+            mix_origin: None,
         };
         built.order.push(slot.id);
         if self.plugin.is_container() && !self.chains.is_empty() {
@@ -662,6 +663,7 @@ mod tests {
             state: Some("c3RhdGU=".into()),
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         });
         t.sends.push(AuxSend {
             id: p.ids.allocate(),
@@ -785,6 +787,7 @@ mod tests {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let echo = PluginSlot {
             id: p.ids.allocate(),
@@ -794,6 +797,7 @@ mod tests {
             state: None,
             sidechain: None,
             mono_to_stereo: false,
+            mix_origin: None,
         };
         let mut wet = Chain::new("Wet");
         wet.gain_db = -6.0;
