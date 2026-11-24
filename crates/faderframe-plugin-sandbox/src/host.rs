@@ -6,7 +6,7 @@
 use crate::shm::{Block, BlockIn, MAX_OUT_BUFFERS, block_size};
 use crate::sys::{self, Control, Ready, Signal, Waiter};
 use crate::wire::{self, EditorCall, Request, Response};
-use crate::{BLOCK_TIMEOUT, Launcher, OFFLINE_BLOCK_TIMEOUT};
+use crate::{BLOCK_TIMEOUT, HOST_STALL, Launcher, OFFLINE_BLOCK_TIMEOUT};
 use faderframe_audio_graph::NodeIo;
 use faderframe_core::ParameterId;
 use faderframe_midi::NoteExpressionKind;
@@ -46,9 +46,13 @@ struct Channel {
     /// The engine's deadline for the whole device callback (none: one
     /// block's duration from the call).
     deadline: Option<Instant>,
-    /// A block sent and not answered in time: when it was sent. The next
-    /// request waits for it (the helper may still read the shared memory).
+    /// A block sent and not answered in time: since when its answer is
+    /// waited for. The next request waits for it (the helper may still
+    /// read the shared memory).
     in_flight: Option<Instant>,
+    /// When the last call started (a long pause since: the host was held
+    /// up, see [`HOST_STALL`]).
+    last_call: Option<Instant>,
     /// Seconds per frame (the activation's rate).
     frame_seconds: f64,
     /// Blocks given up on (silence played): the engine counts them.
@@ -103,6 +107,16 @@ impl Channel {
                 started + Duration::from_secs_f64(frames as f64 * self.frame_seconds)
             })
         };
+        // Held up ourselves since the last call: so, most likely, was the
+        // helper (one stall of the whole machine) — its time to answer
+        // starts now rather than counting the pause against it.
+        let stalled = self
+            .last_call
+            .replace(started)
+            .is_some_and(|prev| started.duration_since(prev) > HOST_STALL);
+        if stalled && self.in_flight.is_some() {
+            self.in_flight = Some(started);
+        }
         if let Some(sent) = self.in_flight {
             // The block given up on last time: its answer first. Still
             // not here: this block's events never reach the helper (the
@@ -938,6 +952,7 @@ impl PluginInstance for RemoteInstance {
                     reduction: Arc::clone(&self.reduction),
                     deadline: None,
                     in_flight: None,
+                    last_call: None,
                     frame_seconds: 1.0 / config.sample_rate.max(1.0),
                     late: 0,
                     offline: config.offline,

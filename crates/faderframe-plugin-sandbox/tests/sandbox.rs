@@ -12,7 +12,7 @@ use faderframe_plugin_host::{
     PluginFactory, PluginFormat, PluginInstance, PluginProcessContext, PluginProcessor,
     PluginRegistry, ProcessConfig, ProcessStatus, TailLength,
 };
-use faderframe_plugin_sandbox::{Launcher, child, instantiate_sandboxed};
+use faderframe_plugin_sandbox::{BLOCK_TIMEOUT, Launcher, child, instantiate_sandboxed};
 use faderframe_transport::TransportInfo;
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,8 @@ impl PluginFactory for Broken {
             broken_descriptor("test.sysex"),
             broken_descriptor("test.slow"),
             broken_descriptor("test.lagging"),
+            broken_descriptor("test.held"),
+            broken_descriptor("test.frozen"),
             broken_descriptor("test.offline"),
         ]
     }
@@ -101,8 +103,17 @@ impl PluginInstance for BrokenInstance {
         if self.0.id == "test.sysex" {
             return Ok(Box::new(SysexSum));
         }
-        if self.0.id == "test.lagging" {
-            return Ok(Box::new(Lagging(true)));
+        let first = match self.0.id.as_str() {
+            "test.lagging" => Some(Duration::from_millis(60)),
+            // Held up longer than a block, not as long as the timeout.
+            "test.held" => Some(Duration::from_millis(700)),
+            // Longer than the timeout: only a host held up as long lets it
+            // live.
+            "test.frozen" => Some(Duration::from_millis(2600)),
+            _ => None,
+        };
+        if first.is_some() {
+            return Ok(Box::new(Lagging(first)));
         }
         Ok(Box::new(BrokenProcessor(self.0.id == "test.crash")))
     }
@@ -124,12 +135,12 @@ impl PluginProcessor for BrokenProcessor {
 
 /// Takes its first block slowly (an editor opening in the helper, the
 /// machine busy), the rest at once.
-struct Lagging(bool);
+struct Lagging(Option<Duration>);
 
 impl PluginProcessor for Lagging {
     fn process(&mut self, _ctx: &PluginProcessContext<'_>, io: &mut NodeIo<'_>) -> ProcessStatus {
-        if std::mem::take(&mut self.0) {
-            std::thread::sleep(Duration::from_millis(60));
+        if let Some(d) = self.0.take() {
+            std::thread::sleep(d);
         }
         for out in io.audio_out.iter_mut() {
             out.clear();
@@ -565,14 +576,15 @@ fn a_hanging_plugin_is_given_up_after_the_deadline() {
         let call = Instant::now();
         let status = run(p.as_mut(), 1, &[], &[]).1;
         slowest = slowest.max(call.elapsed());
-        if status == ProcessStatus::Error || t.elapsed() > Duration::from_secs(2) {
+        if status == ProcessStatus::Error || t.elapsed() > Duration::from_secs(5) {
             break status;
         }
     };
     assert_eq!(status, ProcessStatus::Error);
     let waited = t.elapsed();
     assert!(
-        waited >= Duration::from_millis(200) && waited < Duration::from_secs(2),
+        waited >= BLOCK_TIMEOUT - Duration::from_millis(50)
+            && waited < BLOCK_TIMEOUT + Duration::from_secs(1),
         "{waited:?}"
     );
     assert!(
@@ -839,4 +851,42 @@ fn blocks_a_late_helper_never_gets_say_they_missed_it() {
         ProcessStatus::Continue
     );
     assert!(p.take_underruns() >= 2, "both silent blocks are counted");
+}
+
+/// Blocks until the helper answers again (silence meanwhile) or `within`
+/// passes; whether it is still alive.
+fn plays_on(p: &mut dyn PluginProcessor, within: Duration) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < within {
+        match run(p, 1, &[], &[]).1 {
+            ProcessStatus::Error => return false,
+            ProcessStatus::Continue if p.take_underruns() == 0 => return true,
+            _ => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    false
+}
+
+/// A helper held up for longer than a block (a busy machine, the display
+/// driver stalling while a monitor wakes) plays silence meanwhile and on
+/// afterwards; it is not given up.
+#[test]
+fn a_helper_held_up_for_a_moment_plays_on() {
+    let mut inst = remote(PluginFormat::Vst3, "test.held");
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    assert!(plays_on(p.as_mut(), BLOCK_TIMEOUT));
+    assert_eq!(run(p.as_mut(), 8, &[], &[]).1, ProcessStatus::Continue);
+}
+
+/// The host held up as well (the whole machine stalled) does not count
+/// against the helper: its time to answer starts again when the host runs.
+#[test]
+fn a_stall_of_the_host_is_not_held_against_the_helper() {
+    let mut inst = remote(PluginFormat::Vst3, "test.frozen");
+    let mut p = inst.create_processor(&CONFIG).unwrap();
+    // The block is late; then the host itself stops for longer than the
+    // timeout while the helper is still busy with it.
+    assert_ne!(run(p.as_mut(), 1, &[], &[]).1, ProcessStatus::Error);
+    std::thread::sleep(BLOCK_TIMEOUT + Duration::from_millis(200));
+    assert!(plays_on(p.as_mut(), BLOCK_TIMEOUT));
 }
