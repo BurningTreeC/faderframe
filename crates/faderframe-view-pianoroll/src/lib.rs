@@ -546,6 +546,27 @@ impl PianoRollView {
         Some((id, clip, clip.as_midi()?))
     }
 
+    /// Where files dropped at `pos` go: the shown clip's track, at the
+    /// time under the pointer (snapped to the grid); only on the notes.
+    fn file_drop(
+        &self,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<(faderframe_core::TrackId, MusicalTime)> {
+        let (_, clip, _) = Self::clip(model)?;
+        if !self.layout(size).grid.contains(pos) {
+            return None;
+        }
+        let at = clip.start + self.time_at(pos.x).max(MusicalTime::ZERO);
+        let at = if model.editor.snap {
+            model.editor.snap(at, &model.project().timeline.meter)
+        } else {
+            model.on_sample(at)
+        };
+        Some((clip.track, at))
+    }
+
     fn clamp_scroll(&mut self, size: Size, clip_len: MusicalTime) {
         let g = self.layout(size).grid;
         let max_y = (self.content_h() - g.h).max(0.0);
@@ -780,6 +801,45 @@ impl faderframe_ui_canvas::CanvasView<Session, faderframe_session::Action> for P
 
     fn scroll_held(&mut self, _axis: faderframe_ui_canvas::ScrollAxis, held: bool) {
         self.bar_held = held;
+    }
+
+    fn drag_files(&mut self, pos: Option<Point>, size: Size, model: &Session) -> bool {
+        pos.and_then(|p| self.file_drop(p, size, model)).is_some()
+    }
+
+    /// Files dropped on the notes go where the arranger puts files dropped
+    /// on the clip's track: a MIDI file becomes a clip there.
+    fn drop_files(
+        &mut self,
+        files: &[std::path::PathBuf],
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<faderframe_session::Action> {
+        let (track, at) = self.file_drop(pos, size, model)?;
+        Some(faderframe_session::Action::ImportFiles {
+            files: files.to_vec(),
+            track: Some(track),
+            at,
+        })
+    }
+
+    /// Files from the media browser, placed as on the arranger.
+    fn drop_payload(
+        &mut self,
+        payload: &str,
+        pos: Point,
+        size: Size,
+        model: &Session,
+    ) -> Option<faderframe_session::Action> {
+        use faderframe_session::browser::{BrowserOp, parse_payload};
+        let files = parse_payload(payload)?;
+        let (track, at) = self.file_drop(pos, size, model)?;
+        Some(faderframe_session::Action::Browser(BrowserOp::Place {
+            files,
+            track: Some(track),
+            at,
+        }))
     }
 }
 

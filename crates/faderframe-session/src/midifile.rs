@@ -221,6 +221,7 @@ impl Session {
             .or_else(|| p.tracks.iter().rposition(|t| t.kind.has_clips()))
             .map_or(0, |i| i + 1);
         let mut placed = None;
+        let mut placed_clip = None;
         let mut created = Vec::new();
         for part in parts {
             let mut notes: Vec<MidiNote> = Vec::new();
@@ -403,11 +404,23 @@ impl Session {
                     }),
                 }),
             });
-            if placed != Some(track_id) {
+            if placed == Some(track_id) {
+                placed_clip = Some(clip_id);
+            } else {
                 created.push(track_id);
             }
         }
         self.batch("Import MIDI File", cmds)?;
+        // Dropped on the track the clip editor shows: it shows the new clip.
+        if let (Some(t), Some(clip)) = (placed, placed_clip)
+            && self
+                .editor_clip()
+                .and_then(|c| self.project.clip(c))
+                .is_some_and(|c| c.track == t)
+        {
+            self.editor_clip = Some(clip);
+            self.selection.notes.clear();
+        }
         let shown: Vec<TrackId> = placed.into_iter().chain(created.iter().copied()).collect();
         self.selection
             .select_tracks(&shown, crate::SelectMode::Replace);
