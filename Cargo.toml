@@ -175,6 +175,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(faderframe_check_only)"] }
 unwrap_used = "warn"
 dbg_macro = "warn"
 todo = "warn"
+# Since Rust 1.100 it also flags loops whose index walks several buffers at
+# once (`for c in 0..channels` over input, output and state), the plain way
+# to write them in DSP code.
+needless_range_loop = "allow"
 
 [profile.dev]
 # Keep DSP code usable in debug builds.
